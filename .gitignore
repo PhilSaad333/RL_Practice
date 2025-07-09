@@ -14,3 +14,6 @@ __pycache__/
 *.pt
 *.safetensors
 *.bin
+
+# raw datasets live here – never commit them
+datasets/raw/
