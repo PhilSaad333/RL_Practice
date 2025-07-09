@@ -1,0 +1,16 @@
+# Byte-code & caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+.env/
+
+# Jupyter & VS Code junk
+.ipynb_checkpoints/
+.vscode/
+
+# Model artefacts (kept by Git LFS instead)
+*.pt
+*.safetensors
+*.bin
