@@ -63,9 +63,11 @@ def main():
         logging_steps=cfg["logging_steps"],
         save_steps=cfg["save_steps"],
         eval_strategy=cfg["eval_strategy"],
-        fp16=cfg["fp16"],
+        fp16=False, #cfg["fp16"]
+        bf16=False,
         report_to="none",
     )
+    args.gradient_clipping = 1.0
 
     # 4️⃣  SFT-Trainer ------------------------------------------------------------
     trainer = SFTTrainer(
