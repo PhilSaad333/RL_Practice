@@ -65,7 +65,6 @@ def main():
         fp16=True,
         bf16=False,
         max_grad_norm=1.0,
-        logging_steps=100,
         disable_tqdm=False,
         report_to="none"
     )
