@@ -65,9 +65,9 @@ def main():
         fp16=True,
         bf16=False,
         max_grad_norm=1.0,
-        logging_step=100,
+        logging_steps=100,
         disable_tqdm=False,
-        report_to="none",
+        report_to="none"
     )
 
     # 4️⃣  SFT-Trainer ------------------------------------------------------------
