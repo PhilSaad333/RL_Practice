@@ -14,5 +14,5 @@ num_train_epochs: 3
 logging_steps: 50
 save_steps:    500
 fp16:          true
-load_in_4bit:  true
+load_in_4bit:  false
 eval_strategy:      steps

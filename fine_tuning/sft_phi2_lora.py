@@ -59,7 +59,7 @@ def main():
         per_device_eval_batch_size=cfg["per_device_eval_batch_size"],
         gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
         num_train_epochs=cfg["num_train_epochs"],
-        learning_rate=cfg["learning_rate"],
+        learning_rate=float(cfg["learning_rate"]),
         logging_steps=cfg["logging_steps"],
         save_steps=cfg["save_steps"],
         eval_strategy=cfg["eval_strategy"],
