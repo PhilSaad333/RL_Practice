@@ -1,0 +1,17 @@
+# LoRA-SFT config for Phi-2
+model_name: microsoft/phi-2                # HF model hub id :contentReference[oaicite:2]{index=2}
+dataset_train: datasets/processed/gsm8k_tagged/train
+dataset_val:   datasets/processed/gsm8k_tagged/test
+output_dir:    outputs/phi2_gsm8k_lora
+lora_r:        64
+lora_alpha:    128
+lora_dropout:  0.05
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 2
+learning_rate: 2e-4
+num_train_epochs: 3
+logging_steps: 50
+save_steps:    500
+fp16:          true
+load_in_4bit:  true
