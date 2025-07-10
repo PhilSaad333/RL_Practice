@@ -62,7 +62,7 @@ def main():
         learning_rate=cfg["learning_rate"],
         logging_steps=cfg["logging_steps"],
         save_steps=cfg["save_steps"],
-        evaluation_strategy="steps",
+        eval_strategy=cfg["eval_strategy"],
         fp16=cfg["fp16"],
         report_to="none",
     )
