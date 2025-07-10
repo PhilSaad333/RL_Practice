@@ -37,10 +37,9 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg["model_name"],
-        device_map="auto",
-        trust_remote_code=True,
-        load_in_4bit=cfg["load_in_4bit"],
-        torch_dtype=torch.float16 if cfg["fp16"] else torch.float32,
+        device_map="auto"
+        #trust_remote_code=True,
+        #load_in_4bit=cfg["load_in_4bit"]
     )
 
     lora_cfg = LoraConfig(
@@ -63,11 +62,13 @@ def main():
         logging_steps=cfg["logging_steps"],
         save_steps=cfg["save_steps"],
         eval_strategy=cfg["eval_strategy"],
-        fp16=False, #cfg["fp16"]
+        fp16=True,
         bf16=False,
+        max_grad_norm=1.0,
+        logging_step=100,
+        disable_tqdm=False
         report_to="none",
     )
-    args.gradient_clipping = 1.0
 
     # 4️⃣  SFT-Trainer ------------------------------------------------------------
     trainer = SFTTrainer(
