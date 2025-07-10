@@ -13,6 +13,6 @@ learning_rate: 2e-4
 num_train_epochs: 3
 logging_steps: 100
 save_steps:    500
-fp16:          true
-load_in_4bit:  false
+fp16:          false
+load_in_4bit:  true
 eval_strategy:      steps

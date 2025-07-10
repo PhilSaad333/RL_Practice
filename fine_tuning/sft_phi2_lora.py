@@ -37,9 +37,8 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg["model_name"],
-        device_map="auto"
-        #trust_remote_code=True,
-        #load_in_4bit=cfg["load_in_4bit"]
+        device_map="auto",
+        load_in_4bit=True
     )
 
     lora_cfg = LoraConfig(
