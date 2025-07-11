@@ -62,7 +62,8 @@ def main(
                 logprobs = lps[i],
                 cfg = dict(temperature=temperature,
                         top_p=top_p,
-                        num_return_sequences=num_return_sequences)
+                        num_return_sequences=num_return_sequences),
+                gold=golds[start + i]
             ))
 
 

@@ -5,12 +5,16 @@ import torch, numpy as np
 from datasets import load_from_disk
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, GenerationConfig,
-    StoppingCriteriaList, StoppingCriteria
+    StoppingCriteriaList, StoppingCriteria,
+    Regex
 )
 from peft import PeftModel, PeftConfig
 
 # We will always stop generation when we see the </answer> tag
 TAG_STOP = "</answer>"
+# using regex constrained generation instead
+pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+constraint = Regex(pattern)
 
 class StopOnAnswer(StoppingCriteria):
     def __init__(self, tokenizer):
@@ -67,7 +71,8 @@ def generate_with_logprobs(
         out = model.generate(
             **ids,
             generation_config = gen_cfg,
-            stopping_criteria = stop_crit,
+            constraints = [constraint],
+            #stopping_criteria = stop_crit,
             output_scores     = True,
             return_dict_in_generate = True
         )

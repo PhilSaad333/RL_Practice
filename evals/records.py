@@ -11,6 +11,7 @@ class EvalRecord:
     q_idx: int
     prompt: str
     generations: List[str]          # raw decoded strings
+    gold: str
     logprobs:   List[np.ndarray]    # per-token log-probs
     cfg: Dict                        # temp, top_p, etc.
 

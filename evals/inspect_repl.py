@@ -2,7 +2,10 @@
 import code
 import tyro
 from evals.utils_io import load_everything
-from transformers import GenerationConfig
+from transformers import GenerationConfig, Regex
+
+pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+constraint = Regex(pattern)
 
 def inspect_question(prompt, model, tok, stopper,
                      q_idx: int,
@@ -26,7 +29,8 @@ def inspect_question(prompt, model, tok, stopper,
     outs = model.generate(
         **inp,
         generation_config=cfg,
-        stopping_criteria=stopper
+        constraints = [constraint],
+        #stopping_criteria=stopper
     ).view(num_return_sequences, -1)
     for i, seq in enumerate(outs, 1):
         print(f"\n### sample {i} ###\n" +
