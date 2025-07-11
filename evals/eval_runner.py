@@ -22,7 +22,11 @@ def main(
     subset_frac: float = 1.0,  
 ):
 
+
     model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
+
+    step_id = int(Path(ckpt_dir).name.rsplit("-", 1)[-1])
+
 
     if subset_frac < 1.0:
         keep = int(len(prompts) * subset_frac)
@@ -42,7 +46,7 @@ def main(
 
 
     recs = []
-    for start in tqdm(range(0, len(prompts), batch_size), desc="Generating"):
+    for start in tqdm(range(0, len(prompts), batch_size), desc="Generating Records"):
         batch_prompts = prompts[start : start + batch_size]
         gens, lps = generate_with_logprobs(
             model, tok, batch_prompts, cfg, stopper
