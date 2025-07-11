@@ -1,8 +1,9 @@
 # evals/records.py
-from dataclasses import dataclass
+import json, gzip, pathlib
+from dataclasses import asdict, dataclass
 from typing import List, Dict
 import numpy as np
-import json, gzip, pathlib
+
 
 @dataclass(frozen=True, slots=True)
 class EvalRecord:
@@ -13,12 +14,19 @@ class EvalRecord:
     logprobs:   List[np.ndarray]    # per-token log-probs
     cfg: Dict                        # temp, top_p, etc.
 
-def save_records(recs: List['EvalRecord'], path: str):
+def save_records(recs: List[EvalRecord], path: str):
+    """
+    Write one JSONL line per record, gzipped.
+    Converts numpy arrays to lists so JSON is happy.
+    """
     p = pathlib.Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(p, "wt", encoding="utf-8") as f:
         for r in recs:
-            f.write(json.dumps(r.__dict__, default=lambda x: x.tolist()) + "\n")
+            # asdict returns a dict; convert np.ndarray → list
+            data = asdict(r)
+            data["logprobs"] = [lp.tolist() for lp in data["logprobs"]]
+            f.write(json.dumps(data) + "\n")
 
 def load_records(path: str):
     with gzip.open(path, "rt", encoding="utf-8") as f:

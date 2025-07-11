@@ -18,9 +18,18 @@ def main(
     temperature: float = 0.7,
     top_p: float = 0.9,
     max_new_tokens: int = 256,
+    batch_size: int = 2,
+    subset_frac: float = 1.0,  
 ):
 
     model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
+
+    if subset_frac < 1.0:
+        keep = int(len(prompts) * subset_frac)
+        prompts = prompts[:keep]
+        golds   = golds[:keep]
+
+
     cfg = GenerationConfig(
         num_return_sequences = num_return_sequences,
         temperature          = temperature,
@@ -31,19 +40,32 @@ def main(
         do_sample            = True,
     )
 
-    recs = []
-    for q_idx, prompt in tqdm(enumerate(prompts), 
-                          total=len(prompts), 
-                          desc="Generating records"):
-        gens, lps = generate_with_logprobs(model, tok, prompt, cfg, stopper)
-        recs.append(EvalRecord(step=int(Path(ckpt_dir).name.split('-')[-1]),
-                               q_idx=q_idx, prompt=prompt,
-                               generations=gens, logprobs=lps,
-                               cfg=dict(temperature=temperature, top_p=top_p)))
 
-    ev = Evaluator(recs,
-                   metric_fns=[tag_format.has_good_tags, passk.passk],
-                   out_dir=f"{out_root}/step_{recs[0].step}")
+    recs = []
+    for start in tqdm(range(0, len(prompts), batch_size), desc="Generating"):
+        batch_prompts = prompts[start : start + batch_size]
+        gens, lps = generate_with_logprobs(
+            model, tok, batch_prompts, gen_cfg, stopper
+        )                               # gens: List[List[str]] length = batch_size
+        for i, prompt in enumerate(batch_prompts):
+            recs.append(EvalRecord(
+                step = step_id,
+                q_idx = start + i,
+                prompt = prompt,
+                generations = gens[i],
+                logprobs = lps[i],
+                cfg = dict(temperature=temperature,
+                        top_p=top_p,
+                        num_return_sequences=num_return_sequences)
+            ))
+
+
+    ev = Evaluator(
+        recs,
+        metric_fns=[tag_format.has_good_tags, passk.passk],
+        out_dir=f"{out_root}/step_{recs[0].step}"
+        )
+
     ev.run()
 
 if __name__ == "__main__":

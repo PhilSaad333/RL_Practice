@@ -9,8 +9,9 @@ class Evaluator:
                  record_iter: Iterable[EvalRecord],
                  metric_fns:  List[Callable],
                  out_dir: str):
-        self.record_iter = list(record_iter)       # consume generator
-        self.metric_fns  = metric_fns               # list of callables
+
+        self.record_iter = list(record_iter)        # recs is normally list anyways
+        self.metric_fns  = metric_fns
         self.out_dir     = Path(out_dir); self.out_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self):

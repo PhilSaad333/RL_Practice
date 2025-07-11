@@ -58,40 +58,41 @@ def load_everything(
 # Helper function to generate and return generations and log-probs
 
 def generate_with_logprobs(
-        model,
-        tokenizer,
-        prompt: str,
-        gen_cfg: GenerationConfig,
-        stop_crit: StoppingCriteriaList
-) -> Tuple[List[str], List[np.ndarray]]:
-    """
-    Returns:
-        generations : list[str]      decoded strings
-        logprobs    : list[np.array] token-wise log-probs (shape varies per gen)
-    """
-    ids = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
-        gen_out = model.generate(
+        model, tokenizer, prompts: List[str],
+        gen_cfg: GenerationConfig, stop_crit: StoppingCriteriaList
+):
+    # batch encode
+    ids = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):  # PyTorch ≥2.0  :contentReference[oaicite:1]{index=1}
+        out = model.generate(
             **ids,
             generation_config = gen_cfg,
             stopping_criteria = stop_crit,
-            output_scores = True,
+            output_scores     = True,
             return_dict_in_generate = True
         )
 
-    # gen_out.sequences shape: [num_seqs, T]
-    # gen_out.scores    list of length new_tokens with shape [num_seqs, vocab]
-    generations = tokenizer.batch_decode(gen_out.sequences,
-                                         skip_special_tokens=True)
-    # Convert per-step scores (logits) → log-probs, slice for each sequence
-    logprobs = []
-    for seq_idx in range(gen_out.sequences.size(0)):
-        lp_seq = []
-        for t, step_scores in enumerate(gen_out.scores):
-            logp = step_scores[seq_idx].float().log_softmax(dim=-1).cpu()
-            token_id = gen_out.sequences[seq_idx, -(len(gen_out.scores) - t)]
-            lp_seq.append(logp[token_id].item())
-        logprobs.append(np.array(lp_seq, dtype=np.float32))
+    B = len(prompts)
+    N = gen_cfg.num_return_sequences
+    seqs = out.sequences.view(B, N, -1)           # [B, N, T]  :contentReference[oaicite:2]{index=2}
+    scores = list(out.scores)                     # list[T] of [B*N, vocab]
 
-    return generations, logprobs
+    # unpack per prompt
+    gen_text, gen_lps = [], []
+    for b in range(B):
+        txts, lps = [], []
+        for n in range(N):
+            seq = seqs[b, n]
+            # decode
+            txts.append(tokenizer.decode(seq, skip_special_tokens=True))
+            # per-token log-prob
+            lp = []
+            for t, s in enumerate(scores):
+                row = s[(b * N) + n].float().log_softmax(dim=-1).cpu()
+                tok_id = seq[-len(scores) + t]
+                lp.append(row[tok_id].item())
+            lps.append(np.array(lp, dtype=np.float32))
+        gen_text.append(txts)
+        gen_lps.append(lps)
+    return gen_text, gen_lps
+
