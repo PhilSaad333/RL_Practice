@@ -13,8 +13,7 @@ def passk(records, k_vals=(1,2,4,8)):
         row = {"q_idx": r.q_idx}
         for k in k_vals:
             cum = cum or any(flags[:k])
-            row[f"pass@{k}"] = int(cum)
-        row["tag_ok_first"] = int(has_good_tags(r.generations[0]))
-        row["tag_ok_any"]   = int(any(has_good_tags(g) for g in r.generations))
+            row[f"pass@{k}"] = sum(flags[:k]) / k
+            row[f"pass_any@{k}"] = int(any(flags[:k]))
         rows.append(row)
     return rows
