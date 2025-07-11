@@ -14,16 +14,21 @@ def main(
     ckpt_dir: str,
     data_dir: str,
     out_root: str = "/content/drive/MyDrive/RL_Practice_Files/eval_runs",
-    n_gen: int = 8,
+    num_return_sequences: int = 8,
     temperature: float = 0.7,
     top_p: float = 0.9,
+    max_new_tokens: int = 256,
 ):
 
     model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
     cfg = GenerationConfig(
-        num_return_sequences=n_gen, temperature=temperature, top_p=top_p,
-        max_new_tokens=256, pad_token_id=tok.pad_token_id,
-        eos_token_id=tok.eos_token_id, do_sample=True
+        num_return_sequences = num_return_sequences,
+        temperature          = temperature,
+        top_p                = top_p,
+        max_new_tokens       = max_new_tokens,
+        pad_token_id         = tok.pad_token_id,
+        eos_token_id         = tok.eos_token_id,
+        do_sample            = True,
     )
 
     recs = []
