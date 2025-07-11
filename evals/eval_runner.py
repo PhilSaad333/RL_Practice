@@ -18,7 +18,7 @@ def main(
     temperature: float = 0.7,
     top_p: float = 0.9,
 ):
-    # 1) load model, prompts, golds (reuse your current helpers) -------
+
     model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
     cfg = GenerationConfig(
         num_return_sequences=n_gen, temperature=temperature, top_p=top_p,
@@ -26,7 +26,6 @@ def main(
         eos_token_id=tok.eos_token_id, do_sample=True
     )
 
-    # 2) generate & build records --------------------------------------
     recs = []
     for q_idx, prompt in tqdm(enumerate(prompts), 
                           total=len(prompts), 
@@ -37,7 +36,6 @@ def main(
                                generations=gens, logprobs=lps,
                                cfg=dict(temperature=temperature, top_p=top_p)))
 
-    # 3) run evaluator -------------------------------------------------
     ev = Evaluator(recs,
                    metric_fns=[tag_format.has_good_tags, passk.passk],
                    out_dir=f"{out_root}/step_{recs[0].step}")

@@ -9,7 +9,7 @@ from transformers import (
 )
 from peft import PeftModel, PeftConfig
 
-# ----- regex & stop-criterion reused across project -------------------
+# We will always stop generation when we see the </answer> tag
 TAG_STOP = "</answer>"
 
 class StopOnAnswer(StoppingCriteria):
@@ -19,7 +19,7 @@ class StopOnAnswer(StoppingCriteria):
     def __call__(self, ids, scores, **kw):
         return ids[0, -self.L:].tolist() == self.tag_ids
 
-# ----------------------------------------------------------------------
+# Helper function to load everything we need for evaluation
 
 def load_everything(
         ckpt_dir: str,
@@ -55,6 +55,7 @@ def load_everything(
     stop_crit = StoppingCriteriaList([StopOnAnswer(tok)])
     return model, tok, prompts, golds, stop_crit
 
+# Helper function to generate and return generations and log-probs
 
 def generate_with_logprobs(
         model,

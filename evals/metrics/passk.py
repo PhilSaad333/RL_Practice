@@ -17,4 +17,4 @@ def passk(records, k_vals=(1,2,4,8)):
         row["tag_ok_first"] = int(has_good_tags(r.generations[0]))
         row["tag_ok_any"]   = int(any(has_good_tags(g) for g in r.generations))
         rows.append(row)
-    return rows          # later merged by Evaluator
+    return rows
