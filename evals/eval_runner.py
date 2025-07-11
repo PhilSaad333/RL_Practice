@@ -5,6 +5,8 @@ from evals.records import EvalRecord
 from evals.evaluator import Evaluator
 from evals.metrics import tag_format, passk
 from transformers import GenerationConfig
+from tqdm.auto import tqdm
+
 from evals.utils_io import load_everything, generate_with_logprobs
 
 
@@ -26,7 +28,9 @@ def main(
 
     # 2) generate & build records --------------------------------------
     recs = []
-    for q_idx, prompt in enumerate(prompts):
+    for q_idx, prompt in tqdm(enumerate(prompts), 
+                          total=len(prompts), 
+                          desc="Generating records"):
         gens, lps = generate_with_logprobs(model, tok, prompt, cfg, stopper)
         recs.append(EvalRecord(step=int(Path(ckpt_dir).name.split('-')[-1]),
                                q_idx=q_idx, prompt=prompt,
