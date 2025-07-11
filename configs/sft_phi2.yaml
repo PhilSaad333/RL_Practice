@@ -15,4 +15,4 @@ logging_steps: 100
 save_steps:    500
 fp16:          false
 load_in_4bit:  true
-eval_strategy:      steps
+eval_strategy: steps
