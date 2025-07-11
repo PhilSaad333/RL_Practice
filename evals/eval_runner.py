@@ -8,6 +8,8 @@ from transformers import GenerationConfig
 from tqdm.auto import tqdm
 
 from evals.utils_io import load_everything, generate_with_logprobs
+from evals.metrics.tag_format import tag_format_metrics
+
 
 
 def main(
@@ -66,7 +68,7 @@ def main(
 
     ev = Evaluator(
         recs,
-        metric_fns=[tag_format.has_good_tags, passk.passk],
+        metric_fns=[tag_format.tag_format_metrics, passk.passk],
         out_dir=f"{out_root}/step_{recs[0].step}"
         )
 
