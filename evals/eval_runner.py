@@ -45,7 +45,7 @@ def main(
     for start in tqdm(range(0, len(prompts), batch_size), desc="Generating"):
         batch_prompts = prompts[start : start + batch_size]
         gens, lps = generate_with_logprobs(
-            model, tok, batch_prompts, gen_cfg, stopper
+            model, tok, batch_prompts, cfg, stopper
         )                               # gens: List[List[str]] length = batch_size
         for i, prompt in enumerate(batch_prompts):
             recs.append(EvalRecord(
