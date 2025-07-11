@@ -17,7 +17,7 @@ def main(
     top_p: float = 0.9,
 ):
     # 1) load model, prompts, golds (reuse your current helpers) -------
-    model, tok, prompts, golds = load_everything(ckpt_dir, data_dir)
+    model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
     cfg = GenerationConfig(
         num_return_sequences=n_gen, temperature=temperature, top_p=top_p,
         max_new_tokens=256, pad_token_id=tok.pad_token_id,
@@ -27,7 +27,7 @@ def main(
     # 2) generate & build records --------------------------------------
     recs = []
     for q_idx, prompt in enumerate(prompts):
-        gens, lps = generate_with_logprobs(model, tok, prompt, cfg)
+        gens, lps = generate_with_logprobs(model, tok, prompt, cfg, stopper)
         recs.append(EvalRecord(step=int(Path(ckpt_dir).name.split('-')[-1]),
                                q_idx=q_idx, prompt=prompt,
                                generations=gens, logprobs=lps,
