@@ -66,7 +66,7 @@ def load_everything(
 def generate_with_logprobs(
         model, tokenizer, prompts: List[str],
         gen_cfg: GenerationConfig,
-        stop_crit,
+        stop_crit: StoppingCriteriaList,
 ):
     # batch encode
     ids = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
@@ -91,18 +91,33 @@ def generate_with_logprobs(
         txts, lps = [], []
         for n in range(N):
             seq = seqs[b, n]
-            # decode
-            txts.append(
-                TAG_RGX.search(tokenizer.decode(seq, skip_special_tokens=True)).group(0)
-                )
-            # per-token log-prob
+            decoded = tokenizer.decode(seq, skip_special_tokens=True)
+
+            # 1) try to extract the first well-formed block
+            m = TAG_RGX.search(decoded)
+            if m:
+                tidy = m.group(0)
+            else:
+                # 2) fallback: cut everything after the first "</answer>"
+                idx = decoded.find(TAG_STOP)
+                if idx != -1:
+                    tidy = decoded[: idx + len(TAG_STOP)]
+                else:
+                    # 3) last resort: leave it as-is
+                    tidy = decoded
+
+            txts.append(tidy)
+
+            # per-token log-prob (unchanged)
             lp = []
             for t, s in enumerate(scores):
                 row = s[(b * N) + n].float().log_softmax(dim=-1).cpu()
                 tok_id = seq[-len(scores) + t]
                 lp.append(row[tok_id].item())
             lps.append(np.array(lp, dtype=np.float32))
+
         gen_text.append(txts)
         gen_lps.append(lps)
+
     return gen_text, gen_lps
 
