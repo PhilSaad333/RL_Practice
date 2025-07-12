@@ -2,7 +2,8 @@
 import code
 import tyro
 from evals.utils_io import load_everything
-from transformers import GenerationConfig, Regex
+from transformers import GenerationConfig
+from transformers_re import Regex
 
 PATTERN = r"<think>.*?</think>\s*<answer>.*?</answer>"
 REGEX_CONSTRAINT = Regex(PATTERN)

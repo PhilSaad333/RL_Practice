@@ -4,9 +4,9 @@ from typing import Tuple, List
 import torch, numpy as np
 from datasets import load_from_disk
 from transformers import (
-    AutoTokenizer, AutoModelForCausalLM, GenerationConfig, Regex
+    AutoTokenizer, AutoModelForCausalLM, GenerationConfig
 )
-from transformers_re import RegexLogitsProcessor
+from transformers_re import Regex, RegexLogitsProcessor
 from peft import PeftModel, PeftConfig
 
 # using regex constrained generation instead of stopping pattern
