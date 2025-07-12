@@ -42,4 +42,4 @@ class Evaluator:
             "batch_size":   self.batch_size,
             "decoding_cfg": self.record_iter[0].cfg,
         }
-        (json.dumps(meta, indent=2) | Path(self.out_dir / "run_meta.json").write_text)
+        Path(self.out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2))
