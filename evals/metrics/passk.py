@@ -24,8 +24,10 @@ def passk(records: List[EvalRecord], k_vals=(1, 2, 4, 8)) -> List[Dict]:
             ok = verify(gold_expr, parse(f"${pred}$"))
             flags.append(ok)
 
-        row = {"q_idx": r.q_idx}
-        row = {"pass_rate": sum(flags)/(max(k_vals))}
+        row = {
+            "q_idx": r.q_idx,
+            "pass_rate": sum(flags)/(max(k_vals))
+            }
         for k in k_vals:
             row[f"pass@{k}"] = int(any(flags[:k]))       # Codex metric
         rows.append(row)
