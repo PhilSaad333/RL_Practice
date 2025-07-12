@@ -4,24 +4,14 @@ from typing import Tuple, List
 import torch, numpy as np
 from datasets import load_from_disk
 from transformers import (
-    AutoTokenizer, AutoModelForCausalLM, GenerationConfig,
-    StoppingCriteriaList, StoppingCriteria,
-    Regex
+    AutoTokenizer, AutoModelForCausalLM, GenerationConfig, Regex
 )
+from transformers_re import RegexLogitsProcessor
 from peft import PeftModel, PeftConfig
 
-# We will always stop generation when we see the </answer> tag
-TAG_STOP = "</answer>"
-# using regex constrained generation instead
-pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
-constraint = Regex(pattern)
-
-class StopOnAnswer(StoppingCriteria):
-    def __init__(self, tokenizer):
-        self.tag_ids = tokenizer(TAG_STOP, add_special_tokens=False).input_ids
-        self.L       = len(self.tag_ids)
-    def __call__(self, ids, scores, **kw):
-        return ids[0, -self.L:].tolist() == self.tag_ids
+# using regex constrained generation instead of stopping pattern
+PATTERN = r"<think>.*?</think>\s*<answer>.*?</answer>"
+REGEX_CONSTRAINT = Regex(PATTERN)
 
 # Helper function to load everything we need for evaluation
 
@@ -35,7 +25,6 @@ def load_everything(
         AutoTokenizer,        # tokenizer
         List[str],            # prompts
         List[str],            # gold answers
-        StoppingCriteriaList  # stop criterion (reuse in runner)
 ]:
     # 1️⃣  tokenizer
     tok = AutoTokenizer.from_pretrained("microsoft/phi-2")
@@ -57,13 +46,13 @@ def load_everything(
                for r in ds]
 
     stop_crit = StoppingCriteriaList([StopOnAnswer(tok)])
-    return model, tok, prompts, golds, stop_crit
+    return model, tok, prompts, golds
 
 # Helper function to generate and return generations and log-probs
 
 def generate_with_logprobs(
         model, tokenizer, prompts: List[str],
-        gen_cfg: GenerationConfig, stop_crit: StoppingCriteriaList
+        gen_cfg: GenerationConfig,
 ):
     # batch encode
     ids = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
@@ -71,8 +60,7 @@ def generate_with_logprobs(
         out = model.generate(
             **ids,
             generation_config = gen_cfg,
-            constraints = [constraint],
-            #stopping_criteria = stop_crit,
+            constraints = [REGEX_CONSTRAINT],
             output_scores     = True,
             return_dict_in_generate = True
         )

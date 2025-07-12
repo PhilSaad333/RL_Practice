@@ -4,8 +4,8 @@ import tyro
 from evals.utils_io import load_everything
 from transformers import GenerationConfig, Regex
 
-pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
-constraint = Regex(pattern)
+PATTERN = r"<think>.*?</think>\s*<answer>.*?</answer>"
+REGEX_CONSTRAINT = Regex(PATTERN)
 
 def inspect_question(prompt, model, tok, stopper,
                      q_idx: int,
@@ -29,20 +29,19 @@ def inspect_question(prompt, model, tok, stopper,
     outs = model.generate(
         **inp,
         generation_config=cfg,
-        constraints = [constraint],
-        #stopping_criteria=stopper
+        constraints = [REGEX_CONSTRAINT],
     ).view(num_return_sequences, -1)
     for i, seq in enumerate(outs, 1):
         print(f"\n### sample {i} ###\n" +
               tok.decode(seq, skip_special_tokens=True) + "\n")
 
 def main(ckpt_dir: str, data_dir: str):
-    model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
+    model, tok, prompts, golds = load_everything(ckpt_dir, data_dir)
 
     banner = (
         f"\nLoaded checkpoint {ckpt_dir!r} with {len(prompts)} prompts.\n"
         "Call:\n"
-        "  inspect_question(prompts[q_idx], model, tok, stopper, q_idx, ...)\n"
+        "  inspect_question(prompts[q_idx], model, tok, q_idx, ...)\n"
     )
     # ← merge globals & locals so inspect_question is available
     code.interact(banner=banner, local={**globals(), **locals()})

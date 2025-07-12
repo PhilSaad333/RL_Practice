@@ -25,7 +25,7 @@ def main(
 ):
 
 
-    model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
+    model, tok, prompts, golds = load_everything(ckpt_dir, data_dir)
 
     step_id = int(Path(ckpt_dir).name.rsplit("-", 1)[-1])
 
@@ -51,7 +51,7 @@ def main(
     for start in tqdm(range(0, len(prompts), batch_size), desc="Generating Records"):
         batch_prompts = prompts[start : start + batch_size]
         gens, lps = generate_with_logprobs(
-            model, tok, batch_prompts, cfg, stopper
+            model, tok, batch_prompts, cfg
         )                               # gens: List[List[str]] length = batch_size
         for i, prompt in enumerate(batch_prompts):
             recs.append(EvalRecord(
