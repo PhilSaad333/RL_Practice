@@ -44,7 +44,6 @@ def load_everything(
     golds   = [r["text"].split("<answer>")[-1].split("</answer>")[0].strip()
                for r in ds]
 
-    stop_crit = StoppingCriteriaList([StopOnAnswer(tok)])
     return model, tok, prompts, golds
 
 # Helper function to generate and return generations and log-probs
