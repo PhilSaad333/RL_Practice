@@ -8,7 +8,6 @@ from transformers import (
     AutoTokenizer, AutoModelForCausalLM, GenerationConfig,
     StoppingCriteria, StoppingCriteriaList,
 )
-from transformers_re import RegexLogitsProcessor
 from peft import PeftModel, PeftConfig
 
 TAG_RGX   = re.compile(r"<think>.*?</think>\s*<answer>.*?</answer>", re.S)
