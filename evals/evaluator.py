@@ -27,3 +27,13 @@ class Evaluator:
 
         df.to_csv(self.out_dir / "metrics.csv", index=False)
         print(f"✓ wrote metrics.csv with {len(df)} rows to {self.out_dir}")
+
+        # 3) save global metadata
+        meta = {
+            "ckpt_dir": str(self.out_dir.parents[1] / f"checkpoint-{self.record_iter[0].step}"),
+            "step":     self.record_iter[0].step,
+            "subset_frac":  subset_frac,    # pass in from CLI
+            "batch_size":   batch_size,     # pass in from CLI
+            "decoding_cfg": self.record_iter[0].cfg,   # already in EvalRecord
+        }
+        (json.dumps(meta, indent=2) | Path(self.out_dir / "run_meta.json").write_text)

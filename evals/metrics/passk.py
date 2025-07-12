@@ -8,8 +8,8 @@ from evals.records import EvalRecord
 def passk(records: List[EvalRecord], k_vals=(1, 2, 4, 8)) -> List[Dict]:
     """
     For each EvalRecord compute:
-      • pass@k  = (# correct among first k samples) / k
-      • pass_any@k = 1 if any of first k samples correct, else 0
+      • pass_rate  = (# correct among max(k_vals)) / max(k_vals)
+      • pass@k = 1 if any of first k samples correct, else 0
     """
     rows = []
     for r in records:
@@ -25,8 +25,8 @@ def passk(records: List[EvalRecord], k_vals=(1, 2, 4, 8)) -> List[Dict]:
             flags.append(ok)
 
         row = {"q_idx": r.q_idx}
+        row = {"pass_rate": sum(flags)/(max(k_vals))}
         for k in k_vals:
-            row[f"pass@{k}"]     = sum(flags[:k]) / k        # fraction correct
-            row[f"pass_any@{k}"] = int(any(flags[:k]))       # Codex metric
+            row[f"pass@{k}"] = int(any(flags[:k]))       # Codex metric
         rows.append(row)
     return rows

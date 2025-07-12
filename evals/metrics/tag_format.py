@@ -19,9 +19,10 @@ def tag_format_metrics(records: List[EvalRecord]) -> List[Dict]:
     out = []
     for r in records:
         flags = [has_good_tags(g) for g in r.generations]
+        N = len(flags)
         out.append({
             "q_idx":            r.q_idx,
-            "tag_ok_first":     int(flags[0]),
+            "tag_ok_ave":     sum(flags)/N,
             "tag_ok_any":       int(any(flags)),
         })
     return out

@@ -66,11 +66,13 @@ def main(
                 gold=golds[start + i]
             ))
 
+    # metadata
+    tag = f"T{temperature}_P{top_p}_R{num_return_sequences}"
 
     ev = Evaluator(
         recs,
         metric_fns=[tag_format.tag_format_metrics, passk.passk],
-        out_dir=f"{out_root}/step_{recs[0].step}"
+        out_dir = f"{out_root}/step_{step_id}/{tag}"
         )
 
     ev.run()
