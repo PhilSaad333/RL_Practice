@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Tuple, List
 import torch, numpy as np
 from datasets import load_from_disk
+import re
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, GenerationConfig,
     StoppingCriteria, StoppingCriteriaList,
