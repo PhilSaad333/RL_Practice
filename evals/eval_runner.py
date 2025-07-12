@@ -72,7 +72,9 @@ def main(
     ev = Evaluator(
         recs,
         metric_fns=[tag_format.tag_format_metrics, passk.passk],
-        out_dir = f"{out_root}/step_{step_id}/{tag}"
+        out_dir = f"{out_root}/step_{step_id}/{tag}",
+        subset_frac=subset_frac,
+        batch_size=batch_size,
         )
 
     ev.run()
