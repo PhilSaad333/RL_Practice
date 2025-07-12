@@ -71,11 +71,6 @@ def generate_with_logprobs(
     # batch encode
     ids = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
-        # for enforcing regex constrained generation
-        processors = [
-            RegexLogitsProcessor(tokenizer, p, PATTERN)
-            for p in prompts
-        ]
 
         out = model.generate(
             **ids,
