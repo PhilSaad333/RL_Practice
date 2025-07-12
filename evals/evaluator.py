@@ -1,4 +1,5 @@
 # evals/evaluator.py
+import json
 import pandas as pd, importlib
 from pathlib import Path
 from evals.records import EvalRecord, save_records
