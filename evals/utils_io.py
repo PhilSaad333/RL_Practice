@@ -4,13 +4,26 @@ from typing import Tuple, List
 import torch, numpy as np
 from datasets import load_from_disk
 from transformers import (
-    AutoTokenizer, AutoModelForCausalLM, GenerationConfig
+    AutoTokenizer, AutoModelForCausalLM, GenerationConfig,
+    StoppingCriteria, StoppingCriteriaList,
 )
 from transformers_re import RegexLogitsProcessor
 from peft import PeftModel, PeftConfig
 
-# using regex constrained generation instead of stopping pattern
-PATTERN = r"<think>.*?</think>\s*<answer>.*?</answer>"
+TAG_RGX   = re.compile(r"<think>.*?</think>\s*<answer>.*?</answer>", re.S)
+TAG_STOP  = "</answer>"
+
+
+class StopOnAnswer(StoppingCriteria):
+    def __init__(self, tokenizer):
+        self.tag_ids = tokenizer(TAG_STOP, add_special_tokens=False).input_ids
+        self.L       = len(self.tag_ids)
+
+    def __call__(self, ids, scores, **kw):
+        # halt as soon as last L tokens equal </answer>
+        return ids[0, -self.L :].tolist() == self.tag_ids
+
+
 
 # Helper function to load everything we need for evaluation
 
@@ -44,13 +57,16 @@ def load_everything(
     golds   = [r["text"].split("<answer>")[-1].split("</answer>")[0].strip()
                for r in ds]
 
-    return model, tok, prompts, golds
+    stopper = StoppingCriteriaList([StopOnAnswer(tok)])
+
+    return model, tok, prompts, golds, stopper
 
 # Helper function to generate and return generations and log-probs
 
 def generate_with_logprobs(
         model, tokenizer, prompts: List[str],
         gen_cfg: GenerationConfig,
+        stop_crit,
 ):
     # batch encode
     ids = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
@@ -64,7 +80,7 @@ def generate_with_logprobs(
         out = model.generate(
             **ids,
             generation_config   = gen_cfg,
-            logits_processor    = processors,
+            stopping_criteria = stop_crit,
             output_scores       = True,
             return_dict_in_generate = True,
         )
@@ -81,7 +97,9 @@ def generate_with_logprobs(
         for n in range(N):
             seq = seqs[b, n]
             # decode
-            txts.append(tokenizer.decode(seq, skip_special_tokens=True))
+            txts.append(
+                TAG_RGX.search(tokenizer.decode(seq, skip_special_tokens=True)).group(0)
+                )
             # per-token log-prob
             lp = []
             for t, s in enumerate(scores):

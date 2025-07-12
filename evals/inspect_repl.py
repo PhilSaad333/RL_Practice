@@ -3,11 +3,10 @@ import code
 import tyro
 from evals.utils_io import load_everything
 from transformers import GenerationConfig
-from transformers_re import RegexLogitsProcessor
+from evals.utils_io import load_everything, StopOnAnswer
 
-PATTERN = r"<think>.*?</think>\s*<answer>.*?</answer>"
 
-def inspect_question(prompt, model, tok,
+def inspect_question(prompt, model, tok, stopper,
                      q_idx: int,
                      num_return_sequences: int = 3,
                      temperature: float = 0.7,
@@ -30,14 +29,14 @@ def inspect_question(prompt, model, tok,
     outs = model.generate(
             **inp,
             generation_config = cfg,
-            logits_processor  = [proc]   # enforce regex
+            stopping_criteria = stopper
     ).view(num_return_sequences, -1)
     for i, seq in enumerate(outs, 1):
         print(f"\n### sample {i} ###\n" +
               tok.decode(seq, skip_special_tokens=True) + "\n")
 
 def main(ckpt_dir: str, data_dir: str):
-    model, tok, prompts, golds = load_everything(ckpt_dir, data_dir)
+    model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
 
     banner = (
         f"\nLoaded checkpoint {ckpt_dir!r} with {len(prompts)} prompts.\n"
