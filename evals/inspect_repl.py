@@ -25,7 +25,6 @@ def inspect_question(prompt, model, tok, stopper,
         do_sample            = True,
     )
     inp = tok(prompt, return_tensors="pt").to(model.device)
-    proc = RegexLogitsProcessor(tok, prompt, PATTERN)
     outs = model.generate(
             **inp,
             generation_config = cfg,
