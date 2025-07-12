@@ -7,7 +7,7 @@ from transformers_re import RegexLogitsProcessor
 
 PATTERN = r"<think>.*?</think>\s*<answer>.*?</answer>"
 
-def inspect_question(prompt, model, tok, stopper,
+def inspect_question(prompt, model, tok,
                      q_idx: int,
                      num_return_sequences: int = 3,
                      temperature: float = 0.7,
