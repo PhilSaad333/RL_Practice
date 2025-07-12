@@ -3,10 +3,9 @@ import code
 import tyro
 from evals.utils_io import load_everything
 from transformers import GenerationConfig
-from transformers_re import Regex
+from transformers_re import RegexLogitsProcessor
 
 PATTERN = r"<think>.*?</think>\s*<answer>.*?</answer>"
-REGEX_CONSTRAINT = Regex(PATTERN)
 
 def inspect_question(prompt, model, tok, stopper,
                      q_idx: int,
@@ -27,10 +26,11 @@ def inspect_question(prompt, model, tok, stopper,
         do_sample            = True,
     )
     inp = tok(prompt, return_tensors="pt").to(model.device)
+    proc = RegexLogitsProcessor(tok, prompt, PATTERN)
     outs = model.generate(
-        **inp,
-        generation_config=cfg,
-        constraints = [REGEX_CONSTRAINT],
+            **inp,
+            generation_config = cfg,
+            logits_processor  = [proc]   # enforce regex
     ).view(num_return_sequences, -1)
     for i, seq in enumerate(outs, 1):
         print(f"\n### sample {i} ###\n" +

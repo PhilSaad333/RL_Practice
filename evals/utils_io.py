@@ -6,12 +6,11 @@ from datasets import load_from_disk
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, GenerationConfig
 )
-from transformers_re import Regex, RegexLogitsProcessor
+from transformers_re import RegexLogitsProcessor
 from peft import PeftModel, PeftConfig
 
 # using regex constrained generation instead of stopping pattern
 PATTERN = r"<think>.*?</think>\s*<answer>.*?</answer>"
-REGEX_CONSTRAINT = Regex(PATTERN)
 
 # Helper function to load everything we need for evaluation
 
@@ -56,13 +55,19 @@ def generate_with_logprobs(
 ):
     # batch encode
     ids = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):  # PyTorch ≥2.0  :contentReference[oaicite:1]{index=1}
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+        # for enforcing regex constrained generation
+        processors = [
+            RegexLogitsProcessor(tokenizer, p, PATTERN)
+            for p in prompts
+        ]
+
         out = model.generate(
             **ids,
-            generation_config = gen_cfg,
-            constraints = [REGEX_CONSTRAINT],
-            output_scores     = True,
-            return_dict_in_generate = True
+            generation_config   = gen_cfg,
+            logits_processor    = processors,
+            output_scores       = True,
+            return_dict_in_generate = True,
         )
 
     B = len(prompts)
