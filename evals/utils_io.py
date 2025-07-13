@@ -109,24 +109,19 @@ def generate_with_logprobs(
             txts.append(tidy)
 
             # per-token log-prob and per-token entropy
-            lp = []
-            ent = []
+            lp_list  = []
+            ent_list = []
             for t, s in enumerate(scores):
-                row = s[(b * N) + n].float().log_softmax(dim=-1).cpu()
-                tok_id = seq[-len(scores) + t]
-                lp.append(row[tok_id].item())
-                ent.append(-(row * row.exp()).sum())
-                # logits for (this sample, this generation step)
                 logits = s[(b * N) + n].float()
+                log_p  = logits.log_softmax(dim=-1).cpu()
+                p      = log_p.exp()
+                tok_id = seq[-len(scores) + t]
+                lp_list.append(log_p[tok_id].item())
+                ent_list.append(-(p * log_p).sum().item())
 
-                log_p  = logits.log_softmax(dim=-1).cpu()     # log-probs
-                p      = log_p.exp()                          # probs
+            lps.append(np.asarray(lp_list,  dtype=np.float32))
+            ents.append(np.asarray(ent_list, dtype=np.float32))
 
-                tok_id = seq[-len(scores) + t]                # generated id
-                lp.append(log_p[tok_id].item())               # surprisal
-
-                H = -(p * log_p).sum().item()                 # Shannon entropy
-                ent.append(H)
 
         gen_text.append(txts)
         gen_lps.append(lps)

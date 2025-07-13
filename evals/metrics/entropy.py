@@ -17,6 +17,13 @@ def _stats(arr: np.ndarray, prefix: str) -> Dict[str, float]:
 def entropy_metrics(records: List[EvalRecord]) -> List[Dict]:
     rows: List[Dict] = []
     for r in records:
+        if len(r.logprobs) == 0:
+            row = {"q_idx": r.q_idx}
+            for prefix in ("surp", "ent"):
+                for stat in ("mean", "std", "max", "p95"):
+                    row[f"{prefix}_{stat}"] = float("nan")
+            rows.append(row)
+            continue
         # --- token-level arrays for this prompt (all completions concatenated)
         surp = -np.concatenate(r.logprobs)     # surprisal  = −log p₍chosen₎
         ent  =  np.concatenate(r.entropies)    # true entropy for each step
