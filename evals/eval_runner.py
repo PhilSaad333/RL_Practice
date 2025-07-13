@@ -3,7 +3,7 @@ import tyro
 from pathlib import Path
 from evals.records import EvalRecord
 from evals.evaluator import Evaluator
-from evals.metrics import tag_format, passk
+from evals.metrics import tag_format, passk, response_len, entropy
 from transformers import GenerationConfig
 from tqdm.auto import tqdm
 
@@ -50,7 +50,7 @@ def main(
     recs = []
     for start in tqdm(range(0, len(prompts), batch_size), desc="Generating Records"):
         batch_prompts = prompts[start : start + batch_size]
-        gens, lps = generate_with_logprobs(
+        gens, lps, ents = generate_with_logprobs(
             model, tok, batch_prompts, cfg, stopper
         )                               # gens: List[List[str]] length = batch_size
         for i, prompt in enumerate(batch_prompts):
@@ -60,6 +60,7 @@ def main(
                 prompt = prompt,
                 generations = gens[i],
                 logprobs = lps[i],
+                entropies = ents[i],
                 cfg = dict(temperature=temperature,
                         top_p=top_p,
                         num_return_sequences=num_return_sequences),
@@ -71,7 +72,12 @@ def main(
 
     ev = Evaluator(
         recs,
-        metric_fns=[tag_format.tag_format_metrics, passk.passk],
+        metric_fns=[
+            tag_format.tag_format_metrics,
+            passk.passk,
+            response_len.response_len_metrics,
+            entropy.entropy_metrics,
+            ],
         out_dir = f"{out_root}/step_{step_id}/{tag}",
         subset_frac=subset_frac,
         batch_size=batch_size,

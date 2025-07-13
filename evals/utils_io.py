@@ -86,9 +86,9 @@ def generate_with_logprobs(
     scores = list(out.scores)                     # list[T] of [B*N, vocab]
 
     # unpack per prompt
-    gen_text, gen_lps = [], []
+    gen_text, gen_lps, gen_ents = [], [], []
     for b in range(B):
-        txts, lps = [], []
+        txts, lps, ents = [], [], []
         for n in range(N):
             seq = seqs[b, n]
             decoded = tokenizer.decode(seq, skip_special_tokens=True)
@@ -108,16 +108,29 @@ def generate_with_logprobs(
 
             txts.append(tidy)
 
-            # per-token log-prob (unchanged)
+            # per-token log-prob and per-token entropy
             lp = []
-            for t, s in enumerate(scores):
+            ent = []
+             for t, s in enumerate(scores):
                 row = s[(b * N) + n].float().log_softmax(dim=-1).cpu()
                 tok_id = seq[-len(scores) + t]
                 lp.append(row[tok_id].item())
-            lps.append(np.array(lp, dtype=np.float32))
+                ent.append(-(row * row.exp()).sum())
+                # logits for (this sample, this generation step)
+                logits = s[(b * N) + n].float()
+
+                log_p  = logits.log_softmax(dim=-1).cpu()     # log-probs
+                p      = log_p.exp()                          # probs
+
+                tok_id = seq[-len(scores) + t]                # generated id
+                lp.append(log_p[tok_id].item())               # surprisal
+
+                H = -(p * log_p).sum().item()                 # Shannon entropy
+                ent.append(H)
 
         gen_text.append(txts)
         gen_lps.append(lps)
+        gen_ents.append(ents)
 
-    return gen_text, gen_lps
+    return gen_text, gen_lps, gen_ents
 

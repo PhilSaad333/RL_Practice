@@ -13,6 +13,7 @@ class EvalRecord:
     generations: List[str]          # raw decoded strings
     gold: str
     logprobs:   List[np.ndarray]    # per-token log-probs
+    entropies:  List[np.ndarray]
     cfg: Dict                        # temp, top_p, etc.
 
 def save_records(recs: List[EvalRecord], path: str):
@@ -27,6 +28,7 @@ def save_records(recs: List[EvalRecord], path: str):
             # asdict returns a dict; convert np.ndarray → list
             data = asdict(r)
             data["logprobs"] = [lp.tolist() for lp in data["logprobs"]]
+            data["entropies"] = [lp.tolist() for lp in data["entropies"]]
             f.write(json.dumps(data) + "\n")
 
 def load_records(path: str):
@@ -34,4 +36,5 @@ def load_records(path: str):
         for line in f:
             data = json.loads(line)
             data["logprobs"] = [np.array(lp) for lp in data["logprobs"]]
+            data["entropies"] = [np.array(lp) for lp in data["entropies"]]
             yield EvalRecord(**data)
