@@ -66,9 +66,7 @@ def load_everything(
 
     # 3) dataset → prompts / gold answers
     ds       = load_from_disk(data_dir)
-    # Optional format prompt line
-    format_line = "\nFormat your response as follows: \n<think>\nChain of thought\n</think>\n<answer>\nAnswer\n</answer>."
-    prompts  = [r["text"].split("<think>")[0].strip() + format_line + "\n<think>\n" for r in ds]
+    prompts  = [r["text"].split("<think>")[0].strip() + "\n<think>\n" for r in ds]
     golds    = [
         r["text"].split("<answer>")[-1].split("</answer>")[0].strip()
         for r in ds
