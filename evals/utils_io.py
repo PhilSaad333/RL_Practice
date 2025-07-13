@@ -142,7 +142,9 @@ def generate_with_logprobs(
 
                 tok_id = seq[start + t].item()
                 lp_arr[t]  = log_p[tok_id].item()          # surprisal
-                ent_arr[t] = -(p * log_p).sum().item()     # entropy
+                finite_mask   = p > 0                           # bool tensor
+                H_t           = -(p[finite_mask] * log_p[finite_mask]).sum().item()
+                ent_arr[t]    = H_t
 
             lps .append(lp_arr)
             ents.append(ent_arr)
