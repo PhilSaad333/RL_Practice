@@ -111,7 +111,7 @@ def generate_with_logprobs(
             # per-token log-prob and per-token entropy
             lp = []
             ent = []
-             for t, s in enumerate(scores):
+            for t, s in enumerate(scores):
                 row = s[(b * N) + n].float().log_softmax(dim=-1).cpu()
                 tok_id = seq[-len(scores) + t]
                 lp.append(row[tok_id].item())
