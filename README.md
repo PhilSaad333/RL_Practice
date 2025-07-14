@@ -4,7 +4,7 @@ Getting intuition for RL dynamics in the case of teaching LLMs to do math better
 # Contents
 
 RL_Practice/
-├── README.md
+├── README.md \n
 ├── main.py
 ├── env.txt # pip/conda environment spec (unused in Colab)
 ├── .gitignore
