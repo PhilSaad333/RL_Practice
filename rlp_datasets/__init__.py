@@ -5,6 +5,18 @@ from dataclasses import dataclass
 
 import datasets as hf_ds
 
+# --- auto-discover dataset modules so their @register decorators run ----
+from importlib import import_module
+from pathlib import Path
+import pkgutil
+
+_pkg_path = Path(__file__).with_suffix("")  # folder of rlp_datasets
+for m in pkgutil.iter_modules([str(_pkg_path)]):
+    if m.name.startswith("_"):        # skip private helpers
+        continue
+    import_module(f"{__name__}.{m.name}")
+
+
 DATASET_REGISTRY: Dict[str, "BaseDataset"] = {}
 
 def register(name: str):
