@@ -5,16 +5,6 @@ from dataclasses import dataclass
 
 import datasets as hf_ds
 
-# --- auto-discover dataset modules so their @register decorators run ----
-from importlib import import_module
-from pathlib import Path
-import pkgutil
-
-_pkg_path = Path(__file__).with_suffix("")  # folder of rlp_datasets
-for m in pkgutil.iter_modules([str(_pkg_path)]):
-    if m.name.startswith("_"):        # skip private helpers
-        continue
-    import_module(f"{__name__}.{m.name}")
 
 
 DATASET_REGISTRY: Dict[str, "BaseDataset"] = {}
@@ -60,4 +50,17 @@ class BaseDataset:
         # 2) Arrow
         arrow_table = pa.Table.from_pylist([{"text": r} for r in rows])
         ds.write_dataset(arrow_table, root / self.split, format="arrow")
+
+
+
+# --- auto-import all sibling modules so their @register(...) executes ----------
+from importlib import import_module
+from pathlib import Path
+import pkgutil
+
+_pkg_dir = Path(__file__).resolve().parent     # <— directory, not “__init__.py”
+for mod in pkgutil.iter_modules([str(_pkg_dir)]):
+    if mod.name.startswith("_"):              # skip private helpers like _utils.py
+        continue
+    import_module(f"{__name__}.{mod.name}")
 
