@@ -27,8 +27,10 @@ def main(backbone: str = "phi2",
 
 
     model, tok, prompts, golds, stopper = load_everything(
-        ckpt_path or backbone,   # load from explicit path or registry key
+        backbone, 
         eval_dataset,
+        ckpt_path=ckpt_path,     # apply LoRA adapters if non-null
+        quantized=True,          # or pass through CLI flag
     )
 
     step_id = int(ckpt_step) if ckpt_step else int(Path(ckpt_path).name.rsplit("-", 1)[-1])

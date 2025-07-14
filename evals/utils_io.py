@@ -38,12 +38,15 @@ class StopOnAnswer(StoppingCriteria):
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Load model, tokenizer, dataset                                           │
 # ╰──────────────────────────────────────────────────────────────────────────╯
-def load_everything(model_or_dir: str,
+def load_everything(backbone: str,
                     eval_dataset: str,
                     *,
+                    ckpt_path: str | None = None,
                     quantized: bool = False):
     """
-    Generic loader for any backbone **or** local LoRA checkpoint directory.
+    Generic loader: loads base model+tokenizer by registry key `backbone`,
+    then, if `ckpt_path` is supplied, loads LoRA adapters from that folder.
+    
 
     Parameters
     ----------
@@ -54,7 +57,7 @@ def load_everything(model_or_dir: str,
     quantized : bool
         Forwarded to `models.load_model()` (4-bit QLoRA if True).
     """
-    model, tok = load_model(model_or_dir,
+    model, tok = load_model(backbone,
                             quantized=quantized,
                             device_map="auto")         # PEFT or base ✔️
 
@@ -65,6 +68,10 @@ def load_everything(model_or_dir: str,
     ds_test = DATASET_REGISTRY[eval_dataset]("test")
     prompts = [ex.text for ex in ds_test]
     golds   = [ex.meta for ex in ds_test]              # keep meta for metrics
+
+    if ckpt_path:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, ckpt_path)
 
     stopper = StoppingCriteriaList([StopOnAnswer(tok)])
     return model, tok, prompts, golds, stopper
