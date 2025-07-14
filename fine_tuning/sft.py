@@ -39,13 +39,25 @@ class Config:
 
 # ------------------------------- helpers --------------------------------
 def load_text_dataset(name: str, split: str):
-    ds = DATASET_REGISTRY[name](split)
-    # rlp_datasets yields an iterable of Example objects; wrap in HF Dataset
-    tmp = [e.__dict__ for e in ds]          # convert dataclass -> dict
-    return load_dataset("json", data_files={"train": tmp})["train"] \
-           if split == "train" else \
-           load_dataset("json", data_files={"test": tmp})["test"]
+    """
+    Instantiate your registry-backed loader (yields Example objects),
+    convert to a list of dicts, and wrap in a HuggingFace Dataset.
+    """
+    from datasets import Dataset
 
+    # 1) materialize all examples from your iterable loader
+    examples = list(DATASET_REGISTRY[name](split))
+
+    # 2) each Example has .text and .meta fields, so flatten:
+    records = []
+    for ex in examples:
+        rec = {"text": ex.text}
+        # if you want to keep metadata fields as columns:
+        rec.update(ex.meta)
+        records.append(rec)
+
+    # 3) build and return the Dataset
+    return Dataset.from_list(records)
 
 def main(cfg: Config):
     # 1) Data -------------------------------------------------------------
