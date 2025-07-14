@@ -78,7 +78,7 @@ def generate_with_logprobs(
     tokenizer,
     prompts: List[str],
     gen_cfg: GenerationConfig,
-    stop_crit:,
+    stop_crit,
 ):
     """Return
         gen_text  : List[B][N]   decoded strings (trimmed to <think>…</answer>)
