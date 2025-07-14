@@ -12,6 +12,7 @@ class Evaluator:
                  ft_dataset: str,
                  ckpt_step: str | None,
                  eval_dataset: str,
+                 batch_size: int = 8,
                  model_path: str | None = None,
                  **gen_kwargs):
         """
@@ -33,7 +34,8 @@ class Evaluator:
         self.model, self.tok, self.prompts, self.golds, self.stopper = (
             load_everything(target, eval_dataset)
         )
-
+        
+        self.batch_size = batch_size
         self.gen_cfg = gen_kwargs
         self.timestamp = datetime.utcnow().isoformat()
 
