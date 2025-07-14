@@ -2,6 +2,7 @@
 import json
 import pandas as pd, importlib
 from pathlib import Path
+from typing import Union
 from datetime import datetime
 from evals.records import EvalRecord, save_records
 from typing import Iterable, Callable, List
@@ -13,6 +14,7 @@ class Evaluator:
                  ckpt_step: str | None,
                  eval_dataset: str,
                  batch_size: int = 8,
+                 runs_root: Union[str,Path] = "eval_runs"
                  model_path: str | None = None,
                  **gen_kwargs):
         """
@@ -22,9 +24,10 @@ class Evaluator:
         eval_dataset  : dataset name for prompts
         model_path    : explicit local path (overrides backbone)
         """
-
+        
+        root = Path(runs_root)
         self.run_dir = (
-            RUNS_ROOT
+            root
             / f"{backbone}_{ft_dataset}_finetuned"
             / f"step_{ckpt_step or 'base'}_{eval_dataset}"
         )

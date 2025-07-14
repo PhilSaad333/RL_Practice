@@ -22,7 +22,8 @@ def main(backbone: str = "phi2",
          temperature: float = 0.7,
          top_p: float = 0.9,
          num_return_sequences: int = 8,
-         max_new_tokens: int = 256):
+         max_new_tokens: int = 256,
+         runs_root: str = "eval_runs",):
 
 
     model, tok, prompts, golds, stopper = load_everything(
@@ -80,6 +81,7 @@ def main(backbone: str = "phi2",
         eval_dataset=eval_dataset,
         model_path=ckpt_path,
         batch_size=batch_size,
+        runs_root=runs_root,
         temperature=temperature,
         top_p=top_p,
         num_return_sequences=num_return_sequences,
