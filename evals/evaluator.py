@@ -2,23 +2,40 @@
 import json
 import pandas as pd, importlib
 from pathlib import Path
+from datetime import datetime
 from evals.records import EvalRecord, save_records
 from typing import Iterable, Callable, List
 
 class Evaluator:
     def __init__(self,
-                 record_iter: Iterable[EvalRecord],
-                 metric_fns:  List[Callable],
-                 out_dir: str,
-                 subset_frac: float,
-                 batch_size: int,
-                 ):
+                 backbone: str,
+                 ft_dataset: str,
+                 ckpt_step: str | None,
+                 eval_dataset: str,
+                 model_path: str | None = None,
+                 **gen_kwargs):
+        """
+        backbone      : registry key, e.g. 'tinyllama' or 'phi2'
+        ft_dataset    : dataset used during fine-tune (gsm8k, math, …)
+        ckpt_step     : '500', '1000', … (None if evaluating base model)
+        eval_dataset  : dataset name for prompts
+        model_path    : explicit local path (overrides backbone)
+        """
 
-        self.record_iter = list(record_iter)        # recs is normally list anyways
-        self.metric_fns  = metric_fns
-        self.out_dir     = Path(out_dir); self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.subset_frac = subset_frac
-        self.batch_size  = batch_size
+        self.run_dir = (
+            RUNS_ROOT
+            / f"{backbone}_{ft_dataset}_finetuned"
+            / f"step_{ckpt_step or 'base'}_{eval_dataset}"
+        )
+        self.run_dir.mkdir(parents=True, exist_ok=True)  # pathlib trick :contentReference[oaicite:1]{index=1}
+
+        target = model_path or backbone
+        self.model, self.tok, self.prompts, self.golds, self.stopper = (
+            load_everything(target, eval_dataset)
+        )
+
+        self.gen_cfg = gen_kwargs
+        self.timestamp = datetime.utcnow().isoformat()
 
     def run(self):
         # 1) save raw records once

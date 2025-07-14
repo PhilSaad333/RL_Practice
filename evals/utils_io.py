@@ -7,13 +7,15 @@ import re
 import torch, numpy as np
 from datasets import load_from_disk
 from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
     GenerationConfig,
     StoppingCriteria,
     StoppingCriteriaList,
 )
 from peft import PeftModel, PeftConfig
++from pathlib import Path
++from models import load_model
++from rlp_datasets import DATASET_REGISTRY
++from .stopper import StopOnAnswer
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Regex helpers                                                            │
@@ -38,41 +40,32 @@ class StopOnAnswer(StoppingCriteria):
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Load model, tokenizer, dataset                                           │
 # ╰──────────────────────────────────────────────────────────────────────────╯
-def load_everything(
-    ckpt_dir: str,
-    data_dir: str,
-    padding_side: str = "left",
-    torch_dtype       = torch.float16,
-) -> Tuple[
-    PeftModel,
-    AutoTokenizer,
-    List[str],   # prompts
-    List[str],   # gold answers
-    StoppingCriteriaList,
-]:
-    # 1) tokenizer
-    tok = AutoTokenizer.from_pretrained("microsoft/phi-2")
-    tok.padding_side = padding_side
-    tok.pad_token    = tok.eos_token
+def load_everything(model_or_dir: str,
+                    eval_dataset: str,
+                    *,
+                    quantized: bool = False):
+    """
+    Generic loader for any backbone **or** local LoRA checkpoint directory.
 
-    # 2) base model + LoRA adapter
-    cfg   = PeftConfig.from_pretrained(ckpt_dir)
-    base  = AutoModelForCausalLM.from_pretrained(
-        cfg.base_model_name_or_path,
-        torch_dtype=torch_dtype,
-        device_map="auto",
-    )
-    model = PeftModel.from_pretrained(base, ckpt_dir).eval()
+    Parameters
+    ----------
+    model_or_dir : str
+        Name in MODEL_REGISTRY *or* a local path saved by fine-tuning.
+    eval_dataset : str
+        Name of dataset in rlp_datasets registry (gsm8k, math, …).
+    quantized : bool
+        Forwarded to `models.load_model()` (4-bit QLoRA if True).
+    """
+    model, tok = load_model(model_or_dir,
+                            quantized=quantized,
+                            device_map="auto")         # PEFT or base ✔️
 
-    # 3) dataset → prompts / gold answers
-    ds       = load_from_disk(data_dir)
-    prompts  = [r["text"].split("<think>")[0].strip() + "\n<think>\n" for r in ds]
-    golds    = [
-        r["text"].split("<answer>")[-1].split("</answer>")[0].strip()
-        for r in ds
-    ]
+    # pull prompts + golds from registry
+    ds_test = DATASET_REGISTRY[eval_dataset]("test")
+    prompts = [ex.text for ex in ds_test]
+    golds   = [ex.meta for ex in ds_test]              # keep meta for metrics
 
-    stopper = StoppingCriteriaList([StopOnAnswer(tok)])
+    stopper = StopOnAnswer(tok)                        # unchanged class
     return model, tok, prompts, golds, stopper
 
 

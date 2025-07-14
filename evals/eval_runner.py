@@ -12,17 +12,15 @@ from evals.metrics.tag_format import tag_format_metrics
 
 
 
-def main(
-    ckpt_dir: str,
-    data_dir: str,
-    out_root: str = "/content/drive/MyDrive/RL_Practice_Files/eval_runs",
-    num_return_sequences: int = 8,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    max_new_tokens: int = 256,
-    batch_size: int = 2,
-    subset_frac: float = 1.0,  
-):
+def main(backbone: str = "phi2",
+         ft_dataset: str = "gsm8k",
+         ckpt_path: str | None = None,      # full Drive path or None
+         ckpt_step: str | None = None,      # 500 / 1000 / 1404 / None
+         eval_dataset: str = "gsm8k",
+         temperature: float = 0.7,
+         top_p: float = 0.9,
+         num_return_sequences: int = 8,
+         max_new_tokens: int = 256):
 
 
     model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
@@ -70,20 +68,18 @@ def main(
     # metadata
     tag = f"T{temperature}_P{top_p}_R{num_return_sequences}"
 
-    ev = Evaluator(
-        recs,
-        metric_fns=[
-            tag_format.tag_format_metrics,
-            passk.passk,
-            response_len.response_len_metrics,
-            entropy.entropy_metrics,
-            ],
-        out_dir = f"{out_root}/step_{step_id}/{tag}",
-        subset_frac=subset_frac,
-        batch_size=batch_size,
-        )
-
-    ev.run()
+    evaluator = Evaluator(
+        backbone=backbone,
+        ft_dataset=ft_dataset,
+        ckpt_step=ckpt_step,
+        eval_dataset=eval_dataset,
+        model_path=ckpt_path,
+        temperature=temperature,
+        top_p=top_p,
+        num_return_sequences=num_return_sequences,
+        max_new_tokens=max_new_tokens,
+    )
+    evaluator.run()  # same logic as before
 
 if __name__ == "__main__":
     tyro.cli(main)
