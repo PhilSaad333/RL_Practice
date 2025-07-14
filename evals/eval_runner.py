@@ -24,9 +24,12 @@ def main(backbone: str = "phi2",
          max_new_tokens: int = 256):
 
 
-    model, tok, prompts, golds, stopper = load_everything(ckpt_dir, data_dir)
+    model, tok, prompts, golds, stopper = load_everything(
+        ckpt_path or backbone,   # load from explicit path or registry key
+        eval_dataset,
+    )
 
-    step_id = int(Path(ckpt_dir).name.rsplit("-", 1)[-1])
+    step_id = int(ckpt_step) if ckpt_step else int(Path(ckpt_path).name.rsplit("-", 1)[-1])
 
 
     if subset_frac < 1.0:
