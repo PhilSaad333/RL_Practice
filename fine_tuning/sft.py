@@ -115,22 +115,36 @@ def main(cfg: Config):
     print("✓ done →", out_dir)
 
 
-import yaml
+# fine_tuning/sft.py  (replace your __main__ block)
 
 if __name__ == "__main__":
-    # allow --config to load a YAML, then populate the dataclass
-    parser = tyro.extras.get_parser(Config)       # Tyro helper
-    parser.add_argument("--config", "-c", type=str, help="Path to a YAML config")
-    args, extras = parser.parse_known_args()
+    import yaml, argparse
 
+    # ----- 1. build a base parser with only --config ------------------------
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument("--config", "-c", type=str, help="YAML path with SFT settings")
+    # everything else comes from Tyro
+    cli_parser = tyro.extras.get_parser(Config, parser=base)
+    args = cli_parser.parse_args()
+
+    # ----- 2. start with YAML (if any) --------------------------------------
+    cfg_dict = {}
     if args.config:
-        # load YAML, override args
         with open(args.config) as f:
-            data = yaml.safe_load(f)
-        # merge YAML keys into namespace
-        for k, v in data.items():
-            setattr(args, k, v)
+            cfg_dict = yaml.safe_load(f) or {}
 
-    # now convert namespace back into your dataclass
-    cfg = Config(**vars(args))
+    # ----- 3. overlay CLI overrides -----------------------------------------
+    # argparse stores CLI flags under their *dest* names, which use hyphens;
+    # convert to underscores so they match dataclass field names.
+    for k, v in vars(args).items():
+        if k == "config" or v is None:
+            continue
+        cfg_dict[k.replace("-", "_")] = v
+
+    # ----- 4. instantiate the Config dataclass ------------------------------
+    cfg = Config(**cfg_dict)
+    print("✔ Loaded config:", cfg)
+
+    # ----- 5. run training ---------------------------------------------------
     main(cfg)
+
