@@ -14,7 +14,7 @@ class Evaluator:
                  ckpt_step: str | None,
                  eval_dataset: str,
                  batch_size: int = 8,
-                 runs_root: Union[str,Path] = "eval_runs"
+                 runs_root: Union[str,Path] = "eval_runs",
                  model_path: str | None = None,
                  **gen_kwargs):
         """
