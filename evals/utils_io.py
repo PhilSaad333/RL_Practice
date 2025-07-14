@@ -12,10 +12,8 @@ from transformers import (
     StoppingCriteriaList,
 )
 from peft import PeftModel, PeftConfig
-+from pathlib import Path
-+from models import load_model
-+from rlp_datasets import DATASET_REGISTRY
-+from .stopper import StopOnAnswer
+from models import load_model
+from rlp_datasets import DATASET_REGISTRY
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Regex helpers                                                            │
