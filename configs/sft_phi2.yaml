@@ -8,10 +8,10 @@ lora_alpha:    128
 lora_dropout:  0.05
 per_device_train_batch_size: 8
 per_device_eval_batch_size: 8
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 4
 learning_rate: 2e-4
-num_train_epochs: 3
-logging_steps: 100
+num_train_epochs: 1
+logging_steps: 150
 save_steps:    500
 fp16:          false
 load_in_4bit:  true

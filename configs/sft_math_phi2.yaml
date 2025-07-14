@@ -1,0 +1,23 @@
+# configs/sft_math_phi2.yaml
+inherit: _template_sft.yaml
+
+# — core settings —
+backbone: phi2              # 2.7 B params
+dataset:  math              # the Hendrycks MATH corpus (all 7 sub‐sets)
+
+# — LoRA & precision —
+quantized: true             # 4-bit QLoRA to fit larger batches
+lora_r:     64
+lora_alpha: 128
+lora_dropout: 0.05
+
+# — training size & speed trade-offs —
+batch_size: 8               # per-device batch; safe on A100 in 4-bit
+grad_accum: 2               # effective batch = 8 × 2 = 16
+epochs:     2                # full-pass over Math (~12 K examples)
+
+# — optimizer & logging —
+lr:        2e-4              # tuned for LoRA‐SFT on similar models
+save_steps: 500
+log_steps:  250
+max_seq_len: 1024            # Math problems & CoT usually <1 k tokens
