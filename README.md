@@ -11,7 +11,9 @@ env.txt (was requirements, unused rn because running in colab)
   -- stf_phi2_lora.py
 
 -- configs/
+
   |
+  
   sft_phi2.yaml
 
 -- datasets/
