@@ -82,19 +82,21 @@ def main(cfg: Config):
     # 3) Training args ----------------------------------------------------
     out_dir = cfg.output_dir or f"outputs/{cfg.backbone}_{cfg.dataset}_lora"
     args = TrainingArguments(
-        output_dir          = out_dir,
-        per_device_train_batch_size = cfg.batch_size,
-        per_device_eval_batch_size  = cfg.batch_size,
-        gradient_accumulation_steps = cfg.grad_accum,
-        learning_rate      = cfg.lr,
-        num_train_epochs   = cfg.epochs,
-        logging_steps      = cfg.log_steps,
-        save_steps         = cfg.save_steps,
-        evaluation_strategy= "steps",
-        fp16               = torch.cuda.is_available(),
-        bf16               = False,
-        report_to          = "none",
-    )                                          # HuggingFace trainer API :contentReference[oaicite:2]{index=2}
+        output_dir=out_dir,
+        per_device_train_batch_size=cfg.batch_size,
+        per_device_eval_batch_size=cfg.batch_size,
+        gradient_accumulation_steps=cfg.grad_accum,
+        num_train_epochs=cfg.epochs,
+        learning_rate=cfg.lr,
+        logging_steps=cfg.log_steps,
+        save_steps=cfg.save_steps,
+        eval_strategy="steps",        # ← note: eval_strategy, not evaluation_strategy
+        fp16=torch.cuda.is_available(),
+        bf16=False,
+        max_grad_norm=1.0,            # carried over from your old defaults
+        disable_tqdm=False,
+        report_to="none",
+    )                                        # HuggingFace trainer API :contentReference[oaicite:2]{index=2}
 
     # 4) Trainer ----------------------------------------------------------
     trainer = SFTTrainer(
