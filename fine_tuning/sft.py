@@ -87,7 +87,7 @@ def main(cfg: Config):
         per_device_eval_batch_size=cfg.batch_size,
         gradient_accumulation_steps=cfg.grad_accum,
         num_train_epochs=cfg.epochs,
-        learning_rate=cfg.lr,
+        learning_rate=float(cfg.lr),
         logging_steps=cfg.log_steps,
         save_steps=cfg.save_steps,
         eval_strategy="steps",        # ← note: eval_strategy, not evaluation_strategy
