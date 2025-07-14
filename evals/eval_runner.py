@@ -18,6 +18,7 @@ def main(backbone: str = "phi2",
          ckpt_step: str | None = None,      # 500 / 1000 / 1404 / None
          eval_dataset: str = "gsm8k",
          batch_size: int = 8,
+         subset_frac: float = 1.0,
          temperature: float = 0.7,
          top_p: float = 0.9,
          num_return_sequences: int = 8,
