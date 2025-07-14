@@ -25,15 +25,23 @@ class Evaluator:
         ckpt_step     : '500', '1000', … (None if evaluating base model)
         eval_dataset  : dataset name for prompts
         model_path    : explicit local path (overrides backbone)
+        **gen_kwargs  : decoding params (temperature, top_p, num_return_sequences, etc.)
         """
         
         root = Path(runs_root)
-        self.run_dir = (
+        base_dir = (
             root
             / f"{backbone}_{ft_dataset}_finetuned"
             / f"step_{ckpt_step or 'base'}_{eval_dataset}"
         )
-        self.run_dir.mkdir(parents=True, exist_ok=True)  # pathlib trick :contentReference[oaicite:1]{index=1}
+
+        temp = gen_kwargs.get("temperature", "NA")
+        top_p = gen_kwargs.get("top_p",       "NA")
+        nret  = gen_kwargs.get("num_return_sequences", "NA")
+        params_folder = f"temp{temp}_p{top_p}_r{nret}"
+
+        self.run_dir = base_dir / params_folder
+        self.run_dir.mkdir(parents=True, exist_ok=True)
 
         target = model_path or backbone
         self.model, self.tok, self.prompts, self.golds, self.stopper = (
