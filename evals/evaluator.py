@@ -6,6 +6,7 @@ from typing import Union
 from datetime import datetime
 from evals.records import EvalRecord, save_records
 from typing import Iterable, Callable, List
+from evals.utils_io import load_everything
 
 class Evaluator:
     def __init__(self,
