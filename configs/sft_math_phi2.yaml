@@ -19,5 +19,5 @@ epochs:     2                # full-pass over Math (~12 K examples)
 # — optimizer & logging —
 lr:        2e-4              # tuned for LoRA‐SFT on similar models
 save_steps: 500
-log_steps:  250
+log_steps:  1000
 max_seq_len: 512            # Math problems & CoT usually <1 k tokens
