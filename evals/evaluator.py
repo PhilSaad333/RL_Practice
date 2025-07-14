@@ -37,7 +37,7 @@ class Evaluator:
 
         target = model_path or backbone
         self.model, self.tok, self.prompts, self.golds, self.stopper = (
-            load_everything(target, eval_dataset)
+            load_everything(target, eval_dataset, ckpt_path=model_path)
         )
         
         self.batch_size    = batch_size

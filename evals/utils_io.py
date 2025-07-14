@@ -77,6 +77,7 @@ def load_everything(backbone: str,
     return model, tok, prompts, golds, stopper
 
 
+
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Generate completions + per-token log-probs and entropies                 │
 # ╰──────────────────────────────────────────────────────────────────────────╯
@@ -86,71 +87,75 @@ def generate_with_logprobs(
     prompts: List[str],
     gen_cfg: GenerationConfig,
     stop_crit,
-):
-    """Return
-        gen_text  : List[B][N]   decoded strings (trimmed to <think>…</answer>)
-        gen_lps   : List[B][N]   np.ndarray[T]  (−log p chosen token)
-        gen_ents  : List[B][N]   np.ndarray[T]  (token-level Shannon entropy)
+) -> Tuple[List[List[str]], List[np.ndarray], List[np.ndarray]]:
     """
-    # Encode prompt batch
-    ids = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
+    Returns
+    -------
+    gen_text : List[B][N]  decoded strings (trimmed to <think>…</answer>)
+    gen_lps  : List[B][N]  np.ndarray[T_gen]   log p(token)
+    gen_ents : List[B][N]  np.ndarray[T_gen]   per-token Shannon entropy
+    """
+    # ── encode prompt batch ────────────────────────────────────────────────
+    enc = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
+    prompt_len = enc.input_ids.shape[1]               # after left-padding
 
-    # fp16 / bf16 autocast for speed
+    # ── sampling generation (scores not needed any more) ───────────────────
     amp_dtype = torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
         out = model.generate(
-            **ids,
-            generation_config        = gen_cfg,
-            stopping_criteria        = stop_crit,
-            output_scores            = True,
-            return_dict_in_generate  = True,
+            **enc,
+            generation_config       = gen_cfg,
+            stopping_criteria       = stop_crit,
+            return_dict_in_generate = True,
         )
 
-    B = len(prompts)
-    N = gen_cfg.num_return_sequences
-    T = len(out.scores)                          # # generated tokens per seq
+    B  = len(prompts)
+    N  = gen_cfg.num_return_sequences
+    seqs = out.sequences.view(B, N, -1)               # [B, N, T_full]
+    T_full = seqs.size(-1)
+    T_gen  = T_full - prompt_len                      # tokens *after* prompt
 
-    seqs   = out.sequences.view(B, N, -1)        # [B, N, T_full]
-    scores = out.scores                          # list[T] each: [B*N, vocab]
+    # ── second forward pass to get raw logits ──────────────────────────────
+    seqs_flat = seqs.reshape(B * N, T_full)
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
+        logits = model(seqs_flat).logits              # [B*N, T_full, V]
+    log_p = logits.log_softmax(-1).float().cpu()      # keep on CPU for numpy
+
+    # shift-right so log_p[t] conditions on tokens < t
+    log_p = log_p[:, :-1, :]                          # [B*N, T_full-1, V]
+    target = seqs_flat[:, 1:]                         # ids at positions 1..T_full-1
+
+    lp_all = log_p.gather(2, target.unsqueeze(-1)).squeeze(-1)  # [B*N, T_full-1]
+    ent_all = -(log_p.exp() * log_p).sum(-1)                      # same shape
+
+    # keep only generated part
+    lp_all  = lp_all[:, -T_gen:]                      # [B*N, T_gen]
+    ent_all = ent_all[:, -T_gen:]
+
+    # ── reshape back to [B, N, T_gen] and python lists ────────────────────
+    lp_all  = lp_all.numpy().reshape(B, N, T_gen)
+    ent_all = ent_all.numpy().reshape(B, N, T_gen)
 
     gen_text, gen_lps, gen_ents = [], [], []
-
     for b in range(B):
-        txts, lps, ents = [], [], []
-
+        texts, lps, ents = [], [], []
         for n in range(N):
-            seq     = seqs[b, n]
+            seq = seqs[b, n]
             decoded = tokenizer.decode(seq, skip_special_tokens=True)
 
-            # ── tidy up decoded text ───────────────────────────────────────
+            # tidy up decoded text: keep up to first </answer>
             m = TAG_RGX.search(decoded)
             if m:
                 tidy = m.group(0)
             else:
-                idx  = decoded.find(TAG_STOP)
+                idx = decoded.find(TAG_STOP)
                 tidy = decoded[: idx + len(TAG_STOP)] if idx != -1 else decoded
-            txts.append(tidy)
+            texts.append(tidy)
 
-            # ── per-token log-prob & entropy arrays ───────────────────────
-            lp_arr  = np.empty(T, dtype=np.float32)
-            ent_arr = np.empty(T, dtype=np.float32)
+            lps .append(lp_all [b, n])
+            ents.append(ent_all[b, n])
 
-            start = seq.size(0) - T              # index of FIRST generated token
-            for t, logits in enumerate(scores):  # iterate over generation steps
-                row    = logits[(b * N) + n].float()      # logits for this sample
-                log_p  = row.log_softmax(dim=-1).cpu()
-                p      = log_p.exp()
-
-                tok_id = seq[start + t].item()
-                lp_arr[t]  = log_p[tok_id].item()          # surprisal
-                finite_mask   = p > 0                           # bool tensor
-                H_t           = -(p[finite_mask] * log_p[finite_mask]).sum().item()
-                ent_arr[t]    = H_t
-
-            lps .append(lp_arr)
-            ents.append(ent_arr)
-
-        gen_text.append(txts)
+        gen_text.append(texts)
         gen_lps .append(lps)
         gen_ents.append(ents)
 
