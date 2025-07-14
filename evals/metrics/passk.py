@@ -5,7 +5,7 @@ from evals.metrics.tag_format import has_good_tags
 from math_verify import parse, verify
 from evals.records import EvalRecord
 
-def passk(records: List[EvalRecord], k_vals=(1, 2, 4, 8)) -> List[Dict]:
+def passk_metrics(records: List[EvalRecord], k_vals=(1, 2, 4, 8)) -> List[Dict]:
     """
     For each EvalRecord compute:
       • pass_rate  = (# correct among max(k_vals)) / max(k_vals)
