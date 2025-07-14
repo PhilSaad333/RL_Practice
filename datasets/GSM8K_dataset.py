@@ -1,4 +1,7 @@
 # datasets/GSM8K_dataset.py
+
+# OLD, USE gsm8k.py
+
 from datasets import load_dataset
 from pathlib import Path
 
