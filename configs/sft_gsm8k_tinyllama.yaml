@@ -2,6 +2,6 @@ inherit: _template_sft.yaml
 backbone: tinyllama
 dataset: gsm8k
 quantized: true          # 4-bit fits easily on an L4
-batch_size: 1
-grad_accum: 4
+batch_size: 8
+grad_accum: 2
 epochs: 1                # quick smoke-test
