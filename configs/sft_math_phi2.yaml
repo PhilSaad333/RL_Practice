@@ -12,12 +12,12 @@ lora_alpha: 128
 lora_dropout: 0.05
 
 # — training size & speed trade-offs —
-batch_size: 8               # per-device batch; safe on A100 in 4-bit
-grad_accum: 2               # effective batch = 8 × 2 = 16
+batch_size: 4               # per-device batch; safe on A100 in 4-bit
+grad_accum: 4               # effective batch = 8 × 2 = 16
 epochs:     2                # full-pass over Math (~12 K examples)
 
 # — optimizer & logging —
 lr:        2e-4              # tuned for LoRA‐SFT on similar models
 save_steps: 500
 log_steps:  250
-max_seq_len: 1024            # Math problems & CoT usually <1 k tokens
+max_seq_len: 512            # Math problems & CoT usually <1 k tokens
