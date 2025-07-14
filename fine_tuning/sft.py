@@ -115,6 +115,22 @@ def main(cfg: Config):
     print("✓ done →", out_dir)
 
 
+import yaml
+
 if __name__ == "__main__":
-    cfg = tyro.cli(Config)
+    # allow --config to load a YAML, then populate the dataclass
+    parser = tyro.extras.get_parser(Config)       # Tyro helper
+    parser.add_argument("--config", "-c", type=str, help="Path to a YAML config")
+    args, extras = parser.parse_known_args()
+
+    if args.config:
+        # load YAML, override args
+        with open(args.config) as f:
+            data = yaml.safe_load(f)
+        # merge YAML keys into namespace
+        for k, v in data.items():
+            setattr(args, k, v)
+
+    # now convert namespace back into your dataclass
+    cfg = Config(**vars(args))
     main(cfg)
