@@ -15,6 +15,7 @@ class Evaluator:
                  ckpt_step: str | None,
                  eval_dataset: str,
                  batch_size: int = 8,
+                 subset_frac: float = 1.0,
                  runs_root: Union[str,Path] = "eval_runs",
                  model_path: str | None = None,
                  **gen_kwargs):
@@ -39,13 +40,33 @@ class Evaluator:
             load_everything(target, eval_dataset)
         )
         
-        self.batch_size = batch_size
-        self.gen_cfg = gen_kwargs
-        self.timestamp = datetime.utcnow().isoformat()
+        self.batch_size    = batch_size
+        self.subset_frac   = subset_frac
+        self.gen_cfg       = gen_kwargs
+        self.timestamp     = datetime.utcnow().isoformat()
+
+        # 4 metric functions to apply (must match your imports)
+        from evals.metrics.tag_format import tag_format_metrics
+        from evals.metrics.passk import passk_metrics
+        from evals.metrics.response_len import response_len_metrics
+        from evals.metrics.entropy import entropy_metrics
+        self.metric_fns    = [
+            tag_format_metrics,
+            passk_metrics,
+            response_len_metrics,
+            entropy_metrics,
+        ]
+
+        # placeholder for the actual EvalRecord list
+        self.record_iter   = []
+
+        # alias for convenience (run() writes to self.out_dir)
+        self.out_dir       = self.run_dir
+
 
     def run(self):
         # 1) save raw records once
-        raw_path = self.out_dir / "records.jsonl.gz"
+        raw_path = self.run_dir / "records.jsonl.gz"
         save_records(self.record_iter, raw_path)
 
         # 2) compute & merge metric dataframes
@@ -54,12 +75,12 @@ class Evaluator:
         for d in dfs[1:]:
             df = df.merge(d, on="q_idx", how="left")
 
-        df.to_csv(self.out_dir / "metrics.csv", index=False)
-        print(f"✓ wrote metrics.csv with {len(df)} rows to {self.out_dir}")
+        df.to_csv(self.run_dir / "metrics.csv", index=False)
+        print(f"✓ wrote metrics.csv with {len(df)} rows to {self.run_dir}")
 
         # 3) save global metadata
         meta = {
-            "ckpt_dir": str(self.out_dir.parents[1] / f"checkpoint-{self.record_iter[0].step}"),
+            "ckpt_dir": str(self.run_dir.parents[1] / f"checkpoint-{self.record_iter[0].step}"),
             "step":     self.record_iter[0].step,
             "subset_frac":  self.subset_frac,
             "batch_size":   self.batch_size,

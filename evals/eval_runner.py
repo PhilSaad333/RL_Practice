@@ -79,15 +79,19 @@ def main(backbone: str = "phi2",
         ft_dataset=ft_dataset,
         ckpt_step=ckpt_step,
         eval_dataset=eval_dataset,
-        model_path=ckpt_path,
         batch_size=batch_size,
+        subset_frac=subset_frac,
         runs_root=runs_root,
+        model_path=ckpt_path,
         temperature=temperature,
         top_p=top_p,
         num_return_sequences=num_return_sequences,
         max_new_tokens=max_new_tokens,
     )
-    evaluator.run()  # same logic as before
+    evaluator.record_iter = recs
+    evaluator.out_dir     = evaluator.run_dir
+
+    evaluator.run()
 
 if __name__ == "__main__":
     tyro.cli(main)
