@@ -16,14 +16,16 @@ from models import load_model
 
 def main(
     backbone: str = "phi2",
+    ckpt: str | None = None,
     temperature: float = 0.7,
     top_p: float = 0.9,
     max_new_tokens: int = 256,
     num_return_sequences: int = 1,
     quantized: bool = False,
 ):
-    model, tok = load_model(backbone, quantized=quantized, device_map="auto")
-    model.eval()  # ⬅ good habit even for inference
+    target = ckpt or backbone
+    model, tok = load_model(target, quantized=quantized, device_map="auto")
+    model.eval()
 
     cfg = GenerationConfig(
         temperature=temperature,

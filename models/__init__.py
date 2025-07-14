@@ -1,5 +1,9 @@
 # models/__init__.py
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import os
+from pathlib import Path
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+
 
 MODEL_REGISTRY = {
     "phi2":        "microsoft/phi-2",
@@ -12,16 +16,39 @@ MODEL_REGISTRY = {
     "codellama7b": "codellama/CodeLlama-7b-hf"
 }
 
-def load_model(name: str, quantized: bool = False, **hf_kwargs):
-    """Return (model, tokenizer).  Set quantized=True for 4-bit QLoRA debug."""
-    model_id = MODEL_REGISTRY[name]
+def _is_local(path_like: str) -> bool:
+    return Path(path_like).expanduser().exists()
+
+def load_model(
+    name_or_path: str,
+    *,
+    quantized: bool = False,
+    **hf_kwargs
+):
+    """
+    Load either a hub model (if `name_or_path` is in MODEL_REGISTRY or a valid hub id)
+    or a *local* checkpoint directory.
+    """
+    # 1) Resolve remote vs local
+    if name_or_path in MODEL_REGISTRY:
+        model_id = MODEL_REGISTRY[name_or_path]
+    elif _is_local(name_or_path):
+        model_id = name_or_path                   # -> local folder on Drive
+    else:
+        # treat as raw HF hub id the user typed
+        model_id = name_or_path
+
+    # 2) Tokenizer
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+
+    # 3) Quantisation toggle (works for both local + hub)
     if quantized:
-        from transformers import BitsAndBytesConfig
         hf_kwargs.setdefault("device_map", "auto")
         hf_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_compute_dtype="bfloat16"
         )
+
     model = AutoModelForCausalLM.from_pretrained(model_id, **hf_kwargs)
     return model, tok
+
 
