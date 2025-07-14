@@ -38,43 +38,44 @@ class StopOnAnswer(StoppingCriteria):
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Load model, tokenizer, dataset                                           │
 # ╰──────────────────────────────────────────────────────────────────────────╯
-def load_everything(backbone: str,
-                    eval_dataset: str,
-                    *,
-                    ckpt_path: str | None = None,
-                    quantized: bool = False):
-    """
-    Generic loader: loads base model+tokenizer by registry key `backbone`,
-    then, if `ckpt_path` is supplied, loads LoRA adapters from that folder.
-    
+# add right after the TAG_* definitions
+_Q_SPLIT_RGX = re.compile(r"<think>|<answer>", re.I)
 
-    Parameters
-    ----------
-    model_or_dir : str
-        Name in MODEL_REGISTRY *or* a local path saved by fine-tuning.
-    eval_dataset : str
-        Name of dataset in rlp_datasets registry (gsm8k, math, …).
-    quantized : bool
-        Forwarded to `models.load_model()` (4-bit QLoRA if True).
+# ---------------------------------------------------------------------
+# load_everything  –  NEW version with prompt-cleaning & ckpt_path arg
+# ---------------------------------------------------------------------
+def load_everything(
+    backbone: str,
+    eval_dataset: str,
+    *,
+    ckpt_path: str | None = None,
+    quantized: bool = False,
+):
     """
-    model, tok = load_model(backbone,
-                            quantized=quantized,
-                            device_map="auto")         # PEFT or base ✔️
-
+    1. loads `backbone` (or an explicit directory passed in)
+    2. optionally merges a LoRA at `ckpt_path`
+    3. returns clean *question-only* prompts + gold meta
+    """
+    model, tok = load_model(
+        backbone,
+        quantized=quantized,
+        device_map="auto",
+    )
     tok.padding_side = "left"
     tok.pad_token = tok.eos_token
 
-    # pull prompts + golds from registry
-    ds_test = DATASET_REGISTRY[eval_dataset]("test")
-    prompts = [ex.text for ex in ds_test]
-    golds   = [ex.meta for ex in ds_test]              # keep meta for metrics
-
     if ckpt_path:
-        from peft import PeftModel
         model = PeftModel.from_pretrained(model, ckpt_path)
+
+    # -------- dataset --------
+    ds_test = DATASET_REGISTRY[eval_dataset]("test")
+
+    prompts = [ex.question for ex in ds_test]
+    golds   = [ex.answer for ex in ds_test]
 
     stopper = StoppingCriteriaList([StopOnAnswer(tok)])
     return model, tok, prompts, golds, stopper
+
 
 
 
@@ -87,19 +88,10 @@ def generate_with_logprobs(
     prompts: List[str],
     gen_cfg: GenerationConfig,
     stop_crit,
-) -> Tuple[List[List[str]], List[np.ndarray], List[np.ndarray]]:
-    """
-    Returns
-    -------
-    gen_text : List[B][N]  decoded strings (trimmed to <think>…</answer>)
-    gen_lps  : List[B][N]  np.ndarray[T_gen]   log p(token)
-    gen_ents : List[B][N]  np.ndarray[T_gen]   per-token Shannon entropy
-    """
-    # ── encode prompt batch ────────────────────────────────────────────────
+):
     enc = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
-    prompt_len = enc.input_ids.shape[1]               # after left-padding
+    prompt_len = enc.input_ids.shape[1]
 
-    # ── sampling generation (scores not needed any more) ───────────────────
     amp_dtype = torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
         out = model.generate(
@@ -109,54 +101,41 @@ def generate_with_logprobs(
             return_dict_in_generate = True,
         )
 
-    B  = len(prompts)
-    N  = gen_cfg.num_return_sequences
-    seqs = out.sequences.view(B, N, -1)               # [B, N, T_full]
+    B, N   = len(prompts), gen_cfg.num_return_sequences
+    seqs   = out.sequences.view(B, N, -1)          # [B,N,T_full]
     T_full = seqs.size(-1)
-    T_gen  = T_full - prompt_len                      # tokens *after* prompt
+    T_gen  = T_full - prompt_len
 
-    # ── second forward pass to get raw logits ──────────────────────────────
+    # ── teacher-forcing pass for raw logits (all on the same device) ──
     seqs_flat = seqs.reshape(B * N, T_full)
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
-        logits = model(seqs_flat).logits              # [B*N, T_full, V]
-    log_p = logits.log_softmax(-1).float().cpu()      # keep on CPU for numpy
+        logits = model(seqs_flat).logits           # [B*N,T_full,V]
+    log_p = logits.log_softmax(-1)                 # keep on GPU ⇒ no mismatch
 
-    # shift-right so log_p[t] conditions on tokens < t
-    log_p = log_p[:, :-1, :]                          # [B*N, T_full-1, V]
-    target = seqs_flat[:, 1:]                         # ids at positions 1..T_full-1
+    target  = seqs_flat[:, 1:]                     # gold ids for positions 1..
+    lp_all  = log_p.gather(2, target.unsqueeze(-1)).squeeze(-1)  # [B*N,T_full-1]
+    ent_all = -(log_p.exp() * log_p).sum(-1)                     # same shape
 
-    lp_all = log_p.gather(2, target.unsqueeze(-1)).squeeze(-1)  # [B*N, T_full-1]
-    ent_all = -(log_p.exp() * log_p).sum(-1)                      # same shape
+    lp_all  = lp_all[:, -T_gen:].float().cpu().numpy()
+    ent_all = ent_all[:, -T_gen:].float().cpu().numpy()
+    lp_all  = lp_all.reshape(B, N, T_gen)
+    ent_all = ent_all.reshape(B, N, T_gen)
 
-    # keep only generated part
-    lp_all  = lp_all[:, -T_gen:]                      # [B*N, T_gen]
-    ent_all = ent_all[:, -T_gen:]
-
-    # ── reshape back to [B, N, T_gen] and python lists ────────────────────
-    lp_all  = lp_all.numpy().reshape(B, N, T_gen)
-    ent_all = ent_all.numpy().reshape(B, N, T_gen)
-
-    gen_text, gen_lps, gen_ents = [], [], []
+    # ── decode & trim ──
+    gen_text = []
     for b in range(B):
-        texts, lps, ents = [], [], []
+        row = []
         for n in range(N):
-            seq = seqs[b, n]
-            decoded = tokenizer.decode(seq, skip_special_tokens=True)
-
-            # tidy up decoded text: keep up to first </answer>
-            m = TAG_RGX.search(decoded)
+            dec = tokenizer.decode(seqs[b, n], skip_special_tokens=True)
+            m = TAG_RGX.search(dec)
             if m:
-                tidy = m.group(0)
+                row.append(m.group(0))
             else:
-                idx = decoded.find(TAG_STOP)
-                tidy = decoded[: idx + len(TAG_STOP)] if idx != -1 else decoded
-            texts.append(tidy)
+                idx = dec.find(TAG_STOP)
+                row.append(dec[: idx + len(TAG_STOP)] if idx != -1 else dec)
+        gen_text.append(row)
 
-            lps .append(lp_all [b, n])
-            ents.append(ent_all[b, n])
-
-        gen_text.append(texts)
-        gen_lps .append(lps)
-        gen_ents.append(ents)
-
+    # convert arrays to list-of-arrays to keep existing record code unchanged
+    gen_lps  = [[lp for lp in lp_all[b]]  for b in range(B)]
+    gen_ents = [[en for en in ent_all[b]] for b in range(B)]
     return gen_text, gen_lps, gen_ents

@@ -17,6 +17,8 @@ class GSM8K(BaseDataset):
             yield Example(
                 text=f"{question}\n<think>\n{rationale.strip()}\n</think>\n"
                      f"<answer>\n{final.strip()}\n</answer>",
+                question=question,
+                answer=final.strip(),
                 meta={"dataset": "gsm8k"}
             )
 

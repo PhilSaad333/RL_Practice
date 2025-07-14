@@ -18,6 +18,8 @@ def register(name: str):
 @dataclass
 class Example:
     text: str
+    question: str
+    answer: str
     meta: dict
 
 
