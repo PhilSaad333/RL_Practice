@@ -48,7 +48,7 @@ class HendrycksMath(BaseDataset):
                 text=f"{prob}\n<think>\n{sol}\n</think>\n"
                      f"<answer>\n{final}\n</answer>",
                 question=question,
-                answer=final
+                answer=final,
                 meta={"dataset": "math", "subject": row["subject"]},
             )
 
