@@ -12,8 +12,8 @@ BOXED_RE = re.compile(r"\\boxed\{([^}]+)\}")
 class HendrycksMath(BaseDataset):
     def __iter__(self):
         # subject splits are already shuffled; we keep as-is
-        ds = load_dataset("hendrycks/competition_math", split=self.split,
-                          cache_dir=RAW_DIR)                 # :contentReference[oaicite:7]{index=7}
+        ds = load_dataset("EleutherAI/hendrycks_math",        # public mirror
+                        split=self.split, cache_dir=RAW_DIR)        # :contentReference[oaicite:1]{index=1}
         for row in ds:
             prob = row["problem"].strip()
             sol  = row["solution"].strip()
