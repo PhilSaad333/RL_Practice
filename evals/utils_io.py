@@ -58,12 +58,15 @@ def load_everything(model_or_dir: str,
                             quantized=quantized,
                             device_map="auto")         # PEFT or base ✔️
 
+    tok.padding_side = "left"
+    tok.pad_token = tok.eos_token
+
     # pull prompts + golds from registry
     ds_test = DATASET_REGISTRY[eval_dataset]("test")
     prompts = [ex.text for ex in ds_test]
     golds   = [ex.meta for ex in ds_test]              # keep meta for metrics
 
-    stopper = StopOnAnswer(tok)                        # unchanged class
+    stopper = StoppingCriteriaList([StopOnAnswer(tok)])
     return model, tok, prompts, golds, stopper
 
 
@@ -75,7 +78,7 @@ def generate_with_logprobs(
     tokenizer,
     prompts: List[str],
     gen_cfg: GenerationConfig,
-    stop_crit: StoppingCriteriaList,
+    stop_crit:,
 ):
     """Return
         gen_text  : List[B][N]   decoded strings (trimmed to <think>…</answer>)
