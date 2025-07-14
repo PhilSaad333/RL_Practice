@@ -117,23 +117,32 @@ def main(cfg: Config):
 
 if __name__ == "__main__":
     import argparse, yaml
-    from dataclasses import asdict
+    from pathlib import Path
 
-    # 1) Parse exactly one flag: the config path
     parser = argparse.ArgumentParser(description="LoRA SFT trainer")
     parser.add_argument("-c", "--config", required=True,
                         help="Path to a YAML config file")
     args = parser.parse_args()
 
-    # 2) Load YAML into a dict
-    with open(args.config, "r") as f:
-        cfg_dict = yaml.safe_load(f)
+    # 1) Load your specified YAML
+    cfg_path = Path(args.config)
+    cfg_dict = yaml.safe_load(cfg_path.read_text()) or {}
 
-    # 3) Instantiate your Config dataclass
+    # 2) Handle `inherit:` if present
+    parent_key = cfg_dict.pop("inherit", None)
+    if parent_key:
+        parent_path = cfg_path.parent / parent_key
+        parent_cfg = yaml.safe_load(parent_path.read_text()) or {}
+        # Merge: parent < child
+        parent_cfg.update(cfg_dict)
+        cfg_dict = parent_cfg
+
+    # 3) Now cfg_dict contains only fields that match Config(...)
     cfg = Config(**cfg_dict)
     print("✔ Loaded config:", cfg)
 
-    # 4) Pass it to your main function
+    # 4) Launch the trainer
     main(cfg)
+
 
 
