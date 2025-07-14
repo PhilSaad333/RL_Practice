@@ -1,18 +1,14 @@
-# ------------------------------------------------------------------
-# keys the trainer expects (tyro parses straight into a dataclass)
-# ------------------------------------------------------------------
-dataset: gsm8k
+# default knobs; other YAMLs `inherit` from this
 backbone: phi2
-output_dir: outputs/${dataset}_${backbone}
+dataset: gsm8k
 batch_size: 4
-learning_rate: 2e-5
-num_epochs: 3
-eval_every_steps: 200
-generation:
-  top_p: 0.9
-  temperature: 0.7
-lora:
-  r: 32
-  alpha: 16
-  dropout: 0.05
-quantized: false            # new
+epochs: 3
+lr: 2e-5
+quantized: false
+lora_r: 64
+lora_alpha: 128
+lora_dropout: 0.05
+grad_accum: 1
+save_steps: 500
+log_steps: 100
+max_seq_len: 1024

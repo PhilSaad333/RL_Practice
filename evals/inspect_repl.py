@@ -5,6 +5,7 @@ type prompts and see sampled completions.
 
 Run:
     python evals/inspect_repl.py --backbone phi2 --temperature 0.7 --top_p 0.9
+    then in the input put respond("prompt")
 """
 
 from typing import Optional
