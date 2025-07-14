@@ -3,17 +3,17 @@ Getting intuition for RL dynamics in the case of teaching LLMs to do math better
 
 # Contents
 
+README.md
 main.py
 env.txt (was requirements, unused rn because running in colab)
+.gitignore
 
 -- fine_tuning/
   |
   -- stf_phi2_lora.py
 
 -- configs/
-
   |
-  
   sft_phi2.yaml
 
 -- datasets/
