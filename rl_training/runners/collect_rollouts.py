@@ -19,7 +19,7 @@ from transformers import (
 
 from rl_training.utils.rollout_buffer import RolloutBuffer, RolloutBatch
 from rl_training.rewards import get_reward_fns       # factory that imports by name
-from rl_training.schedulers.round_robin import get_prompt_sampler # factory for curriculum schedulers
+from rl_training.schedulers.mix_passrate import get_prompt_sampler # factory for curriculum schedulers
 from evals.utils_io import StopOnAnswer
 
 
