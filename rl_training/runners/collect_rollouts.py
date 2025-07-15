@@ -123,11 +123,21 @@ class RolloutCollector:
             )
             gen_ids: Tensor = outputs.sequences[:, prompt_ids.shape[1]:]   # (G, T_gen)
             scores: Sequence[Tensor] = outputs.scores                     # list len T_gen
-            # 1) Decode to text
-            gen_texts = self.tokenizer.batch_decode(
-                gen_ids,
-                skip_special_tokens=True,
-            )
+
+            # 1) Decode to text, with safety net in case something goes wrong
+            try:
+                gen_texts = self.tokenizer.batch_decode(
+                    gen_ids,
+                    skip_special_tokens=True,
+                )
+            except Exception as e:
+                # fallback to empty strings so we don't crash
+                print(f"[rollout] WARNING: decode failed: {e}")
+                gen_texts = [""] * self.G
+
+            # in case we somehow got an empty list
+            if not isinstance(gen_texts, list) or len(gen_texts) != self.G:
+                gen_texts = [""] * self.G
 
             # 2) Immediately strip anything after </answer>
             gen_texts = [
