@@ -109,7 +109,6 @@ class RolloutCollector:
             prompt_text = question + "\n<think>\n"
 
             prompt_ids = self.tokenizer(prompt_text, return_tensors="pt").input_ids.to(self.device)
-            prompt_id = hash(question) & 0xFFFFFFFF  # cheap stable-ish id
 
             # ------------------------------------------------------------------
             # generate G continuations with score capture
@@ -166,7 +165,7 @@ class RolloutCollector:
             # ------------------------------------------------------------------
             # reward(s)
             # ------------------------------------------------------------------
-            rewards = torch.stack([fn(prompt, gen_texts) for fn in self.reward_fns]).sum(0)
+            rewards = torch.stack([fn(prompt_id, gen_texts) for fn in self.reward_fns]).sum(0)
             # rewards: Tensor [G]
 
             # ------------------------------------------------------------------
@@ -199,7 +198,7 @@ class RolloutCollector:
                 records.append(
                     GenSample(
                         prompt_id=prompt_id,
-                        prompt_text=prompt,
+                        prompt_text=prompt_text,
                         gen_text=gen_texts[g],
                         think_len=_count_think_tokens(full_texts[g], self.tokenizer),
                         reward=rewards[g].item(),
