@@ -13,11 +13,16 @@ from torch import Tensor
 from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
+    StoppingCriteria,
+    StoppingCriteriaList,
 )
 
 from rl_training.utils.rollout_buffer import RolloutBuffer, RolloutBatch
 from rl_training.rewards import get_reward_fns       # factory that imports by name
 from rl_training.schedulers import get_prompt_sampler # factory for curriculum schedulers
+from evals.utils_io import StopOnAnswer
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -28,6 +33,7 @@ class GenSample:
     prompt_id: int
     prompt_text: str
     gen_text: str
+    think_len: int
     reward: float
     include_in_batch: bool
     difficulty_tag: str                       # "easy" | "normal" | "hard"
@@ -62,6 +68,8 @@ class RolloutCollector:
         self.device = device or policy.device
         self.G: int = cfg["num_generations"]
         self.batch_size: int = cfg["num_prompts"]
+
+        self.stopper = StoppingCriteriaList([StopOnAnswer(tokenizer)])
 
         # factories so you can swap implementations via YAML
         self.reward_fns = get_reward_fns(cfg["reward_fns"])          # list[callable]
@@ -110,11 +118,14 @@ class RolloutCollector:
                 num_return_sequences=self.G,
                 pad_token_id=self.tokenizer.pad_token_id,
                 output_scores=True,
+                stopping_criteria=self.stopper,
                 return_dict_in_generate=True,
             )
             gen_ids: Tensor = outputs.sequences[:, prompt_ids.shape[1]:]   # (G, T_gen)
             scores: Sequence[Tensor] = outputs.scores                     # list len T_gen
-            gen_texts = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            gen_texts = [txt.split("</answer>", 1)[0] + "</answer>"
+            if "</answer>" in txt else txt 
+            for txt in gen_texts]
 
             # ------------------------------------------------------------------
             # token-level stats
@@ -159,6 +170,7 @@ class RolloutCollector:
                         prompt_id=prompt_id,
                         prompt_text=prompt,
                         gen_text=gen_texts[g],
+                        think_len=_count_think_tokens(gen_texts[g], self.tokenizer),
                         reward=rewards[g].item(),
                         include_in_batch=bool(accept),
                         difficulty_tag=diff_tag,
@@ -225,6 +237,16 @@ def _accept_prompt_group(
     if not allow_all_max and torch.all(rewards == rewards.max()):
         return False
     return True
+    
+def _count_think_tokens(text: str, tok: PreTrainedTokenizerBase) -> int:
+    """
+    Number of tokens between <think> ... </think>.
+    Returns 0 if either tag is missing.
+    """
+    if "<think>" not in text or "</think>" not in text:
+        return 0
+    inner = text.split("<think>", 1)[1].split("</think>", 1)[0]
+    return len(tok(inner, add_special_tokens=False).input_ids)
 
 
 def _append_jsonl(file: Path, records: List[GenSample]):
