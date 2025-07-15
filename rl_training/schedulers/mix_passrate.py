@@ -66,7 +66,7 @@ class MixPassRateScheduler(Iterator[int]):
             hash(ex.question) & 0xFFFFFFFF: ex.question
             for ex in self.dataset
         }
-        
+
         set_prompt2gold(mapping)
 
         self.ema_alpha = ema_alpha
@@ -134,7 +134,7 @@ class MixPassRateScheduler(Iterator[int]):
     def _rebuild_all_buckets(self) -> None:
         """Called once at init."""
         for ex in self.dataset:
-            pid = hash(ex.text) & 0xFFFFFFFF
+            pid = hash(ex.question) & 0xFFFFFFFF
             bucket = self._bucket_name(self.win_rate[pid])
             self.buckets[bucket].append(pid)
 
