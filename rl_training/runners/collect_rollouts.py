@@ -123,13 +123,18 @@ class RolloutCollector:
             )
             gen_ids: Tensor = outputs.sequences[:, prompt_ids.shape[1]:]   # (G, T_gen)
             scores: Sequence[Tensor] = outputs.scores                     # list len T_gen
+            # 1) Decode to text
             gen_texts = self.tokenizer.batch_decode(
                 gen_ids,
                 skip_special_tokens=True,
             )
-            gen_texts = [txt.split("</answer>", 1)[0] + "</answer>"
-            if "</answer>" in txt else txt 
-            for txt in gen_texts]
+
+            # 2) Immediately strip anything after </answer>
+            gen_texts = [
+                txt.split("</answer>", 1)[0] + "</answer>"
+                if "</answer>" in txt else txt
+                for txt in gen_texts
+            ]
 
             # ------------------------------------------------------------------
             # token-level stats
