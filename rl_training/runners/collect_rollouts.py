@@ -110,7 +110,7 @@ class RolloutCollector:
             # ------------------------------------------------------------------
             start_t = time.perf_counter()
             outputs = self.policy.generate(
-                prompt_ids.repeat(self.G, 1),
+                prompt_ids,
                 max_new_tokens=self.cfg["max_new_tokens"],
                 do_sample=True,
                 temperature=self.cfg["temperature"],
