@@ -1,1 +1,31 @@
-# rl_training/cfg/grpo_gsm8k.yaml
+# grpo_gsm8k.yaml   –  starter settings for smoke-tests
+# ----------------------------------------------------
+# Anything in this file is passed verbatim to RolloutCollector via cfg.
+# The GRPO trainer will later read the same file and use only what it needs.
+
+# ----- rollout collection ----- #
+num_generations: 4        # G
+num_prompts: 3            # B
+max_new_tokens: 64
+temperature: 0.7
+top_p: 0.9
+
+# acceptance / filtering thresholds
+reward_var_thresh: 0.0
+reject_all_zero: false
+reject_all_max: false
+
+# reward(s) – list of module names inside rl_training/rewards
+reward_fns:
+  - tag_math_correct       # the correctness × tag-adherence reward
+
+# scheduler settings
+scheduler:
+  name: mix_passrate
+  dataset_name: gsm8k
+  split: "train[:0.1%]"      # tiny slice for quick tests
+  ema_alpha: 0.05
+  boundaries: [0.2, 0.8]
+  sample_weights: [4, 3, 1]   # hard : normal : easy
+
+# (trainer-specific keys will go here later, e.g. learning-rate, clip ⋯)
