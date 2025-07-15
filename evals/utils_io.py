@@ -80,7 +80,7 @@ def load_everything(
 
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
-# │ Generate completions + per-token log-probs and entropies                 │
+# │ Generate completions + per-token log-probs and entropies (memory-safe)   │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 def generate_with_logprobs(
     model,
@@ -88,6 +88,8 @@ def generate_with_logprobs(
     prompts: List[str],
     gen_cfg: GenerationConfig,
     stop_crit,
+    *,
+    tf_micro_batch: int = 8,          # ← teacher-forcing chunk size
 ):
     enc = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
     prompt_len = enc.input_ids.shape[1]
@@ -106,28 +108,36 @@ def generate_with_logprobs(
     T_full = seqs.size(-1)
     T_gen  = T_full - prompt_len
 
-    # ── teacher-forcing pass for raw logits (all on the same device) ──
-    seqs_flat = seqs.reshape(B * N, T_full)
-    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
-        logits = model(seqs_flat).logits           # [B*N,T_full,V]
-    log_p = logits.log_softmax(-1)                 # keep on GPU ⇒ no mismatch
+    # ── teacher-forcing pass in micro-batches ──────────────────────────────
+    seqs_flat = seqs.reshape(B * N, T_full)        # [B*N, T_full]
+    lp_chunks, ent_chunks = [], []
+    for i in range(0, seqs_flat.size(0), tf_micro_batch):
+        blk = seqs_flat[i : i + tf_micro_batch]    # [mb, T_full]
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
+            logits = model(blk).logits             # [mb, T_full, V]
+        log_p = logits.log_softmax(-1)             # keep on GPU
 
-    target  = seqs_flat[:, 1:]                     # gold ids for positions 1..
-    lp_all  = log_p.gather(2, target.unsqueeze(-1)).squeeze(-1)  # [B*N,T_full-1]
-    ent_all = -(log_p.exp() * log_p).sum(-1)                     # same shape
+        tgt = blk[:, 1:].unsqueeze(-1)
+        lp  = log_p.gather(2, tgt).squeeze(-1)     # [mb, T_full-1]
+        ent = -(log_p.exp() * log_p).sum(-1)       # same
 
-    lp_all  = lp_all[:, -T_gen:].float().cpu().numpy()
-    ent_all = ent_all[:, -T_gen:].float().cpu().numpy()
-    lp_all  = lp_all.reshape(B, N, T_gen)
-    ent_all = ent_all.reshape(B, N, T_gen)
+        lp_chunks .append(lp[:,  -T_gen:])
+        ent_chunks.append(ent[:, -T_gen:])
 
-    # ── decode & trim ──
+        # free asap
+        del logits, log_p, lp, ent
+        torch.cuda.empty_cache()
+
+    lp_all  = torch.cat(lp_chunks,  0).float().cpu().numpy().reshape(B, N, T_gen)
+    ent_all = torch.cat(ent_chunks, 0).float().cpu().numpy().reshape(B, N, T_gen)
+
+    # ── decode & trim ──────────────────────────────────────────────────────
     gen_text = []
     for b in range(B):
         row = []
         for n in range(N):
             dec = tokenizer.decode(seqs[b, n], skip_special_tokens=True)
-            m = TAG_RGX.search(dec)
+            m   = TAG_RGX.search(dec)
             if m:
                 row.append(m.group(0))
             else:
@@ -135,7 +145,7 @@ def generate_with_logprobs(
                 row.append(dec[: idx + len(TAG_STOP)] if idx != -1 else dec)
         gen_text.append(row)
 
-    # convert arrays to list-of-arrays to keep existing record code unchanged
-    gen_lps  = [[lp for lp in lp_all[b]]  for b in range(B)]
-    gen_ents = [[en for en in ent_all[b]] for b in range(B)]
+    # keep existing EvalRecord expectations
+    gen_lps  = [[lp  for lp  in lp_all [b]] for b in range(B)]
+    gen_ents = [[ent for ent in ent_all[b]] for b in range(B)]
     return gen_text, gen_lps, gen_ents
