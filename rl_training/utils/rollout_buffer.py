@@ -43,16 +43,18 @@ class RolloutBuffer:
         *,
         prompt_ids: torch.LongTensor,          # [T_p]
         gen_ids: torch.LongTensor,             # [G, T_g]
-        rewards: torch.FloatTensor,            # [G]
+        rewards: torch.FloatTensor,            # [G] or [G,1] or [1,G]
     ) -> None:
         assert prompt_ids.dim() == 1, "prompt_ids must be 1-D"
         assert gen_ids.dim() == 2, "gen_ids must be 2-D (G, T_gen)"
         G_here = gen_ids.shape[0]
+        # flatten any extra dims so we get exactly shape (G_here,)
+        rewards = rewards.squeeze()
         if self._G is None:
             self._G = G_here
         else:
             assert G_here == self._G, f"Inconsistent G: expected {self._G}, got {G_here}"
-        assert rewards.shape == (G_here,), "rewards shape mismatch"
+        assert rewards.shape == (G_here,), f"rewards shape mismatch: got {tuple(rewards.shape)}, expected ({G_here},)"
 
         assert len(self) < self.capacity, "Buffer already full"
         self._prompts.append(prompt_ids.cpu())   # keep on CPU; move later
