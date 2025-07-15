@@ -109,7 +109,7 @@ class RolloutCollector:
             prompt_text = question + "\n<think>\n"
 
             prompt_ids = self.tokenizer(prompt_text, return_tensors="pt").input_ids.to(self.device)
-            prompt_id = hash(prompt) & 0xFFFFFFFF  # cheap stable-ish id
+            prompt_id = hash(question) & 0xFFFFFFFF  # cheap stable-ish id
 
             # ------------------------------------------------------------------
             # generate G continuations with score capture
