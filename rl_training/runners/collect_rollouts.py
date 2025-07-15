@@ -19,7 +19,7 @@ from transformers import (
 
 from rl_training.utils.rollout_buffer import RolloutBuffer, RolloutBatch
 from rl_training.rewards import get_reward_fns       # factory that imports by name
-from rl_training.schedulers import get_prompt_sampler # factory for curriculum schedulers
+from rl_training.schedulers.round_robin import get_prompt_sampler # factory for curriculum schedulers
 from evals.utils_io import StopOnAnswer
 
 
@@ -237,7 +237,7 @@ def _accept_prompt_group(
     if not allow_all_max and torch.all(rewards == rewards.max()):
         return False
     return True
-    
+
 def _count_think_tokens(text: str, tok: PreTrainedTokenizerBase) -> int:
     """
     Number of tokens between <think> ... </think>.

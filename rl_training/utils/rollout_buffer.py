@@ -1,4 +1,4 @@
-# rl_training/runners/rollout_buffer.py
+# rl_training/utils/rollout_buffer.py
 
 
 from __future__ import annotations
