@@ -1,83 +1,57 @@
-# rl_training/rewards/math_correctness.py
+# rl_training/rewards/tag_math_correct.py
+"""
+reward(prompt_id, answers:list[str])  →  torch.FloatTensor[G]
 
+* tag_score : 1 if exactly one <answer>…</answer> block, else 0
+* math_score: 1 if math_verify says model answer ≡ gold answer, else 0
+* reward    : tag_score × math_score   (∈ {0,1})
+
+The module expects a global dict PROMPT2GOLD that maps *prompt_id* → gold_latex.
+Prompt IDs are supplied by the scheduler.
+"""
 from __future__ import annotations
 import re
 from typing import Dict, List
 
 import torch
-from math_verify import parse, verify  # pip install math-verify
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Dataset registry (prompt → gold LaTeX string)
-# ──────────────────────────────────────────────────────────────────────────────
-_DATASET: Dict[str, str] = {}
+from math_verify import parse, verify
 
 
-def register_dataset(mapping: Dict[str, str]) -> None:
-    """
-    Add or overwrite reference answers.
+PROMPT2GOLD: Dict[int, str] = {}    # filled once by the scheduler
 
-    Call this once at start-up, e.g. the scheduler can do:
-        from rl_training.rewards.math_correctness import register_dataset
-        register_dataset({p["prompt"]: p["gold"] for p in dataset})
-    """
-    _DATASET.update(mapping)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
 _TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 
 
+def set_prompt2gold(mapping: Dict[int, str]) -> None:
+    """Call exactly once at start-up."""
+    PROMPT2GOLD.update(mapping)
+
+
 def _extract_answer_block(text: str) -> str | None:
-    """Return inner string if exactly one <answer>...</answer>; else None."""
-    m = _TAG_RE.findall(text)
-    if len(m) != 1:
-        return None
-    return m[0].strip()
+    hits = _TAG_RE.findall(text)
+    return hits[0].strip() if len(hits) == 1 else None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Public reward function
-# ──────────────────────────────────────────────────────────────────────────────
-def reward_fn(prompt: str, answers: List[str]) -> torch.FloatTensor:
-    """
-    Args
-    ----
-    prompt   : the prompt string (must exist in the registered dataset)
-    answers  : list of model outputs (length == G)
-
-    Returns
-    -------
-    torch.FloatTensor shape (G,)   values in {0., 1.}
-    """
-    gold_latex = _DATASET.get(prompt)
-    if gold_latex is None:
-        # Unknown prompt → zero reward
+def reward_fn(prompt_id: int, answers: List[str]) -> torch.FloatTensor:
+    gold = PROMPT2GOLD.get(prompt_id)
+    if gold is None:
         return torch.zeros(len(answers))
 
     try:
-        gold_parsed = parse(gold_latex)
+        gold_parsed = parse(gold)
     except Exception:
-        # Parsing gold failed → safest to give zero reward to all
         return torch.zeros(len(answers))
 
     out = []
     for ans in answers:
-        # 1) Tag adherence
         inner = _extract_answer_block(ans)
         if inner is None:
             out.append(0.0)
             continue
-
-        # 2) Correctness
         try:
-            ans_parsed = parse(inner)
-            ok = verify(gold_parsed, ans_parsed)
+            ok = verify(gold_parsed, parse(inner))
         except Exception:
             ok = False
-
         out.append(1.0 if ok else 0.0)
 
     return torch.tensor(out, dtype=torch.float32)

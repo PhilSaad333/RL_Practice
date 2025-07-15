@@ -73,7 +73,7 @@ class RolloutCollector:
 
         # factories so you can swap implementations via YAML
         self.reward_fns = get_reward_fns(cfg["reward_fns"])          # list[callable]
-        self.prompt_sampler = get_prompt_sampler(cfg["scheduler"])   # yields prompt strings
+        self.prompt_sampler = get_prompt_sampler(cfg["scheduler"])   # yields prompt_id ints
 
         # rolling difficulty tracker
         self.win_rate_ema: Dict[int, float] = {}
@@ -101,8 +101,11 @@ class RolloutCollector:
         buffer = RolloutBuffer(capacity=self.batch_size)
 
         while len(buffer) < self.batch_size:
-            prompt = next(self.prompt_sampler)     # text str
-            prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+            prompt_id = next(self.prompt_sampler)     # int
+            question   = self.prompt_sampler.id2text[prompt_id]
+            prompt_text = question + "\n<think>\n"
+
+            prompt_ids = self.tokenizer(prompt_text, return_tensors="pt").input_ids.to(self.device)
             prompt_id = hash(prompt) & 0xFFFFFFFF  # cheap stable-ish id
 
             # ------------------------------------------------------------------
@@ -121,10 +124,11 @@ class RolloutCollector:
                 stopping_criteria=self.stopper,
                 return_dict_in_generate=True,
             )
-            gen_ids: Tensor = outputs.sequences[:, prompt_ids.shape[1]:]   # (G, T_gen)
+            full_ids: Tensor = outputs.sequences    # (G,T_total)
+            gen_ids: Tensor = full_ids[:, prompt_ids.shape[1]:]   # (G, T_gen)
             scores: Sequence[Tensor] = outputs.scores                     # list len T_gen
 
-            # 1) Decode to text, with safety net in case something goes wrong
+            # Decode *generation only*  (for logging / buffer)
             try:
                 gen_texts = self.tokenizer.batch_decode(
                     gen_ids,
@@ -139,12 +143,17 @@ class RolloutCollector:
             if not isinstance(gen_texts, list) or len(gen_texts) != self.G:
                 gen_texts = [""] * self.G
 
-            # 2) Immediately strip anything after </answer>
+            # Immediately strip anything after </answer>
             gen_texts = [
                 txt.split("</answer>", 1)[0] + "</answer>"
                 if "</answer>" in txt else txt
                 for txt in gen_texts
             ]
+
+            # Decode *full prompt+gen* for think-length metric
+            full_texts = self.tokenizer.batch_decode(
+                full_ids, skip_special_tokens=True
+            )
 
             # ------------------------------------------------------------------
             # token-level stats
@@ -189,7 +198,7 @@ class RolloutCollector:
                         prompt_id=prompt_id,
                         prompt_text=prompt,
                         gen_text=gen_texts[g],
-                        think_len=_count_think_tokens(gen_texts[g], self.tokenizer),
+                        think_len=_count_think_tokens(full_texts[g], self.tokenizer),
                         reward=rewards[g].item(),
                         include_in_batch=bool(accept),
                         difficulty_tag=diff_tag,
