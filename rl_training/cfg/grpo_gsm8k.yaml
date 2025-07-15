@@ -23,7 +23,7 @@ reward_fns:
 scheduler:
   name: mix_passrate
   dataset_name: gsm8k
-  split: "train[:0.10]"      # tiny slice for quick tests
+  split: "train[:10]"      # tiny slice for quick tests
   ema_alpha: 0.05
   boundaries: [0.2, 0.8]
   sample_weights: [4, 3, 1]   # hard : normal : easy
