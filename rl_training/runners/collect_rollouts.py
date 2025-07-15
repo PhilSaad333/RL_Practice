@@ -19,7 +19,7 @@ from transformers import (
 
 from rl_training.utils.rollout_buffer import RolloutBuffer, RolloutBatch
 from rl_training.rewards import get_reward_fns       # factory that imports by name
-from rl_training.schedulers.mix_passrate import get_prompt_sampler # factory for curriculum schedulers
+from importlib import import_module
 from evals.utils_io import StopOnAnswer
 
 
@@ -73,7 +73,10 @@ class RolloutCollector:
 
         # factories so you can swap implementations via YAML
         self.reward_fns = get_reward_fns(cfg["reward_fns"])          # list[callable]
-        self.prompt_sampler = get_prompt_sampler(cfg["scheduler"])   # yields prompt_id ints
+        # dynamically load the right scheduler module by name
+        sched_cfg = cfg["scheduler"]
+        sched_mod = import_module(f"rl_training.schedulers.{sched_cfg['name']}")
+        self.prompt_sampler = sched_mod.get_prompt_sampler(sched_cfg)  # yields prompt_id ints   # yields prompt_id ints
 
         # rolling difficulty tracker
         self.win_rate_ema: Dict[int, float] = {}
