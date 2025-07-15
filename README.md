@@ -5,57 +5,83 @@ Getting intuition for RL dynamics in the case of teaching LLMs to do math better
 
 RL_Practice/
 
-
-├── README.md
-
-├── main.py
-
-├── env.txt # pip/conda environment spec (unused in Colab)
-
-├── .gitignore
-
-├── fine_tuning/
-
-│ └── stf_phi2_lora.py
-
-├── configs/
-
-│ └── sft_phi2.yaml
-
-├── datasets/
-
-│ ├── GSM8K_dataset.py
-
-│     └── processed/
-
-│         └── gsm8k_tagged/
-
-│             ├── test/
-
-│             └── train/
-
-├── evals/
-
-│ ├── eval_runner.py
-
-│ ├── evaluator.py
-
-│ ├── records.py
-
-│ ├── inspect_repl.py
-
-│ ├── utils_io.py
-
-│ └── metrics/
-
-│     ├── tag_format.py
-
-│     ├── passk.py
-
-│     ├── response_len.py
-
-│     └── entropy.py
-
-└── rl_training/
-
-    └── (empty)
+./configs/sft_gsm8k_tinyllama.yaml
+./configs/sft_math_phi2.yaml
+./configs/sft_phi2.yaml
+./configs/_template_sft.yaml
+./env.txt
+./evals/eval_runner.py
+./evals/evaluator.py
+./evals/__init__.py
+./evals/inspect_repl.py
+./evals/metrics/entropy.py
+./evals/metrics/__init__.py
+./evals/metrics/passk.py
+./evals/metrics/response_len.py
+./evals/metrics/tag_format.py
+./evals/records.py
+./evals/utils_io.py
+./fine_tuning/__init__.py
+./fine_tuning/sft.py
+./.git/config
+./.git/description
+./.git/FETCH_HEAD
+./.git/HEAD
+./.git/hooks/applypatch-msg.sample
+./.git/hooks/commit-msg.sample
+./.git/hooks/fsmonitor-watchman.sample
+./.git/hooks/post-update.sample
+./.git/hooks/pre-applypatch.sample
+./.git/hooks/pre-commit.sample
+./.git/hooks/pre-merge-commit.sample
+./.git/hooks/prepare-commit-msg.sample
+./.git/hooks/pre-push.sample
+./.git/hooks/pre-rebase.sample
+./.git/hooks/pre-receive.sample
+./.git/hooks/push-to-checkout.sample
+./.git/hooks/update.sample
+./.gitignore
+./.git/index
+./.git/info/exclude
+./.git/logs/HEAD
+./.git/logs/refs/heads/main
+./.git/logs/refs/remotes/origin/HEAD
+./.git/logs/refs/remotes/origin/main
+./.git/objects/54/9259fa9624eca516084dc75d069f0c1d3579a6
+./.git/objects/b2/add616146212f4439ba669b7a97317dcd17a29
+./.git/objects/ba/ba36a994524678433f43bef82dc032d5158818
+./.git/objects/e3/1328a86c408d1cb3dbc826c99d4076ee12326e
+./.git/objects/f5/a3aefc69e5877f7a673f6127bbdc1caf0d1ede
+./.git/objects/pack/pack-c712d07e58ad6da8d9ccdb916e9dd30c9956786a.idx
+./.git/objects/pack/pack-c712d07e58ad6da8d9ccdb916e9dd30c9956786a.pack
+./.git/ORIG_HEAD
+./.git/packed-refs
+./.git/refs/heads/main
+./.git/refs/remotes/origin/HEAD
+./.git/refs/remotes/origin/main
+./.git/shallow
+./__init__.py
+./main.py
+./models/__init__.py
+./README.md
+./rlp_datasets/deepmind_math.py
+./rlp_datasets/GSM8K_dataset.py
+./rlp_datasets/gsm8k.py
+./rlp_datasets/__init__.py
+./rlp_datasets/math.py
+./rlp_datasets/mathqa.py
+./rlp_datasets/openwebmath.py
+./rlp_datasets/svamp.py
+./rl_training/algs/base.py
+./rl_training/algs/grpo.py
+./rl_training/cfg/grpo_gsm8k.yaml
+./rl_training/rewards/__init__.py
+./rl_training/rewards/length_penalty.py
+./rl_training/rewards/math_passk.py
+./rl_training/runners/collect_rollouts.py
+./rl_training/runners/eval_callback.py
+./rl_training/runners/rl_runner.py
+./rl_training/runners/rollout_buffer.py
+./rl_training/schedulers/mix_passrate.py
+./rl_training/utils/io.py
+./rl_training/utils/torch_ops.py
