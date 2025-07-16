@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 from typing import List
-
 import torch
 from torch.nn.utils.rnn import pad_sequence
+import torch.nn.functional as F
 
 from rl_training.algs.base import RolloutBatch
 
@@ -85,8 +85,15 @@ class RolloutBuffer:
         B = len(self)
         G = self._G
 
-        # ------------ pad prompts ------------------------------------------------
-        padded_prompts = pad_sequence(self._prompts, batch_first=True, padding_value=0)  # (B, T_p_max)
+        # ------------ left-pad prompts ---------------------------------------------
+        # Need left padding so we can cleanly concatenate with gens
+        # Apparently pad_sequence doesn't allow left-padding so must do it manually
+        T_max = max(p.size(0) for p in self._prompts)          # longest prompt length
+        padded_prompts = torch.stack(
+            [F.pad(p, (T_max - p.size(0), 0), value=0)         # pad (left, right)
+            for p in self._prompts],
+            dim=0                                              # (B, T_max)
+        )
 
         # ------------ pad generations --------------------------------------------
         # Each element in self._gens is (G, T_gen_i); we pad on dim=1, then stack.
@@ -123,6 +130,7 @@ class RolloutBuffer:
             padded_prompts = padded_prompts.to(device)
             padded_gens = padded_gens.to(device)
             rewards = rewards.to(device)
+            padded_logprobs = padded_logprobs.to(device)
 
         # ------------ pack -------------------------------------------------------
         return RolloutBatch(

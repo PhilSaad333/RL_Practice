@@ -104,7 +104,7 @@ class RolloutCollector:
         buffer = RolloutBuffer(capacity=self.batch_size)
 
         while len(buffer) < self.batch_size:
-            prompt_id = next(self.prompt_sampler)     # int
+            prompt_id = next(self.prompt_sampler)     # int, don't get confused with tokens = prompt_ids
             question   = self.prompt_sampler.id2text[prompt_id]
             prompt_text = question + "\n<think>\n"
 

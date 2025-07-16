@@ -5,7 +5,7 @@ import torch
 
 @dataclass
 class RolloutBatch:
-    prompt_ids:    torch.LongTensor  # (B, T_p_max)
+    prompt_ids:    torch.LongTensor  # (B, T_p_max) (left-padded)
     gen_ids:       torch.LongTensor  # (B, G, T_gen_max)
     reward:        torch.FloatTensor # (B, G)
     logprobs:      torch.FloatTensor # (B, G, T_gen_max)
