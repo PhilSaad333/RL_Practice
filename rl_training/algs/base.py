@@ -5,8 +5,8 @@ import torch
 
 @dataclass
 class RolloutBatch:
-    prompt_ids:    torch.LongTensor  # (B, T_prompt)
-    gen_ids:       torch.LongTensor  # (B, G, T_gen)
+    prompt_ids:    torch.LongTensor  # (B, T_p_max)
+    gen_ids:       torch.LongTensor  # (B, G, T_gen_max)
     reward:        torch.FloatTensor # (B, G)
 
 class RLAlgorithm(ABC):
