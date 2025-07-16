@@ -5,15 +5,15 @@
 
 # ----- rollout collection ----- #
 num_generations: 4        # G
-num_prompts: 3            # B
+num_prompts: 4            # B
 max_new_tokens: 64
 temperature: 0.7
 top_p: 0.9
 
 # acceptance / filtering thresholds
 reward_var_thresh: 0.0
-reject_all_zero: false
-reject_all_max: false
+reject_all_zero: true
+reject_all_max: true
 
 # reward(s) – list of module names inside rl_training/rewards
 reward_fns:

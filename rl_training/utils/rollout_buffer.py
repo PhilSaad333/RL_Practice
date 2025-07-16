@@ -41,9 +41,9 @@ class RolloutBuffer:
     def add(
         self,
         *,
-        prompt_ids: torch.LongTensor,          # [T_p]
-        gen_ids: torch.LongTensor,             # [G, T_g]
-        rewards: torch.FloatTensor,            # [G] or [G,1] or [1,G]
+        prompt_ids: torch.LongTensor,          # (T_p)
+        gen_ids: torch.LongTensor,             # (G, T_g)
+        rewards: torch.FloatTensor,            # (G) or (G,1) or (1,G)
     ) -> None:
         assert prompt_ids.dim() == 1, "prompt_ids must be 1-D"
         assert gen_ids.dim() == 2, "gen_ids must be 2-D (G, T_gen)"
@@ -109,7 +109,7 @@ class RolloutBuffer:
 
         # ------------ pack -------------------------------------------------------
         return RolloutBatch(
-            prompt_ids=padded_prompts,
-            gen_ids=padded_gens,
-            reward=rewards,
+            prompt_ids=padded_prompts, # left-padded, shape (B, T_p_max)
+            gen_ids=padded_gens, # right-padded, shape (B, G, T_gen_max)
+            reward=rewards, # shape (B, G)
         )

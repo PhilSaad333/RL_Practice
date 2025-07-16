@@ -5,9 +5,9 @@ import torch
 
 @dataclass
 class RolloutBatch:
-    prompt_ids:    torch.LongTensor  # [B, T_prompt]
-    gen_ids:       torch.LongTensor  # [B, G, T_gen]
-    reward:        torch.FloatTensor # [B, G]
+    prompt_ids:    torch.LongTensor  # (B, T_prompt)
+    gen_ids:       torch.LongTensor  # (B, G, T_gen)
+    reward:        torch.FloatTensor # (B, G)
 
 class RLAlgorithm(ABC):
     def __init__(self, policy, cfg):
