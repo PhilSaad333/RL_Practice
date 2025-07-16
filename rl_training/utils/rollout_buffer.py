@@ -33,6 +33,7 @@ class RolloutBuffer:
         self._prompts: List[torch.LongTensor] = []
         self._gens: List[torch.LongTensor] = []
         self._rewards: List[torch.FloatTensor] = []
+        self._logprobs: List[torch.FloatTensor] = []
         self._G: int | None = None  # lazily fixed on first add
 
     # --------------------------------------------------------------------- #
@@ -44,6 +45,7 @@ class RolloutBuffer:
         prompt_ids: torch.LongTensor,          # (T_p)
         gen_ids: torch.LongTensor,             # (G, T_g)
         rewards: torch.FloatTensor,            # (G) or (G,1) or (1,G)
+        logprobs: torch.FloatTensor,           # (G, T_g)
     ) -> None:
         assert prompt_ids.dim() == 1, "prompt_ids must be 1-D"
         assert gen_ids.dim() == 2, "gen_ids must be 2-D (G, T_gen)"
@@ -60,6 +62,7 @@ class RolloutBuffer:
         self._prompts.append(prompt_ids.cpu())   # keep on CPU; move later
         self._gens.append(gen_ids.cpu())
         self._rewards.append(rewards.cpu())
+        self._logprobs.append(logprobs.cpu())
 
     # --------------------------------------------------------------------- #
     # read-only API
@@ -74,6 +77,7 @@ class RolloutBuffer:
             prompt_ids : [B, T_prompt_max]
             gen_ids    : [B, G, T_gen_max]
             reward     : [B, G]
+            logprobs   : [B, G, T_gen_max]
 
         Returns ``RolloutBatch`` (defined in algs/base.py).
         """
@@ -99,6 +103,19 @@ class RolloutBuffer:
         ]
         padded_gens = torch.stack(gens_padded_per_prompt, dim=0)          # (B, G, T_gen_max)
 
+        # ------------ pad logprobs ----------------------------------------------
+        # Same as gens
+        logprobs_padded_per_prompt = [
+            pad_sequence(list(g), batch_first=True, padding_value=0)      # (G, T_gen_max_i)
+            for g in self._logprobs
+        ]
+        logprobs_padded_per_prompt = [
+            torch.nn.functional.pad(g, (0, T_gen_max - g.shape[1]))       # pad rhs
+            for g in logprobs_padded_per_prompt
+        ]
+
+        padded_logprobs = torch.stack(logprobs_padded_per_prompt, dim=0)          # (B, G, T_gen_max)
+
         # ------------ rewards ----------------------------------------------------
         rewards = torch.stack(self._rewards, dim=0)                       # (B, G)
 
@@ -109,7 +126,8 @@ class RolloutBuffer:
 
         # ------------ pack -------------------------------------------------------
         return RolloutBatch(
-            prompt_ids=padded_prompts, # left-padded, shape (B, T_p_max)
+            prompt_ids=padded_prompts, # right-padded, shape (B, T_p_max)
             gen_ids=padded_gens, # right-padded, shape (B, G, T_gen_max)
             reward=rewards, # shape (B, G)
+            logprobs=padded_logprobs, # shape (B, G, T_gen_max)
         )

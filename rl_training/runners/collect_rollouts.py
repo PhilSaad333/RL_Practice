@@ -162,6 +162,11 @@ class RolloutCollector:
             # ------------------------------------------------------------------
             logprobs, entropies = _token_stats(gen_ids, scores)
 
+            lp_tensor = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(row) for row in logprobs],  # list[G] of 1-D
+                batch_first=True, padding_value=0.0        # shape (G, T_gen_max_for_this_prompt)
+            )
+
             # ------------------------------------------------------------------
             # reward(s)
             # ------------------------------------------------------------------
@@ -220,6 +225,7 @@ class RolloutCollector:
                     prompt_ids       = prompt_ids.squeeze(0),    #   [T_prompt]
                     gen_ids          = gen_ids,                 # G x T_gen
                     rewards          = rewards,                 #   [G]
+                    logprobs         = lp_tensor
                 )
 
         self._step_idx += 1

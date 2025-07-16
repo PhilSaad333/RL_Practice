@@ -16,7 +16,9 @@ class GRPO(RLAlgorithm):
 
 
         # log-probs for the generated tokens
-        B, G, T = rollouts.gen_ids.shape
+        B, G, T_g = rollouts.gen_ids.shape
+        _, T_p = rollouts.prompt_ids.shape
+
         ids = torch.cat((rollouts.prompt_ids.unsqueeze(1).expand(-1,G,-1), rollouts.gen_ids), dim=-1)
         ids = ids.view(B*G, -1)
         with torch.no_grad():
