@@ -1,99 +1,106 @@
 # rl_training/runners/rl_runner.py
 from __future__ import annotations
-import math, time, json, pathlib
-from typing import Dict, Any
-import torch
-from tqdm import trange
+import json, math, pathlib, datetime, yaml, torch, shutil
+from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import trange
 from rl_training.runners.collect_rollouts import RolloutCollector
 from rl_training.algs.grpo import GRPO
 from rl_training.algs.base import RolloutBatch
+from transformers import (AutoTokenizer, AutoModelForCausalLM,
+                          BitsAndBytesConfig)
+from peft import PeftModel
 
-# --------------------------------------------------------------------------- #
-# helper: slice a RolloutBatch along the prompt (batch) axis                  #
-# --------------------------------------------------------------------------- #
+RUN_ROOT = pathlib.Path("/content/drive/MyDrive/RL_Practice_Files/rl_runs")
+
 def slice_batch(rb: RolloutBatch, sl: slice) -> RolloutBatch:
-    return RolloutBatch(
-        prompt_ids = rb.prompt_ids[sl],
-        gen_ids    = rb.gen_ids[sl],
-        reward     = rb.reward[sl],
-        logprobs   = rb.logprobs[sl],
-    )
+    return RolloutBatch(prompt_ids = rb.prompt_ids[sl],
+                        gen_ids    = rb.gen_ids[sl],
+                        reward     = rb.reward[sl],
+                        logprobs   = rb.logprobs[sl])
 
 class RLRunner:
-    def __init__(
-        self,
-        policy, tokenizer,
-        cfg: Dict[str, Any],
-        out_dir: str | pathlib.Path = "runs/rl",
-        device: torch.device | str | None = None,
-    ):
-        self.device   = device or torch.device("cuda")
-        self.policy   = policy.to(self.device)
+    def __init__(self, cfg_path: str, lora_ckpt: str, save_every: int = 100):
+        # ---------- I/O ---------------------------------------------------
+        cfg = yaml.safe_load(open(cfg_path))
+        stamp     = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.dir  = RUN_ROOT / f"run_{stamp}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(cfg_path, self.dir / "config.yaml")       # save config
 
-        # memory-saving toggles ------------------------------------------------
-        if cfg.get("gradient_checkpointing", True):
-            policy.gradient_checkpointing_enable()
-            policy.enable_input_require_grads()
-            policy.config.use_cache = False
+        self.tb   = SummaryWriter(log_dir=str(self.dir))
+        self.save_every = save_every
+        self.step_id    = 0
 
-        # instantiate subsystems ----------------------------------------------
-        self.collector = RolloutCollector(policy, tokenizer, cfg, out_dir, device=self.device)
-        self.algo      = GRPO(policy, cfg, pad_id=tokenizer.pad_token_id)
+        # ---------- load model + adapters -------------------------------
+        bnb = BitsAndBytesConfig(load_in_4bit=True,
+                                 bnb_4bit_use_double_quant=True,
+                                 bnb_4bit_compute_dtype=torch.bfloat16)
+        base = AutoModelForCausalLM.from_pretrained("microsoft/phi-2",
+                                                    torch_dtype=torch.bfloat16,
+                                                    quantization_config=bnb)
+        base.gradient_checkpointing_enable()
+        base.enable_input_require_grads()
+        base.config.use_cache = False
 
-        self.accum    = cfg["grad_accum_steps"]
-        self.global_t = 0
-        self.log_file = pathlib.Path(out_dir) / "train_log.jsonl"
+        self.model = PeftModel.from_pretrained(base, lora_ckpt).to("cuda")
+        self.tok   = AutoTokenizer.from_pretrained("microsoft/phi-2")
+        self.tok.padding_side = "left"
 
+        # ---------- subsystems ------------------------------------------
+        self.collector = RolloutCollector(self.model, self.tok, cfg,
+                                          out_dir=self.dir, device="cuda")
+        self.algo      = GRPO(self.model, cfg, pad_id=self.tok.pad_token_id)
+        self.accum = cfg["grad_accum_steps"]
 
-    def train_step(self) -> Dict[str, float]:
-        rollouts = self.collector.collect_batch()          # big RolloutBatch
-        B = rollouts.prompt_ids.size(0)
-        mb = math.ceil(B / self.accum)                     # micro-batch size
+    # ---------------- main training loop ------------------------------
+    def train(self, total_steps: int = 1000):
+        for _ in trange(total_steps, desc="RL steps"):
+            self._one_step()
+            if self.step_id % self.save_every == 0:
+                self._save_ckpt()
 
-        metrics_accum: Dict[str, float] = {}
-        for i in range(0, B, mb):
-            sync = ( (i + mb) >= B )                       # last micro-batch?
-            stats = self.algo.step(
-                slice_batch(rollouts, slice(i, i+mb)),
-                sync_grads=sync
-            )
-            # running mean
+        self._save_ckpt(final=True)  # final full save
+
+    def _one_step(self):
+        rb = self.collector.collect_batch()
+        mb = math.ceil(rb.prompt_ids.size(0) / self.accum)
+
+        stats_acc = {}
+        for i in range(0, rb.prompt_ids.size(0), mb):
+            sync = (i + mb) >= rb.prompt_ids.size(0)
+            stats = self.algo.step(slice_batch(rb, slice(i, i+mb)), sync_grads=sync)
             for k, v in stats.items():
-                metrics_accum[k] = metrics_accum.get(k, 0.0) + v / self.accum
+                stats_acc[k] = stats_acc.get(k, 0.0) + v / self.accum
 
-        self.global_t += 1
-        self._log(metrics_accum)
-        return metrics_accum
+        self.step_id += 1
+        self._log(stats_acc)
 
-    # ----------------------------------------------------------------------- #
-    def _log(self, d: Dict[str, float]):
-        d = {"step": self.global_t, **d}
-        with open(self.log_file, "a") as f:
-            f.write(json.dumps(d) + "\n")
+    def _log(self, d):
+        json_out = {"step": self.step_id, **d}
+        with open(self.dir / "train_log.jsonl", "a") as f:
+            f.write(json.dumps(json_out) + "\n")
+        for k, v in d.items():
+            self.tb.add_scalar(k, v, self.step_id)
 
-# ----------------------------- convenience CLI ----------------------------- #
+    def _save_ckpt(self, final: bool = False):
+        tag = f"step-{self.step_id}" if not final else "final"
+        save_dir = self.dir / f"ckpt_{tag}"
+        self.model.save_pretrained(save_dir)        # adapter-only ✔️ :contentReference[oaicite:8]{index=8}
+        # optional merged full model
+        merged = self.model.merge_and_unload()      # combines LoRA → dense  :contentReference[oaicite:9]{index=9}
+        merged.save_pretrained(save_dir / "merged")
+
+
+# ------------------------------- CLI -------------------------------------- #
 if __name__ == "__main__":
     import yaml, argparse
-    from transformers import AutoTokenizer, BitsAndBytesConfig, AutoModelForCausalLM
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--cfg", type=str, required=True)
-    p.add_argument("--steps", type=int, default=100)
-    p.add_argument("--out",   type=str, default="runs/rl")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cfg",   required=True)
+    parser.add_argument("--steps", type=int, default=1000)
+    args   = parser.parse_args()
 
     cfg = yaml.safe_load(open(args.cfg))
-    tok = AutoTokenizer.from_pretrained("microsoft/phi-2")
-    tok.padding_side = "left"     # must match left-pad change earlier
-
-    bnb_conf = BitsAndBytesConfig(load_in_4bit=True,
-                                  bnb_4bit_use_double_quant=True,
-                                  bnb_4bit_compute_dtype=torch.bfloat16)
-    mdl = AutoModelForCausalLM.from_pretrained(
-              "microsoft/phi-2",
-              quantization_config=bnb_conf,
-              torch_dtype=torch.bfloat16)
-
-    runner = RLRunner(mdl, tok, cfg, args.out)
+    runner = RLRunner("/content/drive/MyDrive/RL_Practice_File/phi2_math_lora/checkpoint-938/",
+                      cfg)
     for _ in trange(args.steps):
         runner.train_step()

@@ -3,9 +3,9 @@
 # Anything in this file is passed verbatim to RolloutCollector via cfg.
 # The GRPO trainer will later read the same file and use only what it needs.
 
-# --- collector --------------------------------------------------------- #
-num_generations   : 8            # G
-num_prompts       : 4            # B  (logical; real batch = B * grad_accum_steps)
+# -------------- rollout collector ---------------- #
+num_generations   : 8
+num_prompts       : 4
 max_new_tokens    : 128
 temperature       : 0.7
 top_p             : 0.9
@@ -20,20 +20,20 @@ reward_fns:
 scheduler:
   name          : mix_passrate
   dataset_name  : gsm8k
-  split         : "train[:10]"
+  split         : "train"
   ema_alpha     : 0.05
   boundaries    : [0.2, 0.8]
   sample_weights: [4, 3, 1]
 
-# --- trainer (GRPO) ----------------------------------------------------- #
-lr               : 2.0e-5        # AdamW learning-rate
+# ------------------ trainer (GRPO) --------------- #
+lr               : 2.0e-5
 clip_eps         : 0.2
 kl_beta          : 0.01
-ent_coef         : 0.0           # reserved for future entropy bonus
+ent_coef         : 0.0            # future entropy bonus knob
 grad_clip        : 1.0
 bf16             : true
 
-grad_accum_steps : 4             # micro-batches per optimisation step
+grad_accum_steps : 8
 gradient_checkpointing : true
-pad_left         : true          # asserts tokenizer.padding_side
+
 
