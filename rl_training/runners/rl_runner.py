@@ -77,6 +77,7 @@ class RLRunner:
 
     def _one_step(self):
         rb = self.collector.collect_batch()
+        rb = self.collector.collect_batch().to("cuda") 
         mb = math.ceil(rb.prompt_ids.size(0) / self.accum)
 
         stats_acc = {}
