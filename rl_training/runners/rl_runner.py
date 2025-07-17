@@ -44,6 +44,16 @@ class RLRunner:
 
         self.model = PeftModel.from_pretrained(base, lora_ckpt).to("cuda")
         self.tok   = AutoTokenizer.from_pretrained("microsoft/phi-2")
+        
+        if self.tok.pad_token_id is None:
+            # safest practice is to duplicate eos so you don't expand embeddings
+            self.tok.pad_token = self.tok.eos_token 
+
+        # keep model & GRPO in sync
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = self.tok.pad_token_id
+
+        self.pad_id = self.tok.pad_token_id 
         self.tok.padding_side = "left"
 
         # ---------- subsystems ------------------------------------------
@@ -51,6 +61,10 @@ class RLRunner:
                                           out_dir=self.dir, device="cuda")
         self.algo      = GRPO(self.model, cfg, pad_id=self.tok.pad_token_id)
         self.accum = cfg["grad_accum_steps"]
+
+        # for debug
+        assert isinstance(self.tok.pad_token_id, int), "pad_token_id must not be None"
+
 
     # ---------------- main training loop ------------------------------
     def train(self, total_steps: int = 1000):

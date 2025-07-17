@@ -108,7 +108,9 @@ class RolloutCollector:
             question   = self.prompt_sampler.id2text[prompt_id]
             prompt_text = question + "\n<think>\n"
 
-            prompt_ids = self.tokenizer(prompt_text, return_tensors="pt").input_ids.to(self.device)
+            batch = tokenizer(prompts, return_tensors="pt", padding=True)  # already left-pad
+            prompt_ids     = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
 
             # ------------------------------------------------------------------
             # generate G continuations with score capture
@@ -121,6 +123,7 @@ class RolloutCollector:
                 temperature=self.cfg["temperature"],
                 top_p=self.cfg["top_p"],
                 num_return_sequences=self.G,
+                attention_mask=attention_mask,
                 pad_token_id=self.tokenizer.pad_token_id,
                 output_scores=True,
                 stopping_criteria=self.stopper,
