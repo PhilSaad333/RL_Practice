@@ -46,7 +46,7 @@ class GRPO(RLAlgorithm):
             if gen_len < T_g:                        # right-pad with zeros
                 lp = F.pad(lp, (0, T_g - gen_len), value=0.0)
             new_lp_list.append(lp)
-        new_lp = torch.stack(new_lp_list).view(B, G, T_g)
+        new_logp = torch.stack(new_lp_list).view(B, G, T_g)
 
         old_logp   = rollouts.logprobs                                   # (B,G,T_g)
         ratios     = torch.exp(new_logp - old_logp)                      # (B,G,T_g)
