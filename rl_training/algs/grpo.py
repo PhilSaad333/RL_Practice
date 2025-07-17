@@ -36,7 +36,7 @@ class GRPO(RLAlgorithm):
         targets   = seq_flat[:, 1:]                                       # (BG,T_tot-1)
         logp_tok  = logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
-        new_logp = model.compute_transition_scores(
+        new_logp = self.policy.compute_transition_scores(
                     sequences       = seq_flat,
                     scores          = logits,        # from the same forward pass
                     attention_mask  = attn_mask
