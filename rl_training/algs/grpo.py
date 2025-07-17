@@ -80,6 +80,8 @@ class GRPO(RLAlgorithm):
 
 
         # Compute entropy for logging
+        # used to use idx earlier, just copied it here. maybe revist this
+        idx = prompt_lens[:, None] + torch.arange(T_g, device=device)
         probs      = torch.exp(logp_all)
         H_all      = -(probs * logp_all).sum(-1)
         ent_tok    = H_all.gather(1, idx).view(B, G, T_g)
