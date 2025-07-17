@@ -234,7 +234,7 @@ class RolloutCollector:
         self._step_idx += 1
 
         # pack tensor shapes to match RolloutBatch signature (B, …)
-        return buffer.to_batch()
+        return buffer.to_batch(device=self.device)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

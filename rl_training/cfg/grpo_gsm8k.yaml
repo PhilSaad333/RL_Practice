@@ -4,7 +4,7 @@
 # The GRPO trainer will later read the same file and use only what it needs.
 
 # -------------- rollout collector ---------------- #
-num_generations   : 8
+num_generations   : 4 #8
 num_prompts       : 4
 max_new_tokens    : 128
 temperature       : 0.7
@@ -33,7 +33,7 @@ ent_coef         : 0.0            # future entropy bonus knob
 grad_clip        : 1.0
 bf16             : true
 
-grad_accum_steps : 8
+grad_accum_steps : 2 #8
 gradient_checkpointing : true
 
 
