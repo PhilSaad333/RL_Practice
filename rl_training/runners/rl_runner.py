@@ -95,6 +95,7 @@ class RLRunner:
             f.write(json.dumps(json_out) + "\n")
         for k, v in d.items():
             self.tb.add_scalar(k, v, self.step_id)
+        self.tb.flush()
 
     def _save_ckpt(self, final: bool = False):
         tag = f"step-{self.step_id}" if not final else "final"
