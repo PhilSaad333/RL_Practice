@@ -109,8 +109,8 @@ class RolloutCollector:
             prompt_text = question + "\n<think>\n"
 
             batch = self.tokenizer(prompt_text, return_tensors="pt", padding=True)  # already left-pad
-            prompt_ids     = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            prompt_ids     = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
 
             # ------------------------------------------------------------------
             # generate G continuations with score capture
