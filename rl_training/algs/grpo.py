@@ -8,9 +8,9 @@ from .base import RLAlgorithm, RolloutBatch
 class GRPO(RLAlgorithm):
     def __init__(self, policy, cfg, *, pad_id: int | None = None):
         super().__init__(policy, cfg)
-        self.opt    = torch.optim.AdamW(policy.parameters(), lr=cfg.lr)
+        self.opt    = torch.optim.AdamW(policy.parameters(), lr=cfg["lr"])
         self.pad_id = pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
-        self.accum_steps  = cfg.grad_accum_steps
+        self.accum_steps  = cfg["grad_accum_steps"]
         self._accum_ctr   = 0
 
     def step(self, rollouts: RolloutBatch, *, sync_grads: bool = True) -> dict[str, float]:
@@ -29,7 +29,7 @@ class GRPO(RLAlgorithm):
 
         attn_mask  = (seq_flat != pad_id).long()
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self.cfg.bf16):
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self.cfg["bf16"]):
             logits = self.policy(seq_flat, attention_mask=attn_mask).logits
 
         logp_all  = F.log_softmax(logits, dim=-1)                         # (BG,T_tot,V)
@@ -50,15 +50,15 @@ class GRPO(RLAlgorithm):
         # Log ratios for studying statistics
 
         surr1 = ratios * adv.unsqueeze(-1)
-        surr2 = torch.clamp(ratios, 1 - self.cfg.clip_eps,
-                                    1 + self.cfg.clip_eps) * adv.unsqueeze(-1)
+        surr2 = torch.clamp(ratios, 1 - self.cfg["clip_eps"],
+                                    1 + self.cfg["clip_eps"]) * adv.unsqueeze(-1)
         ppo_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
 
 
         if getattr(self.cfg, "kl_beta", 0.0) > 0:
             delta_lp = new_logp - old_logp
             kl_per_tok = torch.exp(delta_lp) + delta_lp - torch.ones(B,G,T_g)
-            kl_per_tok = kl_per_tok * gen_mask * self.cfg.kl_beta
+            kl_per_tok = kl_per_tok * gen_mask * self.cfg["kl_beta"]
             token_loss = ppo_loss - kl_per_tok
         else:
             kl_per_tok = torch.zeros(B,G,T_g).to(device)
@@ -86,7 +86,7 @@ class GRPO(RLAlgorithm):
 
         self._accum_ctr += 1
         if self._accum_ctr % self.accum_steps == 0:
-            clip_grad_norm_(self.policy.parameters(), self.cfg.grad_clip)
+            clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
             self.opt.step()
             self.opt.zero_grad(set_to_none=True)
 
