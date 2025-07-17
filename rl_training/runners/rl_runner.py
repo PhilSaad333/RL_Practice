@@ -100,5 +100,4 @@ if __name__ == "__main__":
     p.add_argument("--steps", type=int, default=100)
     args = p.parse_args()
     runner = RLRunner(args.cfg, args.ckpt)
-    for _ in trange(args.steps):
-        runner.train_step()
+    runner.train(args.steps)
