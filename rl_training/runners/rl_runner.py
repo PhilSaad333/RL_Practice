@@ -100,7 +100,7 @@ if __name__ == "__main__":
     args   = parser.parse_args()
 
     cfg = yaml.safe_load(open(args.cfg))
-    runner = RLRunner("/content/drive/MyDrive/RL_Practice_File/phi2_math_lora/checkpoint-938/",
+    runner = RLRunner("/content/drive/MyDrive/RL_Practice_Files/phi2_math_lora/checkpoint-938",
                       cfg)
     for _ in trange(args.steps):
         runner.train_step()
