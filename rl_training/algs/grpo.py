@@ -36,10 +36,11 @@ class GRPO(RLAlgorithm):
         targets   = seq_flat[:, 1:]                                       # (BG,T_tot-1)
         logp_tok  = logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
-        plen   = (rollouts.prompt_ids != pad_id).sum(-1)                 # (B)
-        plen   = plen[:, None].expand(-1, G).reshape(-1)                 # (BG)
-        idx    = plen[:, None] + torch.arange(T_g, device=device)        # (BG,T_g)
-        new_logp = logp_tok.gather(1, idx).view(B, G, T_g)                 # (B,G,T_g)
+        new_logp = model.compute_transition_scores(
+                    sequences       = seq_flat,
+                    scores          = logits,        # from the same forward pass
+                    attention_mask  = attn_mask
+        ).view(B, G, -1)[:, :, :T_g]
 
         old_logp   = rollouts.logprobs                                   # (B,G,T_g)
         ratios     = torch.exp(new_logp - old_logp)                      # (B,G,T_g)
