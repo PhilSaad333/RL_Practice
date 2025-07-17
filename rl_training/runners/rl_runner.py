@@ -93,14 +93,12 @@ class RLRunner:
 
 # ------------------------------- CLI -------------------------------------- #
 if __name__ == "__main__":
-    import yaml, argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg",   required=True)
-    parser.add_argument("--steps", type=int, default=1000)
-    args   = parser.parse_args()
-
-    cfg = yaml.safe_load(open(args.cfg))
-    runner = RLRunner("/content/drive/MyDrive/RL_Practice_Files/phi2_math_lora/checkpoint-938/",
-                      cfg)
+    import argparse, yaml
+    p = argparse.ArgumentParser()
+    p.add_argument("--cfg",  required=True, help="Path to YAML config")
+    p.add_argument("--ckpt", required=True, help="Path to LoRA adapter checkpoint dir")
+    p.add_argument("--steps", type=int, default=100)
+    args = p.parse_args()
+    runner = RLRunner(args.cfg, args.ckpt)
     for _ in trange(args.steps):
         runner.train_step()
