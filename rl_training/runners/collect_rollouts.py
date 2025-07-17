@@ -108,7 +108,7 @@ class RolloutCollector:
             question   = self.prompt_sampler.id2text[prompt_id]
             prompt_text = question + "\n<think>\n"
 
-            batch = tokenizer(prompts, return_tensors="pt", padding=True)  # already left-pad
+            batch = self.tokenizer(prompts, return_tensors="pt", padding=True)  # already left-pad
             prompt_ids     = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
 
