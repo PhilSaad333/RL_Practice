@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from .base import RLAlgorithm, RolloutBatch
+from contextlib import nullcontext
 
 class GRPO(RLAlgorithm):
     def __init__(self, policy, cfg, *, pad_id: int | None = None):
