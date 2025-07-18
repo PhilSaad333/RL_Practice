@@ -139,5 +139,6 @@ if __name__ == "__main__":
     p.add_argument("--cfg",  required=True, help="Path to YAML config")
     p.add_argument("--ckpt", required=True, help="Path to LoRA adapter checkpoint dir")
     args = p.parse_args()
+    cfg_dict = yaml.safe_load(open(args.cfg))
     runner = RLRunner(args.cfg, args.ckpt)
-    runner.train(int(args.cfg["total_steps"]))
+    runner.train(total_updates=cfg_dict["total_steps"])
