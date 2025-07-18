@@ -140,4 +140,4 @@ if __name__ == "__main__":
     p.add_argument("--ckpt", required=True, help="Path to LoRA adapter checkpoint dir")
     args = p.parse_args()
     runner = RLRunner(args.cfg, args.ckpt)
-    runner.train(args.cfg["total_steps"])
+    runner.train(int(args.cfg["total_steps"]))
