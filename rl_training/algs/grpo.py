@@ -10,11 +10,11 @@ class GRPO(RLAlgorithm):
     def __init__(self, policy, cfg, *, pad_id: int | None = None):
         super().__init__(policy, cfg)
         total_updates   = cfg["total_steps"] 
-        total_updates   = cfg["total_steps"] 
-        self.opt    = torch.optim.AdamW(model.parameters(),
+        warmup_steps    = int(0.05 * total_updates) 
+        self.opt    = torch.optim.AdamW(policy.parameters(),
                               lr=cfg["lr"], weight_decay=0.01)
         self.lr_sched = get_cosine_schedule_with_warmup(
-            optimizer,
+            self.opt,
             num_warmup_steps = warmup_steps,
             num_training_steps = total_updates,
             )
