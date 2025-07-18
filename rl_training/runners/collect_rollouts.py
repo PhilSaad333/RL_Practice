@@ -230,7 +230,7 @@ class RolloutCollector:
                         gen_text=gen_texts[g],
                         think_len=_count_think_tokens(full_texts[g], self.tokenizer),
                         reward=rewards[g].item(),
-                        tag_correct=tag_correct[g].item()
+                        tag_correct=tag_correct[g].item(),
                         include_in_batch=bool(accept),
                         difficulty_tag=diff_tag,
                         token_entropy=entropies[g],
