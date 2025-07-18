@@ -123,5 +123,5 @@ class GRPO(RLAlgorithm):
             "ratio_mean"  : ratios.mean().item(),
             "r_mean"      : mean_r.mean().item(),
             "tag_correct" : rollouts.tag_correct.mean().item(),
-            "think_len"   : rollouts.think_len.mean().item()
+            "think_len"   : rollouts.think_len.float().mean().item()
         }
