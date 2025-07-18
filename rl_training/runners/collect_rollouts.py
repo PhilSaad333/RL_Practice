@@ -106,12 +106,16 @@ class RolloutCollector:
             r"\n</think>\n<answer>\n[\s\S]+?\n</answer>$"    # fast format check
         )
 
+
         # ----------------------------------------------------------------------
         while len(buffer) < need:
             # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
             take = min(self.B, need - len(buffer))           # don't overshoot buffer
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
-                self.prompt_sampler, take
+                self.prompt_sampler,
+                self.tokenizer,
+                self.device,
+                take
             )                                                # prompt_ids : [B, T_p]
 
             # ── 2) batched generation ─────────────────────────────────────────
@@ -281,7 +285,7 @@ def _append_jsonl(file: Path, records: List[GenSample]):
         for r in records:
             fh.write(json.dumps(asdict(r)) + "\n")
 
-def _next_prompt_batch(sampler, B):
+def _next_prompt_batch(sampler, tokenizer, device, B):
     ids, texts, toks = [], [], []
     for _ in range(B):
         pid = next(sampler)
