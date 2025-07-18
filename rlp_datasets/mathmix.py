@@ -47,14 +47,26 @@ class MathMix(BaseDataset):
             for row in gsm_ds:
                 yield fmt_gsm(row)
 
-        # 2) build Hendrycks Math in the same style
+
+
+        # 1) build Hendrycks Math in the same style
         math_splits = []
         for subj in SUBJECTS:
-            ds = load_dataset(
-                "EleutherAI/hendrycks_math", name=subj,
-                split=self.split, cache_dir=RAW_DIR
-            ).add_column("subject", [subj] * len(ds))
-            math_splits.append(ds)
+            # first load the split into a temporary var
+            ds_subj = load_dataset(
+                "EleutherAI/hendrycks_math",
+                name=subj,
+                split=self.split,
+                cache_dir=RAW_DIR,
+            )
+            # now you can safely refer to len(ds_subj)
+            ds_subj = ds_subj.add_column(
+                "subject",
+                [subj] * len(ds_subj)
+            )
+            math_splits.append(ds_subj)
+
+        # 2) concatenate once after the loop
         math_ds = concatenate_datasets(math_splits)
 
         def fmt_math(row):
