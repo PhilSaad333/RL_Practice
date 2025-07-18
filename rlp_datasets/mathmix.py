@@ -1,4 +1,5 @@
 import random
+import re
 from pathlib import Path
 from datasets import load_dataset, concatenate_datasets
 from . import BaseDataset, Example, register
