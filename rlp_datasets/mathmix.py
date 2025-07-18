@@ -7,11 +7,26 @@ from . import BaseDataset, Example, register
 RAW_DIR  = Path("datasets/raw")
 PROC_DIR = Path("datasets/processed/mathmix_tagged")
 SUBJECTS = [
+    "algebra", "counting_and_probability", "prealgebra",
+]
+# Here just for reference, if I want to change the above
+ALL_SUBJECTS = [
     "algebra", "counting_and_probability", "geometry",
     "intermediate_algebra", "number_theory", "prealgebra",
     "precalculus",
 ]
 BOXED_RE = re.compile(r"\\boxed\{([^}]+)\}")
+
+BAD_WORDS = [
+    'draw', 'graph', 'array', 'diagram',
+    'plot', 'chart', 'table', 'matrix',
+    'tikz', 'coordinate', 'circle', 'ellipse', 'polygon',
+]
+# compile a regex that matches any word in the list, case-insensitive
+_BAD_RX = re.compile(r'\b(?:' + r'|'.join(BAD_WORDS) + r')\b', re.IGNORECASE)
+# also catch explicit TikZ environments
+_TIKZ_RX = re.compile(r'\\begin\{tikzpicture\}')
+
 
 @register("mathmix")
 class MathMix(BaseDataset):
@@ -85,7 +100,22 @@ class MathMix(BaseDataset):
 
         def math_iter():
             for row in math_ds:
-                yield fmt_math(row)
+                prob = row["problem"].strip()
+                sol  = row["solution"].strip()
+                # 1) skip if any bad word in the problem text
+                if _BAD_RX.search(prob) or _TIKZ_RX.search(sol):
+                    continue
+                # 2) extract final answer as before
+                m     = BOXED_RE.search(sol)
+                final = m.group(1).strip() if m else ""
+                yield Example(
+                    text=f"{prob}\n<think>\n{sol}\n</think>\n"
+                        f"<answer>\n{final}\n</answer>",
+                    question=prob,
+                    answer=final,
+                    meta={"dataset": "math", "subject": row["subject"]},
+                )
+
 
         # 3) Interleave them by weighted random sampling
         gsm_gen  = gsm_iter()
