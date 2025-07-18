@@ -1,6 +1,6 @@
 # rl_training/runners/rl_runner.py
 from __future__ import annotations
-import json, math, pathlib, datetime, yaml, torch, shutil
+import json, math, pathlib, datetime, yaml, torch, shutil, gc
 from collections import defaultdict
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import trange
@@ -89,6 +89,8 @@ class RLRunner:
         for _ in trange(outer_loops, desc="outer collect loops"):
             rb = self.collector.collect_batch(batch_prompts=p_per_outer)
             self._train_one_buffer(rb, K, ga_steps, B)
+            gc.collect()
+            torch.cuda.empty_cache()
 
             if self.step_id % self.save_every == 0:
                 self._save_ckpt()
@@ -130,6 +132,7 @@ class RLRunner:
         # optional merged full model
         merged = self.model.merge_and_unload()      # combines LoRA → dense  :contentReference[oaicite:9]{index=9}
         merged.save_pretrained(save_dir / "merged")
+        print(f"saved model to {save_dir}")
 
 
 # ------------------------------- CLI -------------------------------------- #

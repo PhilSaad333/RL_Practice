@@ -112,6 +112,9 @@ class GRPO(RLAlgorithm):
         ent_tok    = H_all.gather(1, idx).view(B, G, T_g)
         entropy    = (ent_tok * gen_mask).sum() / (gen_mask.sum() + 1e-8)
 
+        del logits, logp_all, ref_logits, ref_logp_all
+        torch.cuda.empty_cache()
+
 
         # Optimization  with gradient checkpointing
         maybe = self.policy.no_sync if (hasattr(self.policy, "no_sync") and not sync_grads) else nullcontext
@@ -125,13 +128,15 @@ class GRPO(RLAlgorithm):
             self.lr_sched.step()
             self.opt.zero_grad(set_to_none=True)
 
+        loss_val  = loss.detach().float().item()
+        kl_val    = kl_term.detach().float().item()
 
         # To-Do:
         # More metrics
         return {
-            "loss"        : loss.item(),
+            "loss"        : loss_val,
             "entropy"     : entropy.item(),
-            "kl"          : kl_term.item(),
+            "kl"          : kl_val,
             "ratio_mean"  : ratios.mean().item(),
             "r_mean": rollouts.reward.mean(dim=(0,1)).item(),
             "tag_correct" : rollouts.tag_correct.float().mean(dim=(0, 1)).item(),

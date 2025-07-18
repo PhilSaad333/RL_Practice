@@ -211,16 +211,17 @@ class RolloutCollector:
                 ]
                 _append_jsonl(self._trace_file, samples)
 
-                # --- rollout buffer push (if accepted) ---
                 if accept and len(buffer) < need:
                     buffer.add(
-                        prompt_ids  = prompt_ids[b],
-                        gen_ids     = g_ids,
-                        rewards     = r_vec,
-                        logprobs    = lp_t,
-                        tag_correct = tag_ok,
-                        think_len   = t_len,
+                        prompt_ids = prompt_ids[b].cpu(),
+                        gen_ids    = g_ids.cpu(),         # ← move
+                        rewards    = r_vec.cpu(),
+                        logprobs   = lp_t.cpu(),
+                        tag_correct= tag_ok.cpu(),
+                        think_len  = t_len.cpu(),
                     )
+                    del g_ids, lp_t, tag_ok, t_len        # free references
+
 
             # end for b
         # end while
