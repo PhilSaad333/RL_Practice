@@ -21,4 +21,4 @@ def build_math(split: str = "train"):
     ds = concatenate_datasets(parts)
     return ds.filter(_filter_bad_words, batched=False)
 
-DATASET_REGISTRY["hendrycks_math"] = build_math
+DATASET_REGISTRY["math"] = build_math
