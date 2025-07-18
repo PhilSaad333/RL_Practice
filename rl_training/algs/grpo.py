@@ -121,7 +121,7 @@ class GRPO(RLAlgorithm):
             "entropy"     : entropy.item(),
             "kl"          : kl_term.item(),
             "ratio_mean"  : ratios.mean().item(),
-            "r_mean"      : mean_r.mean().item(),
-            "tag_correct" : rollouts.tag_correct.mean().item(),
-            "think_len"   : rollouts.think_len.float().mean().item()
+            "r_mean": rollouts.reward.mean(dim=(0,1)).item(),
+            "tag_correct" : rollouts.tag_correct.float().mean(dim=(0, 1)).item(),
+            "think_len"   : rollouts.think_len.float().mean(dim=(0,1)).item(),
         }
