@@ -3,8 +3,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
-from .base import RLAlgorithm, RolloutBatch
 from contextlib import nullcontext
+from transformers import get_cosine_schedule_with_warmup
+from .base import RLAlgorithm, RolloutBatch
+
+
 
 class GRPO(RLAlgorithm):
     def __init__(self, policy, cfg, *, pad_id: int | None = None):
