@@ -226,7 +226,7 @@ class RolloutCollector:
         # end while
 
         self._step_idx += 1
-        return buffer.to_batch(device=self.device)
+        return buffer    
 
 
 # ──────────────────────────────────────────────────────────────────────────────
