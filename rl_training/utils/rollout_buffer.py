@@ -58,7 +58,7 @@ class RolloutBuffer:
             sub._rewards.append(self._rewards[j])
             sub._logprobs.append(self._logprobs[j])
             sub._tag_correct.append(self._tag_correct[j])
-            sub._think_len.append(self.think_len[j])
+            sub._think_len.append(self._think_len[j])
         return sub.to_batch(device=device)
 
     def add(
