@@ -9,8 +9,13 @@ PROC_DIR = Path("datasets/processed/gsm8k_tagged")
 class GSM8K(BaseDataset):
     """Grade-School Math 8K, with think/answer tags."""
     def __iter__(self):
-        ds = load_dataset("openai/gsm8k", "main",
-                          split=self.split, cache_dir=RAW_DIR)  # :contentReference[oaicite:6]{index=6}
+        ds = load_dataset(
+            "openai/gsm8k",
+            name="main",
+            split=self.split,
+            cache_dir=RAW_DIR,
+            )
+       
         for row in ds:
             question = row["question"].strip()
             rationale, final = row["answer"].split("####")
