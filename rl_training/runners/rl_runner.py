@@ -1,6 +1,7 @@
 # rl_training/runners/rl_runner.py
 from __future__ import annotations
 import json, math, pathlib, datetime, yaml, torch, shutil
+from collections import defaultdict
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import trange
 from rl_training.runners.collect_rollouts import RolloutCollector
@@ -95,24 +96,24 @@ class RLRunner:
         self._save_ckpt(final=True)
 
     def _train_one_buffer(self, rb, K, ga_steps, B):
-        """Run K PPO epochs over RolloutBuffer `rb`."""
-        stats_running = {}
-        mb_counter    = 0
+        stats_sum  = defaultdict(float)
+        micro_cnt  = 0
 
         for epoch in range(K):
             for idx in rb.iter_minibatches(B, shuffle=True):
-                sync = ((mb_counter + 1) % ga_steps == 0)
+                sync = ((micro_cnt + 1) % ga_steps == 0)
                 mb   = rb.get_batch(idx, device="cuda")
 
                 stats = self.algo.step(mb, self.ref_model, sync_grads=sync)
                 for k, v in stats.items():
-                    stats_running[k] = stats_running.get(k, 0.0) + v / (K * ga_steps)
-
+                    stats_sum[k] += v
+                micro_cnt += 1
                 if sync:
-                    self.step_id += 1         # 1 optimiser update == 1 RL step
-                mb_counter += 1
+                    self.step_id += 1
 
-        self._log(stats_running)
+        # --- final average over *all* micro-batches processed ---
+        stats_avg = {k: v / micro_cnt for k, v in stats_sum.items()}
+        self._log(stats_avg)
 
     def _log(self, d):
         json_out = {"step": self.step_id, **d}
