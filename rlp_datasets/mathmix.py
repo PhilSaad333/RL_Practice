@@ -53,18 +53,19 @@ class MathMix(BaseDataset):
         math_splits = []
         for subj in SUBJECTS:
             # first load the split into a temporary var
-            ds_subj = load_dataset(
-                "EleutherAI/hendrycks_math",
-                name=subj,
-                split=self.split,
-                cache_dir=RAW_DIR,
-            )
-            # now you can safely refer to len(ds_subj)
-            ds_subj = ds_subj.add_column(
-                "subject",
-                [subj] * len(ds_subj)
-            )
-            math_splits.append(ds_subj)
+        +    # 1) load the Hendrycks MATH split
+        +    ds_subj = load_dataset(
+        +        "EleutherAI/hendrycks_math",
+        +        name=subj,
+        +        split=self.split,
+        +        cache_dir=RAW_DIR,
+        +    )
+        +    # 2) now that ds_subj exists, safely compute its length
+        +    ds_subj = ds_subj.add_column(
+        +        "subject",
+        +        [subj] * len(ds_subj)
+        +    )
+        +    math_splits.append(ds_subj)
 
         # 2) concatenate once after the loop
         math_ds = concatenate_datasets(math_splits)
