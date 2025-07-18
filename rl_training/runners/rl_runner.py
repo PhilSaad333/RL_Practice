@@ -138,7 +138,6 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--cfg",  required=True, help="Path to YAML config")
     p.add_argument("--ckpt", required=True, help="Path to LoRA adapter checkpoint dir")
-    p.add_argument("--steps", type=int, default=100)
     args = p.parse_args()
     runner = RLRunner(args.cfg, args.ckpt)
-    runner.train(args.steps)
+    runner.train(args.cfg["total_steps"])

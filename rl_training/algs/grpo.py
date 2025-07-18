@@ -9,7 +9,15 @@ from contextlib import nullcontext
 class GRPO(RLAlgorithm):
     def __init__(self, policy, cfg, *, pad_id: int | None = None):
         super().__init__(policy, cfg)
-        self.opt    = torch.optim.AdamW(policy.parameters(), lr=cfg["lr"])
+        total_updates   = cfg["total_steps"] 
+        total_updates   = cfg["total_steps"] 
+        self.opt    = torch.optim.AdamW(model.parameters(),
+                              lr=cfg["lr"], weight_decay=0.01)
+        self.lr_sched = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps = warmup_steps,
+            num_training_steps = total_updates,
+            )
         self.pad_id = pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
         self.accum_steps  = cfg["grad_accum_steps"]
         self._accum_ctr   = 0
@@ -111,6 +119,7 @@ class GRPO(RLAlgorithm):
         if self._accum_ctr % self.accum_steps == 0:
             clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
             self.opt.step()
+            self.lr_sched.step()
             self.opt.zero_grad(set_to_none=True)
 
 
