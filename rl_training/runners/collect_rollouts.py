@@ -90,183 +90,139 @@ class RolloutCollector:
         self._trace_file = self.out_dir / "rollouts.jsonl"
         self._step_idx = 0
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # public entry point
-    # ──────────────────────────────────────────────────────────────────────────
-    @torch.inference_mode()
-    def collect_batch(self, batch_prompts: int | None = None) -> RolloutBatch:
-        """
-        Keep sampling prompts → G generations each → rewards
-        until                → we have `batch_size` prompts with
-                               reward variance above threshold, etc.
 
-        Returns:
-            RolloutBatch ready for the trainer, plus side-effect:
-            every attempt (accepted or rejected) is appended to rollouts.jsonl
-        """
-        need = batch_prompts or self.batch_size
-        buffer = RolloutBuffer(capacity=need)
+@torch.inference_mode()
+def collect_batch(self, batch_prompts: int | None = None) -> RolloutBatch:
+    """
+    Collect `need = batch_prompts or self.batch_size` prompt-groups.
 
-        # for checking tag format correctness
-        _answer_block = re.compile(
-            r"\n</think>\n"         # end of think-block
-            r"<answer>\n"           # answer tag
-            r"[\s\S]+?\n"           # one or more chars, including newlines
-            r"</answer>$"           # closing answer at very end
-        ) 
+    Generates in parallel over a mini-batch of size `self.B`
+    and pushes accepted groups one-by-one into the RolloutBuffer.
+    """
+    need   = batch_prompts or self.batch_size            # total prompt-groups wanted
+    buffer = RolloutBuffer(capacity=need)
 
+    ans_pat = re.compile(
+        r"\n</think>\n<answer>\n[\s\S]+?\n</answer>$"    # fast format check
+    )
 
-        while len(buffer) < need:
-            prompt_id = next(self.prompt_sampler)     # int, don't get confused with tokens = prompt_ids
-            question   = self.prompt_sampler.id2text[prompt_id]
-            prompt_text = question + "\n<think>\n"
+    # ----------------------------------------------------------------------
+    while len(buffer) < need:
+        # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
+        take = min(self.B, need - len(buffer))           # don't overshoot buffer
+        pids, ptxts, prompt_ids, attn = _next_prompt_batch(
+            self.prompt_sampler, take
+        )                                                # prompt_ids : [B, T_p]
 
-            batch = self.tokenizer(prompt_text, return_tensors="pt", padding=True)  # already left-pad
-            prompt_ids     = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
+        # ── 2) batched generation ─────────────────────────────────────────
+        gen_out = self.policy.generate(
+            prompt_ids,
+            attention_mask      = attn,
+            num_return_sequences= self.G,
+            max_new_tokens      = self.cfg["max_new_tokens"],
+            do_sample           = True,
+            temperature         = self.cfg["temperature"],
+            top_p               = self.cfg["top_p"],
+            pad_token_id        = self.tokenizer.pad_token_id,
+            output_scores       = True,
+            stopping_criteria   = self.stopper,
+            return_dict_in_generate=True,
+        )
 
-            # ------------------------------------------------------------------
-            # generate G continuations with score capture
-            # ------------------------------------------------------------------
-            start_t = time.perf_counter()
-            outputs = self.policy.generate(
-                prompt_ids,
-                max_new_tokens=self.cfg["max_new_tokens"],
-                do_sample=True,
-                temperature=self.cfg["temperature"],
-                top_p=self.cfg["top_p"],
-                num_return_sequences=self.G,
-                attention_mask=attention_mask,
-                pad_token_id=self.tokenizer.pad_token_id,
-                output_scores=True,
-                stopping_criteria=self.stopper,
-                return_dict_in_generate=True,
+        # reshape: (B*G, T) → (B, G, T)
+        full_ids = gen_out.sequences.view(take, self.G, -1)
+        gen_ids  = full_ids[:, :, prompt_ids.shape[1]:]              # (B, G, T_g)
+        scores   = [s.view(take, self.G, -1) for s in gen_out.scores]
+
+        # ── 3) loop *per prompt-group*  (keeps old reward / accept logic) ──
+        for b in range(take):
+            pid    = pids[b]
+            q_text = ptxts[b]
+            g_ids  = gen_ids[b]                                      # (G, T_g)
+
+            # --- decode & clean ---
+            g_txts = self.tokenizer.batch_decode(
+                g_ids, skip_special_tokens=True
             )
-            full_ids: Tensor = outputs.sequences    # (G,T_total)
-            gen_ids: Tensor = full_ids[:, prompt_ids.shape[1]:]   # (G, T_gen)
-            scores: Sequence[Tensor] = outputs.scores                     # list len T_gen
-
-            # Decode *generation only*  (for logging / buffer)
-            try:
-                gen_texts = self.tokenizer.batch_decode(
-                    gen_ids,
-                    skip_special_tokens=True,
-                )
-            except Exception as e:
-                # fallback to empty strings so we don't crash
-                print(f"[rollout] WARNING: decode failed: {e}")
-                gen_texts = [""] * self.G
-
-            # in case we somehow got an empty list
-            if not isinstance(gen_texts, list) or len(gen_texts) != self.G:
-                gen_texts = [""] * self.G
-
-            # Immediately strip anything after </answer>
-            gen_texts = [
-                txt.split("</answer>", 1)[0] + "</answer>"
-                if "</answer>" in txt else txt
-                for txt in gen_texts
+            g_txts = [
+                t.split("</answer>", 1)[0] + "</answer>"
+                if "</answer>" in t else t
+                for t in g_txts
             ]
-
-            # Decode *full prompt+gen* for think-length metric
-            full_texts = self.tokenizer.batch_decode(
-                full_ids, skip_special_tokens=True
+            full_txts = self.tokenizer.batch_decode(
+                full_ids[b], skip_special_tokens=True
             )
 
-            # ------------------------------------------------------------------
-            # token-level stats
-            # ------------------------------------------------------------------
-            logprobs, entropies = _token_stats(gen_ids, scores)
+            # --- token-level stats ---
+            lp, ent = _token_stats(g_ids, [s[b] for s in scores])    # list[G][T]
+            lp_t = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(row) for row in lp],
+                batch_first=True, padding_value=0.0
+            )                                                        # (G, T_g_max_b)
 
-            lp_tensor = torch.nn.utils.rnn.pad_sequence(
-                [torch.tensor(row) for row in logprobs],  # list[G] of 1-D
-                batch_first=True, padding_value=0.0        # shape (G, T_gen_max_for_this_prompt)
-            )
+            # --- rewards ---
+            r_vec  = torch.stack([fn(pid, g_txts) for fn in self.reward_fns]).sum(0)
 
-            # ------------------------------------------------------------------
-            # reward(s)
-            # ------------------------------------------------------------------
-            rewards = torch.stack([fn(prompt_id, gen_texts) for fn in self.reward_fns]).sum(0)
-            # rewards: Tensor [G]
-
-            # ------------------------------------------------------------------
-            # acceptance test for this prompt group
-            # ------------------------------------------------------------------
+            # --- accept / difficulty ---
             accept = _accept_prompt_group(
-                rewards,
-                thresh=self.cfg["reward_var_thresh"],
-                allow_all_zero=not self.cfg["reject_all_zero"],
-                allow_all_max=not self.cfg["reject_all_max"],
+                r_vec,
+                thresh          = self.cfg["reward_var_thresh"],
+                allow_all_zero  = not self.cfg["reject_all_zero"],
+                allow_all_max   = not self.cfg["reject_all_max"],
+            )
+            succ   = (r_vec > 0).float().mean().item()
+            prev   = self.win_rate_ema.get(pid, succ)
+            self.win_rate_ema[pid] = 0.95 * prev + 0.05 * succ
+            diff_tag = ("easy"   if self.win_rate_ema[pid] > 0.8 else
+                        "hard"   if self.win_rate_ema[pid] < 0.2 else
+                        "normal")
+
+            tag_ok = torch.tensor(
+                [bool(ans_pat.search(t)) for t in g_txts],
+                dtype=torch.float32, device=self.device
+            )
+            t_len  = torch.tensor(
+                [_count_think_tokens(t, self.tokenizer) for t in full_txts],
+                dtype=torch.int32, device=self.device
             )
 
-            end_t = time.perf_counter()
-
-            # difficulty heuristic and EMA update
-            success_rate = (rewards > 0).float().mean().item()
-            prev = self.win_rate_ema.get(prompt_id, success_rate)
-            self.win_rate_ema[prompt_id] = 0.95 * prev + 0.05 * success_rate
-            diff_tag = (
-                "easy" if self.win_rate_ema[prompt_id] > 0.8
-                else "hard" if self.win_rate_ema[prompt_id] < 0.2
-                else "normal"
-            )
-
-            # Check tag format
-            tag_correct = torch.tensor(
-                [bool(_answer_block.search(txt)) for txt in gen_texts],
-                dtype=torch.float32,
-                device=self.device,
-            )   # shape: (G,)
-
-            # ------------------------------------------------------------------
-            # trace every sample
-            # ------------------------------------------------------------------
-            records: List[GenSample] = []
-            for g in range(self.G):
-                records.append(
-                    GenSample(
-                        prompt_id=prompt_id,
-                        prompt_text=prompt_text,
-                        gen_text=gen_texts[g],
-                        think_len=_count_think_tokens(full_texts[g], self.tokenizer),
-                        reward=rewards[g].item(),
-                        tag_correct=tag_correct[g].item(),
-                        include_in_batch=bool(accept),
-                        difficulty_tag=diff_tag,
-                        token_entropy=entropies[g],
-                        token_logprob=logprobs[g],
-                        generation_time_s=end_t - start_t,
-                        step_idx=self._step_idx,
-                    )
+            # --- trace JSONL ---
+            now = time.perf_counter()
+            samples = [
+                GenSample(
+                    prompt_id       = pid,
+                    prompt_text     = q_text,
+                    gen_text        = g_txts[g],
+                    think_len       = int(t_len[g]),
+                    reward          = float(r_vec[g]),
+                    tag_correct     = float(tag_ok[g]),
+                    include_in_batch= bool(accept),
+                    difficulty_tag  = diff_tag,
+                    token_entropy   = ent[g],
+                    token_logprob   = lp[g],
+                    generation_time_s = 0.0,   # fill if you want timing
+                    step_idx        = self._step_idx,
                 )
-            _append_jsonl(self._trace_file, records)
+                for g in range(self.G)
+            ]
+            _append_jsonl(self._trace_file, samples)
 
-
-            # For logging in tensorboard
-            think_len = torch.tensor(
-                [_count_think_tokens(t, self.tokenizer) for t in full_texts],
-                dtype=torch.int32,
-                device=self.device,
-            )   # (G)
-
-
-            # ------------------------------------------------------------------
-            # if accepted, push to rollout buffer
-            # ------------------------------------------------------------------
-            if accept:
+            # --- rollout buffer push (if accepted) ---
+            if accept and len(buffer) < need:
                 buffer.add(
-                    prompt_ids       = prompt_ids.squeeze(0),    #   [T_prompt]
-                    gen_ids          = gen_ids,                 # G x T_gen
-                    rewards          = rewards,                 #   [G]
-                    logprobs         = lp_tensor,
-                    tag_correct      = tag_correct,
-                    think_len        = think_len,
+                    prompt_ids  = prompt_ids[b],
+                    gen_ids     = g_ids,
+                    rewards     = r_vec,
+                    logprobs    = lp_t,
+                    tag_correct = tag_ok,
+                    think_len   = t_len,
                 )
 
-        self._step_idx += 1
+        # end for b
+    # end while
 
-        # pack tensor shapes to match RolloutBatch signature (B, …)
-        return buffer.to_batch(device=self.device)
+    self._step_idx += 1
+    return buffer.to_batch(device=self.device)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -324,3 +280,16 @@ def _append_jsonl(file: Path, records: List[GenSample]):
     with file.open("a") as fh:
         for r in records:
             fh.write(json.dumps(asdict(r)) + "\n")
+
+def _next_prompt_batch(sampler, B):
+    ids, texts, toks = [], [], []
+    for _ in range(B):
+        pid = next(sampler)
+        q   = sampler.id2text[pid]
+        ids.append(pid)
+        texts.append(q + "\n<think>\n")
+    batch = tokenizer(texts, return_tensors="pt", padding=True)
+    return ids, texts, batch["input_ids"].to(device), batch["attention_mask"].to(device)
+
+
+
