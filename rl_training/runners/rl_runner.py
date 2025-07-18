@@ -21,7 +21,7 @@ def slice_batch(rb: RolloutBatch, sl: slice) -> RolloutBatch:
                         logprobs   = rb.logprobs[sl])
 
 class RLRunner:
-    def __init__(self, cfg_path: str, lora_ckpt: str, save_every: int = 100):
+    def __init__(self, cfg_path: str, lora_ckpt: str):
         # ---------- I/O ---------------------------------------------------
         cfg = yaml.safe_load(open(cfg_path))
         stamp     = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -30,7 +30,7 @@ class RLRunner:
         shutil.copy(cfg_path, self.dir / "config.yaml")       # save config
 
         self.tb   = SummaryWriter(log_dir=str(self.dir))
-        self.save_every = save_every
+        self.save_every = cfg.get("save_every", 100) #updated
         self.step_id    = 0
 
         # ---------- load model + adapters -------------------------------

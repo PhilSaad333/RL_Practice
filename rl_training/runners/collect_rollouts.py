@@ -91,138 +91,138 @@ class RolloutCollector:
         self._step_idx = 0
 
 
-@torch.inference_mode()
-def collect_batch(self, batch_prompts: int | None = None) -> RolloutBatch:
-    """
-    Collect `need = batch_prompts or self.batch_size` prompt-groups.
+    @torch.inference_mode()
+    def collect_batch(self, batch_prompts: int | None = None) -> RolloutBatch:
+        """
+        Collect `need = batch_prompts or self.batch_size` prompt-groups.
 
-    Generates in parallel over a mini-batch of size `self.B`
-    and pushes accepted groups one-by-one into the RolloutBuffer.
-    """
-    need   = batch_prompts or self.batch_size            # total prompt-groups wanted
-    buffer = RolloutBuffer(capacity=need)
+        Generates in parallel over a mini-batch of size `self.B`
+        and pushes accepted groups one-by-one into the RolloutBuffer.
+        """
+        need   = batch_prompts or self.batch_size            # total prompt-groups wanted
+        buffer = RolloutBuffer(capacity=need)
 
-    ans_pat = re.compile(
-        r"\n</think>\n<answer>\n[\s\S]+?\n</answer>$"    # fast format check
-    )
-
-    # ----------------------------------------------------------------------
-    while len(buffer) < need:
-        # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
-        take = min(self.B, need - len(buffer))           # don't overshoot buffer
-        pids, ptxts, prompt_ids, attn = _next_prompt_batch(
-            self.prompt_sampler, take
-        )                                                # prompt_ids : [B, T_p]
-
-        # ── 2) batched generation ─────────────────────────────────────────
-        gen_out = self.policy.generate(
-            prompt_ids,
-            attention_mask      = attn,
-            num_return_sequences= self.G,
-            max_new_tokens      = self.cfg["max_new_tokens"],
-            do_sample           = True,
-            temperature         = self.cfg["temperature"],
-            top_p               = self.cfg["top_p"],
-            pad_token_id        = self.tokenizer.pad_token_id,
-            output_scores       = True,
-            stopping_criteria   = self.stopper,
-            return_dict_in_generate=True,
+        ans_pat = re.compile(
+            r"\n</think>\n<answer>\n[\s\S]+?\n</answer>$"    # fast format check
         )
 
-        # reshape: (B*G, T) → (B, G, T)
-        full_ids = gen_out.sequences.view(take, self.G, -1)
-        gen_ids  = full_ids[:, :, prompt_ids.shape[1]:]              # (B, G, T_g)
-        scores   = [s.view(take, self.G, -1) for s in gen_out.scores]
+        # ----------------------------------------------------------------------
+        while len(buffer) < need:
+            # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
+            take = min(self.B, need - len(buffer))           # don't overshoot buffer
+            pids, ptxts, prompt_ids, attn = _next_prompt_batch(
+                self.prompt_sampler, take
+            )                                                # prompt_ids : [B, T_p]
 
-        # ── 3) loop *per prompt-group*  (keeps old reward / accept logic) ──
-        for b in range(take):
-            pid    = pids[b]
-            q_text = ptxts[b]
-            g_ids  = gen_ids[b]                                      # (G, T_g)
-
-            # --- decode & clean ---
-            g_txts = self.tokenizer.batch_decode(
-                g_ids, skip_special_tokens=True
-            )
-            g_txts = [
-                t.split("</answer>", 1)[0] + "</answer>"
-                if "</answer>" in t else t
-                for t in g_txts
-            ]
-            full_txts = self.tokenizer.batch_decode(
-                full_ids[b], skip_special_tokens=True
-            )
-
-            # --- token-level stats ---
-            lp, ent = _token_stats(g_ids, [s[b] for s in scores])    # list[G][T]
-            lp_t = torch.nn.utils.rnn.pad_sequence(
-                [torch.tensor(row) for row in lp],
-                batch_first=True, padding_value=0.0
-            )                                                        # (G, T_g_max_b)
-
-            # --- rewards ---
-            r_vec  = torch.stack([fn(pid, g_txts) for fn in self.reward_fns]).sum(0)
-
-            # --- accept / difficulty ---
-            accept = _accept_prompt_group(
-                r_vec,
-                thresh          = self.cfg["reward_var_thresh"],
-                allow_all_zero  = not self.cfg["reject_all_zero"],
-                allow_all_max   = not self.cfg["reject_all_max"],
-            )
-            succ   = (r_vec > 0).float().mean().item()
-            prev   = self.win_rate_ema.get(pid, succ)
-            self.win_rate_ema[pid] = 0.95 * prev + 0.05 * succ
-            diff_tag = ("easy"   if self.win_rate_ema[pid] > 0.8 else
-                        "hard"   if self.win_rate_ema[pid] < 0.2 else
-                        "normal")
-
-            tag_ok = torch.tensor(
-                [bool(ans_pat.search(t)) for t in g_txts],
-                dtype=torch.float32, device=self.device
-            )
-            t_len  = torch.tensor(
-                [_count_think_tokens(t, self.tokenizer) for t in full_txts],
-                dtype=torch.int32, device=self.device
+            # ── 2) batched generation ─────────────────────────────────────────
+            gen_out = self.policy.generate(
+                prompt_ids,
+                attention_mask      = attn,
+                num_return_sequences= self.G,
+                max_new_tokens      = self.cfg["max_new_tokens"],
+                do_sample           = True,
+                temperature         = self.cfg["temperature"],
+                top_p               = self.cfg["top_p"],
+                pad_token_id        = self.tokenizer.pad_token_id,
+                output_scores       = True,
+                stopping_criteria   = self.stopper,
+                return_dict_in_generate=True,
             )
 
-            # --- trace JSONL ---
-            now = time.perf_counter()
-            samples = [
-                GenSample(
-                    prompt_id       = pid,
-                    prompt_text     = q_text,
-                    gen_text        = g_txts[g],
-                    think_len       = int(t_len[g]),
-                    reward          = float(r_vec[g]),
-                    tag_correct     = float(tag_ok[g]),
-                    include_in_batch= bool(accept),
-                    difficulty_tag  = diff_tag,
-                    token_entropy   = ent[g],
-                    token_logprob   = lp[g],
-                    generation_time_s = 0.0,   # fill if you want timing
-                    step_idx        = self._step_idx,
+            # reshape: (B*G, T) → (B, G, T)
+            full_ids = gen_out.sequences.view(take, self.G, -1)
+            gen_ids  = full_ids[:, :, prompt_ids.shape[1]:]              # (B, G, T_g)
+            scores   = [s.view(take, self.G, -1) for s in gen_out.scores]
+
+            # ── 3) loop *per prompt-group*  (keeps old reward / accept logic) ──
+            for b in range(take):
+                pid    = pids[b]
+                q_text = ptxts[b]
+                g_ids  = gen_ids[b]                                      # (G, T_g)
+
+                # --- decode & clean ---
+                g_txts = self.tokenizer.batch_decode(
+                    g_ids, skip_special_tokens=True
                 )
-                for g in range(self.G)
-            ]
-            _append_jsonl(self._trace_file, samples)
-
-            # --- rollout buffer push (if accepted) ---
-            if accept and len(buffer) < need:
-                buffer.add(
-                    prompt_ids  = prompt_ids[b],
-                    gen_ids     = g_ids,
-                    rewards     = r_vec,
-                    logprobs    = lp_t,
-                    tag_correct = tag_ok,
-                    think_len   = t_len,
+                g_txts = [
+                    t.split("</answer>", 1)[0] + "</answer>"
+                    if "</answer>" in t else t
+                    for t in g_txts
+                ]
+                full_txts = self.tokenizer.batch_decode(
+                    full_ids[b], skip_special_tokens=True
                 )
 
-        # end for b
-    # end while
+                # --- token-level stats ---
+                lp, ent = _token_stats(g_ids, [s[b] for s in scores])    # list[G][T]
+                lp_t = torch.nn.utils.rnn.pad_sequence(
+                    [torch.tensor(row) for row in lp],
+                    batch_first=True, padding_value=0.0
+                )                                                        # (G, T_g_max_b)
 
-    self._step_idx += 1
-    return buffer.to_batch(device=self.device)
+                # --- rewards ---
+                r_vec  = torch.stack([fn(pid, g_txts) for fn in self.reward_fns]).sum(0)
+
+                # --- accept / difficulty ---
+                accept = _accept_prompt_group(
+                    r_vec,
+                    thresh          = self.cfg["reward_var_thresh"],
+                    allow_all_zero  = not self.cfg["reject_all_zero"],
+                    allow_all_max   = not self.cfg["reject_all_max"],
+                )
+                succ   = (r_vec > 0).float().mean().item()
+                prev   = self.win_rate_ema.get(pid, succ)
+                self.win_rate_ema[pid] = 0.95 * prev + 0.05 * succ
+                diff_tag = ("easy"   if self.win_rate_ema[pid] > 0.8 else
+                            "hard"   if self.win_rate_ema[pid] < 0.2 else
+                            "normal")
+
+                tag_ok = torch.tensor(
+                    [bool(ans_pat.search(t)) for t in g_txts],
+                    dtype=torch.float32, device=self.device
+                )
+                t_len  = torch.tensor(
+                    [_count_think_tokens(t, self.tokenizer) for t in full_txts],
+                    dtype=torch.int32, device=self.device
+                )
+
+                # --- trace JSONL ---
+                now = time.perf_counter()
+                samples = [
+                    GenSample(
+                        prompt_id       = pid,
+                        prompt_text     = q_text,
+                        gen_text        = g_txts[g],
+                        think_len       = int(t_len[g]),
+                        reward          = float(r_vec[g]),
+                        tag_correct     = float(tag_ok[g]),
+                        include_in_batch= bool(accept),
+                        difficulty_tag  = diff_tag,
+                        token_entropy   = ent[g],
+                        token_logprob   = lp[g],
+                        generation_time_s = 0.0,   # fill if you want timing
+                        step_idx        = self._step_idx,
+                    )
+                    for g in range(self.G)
+                ]
+                _append_jsonl(self._trace_file, samples)
+
+                # --- rollout buffer push (if accepted) ---
+                if accept and len(buffer) < need:
+                    buffer.add(
+                        prompt_ids  = prompt_ids[b],
+                        gen_ids     = g_ids,
+                        rewards     = r_vec,
+                        logprobs    = lp_t,
+                        tag_correct = tag_ok,
+                        think_len   = t_len,
+                    )
+
+            # end for b
+        # end while
+
+        self._step_idx += 1
+        return buffer.to_batch(device=self.device)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
