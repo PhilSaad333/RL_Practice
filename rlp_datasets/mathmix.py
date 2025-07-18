@@ -2,7 +2,7 @@ import random
 import re
 from pathlib import Path
 from datasets import load_dataset, concatenate_datasets
-from . import BaseDataset, Example, register
+from rlp_datasets import BaseDataset, Example, register
 
 RAW_DIR  = Path("datasets/raw")
 PROC_DIR = Path("datasets/processed/mathmix_tagged")
