@@ -113,6 +113,7 @@ class GRPO(RLAlgorithm):
             self.opt.step()
             self.opt.zero_grad(set_to_none=True)
 
+
         # To-Do:
         # More metrics
         return {
@@ -120,5 +121,7 @@ class GRPO(RLAlgorithm):
             "entropy"     : entropy.item(),
             "kl"          : kl_term.item(),
             "ratio_mean"  : ratios.mean().item(),
-            "r_mean"      : mean_r.mean().item()
+            "r_mean"      : mean_r.mean().item(),
+            "tag_correct" : rollouts.tag_correct.mean().item(),
+            "think_len"   : rollouts.think_len.mean().item()
         }

@@ -34,11 +34,32 @@ class RolloutBuffer:
         self._gens: List[torch.LongTensor] = []
         self._rewards: List[torch.FloatTensor] = []
         self._logprobs: List[torch.FloatTensor] = []
-        self._G: int | None = None  # lazily fixed on first add
+        self._tag_correct: List[torch.FloatTensor] = []
+        self._think_len: List[torch.IntTensor] = []
+        self._G: int | None = None
 
-    # --------------------------------------------------------------------- #
-    # mutating API
-    # --------------------------------------------------------------------- #
+
+
+
+    def iter_minibatches(self, B, shuffle=True):
+        """Yield indices of size B*G without replacement."""
+        idx = list(range(len(self)))           # prompts, not generations!
+        if shuffle:
+            random.shuffle(idx)
+        for i in range(0, len(idx), B):
+            yield idx[i : i+B]
+
+    def get_batch(self, idx, device=None):
+        sub = RolloutBuffer(capacity=len(idx))
+        for j in idx:  # copy refs, no padding work
+            sub._prompts.append(self._prompts[j])
+            sub._gens.append(self._gens[j])
+            sub._rewards.append(self._rewards[j])
+            sub._logprobs.append(self._logprobs[j])
+            sub._tag_correct.append(self._tag_correct[j])
+            sub._think_len.append(self.think_len[j])
+        return sub.to_batch(device=device)
+
     def add(
         self,
         *,
@@ -46,6 +67,8 @@ class RolloutBuffer:
         gen_ids: torch.LongTensor,             # (G, T_g)
         rewards: torch.FloatTensor,            # (G) or (G,1) or (1,G)
         logprobs: torch.FloatTensor,           # (G, T_g)
+        tag_correct: torch.FloatTensor,        # (G)
+        think_len: torch.IntTensor,            # (G)
     ) -> None:
         assert prompt_ids.dim() == 1, "prompt_ids must be 1-D"
         assert gen_ids.dim() == 2, "gen_ids must be 2-D (G, T_gen)"
@@ -63,6 +86,8 @@ class RolloutBuffer:
         self._gens.append(gen_ids.cpu())
         self._rewards.append(rewards.cpu())
         self._logprobs.append(logprobs.cpu())
+        self._tag_correct.append(tag_correct.cpu())
+        self._think_len.append(think_len.cpu())
 
     # --------------------------------------------------------------------- #
     # read-only API
@@ -78,6 +103,8 @@ class RolloutBuffer:
             gen_ids    : [B, G, T_gen_max]
             reward     : [B, G]
             logprobs   : [B, G, T_gen_max]
+            tag_correct: [B, G]
+            think_len  : [B, G]
 
         Returns ``RolloutBatch`` (defined in algs/base.py).
         """
@@ -125,12 +152,16 @@ class RolloutBuffer:
 
         # ------------ rewards ----------------------------------------------------
         rewards = torch.stack(self._rewards, dim=0)                       # (B, G)
+        tag_correct = torch.stack(self._tag_correct, dim=0)               # (B, G)
+        think_len = torch.stack(self._think_len, dim=0)                   # (B, G)
 
         if device is not None:
             padded_prompts = padded_prompts.to(device)
             padded_gens = padded_gens.to(device)
             rewards = rewards.to(device)
             padded_logprobs = padded_logprobs.to(device)
+            tag_correct = tag_correct.to(device)
+            think_len = think_len.to(device)
 
         # ------------ pack -------------------------------------------------------
         return RolloutBatch(
@@ -138,4 +169,6 @@ class RolloutBuffer:
             gen_ids=padded_gens, # right-padded, shape (B, G, T_gen_max)
             reward=rewards, # shape (B, G)
             logprobs=padded_logprobs, # shape (B, G, T_gen_max)
+            tag_correct=tag_correct,  # shape (B, G)
+            think_len=think_len,      # shape (B, G)
         )

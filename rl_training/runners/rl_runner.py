@@ -9,6 +9,8 @@ from rl_training.algs.base import RolloutBatch
 from transformers import (AutoTokenizer, AutoModelForCausalLM,
                           BitsAndBytesConfig)
 from peft import PeftModel
+from copy import deepcopy
+
 
 RUN_ROOT = pathlib.Path("/content/drive/MyDrive/RL_Practice_Files/rl_runs")
 
@@ -56,6 +58,13 @@ class RLRunner:
         self.pad_id = self.tok.pad_token_id 
         self.tok.padding_side = "left"
 
+        # frozen model for KL
+        self.ref_model = deepcopy(self.model).eval().requires_grad_(False)
+        # ensure pads match
+        self.ref_model.config.pad_token_id = self.model.config.pad_token_id
+
+
+
         # ---------- subsystems ------------------------------------------
         self.collector = RolloutCollector(self.model, self.tok, cfg,
                                           out_dir=self.dir, device="cuda")
@@ -67,27 +76,43 @@ class RLRunner:
 
 
     # ---------------- main training loop ------------------------------
-    def train(self, total_steps: int = 1000):
-        for _ in trange(total_steps, desc="RL steps"):
-            self._one_step()
+    def train(self, total_updates: int = 1000):
+        """total_updates == number of *optimizer* steps (same definition GRPO uses)."""
+        K         = self.collector.cfg["ppo_epochs"]
+        ga_steps  = self.accum                     # == cfg["grad_accum_steps"]
+        B         = self.collector.batch_size      # == cfg["microbatch_size"]
+
+        outer_loops = math.ceil(total_updates / K)
+        p_per_outer = K * ga_steps * B
+
+        for _ in trange(outer_loops, desc="outer collect loops"):
+            rb = self.collector.collect_batch(batch_prompts=p_per_outer)
+            self._train_one_buffer(rb, K, ga_steps, B)
+
             if self.step_id % self.save_every == 0:
                 self._save_ckpt()
 
-        self._save_ckpt(final=True)  # final full save
+        self._save_ckpt(final=True)
 
-    def _one_step(self):
-        rb = self.collector.collect_batch()
-        mb = math.ceil(rb.prompt_ids.size(0) / self.accum)
+    def _train_one_buffer(self, rb, K, ga_steps, B):
+        """Run K PPO epochs over RolloutBuffer `rb`."""
+        stats_running = {}
+        mb_counter    = 0
 
-        stats_acc = {}
-        for i in range(0, rb.prompt_ids.size(0), mb):
-            sync = (i + mb) >= rb.prompt_ids.size(0)
-            stats = self.algo.step(slice_batch(rb, slice(i, i+mb)), sync_grads=sync)
-            for k, v in stats.items():
-                stats_acc[k] = stats_acc.get(k, 0.0) + v / self.accum
+        for epoch in range(K):
+            for idx in rb.iter_minibatches(B, shuffle=True):
+                sync = ((mb_counter + 1) % ga_steps == 0)
+                mb   = rb.get_batch(idx, device="cuda")
 
-        self.step_id += 1
-        self._log(stats_acc)
+                stats = self.algo.step(mb, self.ref_model, sync_grads=sync)
+                for k, v in stats.items():
+                    stats_running[k] = stats_running.get(k, 0.0) + v / (K * ga_steps)
+
+                if sync:
+                    self.step_id += 1         # 1 optimiser update == 1 RL step
+                mb_counter += 1
+
+        self._log(stats_running)
 
     def _log(self, d):
         json_out = {"step": self.step_id, **d}

@@ -1,6 +1,7 @@
 # rl_training/runners/collect_rollouts.py
 from __future__ import annotations
 
+import re
 import json
 import math
 import time
@@ -35,6 +36,7 @@ class GenSample:
     gen_text: str
     think_len: int
     reward: float
+    tag_correct: float
     include_in_batch: bool
     difficulty_tag: str                       # "easy" | "normal" | "hard"
     token_entropy: List[float]                # length == T_gen
@@ -67,7 +69,8 @@ class RolloutCollector:
         self.cfg = cfg
         self.device = device or policy.device
         self.G: int = cfg["num_generations"]
-        self.batch_size: int = cfg["num_prompts"]
+        self.B: int = cfg["microbatch_size"]
+        self.batch_size: int = cfg["microbatch_size"]
 
         self.stopper = StoppingCriteriaList([StopOnAnswer(tokenizer)])
 
@@ -91,7 +94,7 @@ class RolloutCollector:
     # public entry point
     # ──────────────────────────────────────────────────────────────────────────
     @torch.inference_mode()
-    def collect_batch(self) -> RolloutBatch:
+    def collect_batch(self, batch_prompts: int | None = None) -> RolloutBatch:
         """
         Keep sampling prompts → G generations each → rewards
         until                → we have `batch_size` prompts with
@@ -101,9 +104,19 @@ class RolloutCollector:
             RolloutBatch ready for the trainer, plus side-effect:
             every attempt (accepted or rejected) is appended to rollouts.jsonl
         """
-        buffer = RolloutBuffer(capacity=self.batch_size)
+        need = batch_prompts or self.batch_size
+        buffer = RolloutBuffer(capacity=need)
 
-        while len(buffer) < self.batch_size:
+        # for checking tag format correctness
+        _answer_block = re.compile(
+            r"\n</think>\n"         # end of think-block
+            r"<answer>\n"           # answer tag
+            r"[\s\S]+?\n"           # one or more chars, including newlines
+            r"</answer>$"           # closing answer at very end
+        ) 
+
+
+        while len(buffer) < need:
             prompt_id = next(self.prompt_sampler)     # int, don't get confused with tokens = prompt_ids
             question   = self.prompt_sampler.id2text[prompt_id]
             prompt_text = question + "\n<think>\n"
@@ -198,6 +211,13 @@ class RolloutCollector:
                 else "normal"
             )
 
+            # Check tag format
+            tag_correct = torch.tensor(
+                [bool(_answer_block.search(txt)) for txt in gen_texts],
+                dtype=torch.float32,
+                device=self.device,
+            )   # shape: (G,)
+
             # ------------------------------------------------------------------
             # trace every sample
             # ------------------------------------------------------------------
@@ -210,6 +230,7 @@ class RolloutCollector:
                         gen_text=gen_texts[g],
                         think_len=_count_think_tokens(full_texts[g], self.tokenizer),
                         reward=rewards[g].item(),
+                        tag_correct=tag_correct[g].item()
                         include_in_batch=bool(accept),
                         difficulty_tag=diff_tag,
                         token_entropy=entropies[g],
@@ -220,6 +241,15 @@ class RolloutCollector:
                 )
             _append_jsonl(self._trace_file, records)
 
+
+            # For logging in tensorboard
+            think_len = torch.tensor(
+                [_count_think_tokens(t, self.tokenizer) for t in full_texts],
+                dtype=torch.int32,
+                device=self.device,
+            )   # (G)
+
+
             # ------------------------------------------------------------------
             # if accepted, push to rollout buffer
             # ------------------------------------------------------------------
@@ -228,7 +258,9 @@ class RolloutCollector:
                     prompt_ids       = prompt_ids.squeeze(0),    #   [T_prompt]
                     gen_ids          = gen_ids,                 # G x T_gen
                     rewards          = rewards,                 #   [G]
-                    logprobs         = lp_tensor
+                    logprobs         = lp_tensor,
+                    tag_correct      = tag_correct,
+                    think_len        = think_len,
                 )
 
         self._step_idx += 1

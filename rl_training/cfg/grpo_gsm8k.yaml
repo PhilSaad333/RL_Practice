@@ -4,8 +4,10 @@
 # The GRPO trainer will later read the same file and use only what it needs.
 
 # -------------- rollout collector ---------------- #
-num_generations   : 8
-num_prompts       : 4
+num_generations   : 8   # G: number of generations per prompt
+microbatch_size   : 4   # B: prompts used for each gradient checkpointing steps
+grad_accum_steps  : 8   # ga_steps: total number of prompts per update batch = ga_step*B
+ppo_epochs        : 4   # K: number of updates per rollout-collection step.
 max_new_tokens    : 128
 temperature       : 0.7
 top_p             : 0.9
@@ -29,11 +31,12 @@ scheduler:
 lr               : 2.0e-5
 clip_eps         : 0.2
 kl_beta          : 0.01
+kl_target        : 0.1
+max_kl           : 0.15
 ent_coef         : 0.0            # future entropy bonus knob
 grad_clip        : 1.0
 bf16             : true
 
-grad_accum_steps : 8
 gradient_checkpointing : true
 
 
