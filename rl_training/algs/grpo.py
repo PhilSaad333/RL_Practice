@@ -14,7 +14,7 @@ class GRPO(RLAlgorithm):
         self.accum_steps  = cfg["grad_accum_steps"]
         self._accum_ctr   = 0
 
-    def step(self, rollouts: RolloutBatch, *, sync_grads: bool = True) -> dict[str, float]:
+    def step(self, rollouts: RolloutBatch, ref_model, *, sync_grads: bool = True) -> dict[str, float]:
         B, G, T_g = rollouts.gen_ids.shape
         device    = rollouts.gen_ids.device
         pad_id    = self.pad_id
@@ -62,15 +62,28 @@ class GRPO(RLAlgorithm):
                                     1 + self.cfg["clip_eps"]) * adv.unsqueeze(-1)
         ppo_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
 
-
         if getattr(self.cfg, "kl_beta", 0.0) > 0:
-            delta_lp = new_logp - old_logp
+            with torch.no_grad():
+                ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
+            ref_logp_all = F.log_softmax(ref_logits, -1)
+            ref_logp_tok = ref_logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+            ref_lp_list = []
+            for i in range(B * G):
+                p = plen[i].item()
+                gen_len = min(T_g, ref_logp_tok.size(1) - p)
+                lp = ref_logp_tok[i, p : p + gen_len]
+                if gen_len < T_g:                        # right-pad with zeros
+                    lp = F.pad(lp, (0, T_g - gen_len), value=0.0)
+                ref_lp_list.append(lp)
+            ref_logp = torch.stack(ref_lp_list).view(B, G, T_g)
+            delta_lp = new_logp - ref_logp
             kl_per_tok = torch.exp(delta_lp) + delta_lp - torch.ones(B,G,T_g)
             kl_per_tok = kl_per_tok * gen_mask * self.cfg["kl_beta"]
             token_loss = ppo_loss - kl_per_tok
         else:
             kl_per_tok = torch.zeros(B,G,T_g).to(device)
             token_loss = ppo_loss
+
 
         # per-prompt normalisation
         tokens_per_prompt = gen_mask.sum(dim=(1,2))                       # (B)
