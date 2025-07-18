@@ -7,7 +7,7 @@ from rlp_datasets.local_paths import BASE   # "/content/drive/.../arrow"
 ANS_RE = re.compile(r"####\s*([-\d,\.]+)")   # GSM8K answer spec  :contentReference[oaicite:2]{index=2}
 
 def _parse_one(rec: dict, split: str) -> Example:
-    q = rec["problem"].strip()
+    q = rec["question"].strip()
     sol = rec["answer"].strip()
     m = ANS_RE.search(sol)
     ans = m.group(1) if m else sol.split()[-1]   # fallback
