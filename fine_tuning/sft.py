@@ -35,7 +35,7 @@ class Config:
     grad_accum: int = 1
     save_steps: int = 500
     log_steps: int = 100
-    max_seq_len: int = 512
+    max_seq_len: int = 256
     lr_scheduler_type: Literal["linear","cosine","constant"] = "linear"
     warmup_ratio: float = 0.05
     packing: bool = True
@@ -96,6 +96,7 @@ def main(cfg: Config):
         lr_scheduler_type=cfg.lr_scheduler_type,
         warmup_ratio=cfg.warmup_ratio,
         logging_steps=cfg.log_steps,
+        gradient_checkpointing=True,
         save_steps=cfg.save_steps,
         eval_strategy="steps",        # ← note: eval_strategy, not evaluation_strategy
         fp16=torch.cuda.is_available(),
