@@ -98,7 +98,8 @@ def main(cfg: Config):
         logging_steps=cfg.log_steps,
         gradient_checkpointing=True,
         save_steps=cfg.save_steps,
-        eval_strategy="steps",        # ← note: eval_strategy, not evaluation_strategy
+        eval_strategy="steps",
+        label_names=['labels']
         fp16=torch.cuda.is_available(),
         bf16=False,
         max_grad_norm=1.0,            # carried over from your old defaults
@@ -124,7 +125,7 @@ def main(cfg: Config):
         tokenizer        = tok,
         dataset_text_field= "text",
         max_seq_length   = cfg.max_seq_len,
-        packing          = cfg.packing,
+        packing          = False, # explicit for now
         data_collator    = collator,
     )                                          # TRL docs :contentReference[oaicite:3]{index=3}
 
