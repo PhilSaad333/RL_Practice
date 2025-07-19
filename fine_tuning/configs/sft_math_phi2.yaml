@@ -15,7 +15,7 @@ lora_dropout: 0.05
 batch_size: 8               # per-device batch; safe on A100 in 4-bit
 grad_accum: 2               # effective batch = batch_size × grad_accum
 epochs:     2              
-packing: true 
+packing: false 
 
 # — optimizer & logging —
 lr:        2e-4              # tuned for LoRA‐SFT on similar models

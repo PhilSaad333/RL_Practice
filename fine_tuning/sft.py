@@ -107,11 +107,13 @@ def main(cfg: Config):
     )                                        # HuggingFace trainer API :contentReference[oaicite:2]{index=2}
 
     # 4) Trainer ----------------------------------------------------------
-    from transformers import DataCollatorForSeq2Seq
-    collator = DataCollatorForSeq2Seq(
-        tokenizer = tok,
-        pad_to_multiple_of = 8,        # tensor-core friendly :contentReference[oaicite:4]{index=4}
-        return_tensors      = "pt",
+    from transformers import DataCollatorForLanguageModeling
+
+    collator = DataCollatorForLanguageModeling(
+        tokenizer         = tok,
+        mlm               = False,        # causal LM (no masking)
+        pad_to_multiple_of=8,             # tensor-core friendly
+        return_tensors    ="pt",
     )
 
     trainer = SFTTrainer(
