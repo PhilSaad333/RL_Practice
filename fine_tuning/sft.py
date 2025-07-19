@@ -11,7 +11,7 @@ from datasets import load_dataset, load_from_disk
 from typing import Literal
 from models import load_model
 from rlp_datasets import DATASET_REGISTRY
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import TrainingArguments, GenerationConfig
 from trl import SFTTrainer
 
@@ -75,14 +75,26 @@ def main(cfg: Config):
                             device_map="auto")     # FP4 if quantized
     tok.pad_token = tok.eos_token     # safe default for most CAUSAL_LM
 
+
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+
     lora_cfg = LoraConfig(
-        r=cfg.lora_r,
-        lora_alpha=cfg.lora_alpha,
-        lora_dropout=cfg.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )                                         # :contentReference[oaicite:1]{index=1}
+        r               = cfg.lora_r,
+        lora_alpha      = cfg.lora_alpha,
+        lora_dropout    = cfg.lora_dropout,
+        bias            = "none",
+        task_type       = "CAUSAL_LM",
+        target_modules=[
+            "Wqkv",          # attention projections in Phi-2
+            "out_proj",      # output projection
+            "fc1", "fc2",    # MLP
+            "dense"          # residual projection
+        ],
+    )
+
     model = get_peft_model(model, lora_cfg)
+    model.print_trainable_parameters() #debug
 
     # 3) Training args ----------------------------------------------------
     out_dir = cfg.output_dir or f"outputs/{cfg.backbone}_{cfg.dataset}_lora"
@@ -99,7 +111,7 @@ def main(cfg: Config):
         gradient_checkpointing=True,
         save_steps=cfg.save_steps,
         eval_strategy="steps",
-        label_names=['labels'],
+        label_names=["labels"],
         fp16=torch.cuda.is_available(),
         bf16=False,
         max_grad_norm=1.0,            # carried over from your old defaults
