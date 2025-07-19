@@ -1,9 +1,31 @@
 """
 Generic LoRA-SFT trainer.
+
+In colab, installs:
+
+!pip uninstall -y -q gcsfs
+
+# 2 · core deps (no implicit “extras”)
+!pip install -q pyarrow_hotfix tyro
+!pip install -q --no-deps fsspec==2024.2.0
+!pip install -q --no-deps datasets==2.19.2
+!pip install -q --no-deps transformers==4.53.0
+!pip install -q --no-deps peft==0.10.0
+!pip install -q --no-deps trl==0.8.6
+!pip install -q --no-deps accelerate>=1.8.1
+
+# 3 · 4-bit / LoRA helpers
+!pip install -q --no-deps bitsandbytes==0.43.2 triton==3.1.0
+
+
+
+
+
+
 Run, e.g.:
 
     python -m fine_tuning.sft \
-        --config configs/sft_gsm8k_tinyllama.yaml
+        --config fine_tuning/configs/sft_gsm8k_tinyllama.yaml
 """
 from pathlib import Path
 import yaml, tyro, torch

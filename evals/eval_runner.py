@@ -1,4 +1,44 @@
 # evals/eval_runner.py
+
+"""
+In colab, installs:
+
+%pip install --upgrade --quiet pyarrow_hotfix tyro \
+    datasets==2.19.2 transformers==4.53.0 \
+    peft==0.10.0 trl==0.8.6 accelerate>=1.8.1 \
+    math-verify[antlr4_13_2] bitsandbytes
+
+to run:
+
+!python -m evals.eval_runner \
+      --backbone tinyllama \
+      --ft_dataset gsm8k \
+      --ckpt_path /content/drive/MyDrive/RL_Practice_Files/tinyllama_gsm8k_lora \
+      --ckpt_step {step} \
+      --batch_size 12 \
+      --subset_frac 0.3 \
+      --eval_dataset gsm8k \
+      --temperature {temp} --top_p {p} \
+      --runs_root /content/drive/MyDrive/RL_Practice_Files/eval_runs
+
+
+
+
+"""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import tyro
 from pathlib import Path
 from evals.records import EvalRecord

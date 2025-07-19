@@ -3,9 +3,19 @@
 Mini-REPL: load any backbone from models.load_model(), then
 type prompts and see sampled completions.
 
+in colab, installs:
+
+%pip install --quiet tyro transformers==4.53.0 bitsandbytes datasets==2.19.2
+
+# 2) path to your fine-tuned checkpoint folder on Drive
+CKPT="/content/drive/MyDrive/RL_Practice_Files/phi2_math_lora/checkpoint-500"
+
+
 Run:
-    python evals/inspect_repl.py --backbone phi2 --temperature 0.7 --top_p 0.9
-    then in the input put respond("prompt")
+    !python -m evals.inspect_repl --backbone phi2 --ckpt $CKPT --temperature 0.7 --top_p 0.9
+
+    then in the input put #respond(prompt, stop_on="</answer>")
+
 """
 
 from typing import Optional
