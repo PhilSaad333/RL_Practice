@@ -108,15 +108,6 @@ def main(cfg: Config):
     )                                        # HuggingFace trainer API :contentReference[oaicite:2]{index=2}
 
     # 4) Trainer ----------------------------------------------------------
-    from transformers import DataCollatorForLanguageModeling
-
-    collator = DataCollatorForLanguageModeling(
-        tokenizer         = tok,
-        mlm               = False,        # causal LM (no masking)
-        pad_to_multiple_of=8,             # tensor-core friendly
-        return_tensors    ="pt",
-    )
-
     trainer = SFTTrainer(
         model            = model,
         args             = args,
@@ -126,7 +117,6 @@ def main(cfg: Config):
         dataset_text_field= "text",
         max_seq_length   = cfg.max_seq_len,
         packing          = False, # explicit for now
-        data_collator    = collator,
     )                                          # TRL docs :contentReference[oaicite:3]{index=3}
 
     trainer.train()
