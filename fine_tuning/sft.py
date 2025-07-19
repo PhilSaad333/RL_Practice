@@ -8,6 +8,7 @@ Run, e.g.:
 from pathlib import Path
 import yaml, tyro, torch
 from datasets import load_dataset, load_from_disk
+from typing import Literal
 from models import load_model
 from rlp_datasets import DATASET_REGISTRY
 from peft import LoraConfig, get_peft_model
@@ -34,7 +35,11 @@ class Config:
     grad_accum: int = 1
     save_steps: int = 500
     log_steps: int = 100
-    max_seq_len: int = 1024
+    max_seq_len: int = 512
+    lr_scheduler_type: Literal["linear","cosine","constant"] = "linear"
+    warmup_ratio: float = 0.05
+    packing: bool = True
+
 
 
 # ------------------------------- helpers --------------------------------
@@ -88,6 +93,8 @@ def main(cfg: Config):
         gradient_accumulation_steps=cfg.grad_accum,
         num_train_epochs=cfg.epochs,
         learning_rate=float(cfg.lr),
+        lr_scheduler_type=cfg.lr_scheduler_type,
+        warmup_ratio=cfg.warmup_ratio,
         logging_steps=cfg.log_steps,
         save_steps=cfg.save_steps,
         eval_strategy="steps",        # ← note: eval_strategy, not evaluation_strategy
@@ -99,6 +106,13 @@ def main(cfg: Config):
     )                                        # HuggingFace trainer API :contentReference[oaicite:2]{index=2}
 
     # 4) Trainer ----------------------------------------------------------
+    from transformers import DataCollatorForSeq2Seq
+    collator = DataCollatorForSeq2Seq(
+        tokenizer = tok,
+        pad_to_multiple_of = 8,        # tensor-core friendly :contentReference[oaicite:4]{index=4}
+        return_tensors      = "pt",
+    )
+
     trainer = SFTTrainer(
         model            = model,
         args             = args,
@@ -107,6 +121,8 @@ def main(cfg: Config):
         tokenizer        = tok,
         dataset_text_field= "text",
         max_seq_length   = cfg.max_seq_len,
+        packing          = cfg.packing,
+        data_collator    = collator,
     )                                          # TRL docs :contentReference[oaicite:3]{index=3}
 
     trainer.train()

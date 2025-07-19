@@ -12,12 +12,16 @@ lora_alpha: 128
 lora_dropout: 0.05
 
 # — training size & speed trade-offs —
-batch_size: 4               # per-device batch; safe on A100 in 4-bit
-grad_accum: 4               # effective batch = batch_size × grad_accum
-epochs:     2               
+batch_size: 8               # per-device batch; safe on A100 in 4-bit
+grad_accum: 2               # effective batch = batch_size × grad_accum
+epochs:     2              
+packing: true 
 
 # — optimizer & logging —
 lr:        2e-4              # tuned for LoRA‐SFT on similar models
 save_steps: 500
-log_steps:  1000
+log_steps:  250
 max_seq_len: 512            # Math problems & CoT usually <1 k tokens
+
+lr_scheduler_type: linear
+warmup_ratio:    0.05      # ~5 %
