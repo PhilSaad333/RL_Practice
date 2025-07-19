@@ -78,7 +78,7 @@ def main(cfg: Config):
 
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
-
+    # SPECIFIC TO PHI2 - CHANGE IF YOU USE A DIFFERENT MODEL!
     lora_cfg = LoraConfig(
         r               = cfg.lora_r,
         lora_alpha      = cfg.lora_alpha,
