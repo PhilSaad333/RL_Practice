@@ -1,5 +1,6 @@
 # rlp_datasets/mathmix.py
 import random
+import itertools
 from rlp_datasets.registry import DATASET_REGISTRY, Example
 
 def build_mix(split="train", p_gsm=0.5, seed=42) -> list[Example]:
