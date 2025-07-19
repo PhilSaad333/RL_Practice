@@ -5,6 +5,9 @@ inherit: _template_sft.yaml
 backbone: phi2              # 2.7 B params
 dataset:  mathmix           
 
+output_dir: "/content/drive/MyDrive/RL_Practice_Files/outputs/phi2_mathmix_lora"
+
+
 # — LoRA & precision —
 quantized: true             # 4-bit QLoRA to fit larger batches
 lora_r:     96
