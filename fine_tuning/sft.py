@@ -99,7 +99,7 @@ def main(cfg: Config):
         gradient_checkpointing=True,
         save_steps=cfg.save_steps,
         eval_strategy="steps",
-        label_names=['labels']
+        label_names=['labels'],
         fp16=torch.cuda.is_available(),
         bf16=False,
         max_grad_norm=1.0,            # carried over from your old defaults
