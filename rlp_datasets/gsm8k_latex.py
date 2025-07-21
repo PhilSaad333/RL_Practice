@@ -1,6 +1,5 @@
 # rlp_datasets/gsm8k_latex.py
 import re, json, os
-from datasets import load_from_disk
 from rlp_datasets.registry import DATASET_REGISTRY, Example
 
 BASE = '/content/drive/MyDrive/RL_Practice_Files/datasets'
@@ -16,7 +15,12 @@ def _parse_one(rec: dict, split: str) -> Example:
     return Example(text=text, question=q, answer=ans, meta=meta)
 
 def build_gsm8k(split: str = "train") -> list[Example]:
-    ds = load_from_disk(os.path.join(BASE, f"gsm8k_latex_{split}.jsonl"))
+
+import json
+    ds = []
+    with open(os.path.join(BASE, f"gsm8k_latex_{split}.jsonl"), 'r') as f:
+        for line in f:
+            ds.append(json.loads(line))
     return [_parse_one(rec, split) for rec in ds]
 
 DATASET_REGISTRY["gsm8k_latex"] = build_gsm8k
