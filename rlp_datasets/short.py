@@ -16,7 +16,7 @@ def prompt_ntokens(prompt: str) -> int:
     return len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
 
 def filter_lens(unfiltered, tolerance: int = 200):
-    filterted = []
+    filtered = []
     for ex in unfiltered:
         if prompt_ntokens(ex.text) <= tolerance:
             filtered.append(ex)
