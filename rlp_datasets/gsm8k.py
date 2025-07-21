@@ -1,4 +1,4 @@
-# rlp_datasets/gsm8k_local.py
+# rlp_datasets/gsm8k.py
 import re, json, os
 from datasets import load_from_disk
 from rlp_datasets.registry import DATASET_REGISTRY, Example
