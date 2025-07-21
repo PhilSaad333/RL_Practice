@@ -3,7 +3,7 @@ import re, json, os
 from datasets import load_from_disk
 from rlp_datasets.registry import DATASET_REGISTRY, Example
 
-DIR = '/content/drive/MyDrive/RL_Practice_Files/datasets/gsm8k_latex
+DIR = '/content/drive/MyDrive/RL_Practice_Files/datasets/gsm8k_latex'
 
 
 def _parse_one(rec: dict, split: str) -> Example:
