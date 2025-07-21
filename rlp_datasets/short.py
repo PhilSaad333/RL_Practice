@@ -12,13 +12,13 @@ tokenizer = AutoTokenizer.from_pretrained(
     add_prefix_space=False
 )
 
-def prompt_ntokens(prompt: str) -> int:
-    return len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+def text_ntokens(text: str) -> int:
+    return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
 def filter_lens(unfiltered, tolerance: int = 200):
     filtered = []
     for ex in unfiltered:
-        if prompt_ntokens(ex.text) <= tolerance:
+        if text_ntokens(ex.text) <= tolerance:
             filtered.append(ex)
     return filtered
 
