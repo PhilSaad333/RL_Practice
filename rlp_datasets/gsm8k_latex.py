@@ -3,7 +3,7 @@ import re, json, os
 from datasets import load_from_disk
 from rlp_datasets.registry import DATASET_REGISTRY, Example
 
-BASE = '/content/drive/MyDrive/RL_Practice_Files/datasets/gsm8k_latex'
+BASE = '/content/drive/MyDrive/RL_Practice_Files/datasets'
 
 
 def _parse_one(rec: dict, split: str) -> Example:
@@ -16,7 +16,7 @@ def _parse_one(rec: dict, split: str) -> Example:
     return Example(text=text, question=q, answer=ans, meta=meta)
 
 def build_gsm8k(split: str = "train") -> list[Example]:
-    ds = load_from_disk(os.path.join(BASE, f"_{split}"))
+    ds = load_from_disk(os.path.join(BASE, f"gsm8k_latex_{split}"))
     return [_parse_one(rec, split) for rec in ds]
 
 DATASET_REGISTRY["gsm8k_latex"] = build_gsm8k
