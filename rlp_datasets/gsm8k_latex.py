@@ -15,8 +15,6 @@ def _parse_one(rec: dict, split: str) -> Example:
     return Example(text=text, question=q, answer=ans, meta=meta)
 
 def build_gsm8k(split: str = "train") -> list[Example]:
-
-import json
     ds = []
     with open(os.path.join(BASE, f"gsm8k_latex_{split}.jsonl"), 'r') as f:
         for line in f:
