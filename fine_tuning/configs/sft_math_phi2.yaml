@@ -3,9 +3,9 @@ inherit: _template_sft.yaml
 
 # — core settings —
 backbone: phi2              # 2.7 B params
-dataset:  mathmix           
+dataset:  short           
 
-output_dir: "/content/drive/MyDrive/RL_Practice_Files/outputs/phi2_mathmix_lora"
+output_dir: "/content/drive/MyDrive/RL_Practice_Files/finetuned/phi2_short_lora"
 
 
 # — LoRA & precision —
@@ -21,7 +21,7 @@ epochs:     2
 packing: false 
 
 # — optimizer & logging —
-lr:        3e-4              # tuned for LoRA‐SFT on similar models
+lr:        2e-4              # tuned for LoRA‐SFT on similar models
 save_steps: 500
 log_steps:  1000
 max_seq_len: 256            # Math problems & CoT usually <1 k tokens
