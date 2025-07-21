@@ -16,7 +16,7 @@ def _parse_one(rec: dict, split: str) -> Example:
     return Example(text=text, question=q, answer=ans, meta=meta)
 
 def build_gsm8k(split: str = "train") -> list[Example]:
-    ds = load_from_disk(os.path.join(BASE, f"gsm8k_latex_{split}"))
+    ds = load_from_disk(os.path.join(BASE, f"gsm8k_latex_{split}.jsonl"))
     return [_parse_one(rec, split) for rec in ds]
 
 DATASET_REGISTRY["gsm8k_latex"] = build_gsm8k
