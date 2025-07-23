@@ -148,6 +148,8 @@ class RolloutCollector:
                 g_txts = self.tokenizer.batch_decode(
                     g_ids, skip_special_tokens=True
                 )
+                # HERE WE MANUALLY STRIP OFF ANY EXTRA TEXT AFTER THE FIRST </answer> TAG
+                # THE STOP CRITERION SHOULD HAVE PREVENTED THIS BUT SEEMS INCONSISTENT?
                 g_txts = [
                     t.split("</answer>", 1)[0] + "</answer>"
                     if "</answer>" in t else t
