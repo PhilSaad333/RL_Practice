@@ -17,11 +17,15 @@ def _load_records(records_path: Path) -> List[dict]:
     return out
 
 def _model_from_base(base_root: Path) -> str:
-    # e.g. ".../eval_runs/phi2_math_finetuned"  ->  "phi2"
     m = re.search(r"/([^/_]+)(?:_[^/]+)?_finetuned$", str(base_root))
     if not m:
         raise ValueError(f"Cannot infer model name from {base_root}")
-    return m.group(1)
+    name = m.group(1).lower()
+
+    # --- special-case short aliases -----------------------------------
+    alias = {"phi2": "microsoft/phi-2", "phi-2": "microsoft/phi-2"}
+    return alias.get(name, name)
+
 
 def _discover_one_run(base_root: Path) -> Path:
     """Return path to exactly ONE records.jsonl.gz or raise."""
