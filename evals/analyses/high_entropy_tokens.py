@@ -35,22 +35,30 @@ def _discover_one_run(base_root: Path) -> Path:
         )
     return rec_paths[0]
 
-def _top_ent(records: List[dict], k: int) -> List[Tuple[float,int,int,int]]:
-    heap: List[Tuple[float,int,int,int]] = []
-    for q, rec in enumerate(records):
-        for g, ent_arr in enumerate(rec["entropies"]):
-            vals, idxs = torch.tensor(ent_arr).topk(min(k, len(ent_arr)))
+def _top_ent(records: list[dict], k: int) -> list[tuple[float,int,int,int]]:
+    heap: list[tuple[float,int,int,int]] = []
+    seen = 0                                                # NEW ✔
+    for q_idx, rec in enumerate(records):
+        for g_idx, ent_arr in enumerate(rec["entropies"]):
+            tens = torch.tensor(ent_arr, dtype=torch.float32)
+            seen += tens.numel()                            # count total scalars
+            if tens.numel() == 0 or torch.isnan(tens).all():
+                continue                                    # skip empty / all-nan
+
+            vals, idxs = tens.topk(min(k, tens.numel()))    # local top-k
             for v, s in zip(vals.tolist(), idxs.tolist()):
                 if len(heap) < k:
-                    heapq.heappush(heap, (v, q, g, s))
+                    heapq.heappush(heap, (v, q_idx, g_idx, s))
                 elif v > heap[0][0]:
-                    heapq.heapreplace(heap, (v, q, g, s))
-                else:
+                    heapq.heapreplace(heap, (v, q_idx, g_idx, s))
+                else:                                       # vals are descending
                     break
 
-    print("[DEBUG] total entropy scalars seen:", seen)         # 👈
-    print("[DEBUG] heap length after scan  :", len(heap))      # 👈
+    # always print a short summary so you know what happened
+    print(f"[DEBUG] scalar entropies seen: {seen}")
+    print(f"[DEBUG] global-top heap size : {len(heap)}")
     return sorted(heap, reverse=True)
+
 
 def _highlight(gen: str, pos: int, tok, window=5) -> str:
     ids   = tok(gen, add_special_tokens=False)["input_ids"]
