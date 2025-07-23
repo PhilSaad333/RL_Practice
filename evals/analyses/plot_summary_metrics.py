@@ -81,6 +81,18 @@ def main(
     if not steps:
         raise RuntimeError(f"No `step_*` folders found under {base_root}")
 
+    # pick the actual on-disk folder for the first step, e.g. "step_394_gsm8k_latex"
+    step_dirs = list(base_root.glob(f"step_{steps[0]}_*"))
+    if not step_dirs:
+        raise FileNotFoundError(f"No step_{steps[0]}_* folder under {base_root}")
+    step_name = step_dirs[0].name
+
+    # extract everything after "step_<num>_"
+    m = re.match(r"^step_\d+_(.+)$", step_name)
+    if not m:
+        raise ValueError(f"Couldn't parse eval_dataset from {step_name}")
+    eval_dataset = m.group(1)      # e.g. "gsm8k_latex"
+
 
     print(f"Found steps={steps}, temps={temps}, top_p={ps}, gens_per_prompt={gens_per_prompt}")
 
