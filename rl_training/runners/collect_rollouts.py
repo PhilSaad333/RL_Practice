@@ -119,6 +119,7 @@ class RolloutCollector:
                 self.device,
                 take
             )                                                # prompt_ids : [B, T_p]
+            print(f'ptexts[0] = {ptxts[0]}')
 
             # ── 2) batched generation ─────────────────────────────────────────
             gen_out = self.policy.generate(
@@ -150,6 +151,7 @@ class RolloutCollector:
                 g_txts = self.tokenizer.batch_decode(
                     g_ids, skip_special_tokens=True
                 )
+                print(f'gen {g_txts[0]}')
                 # HERE WE MANUALLY STRIP OFF ANY EXTRA TEXT AFTER THE FIRST </answer> TAG
                 # THE STOP CRITERION SHOULD HAVE PREVENTED THIS BUT SEEMS INCONSISTENT?
                 g_txts = [
