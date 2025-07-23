@@ -34,7 +34,6 @@ def _extract_answer_block(text: str) -> str | None:
 
 def reward_fn(prompt_id: int, answers: List[str]) -> torch.FloatTensor:
     gold = PROMPT2GOLD.get(prompt_id)
-    print(f'gold = {gold}')
     if gold is None:
         return torch.zeros(len(answers))
 

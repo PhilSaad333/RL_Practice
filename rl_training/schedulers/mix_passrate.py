@@ -30,6 +30,8 @@ from typing import Deque, Dict, Iterator, List
 
 from rlp_datasets import DATASET_REGISTRY
 from rl_training.rewards.tag_math_correct import set_prompt2gold
+from rl_training.rewards.tag_pref import set_prompt2gold
+
 
 
 class MixPassRateScheduler(Iterator[int]):

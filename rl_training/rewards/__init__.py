@@ -1,5 +1,8 @@
 # rl_training/rewards/__init__.py
 
+
+# FOR ANY NEW REWARD FN MAKE SURE TO ADD SET PROMPT2GOLD IN SCHEDULER
+
 # To be used in rl_training/runners/collect_rollouts.py
 def get_reward_fns(names: list[str]):
     from importlib import import_module

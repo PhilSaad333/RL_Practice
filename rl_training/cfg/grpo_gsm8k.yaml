@@ -17,8 +17,8 @@ reject_all_zero   : true
 reject_all_max    : true
 
 reward_fns:
-  #- tag_pref
-  - tag_math_correct
+  - tag_pref
+  #- tag_math_correct
 
 scheduler:
   name          : mix_passrate
