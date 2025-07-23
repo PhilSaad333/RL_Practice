@@ -1,12 +1,18 @@
 # evals/analyses/plot_summary_metrics.py
 #
 # Usage example (Colab):
-#   %run evals/plot_metrics.py --model_name phi2 \
-#                              --train_dataset math \
-#                              --eval_dataset math
-#
-# Optional --run_name lets you override the auto-detected tag if you keep more
-# than one (e.g. r4 vs r8) under a step folder.
+# !pip --quiet install tyro
+# !python -m evals.cli \
+#     --analysis     plot_summary_metrics \
+#     --base-root    /content/drive/MyDrive/RL_Practice_Files/eval_runs/phi2_gsm8k_latex_finetuned \
+#     --show \
+#     --save-dir /content/plots
+# from IPython.display import Image, display
+# import glob, os
+# 
+# for png in glob.glob("/content/plots/*.png"):
+#     display(Image(png))
+
 
 import os
 import re

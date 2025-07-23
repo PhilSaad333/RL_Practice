@@ -47,6 +47,9 @@ def _top_ent(records: List[dict], k: int) -> List[Tuple[float,int,int,int]]:
                     heapq.heapreplace(heap, (v, q, g, s))
                 else:
                     break
+
+    print("[DEBUG] total entropy scalars seen:", seen)         # 👈
+    print("[DEBUG] heap length after scan  :", len(heap))      # 👈
     return sorted(heap, reverse=True)
 
 def _highlight(gen: str, pos: int, tok, window=5) -> str:
