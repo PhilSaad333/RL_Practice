@@ -126,7 +126,7 @@ def generate_with_logprobs(
 
 
 
-    lp_chunks, ent_chunks = [], []
+    lp_chunks, ent_chunks, keep_lens = [], [], []
     for i in range(0, seqs_flat.size(0), tf_micro_batch):
         blk = seqs_flat[i : i + tf_micro_batch]           # [mb, T_full]
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
@@ -142,25 +142,24 @@ def generate_with_logprobs(
         gl_sub = gen_lens[i : i + tf_micro_batch].tolist()      # list[int]
 
         for row, g_len in enumerate(gl_sub):
-            # generation starts after the prompt
-            start = prompt_len - 1                    # first gen-token entropy
-            end   = start + g_len                     # false end, contains to-be-trimmed tokens
+            start = prompt_len - 1
+            end   = start + g_len
 
-            row_ids = blk[row]                        # [T_full] token ids on GPU
-
-            # find first occurrence of "</answer>"
-            # search only inside generation:
-            search_start = prompt_len                 # first gen token (not entropy!)
+            row_ids = blk[row]           # tensor on GPU
+            # --- locate first "</answer>" tag -------------------------------
+            search_start = prompt_len
             search_end   = prompt_len + g_len - L_tag + 1
             cut = None
             for idx in range(search_start, search_end):
-                if torch.equal(row_ids[idx : idx + L_tag], torch.tensor(tag_ids, device=row_ids.device)):
-                    cut = idx + L_tag                 # keep the tag itself, drop after
+                if torch.equal(row_ids[idx : idx + L_tag],
+                            torch.tensor(tag_ids, device=row_ids.device)):
+                    cut = idx + L_tag
                     break
             if cut is None:
-                cut = prompt_len + g_len              # tag not found -> keep all
+                cut = prompt_len + g_len        # tag not found → keep all
 
-            keep = cut - prompt_len                   # how many gen tokens remain
+            keep = cut - prompt_len             # #tokens we actually keep
+            keep_lens.append(keep)              # ❶ remember it
             lp_chunks .append(lp [row, start : start + keep])
             ent_chunks.append(ent[row, start : start + keep])
 
@@ -177,19 +176,18 @@ def generate_with_logprobs(
 
 
 
-    # ── decode & trim (unchanged) ────────────────────────────────────────
+    # ── decode & trim ────────────────────────────────────────
     gen_text = []
+    row_idx  = 0
     for b in range(B):
-        row = []
+        row_txt = []
         for n in range(N):
-            dec = tokenizer.decode(seqs[b, n], skip_special_tokens=True)
-            m   = TAG_RGX.search(dec)
-            if m:
-                row.append(m.group(0))
-            else:
-                idx = dec.find(TAG_STOP)
-                row.append(dec[: idx + len(TAG_STOP)] if idx != -1 else dec)
-        gen_text.append(row)
+            keep = keep_lens[row_idx]
+            seq  = seqs[b, n, prompt_len : prompt_len + keep]   # slice on GPU
+            txt  = tokenizer.decode(seq, skip_special_tokens=True)
+            row_txt.append(txt)
+            row_idx += 1
+        gen_text.append(row_txt)
 
     # ── reshape flat lists into [B][N] ───────────────────────────────────
     gen_lps  = [
