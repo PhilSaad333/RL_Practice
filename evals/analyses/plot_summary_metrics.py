@@ -86,9 +86,14 @@ def main(
 
 
     # 2) Pick an example to read metric columns
+    # find the actual step directory on disk (e.g. "step_394_gsm8k_latex")
+    step_glob = list(base_root.glob(f"step_{steps[0]}_*"))
+    if not step_glob:
+        raise FileNotFoundError(f"No step directory matching step_{steps[0]}_* under {base_root}")
+    step_dir = step_glob[0]
+
     example_csv = (
-        base_root
-        / f"step_{steps[0]}"
+        step_dir
         / f"temp{temps[0]}_p{ps[0]}_r{gens_per_prompt}"
         / "metrics.csv"
     )
@@ -109,13 +114,14 @@ def main(
 
     # 4) Fill in means
     for step, temp, p in product(steps, temps, ps):
-        metrics_path = (
-            base_root
-            / f"step_{step}"
-            / f"temp{temp}_p{p}_r{gens_per_prompt}"
-            / "metrics.csv"
-        )
+        # locate the correct step‐directory again
+        step_glob = list(base_root.glob(f"step_{step}_*"))
+        if not step_glob:
+            print(f"[WARNING] no dir step_{step}_*")
+            continue
+        step_dir = step_glob[0]
 
+        metrics_path = step_dir / f"temp{temp}_p{p}_r{gens_per_prompt}" / "metrics.csv"
         if not metrics_path.exists():
             print(f"[WARNING] missing {metrics_path}")
             continue
