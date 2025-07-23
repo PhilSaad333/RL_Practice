@@ -22,7 +22,7 @@ reward_fns:
 
 scheduler:
   name          : mix_passrate
-  dataset_name  : gsm8k
+  dataset_name  : gsm8k_latex
   split         : "train"
   ema_alpha     : 0.05
   boundaries    : [0.2, 0.8]
