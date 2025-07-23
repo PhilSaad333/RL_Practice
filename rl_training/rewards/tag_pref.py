@@ -9,8 +9,8 @@ from math_verify import parse, verify
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 #hardcoded here rather than in config for now
-W_TAG: float = 2.0   # weight for formatting adherence
-W_ANS: float = 1.0   # weight for correctness when formatted properly
+W_TAG: float = 0.5   # weight for formatting adherence
+W_ANS: float = 0.5   # weight for correctness when formatted properly
 
 # ── Global prompt→gold map (populated once by your scheduler) ───────────────────
 PROMPT2GOLD: Dict[int, str] = {}

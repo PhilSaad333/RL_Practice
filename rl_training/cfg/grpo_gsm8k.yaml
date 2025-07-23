@@ -12,7 +12,7 @@ max_new_tokens    : 192
 temperature       : 0.7
 top_p             : 0.95
 
-reward_var_thresh : 0.0
+reward_var_thresh : 0.1
 reject_all_zero   : true
 reject_all_max    : true
 

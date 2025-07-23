@@ -110,7 +110,8 @@ class RolloutCollector:
         # ----------------------------------------------------------------------
         while len(buffer) < need:
             # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
-            take = min(self.B, need - len(buffer))           # don't overshoot buffer
+            take = min(2 * self.B, need - len(buffer))           # don't overshoot buffer.
+                                                                # Also factor of two since extra ram available during rollout collection
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
                 self.prompt_sampler,
                 self.tokenizer,
