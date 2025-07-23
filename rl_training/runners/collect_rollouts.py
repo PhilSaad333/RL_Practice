@@ -170,7 +170,7 @@ class RolloutCollector:
 
                 # --- rewards ---
                 r_vec  = torch.stack([fn(pid, g_txts) for fn in self.reward_fns]).sum(0)
-                print(f'rvec = {rvec}')
+                print(f'rvec = {r_vec}')
 
                 # --- accept / difficulty ---
                 accept = _accept_prompt_group(
