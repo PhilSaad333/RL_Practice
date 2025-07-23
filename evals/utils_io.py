@@ -140,7 +140,7 @@ def generate_with_logprobs(
         for row, g_len in enumerate(gl_sub):
             start = prompt_len - 1                              # same for all rows
             end   = start + g_len
-            lp_chunks .append(lp [row, start:end])
+            lp_chunks.append(lp[row, start:end])
             ent_chunks.append(ent[row, start:end])
 
         # free GPU RAM early
