@@ -10,7 +10,7 @@ grad_accum_steps  : 8 #8   # ga_steps: total number of prompts per update batch 
 ppo_epochs        : 3 #4   # K: number of updates per rollout-collection step.
 max_new_tokens    : 128
 temperature       : 0.7
-top_p             : 0.9
+top_p             : 0.95
 
 reward_var_thresh : 0.0
 reject_all_zero   : true
