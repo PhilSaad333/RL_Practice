@@ -78,6 +78,9 @@ def main(
     tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
     top = _top_ent(records, k)
+    if not top:
+        print("[INFO] No entropy values found – is this the right records file?")
+        return
 
     for H, q, g, s in top:
         rec  = records[q]
