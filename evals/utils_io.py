@@ -132,7 +132,7 @@ def generate_with_logprobs(
         ent = -(log_p.exp() * log_p).sum(-1)       # same
 
         for row, glen in enumerate(gen_lens[i : i+tf_micro_batch]):
-            lp_chunks.append(lp [row, -glen:])
+            lp_chunks.append(lp[row, -glen:])
             ent_chunks.append(ent[row, -glen:])
 
         # free asap
