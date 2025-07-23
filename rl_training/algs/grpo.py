@@ -24,6 +24,7 @@ class GRPO(RLAlgorithm):
         self.pad_id = pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
         self.accum_steps  = cfg["grad_accum_steps"]
         self._accum_ctr   = 0
+        self.cfg = cfg
 
     def step(self, rollouts: RolloutBatch, ref_model, *, sync_grads: bool = True) -> dict[str, float]:
         B, G, T_g = rollouts.gen_ids.shape
