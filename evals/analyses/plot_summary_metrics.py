@@ -1,4 +1,4 @@
-# evals/plot_metrics.py
+# evals/analyses/plot_summary_metrics.py
 #
 # Usage example (Colab):
 #   %run evals/plot_metrics.py --model_name phi2 \
@@ -19,20 +19,15 @@ import matplotlib.pyplot as plt
 import tyro
 
 
-def _discover(
+def _discover_metrics(
     base_root: Path,
-    eval_dataset: str,
 ) -> Tuple[List[int], List[float], List[float], Set[str]]:
     """
-    Walk only those step_*_{eval_dataset} folders under `base_root` and
-    return:
-      • steps   – sorted list of ints
-      • temps   – sorted list of floats
-      • ps      – sorted list of floats
-      • runs    – set of distinct run tags (strings)
+    Walk all step_* folders under `base_root` and
+    # Match any step directory:
     """
     # Only match step directories for the eval_dataset we care about:
-    step_pattern = re.compile(rf"^step_(\d+)_{re.escape(eval_dataset)}$")
+    step_pattern = re.compile(r"^step_(\d+)_")    
     sub_re       = re.compile(r"^temp(?P<temp>[0-9.]+)_p(?P<p>[0-9.]+)_(?P<run>.+)$")
 
     steps:   Set[int]   = set()
@@ -40,8 +35,8 @@ def _discover(
     ps:      Set[float] = set()
     run_set: Set[str]   = set()
 
-    # Glob only step_*_{eval_dataset}
-    for step_dir in base_root.glob(f"step_*_{eval_dataset}"):
+    # Glob every step_* folder
+    for step_dir in base_root.glob("step_*"):
         if not step_dir.is_dir():
             continue
 
@@ -67,47 +62,38 @@ def _discover(
 
 
 def main(
-    model_name: str,
-    train_dataset: str,
-    eval_dataset: str,
+    base_root: Path,
     run_name: Optional[str] = None,
     show: bool = True,
-    save_dir: Optional[str] = None,
+    save_dir: Optional[Path] = None,
 ):
-    base_root = Path(
-        f"/content/drive/MyDrive/RL_Practice_Files/eval_runs/"
-        f"{model_name}_{train_dataset}_finetuned"
-    )
+    """
+    Plot summary metrics for every step/temp/top_p under base_root.
 
-    # 1) Discover only the step_*_{eval_dataset} folders:
-    steps, temps, ps, run_tags = _discover(base_root, eval_dataset)
+    base_root should be something like
+      /…/eval_runs/phi2_math_finetuned
+    """
+
+
+    # 1) Discover every step_* folder under base_root:
+    steps, temps, ps, run_tags = _discover_metrics(base_root)
 
     if not steps:
-        raise RuntimeError(f"No `step_*_{eval_dataset}` folders found in {base_root}")
+        raise RuntimeError(f"No `step_*` folders found under {base_root}")
 
     if run_name is None:
         if len(run_tags) != 1:
             raise ValueError(
-                f"Multiple run tags found ({', '.join(sorted(run_tags))}); "
-                "pass --run_name to select one."
+                f"Multiple run tags found: {sorted(run_tags)}; pass --run_name to select one."
             )
         run_name = next(iter(run_tags))
 
-    print(
-        f"Discovered for eval_dataset={eval_dataset!r}:\n"
-        f"  steps = {steps}\n"
-        f"  temps = {temps}\n"
-        f"  top_p = {ps}\n"
-        f"  run   = {run_name!r}"
-    )
+    print(f"Found steps={steps}, temps={temps}, top_p={ps}, run_tag={run_name!r}")
+
 
     # 2) Pick an example to read metric columns
-    example_csv = (
-        base_root
-        / f"step_{steps[0]}_{eval_dataset}"
-        / f"temp{temps[0]}_p{ps[0]}_{run_name}"
-        / "metrics.csv"
-    )
+    example_csv = base_root / f"step_{steps[0]}" / f"temp{temps[0]}_p{ps[0]}_{run_name}" / "metrics.csv"
+
     if not example_csv.exists():
         raise FileNotFoundError(f"Expected metrics.csv at {example_csv}")
 
@@ -123,12 +109,8 @@ def main(
 
     # 4) Fill in means
     for step, temp, p in product(steps, temps, ps):
-        metrics_path = (
-            base_root
-            / f"step_{step}_{eval_dataset}"
-            / f"temp{temp}_p{p}_{run_name}"
-            / "metrics.csv"
-        )
+        metrics_path = base_root / f"step_{step}" / f"temp{temp}_p{p}_{run_name}" / "metrics.csv"
+
         if not metrics_path.exists():
             print(f"[WARNING] missing {metrics_path}")
             continue
@@ -159,7 +141,7 @@ def main(
         plt.tight_layout()
 
         if save_dir:
-            out = Path(save_dir) / f"{eval_dataset}_{m}.png"
+            out = Path(save_dir) / f"{m}.png"
             plt.savefig(out, dpi=140)
             print(f"Saved plot to {out}")
 
