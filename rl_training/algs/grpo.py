@@ -74,10 +74,7 @@ class GRPO(RLAlgorithm):
                                     1 + self.cfg["clip_eps"]) * adv.unsqueeze(-1)
         ppo_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
 
-        print(f'kl beta = {self.cfg["kl_beta"]}')
-
-        if getattr(self.cfg, "kl_beta", 0.0) > 0:
-            print(f'should see this - kl beta = {getattr(self.cfg, "kl_beta", 0.0)}')
+        if self.cfg["kl_beta"] > 0:
             with torch.no_grad():
                 ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
             ref_logp_all = F.log_softmax(ref_logits, -1)
@@ -117,7 +114,7 @@ class GRPO(RLAlgorithm):
         entropy    = (ent_tok * gen_mask).sum() / (gen_mask.sum() + 1e-8)
 
         del logits, logp_all
-        if getattr(self.cfg, "kl_beta", 0.0) > 0:
+        if self.cfg["kl_beta"] > 0:
             del ref_logits, ref_logp_all
         torch.cuda.empty_cache()
 
