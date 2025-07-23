@@ -114,33 +114,46 @@ def generate_with_logprobs(
     # ── teacher-forcing pass in micro-batches ──────────────────────────────
     seqs_flat = seqs.reshape(B * N, T_full)        # [B*N, T_full]
 
-    # 
+
+    # to compute gen_lens
     att = (seqs_flat != tokenizer.pad_token_id).int()      # 1 = real token
     seq_lens    = att.sum(-1)                              # per-row T_i
     prompt_lens = att[:, :prompt_len].sum(-1)              # per-row p_i
     gen_lens    = seq_lens - prompt_lens                   # per-row g_i
 
     lp_chunks, ent_chunks = [], []
+
     for i in range(0, seqs_flat.size(0), tf_micro_batch):
-        blk = seqs_flat[i : i + tf_micro_batch]    # [mb, T_full]
+        blk = seqs_flat[i : i + tf_micro_batch]           # [mb, T_full]
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
-            logits = model(blk).logits             # [mb, T_full, V]
-        log_p = logits.log_softmax(-1)             # keep on GPU
+            logits = model(blk).logits                    # [mb, T_full, V]
+        log_p = logits.log_softmax(-1)                    # on GPU
 
-        tgt = blk[:, 1:].unsqueeze(-1)
-        lp  = log_p.gather(2, tgt).squeeze(-1)     # [mb, T_full-1]
-        ent = -(log_p.exp() * log_p).sum(-1)       # same
+        # causal-LM shift (labels are next-token ids)
+        tgt = blk[:, 1:].unsqueeze(-1)                    # [mb, T_full-1, 1]
+        lp  = log_p[:, :-1].gather(2, tgt).squeeze(-1)    # [mb, T_full-1]
+        ent = -(log_p[:, :-1].exp() * log_p[:, :-1]).sum(-1)
 
-        for row, glen in enumerate(gen_lens[i : i+tf_micro_batch]):
-            lp_chunks.append(lp[row, -glen:])
-            ent_chunks.append(ent[row, -glen:])
+        # slice *row by row* so we keep only real generation tokens
+        gl_sub = gen_lens[i : i + tf_micro_batch].tolist()      # list[int]
 
-        # free asap
+        for row, g_len in enumerate(gl_sub):
+            start = prompt_len - 1                              # same for all rows
+            end   = start + g_len
+            lp_chunks .append(lp [row, start:end])
+            ent_chunks.append(ent[row, start:end])
+
+        # free GPU RAM early
         del logits, log_p, lp, ent
         torch.cuda.empty_cache()
 
+
     flat_lps  = [lp.cpu().numpy() for lp  in lp_chunks]
     flat_ents = [ent.cpu().numpy() for ent in ent_chunks]
+
+
+
+
 
     # ── decode & trim (unchanged) ────────────────────────────────────────
     gen_text = []
