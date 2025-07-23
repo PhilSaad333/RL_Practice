@@ -63,7 +63,7 @@ def _discover_metrics(
 
 def main(
     base_root: Path,
-    run_name: Optional[str] = None,
+    gens_per_prompt: int = 8,
     show: bool = True,
     save_dir: Optional[Path] = None,
 ):
@@ -81,18 +81,18 @@ def main(
     if not steps:
         raise RuntimeError(f"No `step_*` folders found under {base_root}")
 
-    if run_name is None:
-        if len(run_tags) != 1:
-            raise ValueError(
-                f"Multiple run tags found: {sorted(run_tags)}; pass --run_name to select one."
-            )
-        run_name = next(iter(run_tags))
 
-    print(f"Found steps={steps}, temps={temps}, top_p={ps}, run_tag={run_name!r}")
+    print(f"Found steps={steps}, temps={temps}, top_p={ps}, gens_per_prompt={gens_per_prompt}")
 
 
     # 2) Pick an example to read metric columns
-    example_csv = base_root / f"step_{steps[0]}" / f"temp{temps[0]}_p{ps[0]}_{run_name}" / "metrics.csv"
+    example_csv = (
+        base_root
+        / f"step_{steps[0]}"
++        / f"temp{temps[0]}_p{ps[0]}_r{gens_per_prompt}"
+        / "metrics.csv"
+    )
+
 
     if not example_csv.exists():
         raise FileNotFoundError(f"Expected metrics.csv at {example_csv}")
@@ -109,7 +109,12 @@ def main(
 
     # 4) Fill in means
     for step, temp, p in product(steps, temps, ps):
-        metrics_path = base_root / f"step_{step}" / f"temp{temp}_p{p}_{run_name}" / "metrics.csv"
+        metrics_path = (
+            base_root
+            / f"step_{step}"
+            / f"temp{temp}_p{p}_r{gens_per_prompt}"
+            / "metrics.csv"
+        )
 
         if not metrics_path.exists():
             print(f"[WARNING] missing {metrics_path}")
