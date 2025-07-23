@@ -139,10 +139,10 @@ def generate_with_logprobs(
         del logits, log_p, lp, ent
         torch.cuda.empty_cache()
 
-    lp_all  = torch.cat(lp_chunks,  0).float().cpu().numpy().reshape(B, N, T_gen)
-    ent_all = torch.cat(ent_chunks, 0).float().cpu().numpy().reshape(B, N, T_gen)
+    flat_lps  = [lp.cpu().numpy() for lp  in lp_chunks]
+    flat_ents = [ent.cpu().numpy() for ent in ent_chunks]
 
-    # ── decode & trim ──────────────────────────────────────────────────────
+    # ── decode & trim (unchanged) ────────────────────────────────────────
     gen_text = []
     for b in range(B):
         row = []
@@ -156,7 +156,14 @@ def generate_with_logprobs(
                 row.append(dec[: idx + len(TAG_STOP)] if idx != -1 else dec)
         gen_text.append(row)
 
-    # keep existing EvalRecord expectations
-    gen_lps  = [[lp  for lp  in lp_all [b]] for b in range(B)]
-    gen_ents = [[ent for ent in ent_all[b]] for b in range(B)]
+    # ── reshape flat lists into [B][N] ───────────────────────────────────
+    gen_lps  = [
+        [ flat_lps [b * N + n] for n in range(N) ]
+        for b in range(B)
+    ]
+    gen_ents = [
+        [ flat_ents[b * N + n] for n in range(N) ]
+        for b in range(B)
+    ]
+
     return gen_text, gen_lps, gen_ents
