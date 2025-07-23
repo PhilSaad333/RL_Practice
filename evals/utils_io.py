@@ -38,8 +38,6 @@ class StopOnAnswer(StoppingCriteria):
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Load model, tokenizer, dataset                                           │
 # ╰──────────────────────────────────────────────────────────────────────────╯
-# add right after the TAG_* definitions
-_Q_SPLIT_RGX = re.compile(r"<think>|<answer>", re.I)
 
 # ---------------------------------------------------------------------
 # load_everything  –  NEW version with prompt-cleaning & ckpt_path arg
@@ -121,8 +119,14 @@ def generate_with_logprobs(
     prompt_lens = att[:, :prompt_len].sum(-1)              # per-row p_i
     gen_lens    = seq_lens - prompt_lens                   # per-row g_i
 
-    lp_chunks, ent_chunks = [], []
 
+    # to figure out where the gen tokens should be trimmed
+    tag_ids = tokenizer(TAG_STOP, add_special_tokens=False).input_ids
+    L_tag   = len(tag_ids)
+
+
+
+    lp_chunks, ent_chunks = [], []
     for i in range(0, seqs_flat.size(0), tf_micro_batch):
         blk = seqs_flat[i : i + tf_micro_batch]           # [mb, T_full]
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
@@ -138,10 +142,28 @@ def generate_with_logprobs(
         gl_sub = gen_lens[i : i + tf_micro_batch].tolist()      # list[int]
 
         for row, g_len in enumerate(gl_sub):
-            start = prompt_len - 1                              # same for all rows
-            end   = start + g_len
-            lp_chunks.append(lp[row, start:end])
-            ent_chunks.append(ent[row, start:end])
+            # generation starts after the prompt
+            start = prompt_len - 1                    # first gen-token entropy
+            end   = start + g_len                     # false end, contains to-be-trimmed tokens
+
+            row_ids = blk[row]                        # [T_full] token ids on GPU
+
+            # find first occurrence of "</answer>"
+            # search only inside generation:
+            search_start = prompt_len                 # first gen token (not entropy!)
+            search_end   = prompt_len + g_len - L_tag + 1
+            cut = None
+            for idx in range(search_start, search_end):
+                if torch.equal(row_ids[idx : idx + L_tag], torch.tensor(tag_ids, device=row_ids.device)):
+                    cut = idx + L_tag                 # keep the tag itself, drop after
+                    break
+            if cut is None:
+                cut = prompt_len + g_len              # tag not found -> keep all
+
+            keep = cut - prompt_len                   # how many gen tokens remain
+            lp_chunks .append(lp [row, start : start + keep])
+            ent_chunks.append(ent[row, start : start + keep])
+
 
         # free GPU RAM early
         del logits, log_p, lp, ent
