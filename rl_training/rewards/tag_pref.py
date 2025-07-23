@@ -41,7 +41,6 @@ def reward_fn(prompt_id: int, answers: List[str]) -> torch.FloatTensor:
       • reward = W_TAG * tag_score + W_ANS * ans_score
     """
     gold = PROMPT2GOLD.get(prompt_id)
-    print(f'gold = {gold}')
     if gold is None:
         return torch.zeros(len(answers), dtype=torch.float32)
 
