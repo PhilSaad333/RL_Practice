@@ -74,7 +74,7 @@ class GRPO(RLAlgorithm):
                                     1 + self.cfg["clip_eps"]) * adv.unsqueeze(-1)
         ppo_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
 
-        print(f'kl beta = {getattr(self.cfg, "kl_beta", 0.0)}')
+        print(f'kl beta = {self.cfg["kl_beta"]}')
 
         if getattr(self.cfg, "kl_beta", 0.0) > 0:
             print(f'should see this - kl beta = {getattr(self.cfg, "kl_beta", 0.0)}')
