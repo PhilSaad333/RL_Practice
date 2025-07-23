@@ -91,6 +91,7 @@ def generate_with_logprobs(
     *,
     tf_micro_batch: int = 8,          # ← teacher-forcing chunk size
 ):
+    # Here prompts are left-padded
     enc = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
     prompt_len = enc.input_ids.shape[1]
 
@@ -105,11 +106,20 @@ def generate_with_logprobs(
 
     B, N   = len(prompts), gen_cfg.num_return_sequences
     seqs   = out.sequences.view(B, N, -1)          # [B,N,T_full]
+    # prompts left padded, gens right padded, so seqs has a single
+    # prompt-gen split at idx promp_len
     T_full = seqs.size(-1)
     T_gen  = T_full - prompt_len
 
     # ── teacher-forcing pass in micro-batches ──────────────────────────────
     seqs_flat = seqs.reshape(B * N, T_full)        # [B*N, T_full]
+
+    # 
+    att = (seqs_flat != tokenizer.pad_token_id).int()      # 1 = real token
+    seq_lens    = att.sum(-1)                              # per-row T_i
+    prompt_lens = att[:, :prompt_len].sum(-1)              # per-row p_i
+    gen_lens    = seq_lens - prompt_lens                   # per-row g_i
+
     lp_chunks, ent_chunks = [], []
     for i in range(0, seqs_flat.size(0), tf_micro_batch):
         blk = seqs_flat[i : i + tf_micro_batch]    # [mb, T_full]
@@ -121,8 +131,9 @@ def generate_with_logprobs(
         lp  = log_p.gather(2, tgt).squeeze(-1)     # [mb, T_full-1]
         ent = -(log_p.exp() * log_p).sum(-1)       # same
 
-        lp_chunks .append(lp[:,  -T_gen:])
-        ent_chunks.append(ent[:, -T_gen:])
+        for row, glen in enumerate(gen_lens[i : i+tf_micro_batch]):
+            lp_chunks.append(lp [row, -glen:])
+            ent_chunks.append(ent[row, -glen:])
 
         # free asap
         del logits, log_p, lp, ent
