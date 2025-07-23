@@ -89,7 +89,7 @@ class GRPO(RLAlgorithm):
                 ref_lp_list.append(lp)
             ref_logp = torch.stack(ref_lp_list).view(B, G, T_g)
             delta_lp = new_logp - ref_logp
-            kl_per_tok = torch.exp(delta_lp) + delta_lp - torch.ones(B,G,T_g)
+            kl_per_tok = torch.exp(delta_lp) + delta_lp - torch.ones(B,G,T_g).to(device)
             kl_per_tok = kl_per_tok * gen_mask * self.cfg["kl_beta"]
             token_loss = ppo_loss - kl_per_tok
         else:
