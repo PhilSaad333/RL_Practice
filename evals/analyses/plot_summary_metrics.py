@@ -89,7 +89,7 @@ def main(
     example_csv = (
         base_root
         / f"step_{steps[0]}"
-+        / f"temp{temps[0]}_p{ps[0]}_r{gens_per_prompt}"
+        / f"temp{temps[0]}_p{ps[0]}_r{gens_per_prompt}"
         / "metrics.csv"
     )
 
