@@ -77,8 +77,8 @@ class RolloutCollector:
 
         # for trimming generation tokens
         self.TAG_IDS  = tokenizer("</answer>", add_special_tokens=False).input_ids
-        self.L_TAG    = len(TAG_IDS)
-        self.TAG_TENS = torch.tensor(TAG_IDS, device=self.device)
+        self.L_TAG    = len(self.TAG_IDS)
+        self.TAG_TENS = torch.tensor(self.TAG_IDS, device=self.device)
 
 
         self.stopper = StoppingCriteriaList([StopOnAnswer(tokenizer)])
