@@ -71,6 +71,8 @@ class RLRunner:
         self.algo      = GRPO(self.model, cfg, pad_id=self.tok.pad_token_id)
         self.accum = cfg["grad_accum_steps"]
 
+        self.buffer_size = cfg["buffer_size"] # multiple of self.accum * self.collector.batch_size
+
         # for debug
         assert isinstance(self.tok.pad_token_id, int), "pad_token_id must not be None"
 
@@ -83,7 +85,7 @@ class RLRunner:
         B         = self.collector.batch_size      # == cfg["microbatch_size"]
 
         outer_loops = math.ceil(total_updates / K)
-        p_per_outer = K * ga_steps * B
+        p_per_outer = self.buffer_size
 
         for _ in trange(outer_loops, desc="outer collect loops"):
             rb = self.collector.collect_batch(batch_prompts=p_per_outer)
@@ -100,8 +102,9 @@ class RLRunner:
         stats_sum  = defaultdict(float)
 
         for epoch in range(K):
-            micro_cnt = 0                    # ← reset each epoch
-            for idx in rb.iter_minibatches(B, shuffle=True):
+            micro_cnt = 0
+            # iter_minibatches returns list of B indices
+            for idx in rb.iter_minibatches(B, shuffle=True): 
                 sync = ((micro_cnt + 1) % ga_steps == 0)   # last micro-batch → step
                 mb   = rb.get_batch(idx, device="cuda")
 
