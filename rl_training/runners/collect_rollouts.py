@@ -251,15 +251,15 @@ class RolloutCollector:
                 _append_jsonl(self._trace_file, samples)
 
                 if accept and len(buffer) < need:
-                buffer.add(
-                    prompt_ids = prompt_ids[b].cpu(),
-                    gen_ids    = g_ids.cpu(),         # already trimmed & padded
-                    rewards    = r_vec.cpu(),
-                    logprobs   = lp_t.cpu(),
-                    tag_correct= tag_ok.cpu(),
-                    think_len  = t_len.cpu(),
-                    attn_mask  = (g_ids != tokenizer.pad_token_id).cpu(),  # NEW
-                )
+                    buffer.add(
+                        prompt_ids = prompt_ids[b].cpu(),
+                        gen_ids    = g_ids.cpu(),         # already trimmed & padded
+                        rewards    = r_vec.cpu(),
+                        logprobs   = lp_t.cpu(),
+                        tag_correct= tag_ok.cpu(),
+                        think_len  = t_len.cpu(),
+                        attn_mask  = (g_ids != tokenizer.pad_token_id).cpu(),  # NEW
+                    )
                     del g_ids, lp_t, tag_ok, t_len        # free references
 
 
