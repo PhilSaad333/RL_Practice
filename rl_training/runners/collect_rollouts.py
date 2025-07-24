@@ -5,6 +5,7 @@ import re
 import json
 import math
 import time
+from tqdm.auto import tqdm
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Sequence
@@ -117,10 +118,14 @@ class RolloutCollector:
 
 
         # ----------------------------------------------------------------------
+        bar = tqdm(total=need, desc="Collecting rollouts", leave=False)
+
         while len(buffer) < need:
-            print(f'Buffer has {len(buffer)}/{need}')
             # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
-            take = min(self.B, need - len(buffer))           # don't overshoot buffer.
+            
+            # Hard coded amount assuming G=8            
+            take = min(4, need - len(buffer))           # don't overshoot buffer.
+            #take = min(self.B, need - len(buffer))           # don't overshoot buffer.
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
                 self.prompt_sampler,
                 self.tokenizer,
@@ -147,6 +152,8 @@ class RolloutCollector:
             full_ids = gen_out.sequences.view(take, self.G, -1)
             gen_ids  = full_ids[:, :, prompt_ids.shape[1]:]              # (B, G, T_g)
             scores   = [s.view(take, self.G, -1) for s in gen_out.scores]
+
+            before = len(buffer)
 
             # ── 3) loop *per prompt-group*  (keeps old reward / accept logic) ──
             for b in range(take):
@@ -265,10 +272,14 @@ class RolloutCollector:
                     )
                     del g_ids, lp_t, tag_ok, t_len        # free references
 
+            # ── Advance the progress bar by however many we just added ───────────
+            added = len(buffer) - before
+            if added:
+                bar.update(added)
 
             # end for b
         # end while
-
+        bar.close()
         self._step_idx += 1
         return buffer    
 
