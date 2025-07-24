@@ -106,7 +106,7 @@ class GRPO(RLAlgorithm):
 
         del logits, logp_all
         if self.cfg["kl_beta"] > 0:
-            del ref_logits, ref_logp_all
+            del ref_logits, ref_lp_all
         torch.cuda.empty_cache()
 
 
