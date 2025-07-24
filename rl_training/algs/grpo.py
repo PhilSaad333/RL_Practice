@@ -55,14 +55,32 @@ class GRPO(RLAlgorithm):
         targets   = seq_flat[:, 1:]                                       # (BG,T_tot-1)
 
 
-
         logp_tok  = logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        new_logp = logp_tok[:, -T_g:].view(B, G, T_g)
+        new_logp  = logp_tok[:, -T_g:].view(B, G, T_g)          # last T_g tokens
 
-        old_logp   = rollouts.logprobs                                   # (B,G,T_g)
-        gen_mask = (rollouts.gen_ids != pad_id).float()      # already in file【3file4†L6-L8】
-        ratios   = torch.exp((new_logp - old_logp).clamp(-80, 80))  # avoid overflow
-        ratios   = ratios * gen_mask
+        old_logp  = rollouts.logprobs                          # (B,G,T_g)
+        gen_mask  = (rollouts.gen_ids != pad_id).float()       # (B,G,T_g)
+
+        ratios = torch.exp((new_logp - old_logp).clamp(-80, 80)) * gen_mask
+
+        # -------------- KL term ----------------
+        if self.cfg["kl_beta"] > 0:
+            with torch.no_grad():
+                ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
+            ref_lp_all = F.log_softmax(ref_logits, -1)
+            ref_lp_tok = ref_lp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+            ref_logp   = ref_lp_tok[:, -T_g:].view(B, G, T_g)            # aligned slice
+            delta_lp   = new_logp - ref_logp
+            kl_per_tok = (torch.exp(delta_lp) + delta_lp - 1.0) * gen_mask * self.cfg["kl_beta"]
+        else:
+            kl_per_tok = torch.zeros_like(new_logp)
+
+        # Compute entropy for logging
+        probs_all = torch.exp(logp_all)
+        H_all     = -(probs_all * logp_all).sum(-1)            # (BG,T_tot)
+        ent_tok   = H_all[:, -T_g:].view(B, G, T_g) * gen_mask
+        entropy   = ent_tok.sum() / (gen_mask.sum() + 1e-8)
+
 
         # To-Do:
         # Add variations here related to clipping
@@ -74,27 +92,6 @@ class GRPO(RLAlgorithm):
         ppo_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
 
         # add kl term per token
-
-        if self.cfg["kl_beta"] > 0:
-            with torch.no_grad():
-                ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
-            ref_logp_all = F.log_softmax(ref_logits, -1)
-            ref_logp_tok = ref_logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-            ref_lp_list = []
-            for i in range(B * G):
-                p = plen[i].item()
-                gen_len = min(T_g, ref_logp_tok.size(1) - p)
-                lp = ref_logp_tok[i, p : p + gen_len]
-                if gen_len < T_g:                        # right-pad with zeros
-                    lp = F.pad(lp, (0, T_g - gen_len), value=0.0)
-                ref_lp_list.append(lp)
-            ref_logp = torch.stack(ref_lp_list).view(B, G, T_g)
-            delta_lp = new_logp - ref_logp
-            kl_per_tok = torch.exp(delta_lp) + delta_lp - torch.ones(B,G,T_g).to(self.device)
-            kl_per_tok = kl_per_tok * gen_mask * self.cfg["kl_beta"]
-        else:
-            kl_per_tok = torch.zeros(B,G,T_g).to(self.device)
-
         kl_per_tok = kl_per_tok * gen_mask
         token_loss = ppo_loss - kl_per_tok
 
@@ -106,14 +103,6 @@ class GRPO(RLAlgorithm):
         loss              = (loss_per_prompt.mean() * scale)
         kl_term           = kl_per_prompt.mean()
 
-
-        # Compute entropy for logging
-        # used to use idx earlier, just copied it here. maybe revist this
-        idx        = plen[:, None] + torch.arange(T_g, device=device)
-        probs      = torch.exp(logp_all)
-        H_all      = -(probs * logp_all).sum(-1)
-        ent_tok    = H_all.gather(1, idx).view(B, G, T_g)
-        entropy    = (ent_tok * gen_mask).sum() / (gen_mask.sum() + 1e-8)
 
         del logits, logp_all
         if self.cfg["kl_beta"] > 0:
