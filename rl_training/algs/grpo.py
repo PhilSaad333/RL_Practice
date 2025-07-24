@@ -27,6 +27,9 @@ class GRPO(RLAlgorithm):
         self.cfg = cfg
         self.device = None # set in step
 
+        # for debug
+        self.actual_op_step = 0
+
     def step(self, rollouts: RolloutBatch, ref_model, *, sync_grads: bool = True) -> dict[str, float]:
         B, G, T_g = rollouts.gen_ids.shape
         device    = rollouts.gen_ids.device
@@ -135,6 +138,8 @@ class GRPO(RLAlgorithm):
             self.opt.step()
             self.lr_sched.step()
             self.opt.zero_grad(set_to_none=True)
+            self.actual_opt_step += 1
+            print(f"Actual Opt Steps = {self.actual_opt_step}")
 
         loss_val  = loss.detach().float().item()
         kl_val    = kl_term.detach().float().item()
