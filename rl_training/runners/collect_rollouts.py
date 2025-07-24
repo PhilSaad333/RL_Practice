@@ -120,8 +120,7 @@ class RolloutCollector:
         while len(buffer) < need:
             print(f'Buffer has {len(buffer)}/{need}')
             # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
-            take = min(2 * self.B, need - len(buffer))           # don't overshoot buffer.
-                                                                # Also factor of two since extra ram available during rollout collection
+            take = min(self.B, need - len(buffer))           # don't overshoot buffer.
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
                 self.prompt_sampler,
                 self.tokenizer,

@@ -111,18 +111,23 @@ class GRPO(RLAlgorithm):
 
 
         # Optimization  with gradient checkpointing
-        maybe = self.policy.no_sync if (hasattr(self.policy, "no_sync") and not sync_grads) else nullcontext
+
+        maybe = (
+            self.policy.no_sync
+            if (hasattr(self.policy, "no_sync") and not sync_grads)
+            else nullcontext
+        )
         with maybe():
             loss.backward()
 
-        self._accum_ctr += 1
-        if self._accum_ctr % self.accum_steps == 0:
+        if sync_grads:                          # ← step *only* when caller says so
             clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
             self.opt.step()
             self.lr_sched.step()
             self.opt.zero_grad(set_to_none=True)
             self.actual_opt_step += 1
-            print(f"Actual Opt Steps = {self.actual_opt_step}")
+             print(f"Actual Opt Steps = {self.actual_opt_step}")
+
 
         loss_val  = loss.detach().float().item()
         kl_val    = kl_term.detach().float().item()

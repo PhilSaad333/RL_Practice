@@ -98,11 +98,11 @@ class RLRunner:
 
     def _train_one_buffer(self, rb, K, ga_steps, B):
         stats_sum  = defaultdict(float)
-        micro_cnt  = 0
 
         for epoch in range(K):
+            micro_cnt = 0                    # ← reset each epoch
             for idx in rb.iter_minibatches(B, shuffle=True):
-                sync = ((micro_cnt + 1) % ga_steps == 0)
+                sync = ((micro_cnt + 1) % ga_steps == 0)   # last micro-batch → step
                 mb   = rb.get_batch(idx, device="cuda")
 
                 stats = self.algo.step(mb, self.ref_model, sync_grads=sync)
