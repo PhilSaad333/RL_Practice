@@ -24,6 +24,11 @@ from importlib import import_module
 from evals.utils_io import StopOnAnswer
 
 
+# for trimming generation tokens
+TAG_IDS  = tokenizer("</answer>", add_special_tokens=False).input_ids
+L_TAG    = len(TAG_IDS)
+TAG_TENS = torch.tensor(TAG_IDS, device=self.device)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -66,6 +71,7 @@ class RolloutCollector:
     ):
         self.policy = policy
         self.tokenizer = tokenizer
+        assert tokenizer.padding_side == "left"
         self.cfg = cfg
         self.device = device or policy.device
         self.G: int = cfg["num_generations"]
@@ -162,11 +168,40 @@ class RolloutCollector:
                 )
 
                 # --- token-level stats ---
-                lp, ent = _token_stats(g_ids, [s[b] for s in scores])    # list[G][T]
-                lp_t = torch.nn.utils.rnn.pad_sequence(
-                    [torch.tensor(row) for row in lp],
-                    batch_first=True, padding_value=0.0
-                )                                                        # (G, T_g_max_b)
+                # use trimming logic from evals/utils_io.py
+                lp_rows, ent_rows, gid_rows = [], [], []
+                keep_max = 0
+                for g in range(self.G):
+                    ids_full = g_ids[g]                      # (T_raw,)
+                    # 1) find first "</answer>"
+                    cut = None
+                    for idx in range(0, ids_full.size(0) - L_TAG + 1):
+                        if torch.equal(ids_full[idx:idx+L_TAG], TAG_TENS):
+                            cut = idx + L_TAG
+                            break
+                    cut = cut or ids_full.size(0)
+                    keep_max = max(keep_max, cut)            # track padding length
+
+                    ids_trim = ids_full[:cut]                # 2) slice tokens
+                    gid_rows.append(ids_trim)
+
+                    # 3) slice scores the same way
+                    lp_row, ent_row = _token_stats(
+                        ids_trim.unsqueeze(0),               # shape (1,T_keep)
+                        [s[b, g, :cut] for s in scores]      # slice each score tensor
+                    )
+                    lp_rows .append(torch.tensor(lp_row[0]))
+                    ent_rows.append(torch.tensor(ent_row[0]))
+
+
+                # 4) pad AFTER trimming so all G sequences line up
+                pad = lambda lst: torch.nn.utils.rnn.pad_sequence(
+                    lst, batch_first=True, padding_value=0.0
+                )
+
+                lp_t   = pad(lp_rows)        # shape (G, keep_max)
+                ent_t  = pad(ent_rows)
+                g_ids  = pad(gid_rows).to(g_ids.device)                                               # (G, T_g_max_b)
 
                 # --- rewards ---
                 r_vec  = torch.stack([fn(pid, g_txts) for fn in self.reward_fns]).sum(0)
@@ -206,8 +241,8 @@ class RolloutCollector:
                         tag_correct     = float(tag_ok[g]),
                         include_in_batch= bool(accept),
                         difficulty_tag  = diff_tag,
-                        token_entropy   = ent[g],
-                        token_logprob   = lp[g],
+                        token_entropy   = ent_t[g].tolist(),
+                        token_logprob   = lp_t[g].tolist(),
                         generation_time_s = 0.0,   # fill if you want timing
                         step_idx        = self._step_idx,
                     )
@@ -216,14 +251,15 @@ class RolloutCollector:
                 _append_jsonl(self._trace_file, samples)
 
                 if accept and len(buffer) < need:
-                    buffer.add(
-                        prompt_ids = prompt_ids[b].cpu(),
-                        gen_ids    = g_ids.cpu(),         # ← move
-                        rewards    = r_vec.cpu(),
-                        logprobs   = lp_t.cpu(),
-                        tag_correct= tag_ok.cpu(),
-                        think_len  = t_len.cpu(),
-                    )
+                buffer.add(
+                    prompt_ids = prompt_ids[b].cpu(),
+                    gen_ids    = g_ids.cpu(),         # already trimmed & padded
+                    rewards    = r_vec.cpu(),
+                    logprobs   = lp_t.cpu(),
+                    tag_correct= tag_ok.cpu(),
+                    think_len  = t_len.cpu(),
+                    attn_mask  = (g_ids != tokenizer.pad_token_id).cpu(),  # NEW
+                )
                     del g_ids, lp_t, tag_ok, t_len        # free references
 
 

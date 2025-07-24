@@ -53,23 +53,16 @@ class GRPO(RLAlgorithm):
 
         logp_all  = F.log_softmax(logits, dim=-1)                         # (BG,T_tot,V)
         targets   = seq_flat[:, 1:]                                       # (BG,T_tot-1)
-        logp_tok  = logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
-        plen   = (rollouts.prompt_ids != pad_id).sum(-1)                 # (B)
-        plen   = plen[:, None].expand(-1, G).reshape(-1)                 # (BG)
-        new_lp_list = []
-        for i in range(B * G):
-            p = plen[i].item()
-            gen_len = min(T_g, logp_tok.size(1) - p)
-            lp = logp_tok[i, p : p + gen_len]
-            if gen_len < T_g:                        # right-pad with zeros
-                lp = F.pad(lp, (0, T_g - gen_len), value=0.0)
-            new_lp_list.append(lp)
-        new_logp = torch.stack(new_lp_list).view(B, G, T_g)
+
+
+        logp_tok  = logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        new_logp = logp_tok[:, -T_g:].view(B, G, T_g)
 
         old_logp   = rollouts.logprobs                                   # (B,G,T_g)
-        ratios     = torch.exp(new_logp - old_logp)                      # (B,G,T_g)
-        gen_mask   = (rollouts.gen_ids != pad_id).float()                # (B,G,T_g)
+        gen_mask = (rollouts.gen_ids != pad_id).float()      # already in file【3file4†L6-L8】
+        ratios   = torch.exp((new_logp - old_logp).clamp(-80, 80))  # avoid overflow
+        ratios   = ratios * gen_mask
 
         # To-Do:
         # Add variations here related to clipping
@@ -102,6 +95,7 @@ class GRPO(RLAlgorithm):
         else:
             kl_per_tok = torch.zeros(B,G,T_g).to(self.device)
 
+        kl_per_tok = kl_per_tok * gen_mask
         token_loss = ppo_loss - kl_per_tok
 
 

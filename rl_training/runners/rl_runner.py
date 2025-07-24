@@ -47,7 +47,6 @@ class RLRunner:
 
         self.model = PeftModel.from_pretrained(base, lora_ckpt).to("cuda")
         self.tok   = AutoTokenizer.from_pretrained("microsoft/phi-2")
-        
         if self.tok.pad_token_id is None:
             # safest practice is to duplicate eos so you don't expand embeddings
             self.tok.pad_token = self.tok.eos_token 
