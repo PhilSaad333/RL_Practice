@@ -5,8 +5,8 @@
 
 # -------------- rollout collector ---------------- #
 num_generations   : 8 #8   # G: number of generations per prompt
-buffer_size       : 8   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
-microbatch_size   : 2   # B: prompts used for each gradient checkpointing steps
+buffer_size       : 12   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
+microbatch_size   : 3   # B: prompts used for each gradient checkpointing steps
 grad_accum_steps  : 2 #8   # ga_steps: total number of prompts per update batch = ga_step*B
 ppo_epochs        : 2 #3   # K: number of updates per rollout-collection step.
 max_new_tokens    : 192
