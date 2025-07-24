@@ -37,7 +37,6 @@ class RolloutBuffer:
         self._logprobs: List[torch.FloatTensor] = []
         self._tag_correct: List[torch.FloatTensor] = []
         self._think_len: List[torch.IntTensor] = []
-        self._attn_mask: List[torch.FloatTensor] = []
         self._G: int | None = None
 
 
@@ -60,7 +59,6 @@ class RolloutBuffer:
             sub._logprobs.append(self._logprobs[j])
             sub._tag_correct.append(self._tag_correct[j])
             sub._think_len.append(self._think_len[j])
-            sub._attn_mask.append(self._attn_mask[j])
         return sub.to_batch(device=device)
 
     def add(
@@ -72,7 +70,6 @@ class RolloutBuffer:
         logprobs: torch.FloatTensor,           # (G, T_g)
         tag_correct: torch.FloatTensor,        # (G)
         think_len: torch.IntTensor,            # (G)
-        attn_mask: torch.FloatTensor,
     ) -> None:
         assert prompt_ids.dim() == 1, "prompt_ids must be 1-D"
         assert gen_ids.dim() == 2, "gen_ids must be 2-D (G, T_gen)"
@@ -92,7 +89,6 @@ class RolloutBuffer:
         self._logprobs.append(logprobs.cpu())
         self._tag_correct.append(tag_correct.cpu())
         self._think_len.append(think_len.cpu())
-        self._attn_mask.append(attn_mask.cpu())
     # --------------------------------------------------------------------- #
     # read-only API
     # --------------------------------------------------------------------- #
@@ -158,7 +154,6 @@ class RolloutBuffer:
         rewards = torch.stack(self._rewards, dim=0)                       # (B, G)
         tag_correct = torch.stack(self._tag_correct, dim=0)               # (B, G)
         think_len = torch.stack(self._think_len, dim=0)                   # (B, G)
-        attn_mask = torch.stack(self._attn_mask, dim=0)
 
         if device is not None:
             padded_prompts = padded_prompts.to(device)
@@ -167,7 +162,6 @@ class RolloutBuffer:
             padded_logprobs = padded_logprobs.to(device)
             tag_correct = tag_correct.to(device)
             think_len = think_len.to(device)
-            attn_mask = attn_mask.to(device)
 
         # ------------ pack -------------------------------------------------------
         return RolloutBatch(
@@ -177,5 +171,4 @@ class RolloutBuffer:
             logprobs=padded_logprobs, # shape (B, G, T_gen_max)
             tag_correct=tag_correct,  # shape (B, G)
             think_len=think_len,      # shape (B, G)
-            attn_mask=attn_mask,
         )

@@ -263,7 +263,6 @@ class RolloutCollector:
                         logprobs   = lp_t.cpu(),
                         tag_correct= tag_ok.cpu(),
                         think_len  = t_len.cpu(),
-                        attn_mask  = (g_ids != self.tokenizer.pad_token_id).cpu(),  # NEW
                     )
                     del g_ids, lp_t, tag_ok, t_len        # free references
 
