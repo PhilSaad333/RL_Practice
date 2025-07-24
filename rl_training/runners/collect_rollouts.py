@@ -24,10 +24,7 @@ from importlib import import_module
 from evals.utils_io import StopOnAnswer
 
 
-# for trimming generation tokens
-TAG_IDS  = tokenizer("</answer>", add_special_tokens=False).input_ids
-L_TAG    = len(TAG_IDS)
-TAG_TENS = torch.tensor(TAG_IDS, device=self.device)
+
 
 
 
@@ -77,6 +74,12 @@ class RolloutCollector:
         self.G: int = cfg["num_generations"]
         self.B: int = cfg["microbatch_size"]
         self.batch_size: int = cfg["microbatch_size"]
+
+        # for trimming generation tokens
+        self.TAG_IDS  = tokenizer("</answer>", add_special_tokens=False).input_ids
+        self.L_TAG    = len(TAG_IDS)
+        self.TAG_TENS = torch.tensor(TAG_IDS, device=self.device)
+
 
         self.stopper = StoppingCriteriaList([StopOnAnswer(tokenizer)])
 
@@ -175,9 +178,9 @@ class RolloutCollector:
                     ids_full = g_ids[g]                      # (T_raw,)
                     # 1) find first "</answer>"
                     cut = None
-                    for idx in range(0, ids_full.size(0) - L_TAG + 1):
-                        if torch.equal(ids_full[idx:idx+L_TAG], TAG_TENS):
-                            cut = idx + L_TAG
+                    for idx in range(0, ids_full.size(0) - self.L_TAG + 1):
+                        if torch.equal(ids_full[idx:idx+self.L_TAG], self.TAG_TENS):
+                            cut = idx + self.L_TAG
                             break
                     cut = cut or ids_full.size(0)
                     keep_max = max(keep_max, cut)            # track padding length
