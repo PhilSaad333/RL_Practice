@@ -104,9 +104,16 @@ class GRPO(RLAlgorithm):
         kl_term           = kl_per_prompt.mean()
 
 
+
         del logits, logp_all
+
+        # keep only what you still need for back-prop
+        del logp_tok, old_logp, new_logp, ratios, token_loss
+        del surr1, surr2, kl_per_tok, delta_lp          # large BG × T_g tensors
+        del probs_all, H_all, ent_tok                   # entropy scratch
+
         if self.cfg["kl_beta"] > 0:
-            del ref_logits, ref_lp_all
+            del ref_logits, ref_lp_all, ref_lp_tok, ref_logp
         torch.cuda.empty_cache()
 
 
@@ -128,7 +135,7 @@ class GRPO(RLAlgorithm):
             self.actual_opt_step += 1
             print(f"Actual Opt Steps = {self.actual_opt_step}")
 
-
+        # These aren't actual val loss or KL. maybe delete these
         loss_val  = loss.detach().float().item()
         kl_val    = kl_term.detach().float().item()
 
