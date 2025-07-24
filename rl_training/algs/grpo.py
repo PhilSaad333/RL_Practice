@@ -28,7 +28,7 @@ class GRPO(RLAlgorithm):
         self.device = None # set in step
 
         # for debug
-        self.actual_op_step = 0
+        self.actual_opt_step = 0
 
     def step(self, rollouts: RolloutBatch, ref_model, *, sync_grads: bool = True) -> dict[str, float]:
         B, G, T_g = rollouts.gen_ids.shape
