@@ -158,6 +158,7 @@ class RolloutBuffer:
         rewards = torch.stack(self._rewards, dim=0)                       # (B, G)
         tag_correct = torch.stack(self._tag_correct, dim=0)               # (B, G)
         think_len = torch.stack(self._think_len, dim=0)                   # (B, G)
+        attn_mask = torch.stack(self._attn_mask, dim=0)
 
         if device is not None:
             padded_prompts = padded_prompts.to(device)
