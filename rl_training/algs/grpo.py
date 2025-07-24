@@ -105,6 +105,12 @@ class GRPO(RLAlgorithm):
 
 
 
+
+        ratio_mean_val = ratios.mean().item()      # take scalar now
+        kl_val         = kl_term.item()
+        entropy_val    = entropy.item()
+
+
         del logits, logp_all
 
         # keep only what you still need for back-prop
@@ -135,17 +141,15 @@ class GRPO(RLAlgorithm):
             self.actual_opt_step += 1
             print(f"Actual Opt Steps = {self.actual_opt_step}")
 
-        # These aren't actual val loss or KL. maybe delete these
         loss_val  = loss.detach().float().item()
-        kl_val    = kl_term.detach().float().item()
 
         # To-Do:
         # More metrics
         return {
             "loss"        : loss_val,
-            "entropy"     : entropy.item(),
+            "entropy"     : entropy_val,
             "kl"          : kl_val,
-            "ratio_mean"  : ratios.mean().item(),
+            "ratio_mean"  : ratio_mean_val,
             "r_mean": rollouts.reward.mean(dim=(0,1)).item(),
             "tag_correct" : rollouts.tag_correct.float().mean(dim=(0, 1)).item(),
             "think_len"   : rollouts.think_len.float().mean(dim=(0,1)).item(),
