@@ -126,7 +126,7 @@ class GRPO(RLAlgorithm):
             self.lr_sched.step()
             self.opt.zero_grad(set_to_none=True)
             self.actual_opt_step += 1
-             print(f"Actual Opt Steps = {self.actual_opt_step}")
+            print(f"Actual Opt Steps = {self.actual_opt_step}")
 
 
         loss_val  = loss.detach().float().item()
