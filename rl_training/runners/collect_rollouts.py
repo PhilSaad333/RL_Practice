@@ -188,10 +188,12 @@ class RolloutCollector:
                     ids_trim = ids_full[:cut]                # 2) slice tokens
                     gid_rows.append(ids_trim)
 
-                    # 3) slice scores the same way
+
+                    scores_trim = [s_t[b, g].unsqueeze(0)     # shape (1, vocab)  ← keep rank
+                                  for s_t in scores[:cut]]    # only the first cut time-steps
                     lp_row, ent_row = _token_stats(
-                        ids_trim.unsqueeze(0),               # shape (1,T_keep)
-                        [s[b, g, :cut] for s in scores]      # slice each score tensor
+                        ids_trim.unsqueeze(0),                # (1, T_keep)
+                        scores_trim                            # list[(1, vocab)]
                     )
                     lp_rows .append(torch.tensor(lp_row[0]))
                     ent_rows.append(torch.tensor(ent_row[0]))
@@ -261,7 +263,7 @@ class RolloutCollector:
                         logprobs   = lp_t.cpu(),
                         tag_correct= tag_ok.cpu(),
                         think_len  = t_len.cpu(),
-                        attn_mask  = (g_ids != tokenizer.pad_token_id).cpu(),  # NEW
+                        attn_mask  = (g_ids != self.tokenizer.pad_token_id).cpu(),  # NEW
                     )
                     del g_ids, lp_t, tag_ok, t_len        # free references
 
