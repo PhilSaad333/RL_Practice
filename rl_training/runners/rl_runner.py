@@ -118,12 +118,13 @@ class RLRunner:
                 del mb, stats
                 torch.cuda.empty_cache()
         
-        del stats_sum   # all values are now copied to stats_avg
 
         # --- final average over *all* micro-batches processed ---
         stats_avg = {k: v / micro_cnt for k, v in stats_sum.items()}
         print(f"stats: {stats_avg}")
         self._log(stats_avg)
+        del stats_sum   # all values are now copied to stats_avg
+
 
     def _log(self, d):
         json_out = {"step": self.step_id, **d}
