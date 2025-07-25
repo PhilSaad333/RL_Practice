@@ -90,8 +90,9 @@ class RLRunner:
         for _ in trange(outer_loops, desc="outer collect loops"):
             rb = self.collector.collect_batch(batch_prompts=p_per_outer)
             self._train_one_buffer(rb, K, ga_steps, B)
-            gc.collect()
+            del rb               # free references to all batch tensors
             torch.cuda.empty_cache()
+            gc.collect()
 
             if self.step_id % self.save_every == 0:
                 self._save_ckpt()
@@ -114,9 +115,14 @@ class RLRunner:
                 micro_cnt += 1
                 if sync:
                     self.step_id += 1
+                del mb, stats
+                torch.cuda.empty_cache()
+        
+        del stats_sum   # all values are now copied to stats_avg
 
         # --- final average over *all* micro-batches processed ---
         stats_avg = {k: v / micro_cnt for k, v in stats_sum.items()}
+        print(f"stats: {stats_avg}")
         self._log(stats_avg)
 
     def _log(self, d):
