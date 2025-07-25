@@ -220,7 +220,7 @@ class RolloutCollector:
                     gid_rows, batch_first=True,
                     padding_value=self.tokenizer.pad_token_id
                 )
-                lp_tf, ent_tf = _teacher_forcing_lp_ent(
+                lp_tf, ent_tf = _teacher_forcing_logprobs(
                     self.policy, g_padded, self.tokenizer.pad_token_id
                 )                                             # lists length G
 
@@ -378,9 +378,9 @@ def _next_prompt_batch(sampler, tokenizer, device, B):
     return ids, texts, batch["input_ids"].to(device), batch["attention_mask"].to(device)
 
 @torch.inference_mode()
-def teacher_forcing_logprobs(model, ids):
+def teacher_forcing_logprobs(model, ids, pad_id):
     # ids : (G, T) on current device
-    attn   = (ids != tokenizer.pad_token_id)
+    attn   = (ids != pad_id)
     logits = model(ids, attention_mask=attn).logits           # (G, T, V)
     lp     = logits.log_softmax(-1).gather(
                  -1, ids.unsqueeze(-1)).squeeze(-1)           # (G, T)
