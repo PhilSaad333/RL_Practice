@@ -238,7 +238,6 @@ class RolloutCollector:
                 g_ids  = pad(gid_rows).to(g_ids.device)                                               # (G, T_g_max_b)
 
 
-                print("lp_t row 0 (first 20):", lp_t[0][:20])
 
 
                 # --- rewards ---
