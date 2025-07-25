@@ -102,7 +102,7 @@ class RLRunner:
     def _train_one_buffer(self, rb, K, ga_steps, B):
         stats_sum  = defaultdict(float)
 
-        total_mb_ct = 0
+        total_mb_cnt = 0
 
         for epoch in range(K):
             micro_cnt = 0
@@ -115,7 +115,7 @@ class RLRunner:
                 for k, v in stats.items():
                     stats_sum[k] += v
                 micro_cnt += 1
-                total_mb_ct += 1
+                total_mb_cnt += 1
                 if sync:
                     self.step_id += 1
                 del mb, stats
