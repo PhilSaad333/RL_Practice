@@ -220,7 +220,7 @@ class RolloutCollector:
                     gid_rows, batch_first=True,
                     padding_value=self.tokenizer.pad_token_id
                 )
-                lp_tf, ent_tf = _teacher_forcing_logprobs(
+                lp_tf, ent_tf = teacher_forcing_logprobs(
                     self.policy, g_padded, self.tokenizer.pad_token_id
                 )                                             # lists length G
 
