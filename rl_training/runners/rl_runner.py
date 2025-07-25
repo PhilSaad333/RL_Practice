@@ -126,7 +126,6 @@ class RLRunner:
         stats_avg = {k: v / total_mb_cnt for k, v in stats_sum.items()}
         print(f"stats: {stats_avg}")
         self._log(stats_avg)
-        del stats_sum   # all values are now copied to stats_avg
 
 
     def _log(self, d):

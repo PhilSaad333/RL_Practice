@@ -62,6 +62,16 @@ class GRPO(RLAlgorithm):
         gen_mask  = (rollouts.gen_ids != pad_id).float()       # (B,G,T_g)
 
         ratios = torch.exp((new_logp - old_logp).clamp(-80, 80)) * gen_mask
+        log_r   = (new_logp - old_logp) * gen_mask # for metrics
+
+
+
+
+
+
+
+
+
 
         # -------------- KL term ----------------
         if self.cfg["kl_beta"] > 0:
@@ -104,9 +114,17 @@ class GRPO(RLAlgorithm):
         kl_term           = kl_per_prompt.mean()
 
 
+        # ratio statistics as indirect way to check if this is all working right
+        clip    = 8.0
 
+        ratio_mean_val      = ratios.mean().item()      # take scalar now
+        ratio_median_val    = ratios.median().item()
+        ratio_p90_val       = ratios.quantile(0.90).item()
+        ratio_p99_val       = ratios.quantile(0.99).item()
+        ratio_max_val       = ratios.max().item()
+        ratio_clip_frac_val = (log_r.abs() > clip).float().mean().item()
+        logr_std_val        = log_r.std().item()
 
-        ratio_mean_val = ratios.mean().item()      # take scalar now
         kl_val         = kl_term.item()
         entropy_val    = entropy.item()
 
@@ -146,12 +164,18 @@ class GRPO(RLAlgorithm):
         # To-Do:
         # More metrics
         return {
-            "loss"        : loss_val,
-            "entropy"     : entropy_val,
-            "kl"          : kl_val,
-            "ratio_mean"  : ratio_mean_val,
-            "r_mean": rollouts.reward.mean(dim=(0,1)).item(),
-            "tag_correct" : rollouts.tag_correct.float().mean(dim=(0, 1)).item(),
-            "think_len"   : rollouts.think_len.float().mean(dim=(0,1)).item(),
+            "loss"            : loss_val,
+            "entropy"         : entropy_val,
+            "kl"              : kl_val,
+            "ratio_mean"      : ratio_mean_val,
+            "ratio_median"    : ratio_median_val,
+            "ratio_p90"       : ratio_p90_val,
+            "ratio_p99"       : ratio_p99_val,
+            "ratio_max"       : ratio_max_val,
+            "ratio_clip_frac" : ratio_clip_frac_val,
+            "logr_std"        : logr_std_val,
+            "r_mean"          : rollouts.reward.mean(dim=(0,1)).item(),
+            "tag_correct"     : rollouts.tag_correct.float().mean(dim=(0, 1)).item(),
+            "think_len"       : rollouts.think_len.float().mean(dim=(0,1)).item(),
         }
 
