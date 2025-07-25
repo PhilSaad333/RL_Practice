@@ -17,12 +17,32 @@ from transformers import (
     PreTrainedTokenizerBase,
     StoppingCriteria,
     StoppingCriteriaList,
+    LogitsProcessor,
+    LogitsProcessorList,
 )
 
 from rl_training.utils.rollout_buffer import RolloutBuffer, RolloutBatch
 from rl_training.rewards import get_reward_fns       # factory that imports by name
 from importlib import import_module
-from evals.utils_io import StopOnAnswer
+
+
+TAG_STOP = "</answer>"
+
+class StopAfterAnswer(LogitsProcessor):
+    def __init__(self, tokenizer):
+        self.tag_ids = tokenizer("</answer>", add_special_tokens=False).input_ids
+        self.L       = len(self.tag_ids)
+        self.tokenizer = tokenizer
+
+    def __call__(self, input_ids, scores):
+        # rows already finished → mask everything except pad/eos token
+        tag = torch.tensor(self.tag_ids, device=input_ids.device)
+        done = (input_ids[:, -self.L:] == tag).all(-1)             # (B,)
+        if done.any():
+            # keep only the pad_token for finished rows
+            scores[done] = float("-inf")
+            scores[done, self.tokenizer.pad_token_id] = 0.0
+        return scores
 
 
 
@@ -82,7 +102,7 @@ class RolloutCollector:
         self.TAG_TENS = torch.tensor(self.TAG_IDS, device=self.device)
 
 
-        self.stopper = StoppingCriteriaList([StopOnAnswer(tokenizer)])
+        self.logits_processor = LogitsProcessorList([StopAfterAnswer(tokenizer)])
 
         # factories so you can swap implementations via YAML
         self.reward_fns = get_reward_fns(cfg["reward_fns"])          # list[callable]
@@ -124,7 +144,7 @@ class RolloutCollector:
             # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
             
             # Hard coded amount assuming G=8            
-            take = min(8, need - len(buffer))           # don't overshoot buffer.
+            take = min(6, need - len(buffer))           # don't overshoot buffer.
             #take = min(self.B, need - len(buffer))           # don't overshoot buffer.
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
                 self.prompt_sampler,
@@ -134,6 +154,7 @@ class RolloutCollector:
             )                                                # prompt_ids : [B, T_p]
 
             # ── 2) batched generation ─────────────────────────────────────────
+
             gen_out = self.policy.generate(
                 prompt_ids,
                 attention_mask      = attn,
@@ -141,10 +162,10 @@ class RolloutCollector:
                 max_new_tokens      = self.cfg["max_new_tokens"],
                 do_sample           = True,
                 temperature         = self.cfg["temperature"],
-                top_p               = self.cfg["top_p"],
+                #top_p               = self.cfg["top_p"],
                 pad_token_id        = self.tokenizer.pad_token_id,
                 output_scores       = True,
-                stopping_criteria   = self.stopper,
+                logits_processor    = self.logits_processor,
                 return_dict_in_generate=True,
             )
 
@@ -178,31 +199,33 @@ class RolloutCollector:
 
                 # --- token-level stats ---
                 # use trimming logic from evals/utils_io.py
+
                 lp_rows, ent_rows, gid_rows = [], [], []
                 keep_max = 0
                 for g in range(self.G):
                     ids_full = g_ids[g]                      # (T_raw,)
                     # 1) find first "</answer>"
-                    cut = None
-                    for idx in range(0, ids_full.size(0) - self.L_TAG + 1):
-                        if torch.equal(ids_full[idx:idx+self.L_TAG], self.TAG_TENS):
-                            cut = idx + self.L_TAG
-                            break
-                    cut = cut or ids_full.size(0)
-                    keep_max = max(keep_max, cut)            # track padding length
+                    cut = next((i+self.L_TAG
+                                for i in range(ids_full.size(0)-self.L_TAG+1)
+                                if torch.equal(ids_full[i:i+self.L_TAG],
+                                               self.TAG_TENS)), ids_full.size(0))
+                    keep_max = max(keep_max, cut) 
 
-                    ids_trim = ids_full[:cut]                # 2) slice tokens
+                    ids_trim = ids_full[:cut]                # (T_keep)
                     gid_rows.append(ids_trim)
 
+                # -- teacher-forcing forward pass once per prompt-group ------
+                #   Stack -> (G, T_max) ; right-pad *before* TF so shape is rectangular
+                g_padded = torch.nn.utils.rnn.pad_sequence(
+                    gid_rows, batch_first=True,
+                    padding_value=self.tokenizer.pad_token_id
+                )
+                lp_tf, ent_tf = _teacher_forcing_lp_ent(
+                    self.policy, g_padded, self.tokenizer.pad_token_id
+                )                                             # lists length G
 
-                    scores_trim = [s_t[b, g].unsqueeze(0)     # shape (1, vocab)  ← keep rank
-                                  for s_t in scores[:cut]]    # only the first cut time-steps
-                    lp_row, ent_row = _token_stats(
-                        ids_trim.unsqueeze(0),                # (1, T_keep)
-                        scores_trim                            # list[(1, vocab)]
-                    )
-                    lp_rows .append(torch.tensor(lp_row[0]))
-                    ent_rows.append(torch.tensor(ent_row[0]))
+                lp_rows  = lp_tf
+                ent_rows = ent_tf
 
 
                 # 4) pad AFTER trimming so all G sequences line up
@@ -213,6 +236,10 @@ class RolloutCollector:
                 lp_t   = pad(lp_rows)        # shape (G, keep_max)
                 ent_t  = pad(ent_rows)
                 g_ids  = pad(gid_rows).to(g_ids.device)                                               # (G, T_g_max_b)
+
+
+                print("lp_t row 0 (first 20):", lp_t[0][:20])
+
 
                 # --- rewards ---
                 r_vec  = torch.stack([fn(pid, g_txts) for fn in self.reward_fns]).sum(0)
@@ -346,9 +373,17 @@ def _next_prompt_batch(sampler, tokenizer, device, B):
         pid = next(sampler)
         q   = sampler.id2text[pid]
         ids.append(pid)
-        texts.append(q + "\n<think>\n")
+        texts.append(q if q.rstrip().endswith("<think>") else q + "\n<think>\n")
     batch = tokenizer(texts, return_tensors="pt", padding=True)
     return ids, texts, batch["input_ids"].to(device), batch["attention_mask"].to(device)
 
-
+@torch.inference_mode()
+def teacher_forcing_logprobs(model, ids):
+    # ids : (G, T) on current device
+    attn   = (ids != tokenizer.pad_token_id)
+    logits = model(ids, attention_mask=attn).logits           # (G, T, V)
+    lp     = logits.log_softmax(-1).gather(
+                 -1, ids.unsqueeze(-1)).squeeze(-1)           # (G, T)
+    ent    = -(logits.softmax(-1) * logits.log_softmax(-1)).sum(-1)
+    return lp, ent                                            # tensors, no padding
 
