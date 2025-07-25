@@ -224,8 +224,8 @@ class RolloutCollector:
                     self.policy, g_padded, self.tokenizer.pad_token_id
                 )                                             # lists length G
 
-                lp_rows  = lp_tf
-                ent_rows = ent_tf
+                lp_rows  = [row for row in lp_tf]     # each len = T_keep-1
+                ent_rows = [row for row in ent_tf]
 
 
                 # 4) pad AFTER trimming so all G sequences line up
@@ -381,8 +381,8 @@ def teacher_forcing_logprobs(model, ids, pad_id):
     # ids : (G, T) on current device
     attn   = (ids != pad_id)
     logits = model(ids, attention_mask=attn).logits           # (G, T, V)
-    lp     = logits.log_softmax(-1).gather(
-                 -1, ids.unsqueeze(-1)).squeeze(-1)           # (G, T)
+    lp     = logits[:, :-1].log_softmax(-1).gather(            #  Make sure to shift
+                 -1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)     # (G, T-1)
     ent    = -(logits.softmax(-1) * logits.log_softmax(-1)).sum(-1)
     return lp, ent                                            # tensors, no padding
 

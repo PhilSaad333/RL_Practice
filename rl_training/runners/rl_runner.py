@@ -102,6 +102,8 @@ class RLRunner:
     def _train_one_buffer(self, rb, K, ga_steps, B):
         stats_sum  = defaultdict(float)
 
+        total_mb_ct = 0
+
         for epoch in range(K):
             micro_cnt = 0
             # iter_minibatches returns list of B indices
@@ -113,6 +115,7 @@ class RLRunner:
                 for k, v in stats.items():
                     stats_sum[k] += v
                 micro_cnt += 1
+                total_mb_ct += 1
                 if sync:
                     self.step_id += 1
                 del mb, stats
@@ -120,7 +123,7 @@ class RLRunner:
         
 
         # --- final average over *all* micro-batches processed ---
-        stats_avg = {k: v / micro_cnt for k, v in stats_sum.items()}
+        stats_avg = {k: v / total_mb_cnt for k, v in stats_sum.items()}
         print(f"stats: {stats_avg}")
         self._log(stats_avg)
         del stats_sum   # all values are now copied to stats_avg
@@ -130,8 +133,8 @@ class RLRunner:
         json_out = {"step": self.step_id, **d}
         with open(self.dir / "train_log.jsonl", "a") as f:
             f.write(json.dumps(json_out) + "\n")
-        for k, v in d.items():
-            self.tb.add_scalar(k, v, self.step_id)
+        for k, v in stats_avg.items():
+            self.tb.add_scalar(k, float(v), self.step_id)
         self.tb.flush()
 
     def _save_ckpt(self, final: bool = False):
