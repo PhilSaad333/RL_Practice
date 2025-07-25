@@ -128,15 +128,15 @@ class RLRunner:
         self._log(stats_avg)
 
 
-        def _log(self, d):
-            json_out = {"step": self.step_id, **d}
-            with open(self.dir / "train_log.jsonl", "a") as f:
-                f.write(json.dumps(json_out) + "\n")
+    def _log(self, d):
+        json_out = {"step": self.step_id, **d}
+        with open(self.dir / "train_log.jsonl", "a") as f:
+            f.write(json.dumps(json_out) + "\n")
 
-            for k, v in d.items():               # ← use d, not stats_avg
-                self.tb.add_scalar(k, float(v), self.step_id)
+        for k, v in d.items():               # ← use d, not stats_avg
+            self.tb.add_scalar(k, float(v), self.step_id)
 
-            self.tb.flush()
+        self.tb.flush()
 
     def _save_ckpt(self, final: bool = False):
         tag = f"step-{self.step_id}" if not final else "final"
