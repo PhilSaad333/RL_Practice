@@ -10,6 +10,8 @@ from transformers import (
     GenerationConfig,
     StoppingCriteria,
     StoppingCriteriaList,
+    LogitsProcessor,
+    LogitsProcessorList,
 )
 from peft import PeftModel, PeftConfig
 from models import load_model
@@ -25,14 +27,22 @@ TAG_STOP = "</answer>"
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Custom stopping criterion: stop after "</answer>"                        │
 # ╰──────────────────────────────────────────────────────────────────────────╯
-class StopOnAnswer(StoppingCriteria):
+class StopAfterAnswer(LogitsProcessor):
     def __init__(self, tokenizer):
-        self.tag_ids = tokenizer(TAG_STOP, add_special_tokens=False).input_ids
+        self.tag_ids = tokenizer("</answer>", add_special_tokens=False).input_ids
         self.L       = len(self.tag_ids)
+        self.tokenizer = tokenizer
 
-    def __call__(self, ids, scores, **kw):
-        # stop as soon as the last L tokens equal "</answer>"
-        return ids[0, -self.L :].tolist() == self.tag_ids
+    def __call__(self, input_ids, scores):
+        # rows already finished → mask everything except pad/eos token
+        tag = torch.tensor(self.tag_ids, device=input_ids.device)
+        done = (input_ids[:, -self.L:] == tag).all(-1)             # (B,)
+        if done.any():
+            # keep only the pad_token for finished rows
+            scores[done] = float("-inf")
+            scores[done, self.tokenizer.pad_token_id] = 0.0
+        return scores
+
 
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
@@ -71,7 +81,7 @@ def load_everything(
     prompts = [ex.question for ex in ds_test]
     golds   = [ex.answer for ex in ds_test]
 
-    stopper = StoppingCriteriaList([StopOnAnswer(tok)])
+    stopper = LogitsProcessorList([StopAfterAnswer(tokenizer)]) # Now using logitsprocessor
     return model, tok, prompts, golds, stopper
 
 
@@ -98,7 +108,7 @@ def generate_with_logprobs(
         out = model.generate(
             **enc,
             generation_config       = gen_cfg,
-            stopping_criteria       = stop_crit,
+            logits_processor        = stop_crit, # now using logits processor
             return_dict_in_generate = True,
         )
 

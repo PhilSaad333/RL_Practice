@@ -67,12 +67,6 @@ class GRPO(RLAlgorithm):
 
 
 
-
-
-
-
-
-
         # -------------- KL term ----------------
         if self.cfg["kl_beta"] > 0:
             with torch.no_grad():
@@ -94,7 +88,6 @@ class GRPO(RLAlgorithm):
 
         # To-Do:
         # Add variations here related to clipping
-        # Log ratios for studying statistics
 
         surr1 = ratios * adv.unsqueeze(-1)
         surr2 = torch.clamp(ratios, 1 - self.cfg["clip_eps"],
