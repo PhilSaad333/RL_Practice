@@ -81,7 +81,7 @@ def load_everything(
     prompts = [ex.question for ex in ds_test]
     golds   = [ex.answer for ex in ds_test]
 
-    stopper = LogitsProcessorList([StopAfterAnswer(tokenizer)]) # Now using logitsprocessor
+    stopper = LogitsProcessorList([StopAfterAnswer(tok)]) # Now using logitsprocessor
     return model, tok, prompts, golds, stopper
 
 
