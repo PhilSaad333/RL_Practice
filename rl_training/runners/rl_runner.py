@@ -139,12 +139,12 @@ class RLRunner:
         self.tb.flush()
 
     def _save_ckpt(self, final: bool = False):
-        tag = f"step-{self.step_id}" if not final else "final"
-        save_dir = self.dir / f"ckpt_{tag}"
+        tag = f"{self.step_id}" if not final else "final"
+        save_dir = self.dir / f"checkpoint-{tag}"
         self.model.save_pretrained(save_dir)        # adapter-only ✔️ :contentReference[oaicite:8]{index=8}
         # optional merged full model
-        merged = self.model.merge_and_unload()      # combines LoRA → dense  :contentReference[oaicite:9]{index=9}
-        merged.save_pretrained(save_dir / "merged")
+        #merged = self.model.merge_and_unload()      # combines LoRA → dense  :contentReference[oaicite:9]{index=9}
+        #merged.save_pretrained(save_dir / "merged")
         print(f"saved model to {save_dir}")
 
 
