@@ -5,6 +5,7 @@ from collections import defaultdict
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import trange
 from rl_training.runners.collect_rollouts import RolloutCollector
+from rl_training.runners.eval_callback import EvalCallback
 from rl_training.algs.grpo import GRPO
 from rl_training.algs.base import RolloutBatch
 from transformers import (AutoTokenizer, AutoModelForCausalLM,
@@ -73,6 +74,8 @@ class RLRunner:
 
         self.buffer_size = cfg["buffer_size"] # multiple of self.accum * self.collector.batch_size
 
+        # for eval
+        self.eval_cb = EvalCallback(self.dir, cfg)
         # for debug
         assert isinstance(self.tok.pad_token_id, int), "pad_token_id must not be None"
 
@@ -146,7 +149,43 @@ class RLRunner:
         #merged = self.model.merge_and_unload()      # combines LoRA → dense  :contentReference[oaicite:9]{index=9}
         #merged.save_pretrained(save_dir / "merged")
         print(f"saved model to {save_dir}")
+        # kick off an eval if requested
+        # --------- periodic evaluation, *blocking* ----------
+        if not final and self.cfg.get("eval_every", 0) \
+                and self.step_id % self.cfg["eval_every"] == 0:
+            self._run_eval(save_dir)
 
+    # ---------------- NEW -----------------------------------
+    def _run_eval(self, ckpt_dir: pathlib.Path):
+        print(f"[Eval] starting eval for step {self.step_id} …")
+
+        # 1) free GPU RAM from the training model
+        self.model.to("cpu"); torch.cuda.empty_cache(); gc.collect()
+
+        # 2) build eval command
+        cmd = textwrap.dedent(f"""
+            python -m evals.eval_runner
+                --backbone phi2
+                --ft_dataset gsm8k_latex
+                --ckpt_path {ckpt_dir}
+                --ckpt_step {self.step_id}
+                --batch_size 12
+                --subset_frac 1.0
+                --eval_dataset gsm8k_latex
+                --temperature 0.7 --top_p 1.0
+                --runs_root /content/drive/MyDrive/RL_Practice_Files/eval_runs/rl_evals
+        """).split()
+
+        env = os.environ.copy()
+        env["TOKENIZERS_PARALLELISM"] = "false"   # keeps HF quiet
+
+        # 3) run *synchronously* (blocks until eval finishes)
+        run_sync(cmd, env=env, check=True)
+
+        # 4) clean up eval model & reload training model to GPU
+        torch.cuda.empty_cache(); gc.collect()
+        self.model.to("cuda")
+        print(f"[Eval] finished, resuming training.")
 
 # ------------------------------- CLI -------------------------------------- #
 if __name__ == "__main__":
