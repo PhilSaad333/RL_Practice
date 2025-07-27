@@ -43,7 +43,8 @@ class Evaluator:
         self.run_dir = base_dir / params_folder
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
-        target = model_path or backbone
+        #target = model_path or backbone
+        target = backbone
         self.model, self.tok, self.prompts, self.golds, self.stopper = (
             load_everything(target, eval_dataset, ckpt_path=model_path)
         )
