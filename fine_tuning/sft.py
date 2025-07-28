@@ -101,19 +101,39 @@ def main(cfg: Config):
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     # SPECIFIC TO PHI2 - CHANGE IF YOU USE A DIFFERENT MODEL!
-    lora_cfg = LoraConfig(
-        r               = cfg.lora_r,
-        lora_alpha      = cfg.lora_alpha,
-        lora_dropout    = cfg.lora_dropout,
-        bias            = "none",
-        task_type       = "CAUSAL_LM",
-        target_modules=[
-            "Wqkv",          # attention projections in Phi-2
-            "out_proj",      # output projection
-            "fc1", "fc2",    # MLP
-            "dense"          # residual projection
-        ],
-    )
+    if "phi2" in cfg.backbone.lower():
+        lora_cfg = LoraConfig(
+            r               = cfg.lora_r,
+            lora_alpha      = cfg.lora_alpha,
+            lora_dropout    = cfg.lora_dropout,
+            bias            = "none",
+            task_type       = "CAUSAL_LM",
+            target_modules=[
+                "Wqkv",          # attention projections in Phi-2
+                "out_proj",      # output projection
+                "fc1", "fc2",    # MLP
+                "dense"          # residual projection
+            ],
+        )
+
+    if "qwen" in cfg.backbone.lower():
+        lora_cfg = LoraConfig(
+            r=cfg.lora_r,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=[
+                # attention
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                # MLP
+                "gate_proj", "up_proj", "down_proj"
+            ],
+        )
+
+
+
+
 
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters() #debug

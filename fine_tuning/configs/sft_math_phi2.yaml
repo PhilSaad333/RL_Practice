@@ -12,7 +12,7 @@ output_dir: "/content/drive/MyDrive/RL_Practice_Files/finetuned/phi2_gsm8k_latex
 quantized: true             # 4-bit QLoRA to fit larger batches
 lora_r:     96
 lora_alpha: 192
-lora_dropout: 0.05
+lora_dropout: 0.0
 
 # — training size & speed trade-offs —
 batch_size: 16               # per-device batch; safe on A100 in 4-bit
