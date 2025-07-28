@@ -89,9 +89,12 @@ class GRPO(RLAlgorithm):
         # To-Do:
         # Add variations here related to clipping
 
+        clip_+ = self.cfg.get('clip_+', self.cfg['clip_eps'])
+        clip_- = self.cfg['clip_eps']
+
         surr1 = ratios * adv.unsqueeze(-1)
-        surr2 = torch.clamp(ratios, 1 - self.cfg["clip_eps"],
-                                    1 + self.cfg["clip_eps"]) * adv.unsqueeze(-1)
+        surr2 = torch.clamp(ratios, 1 - clip_-,
+                                    1 + clip_+) * adv.unsqueeze(-1)
         ppo_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
 
         # add kl term per token

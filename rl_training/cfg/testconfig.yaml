@@ -13,7 +13,8 @@ max_new_tokens    : 128
 temperature       : 1.0
 #top_p             : 0.95 #remove 
 
-eval_every: 48        # ← run eval every 48 optimiser steps
+eval_every: 16
+eval_frac: 0.1        # ← run eval every 48 optimiser steps
 eval_cfg:             # (reserved for future – temperature, top-p, etc.)
   temperature: 0.7
   top_p: 1.0

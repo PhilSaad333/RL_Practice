@@ -40,6 +40,7 @@ scheduler:
 # ------------------ trainer (GRPO) --------------- #
 lr               : 2.0e-4
 clip_eps         : 0.2
+clip_+           : 0.5 #asymmetric clipping
 kl_beta          : 0.05
 kl_target        : 0.1
 max_kl           : 0.15

@@ -153,10 +153,10 @@ class RLRunner:
         # --------- periodic evaluation, *blocking* ----------
         if not final and self.cfg.get("eval_every", 0) \
                 and self.step_id % self.cfg["eval_every"] == 0:
-            self._run_eval(save_dir)
+            self._run_eval(self.cfg, save_dir)
 
     # ---------------- NEW -----------------------------------
-    def _run_eval(self, ckpt_dir: pathlib.Path):
+    def _run_eval(self, cfg, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
 
         # 1) free GPU RAM from the training model
@@ -170,7 +170,7 @@ class RLRunner:
                 --ckpt_path {ckpt_dir}
                 --ckpt_step {self.step_id}
                 --batch_size 12
-                --subset_frac 1.0
+                --subset_frac {self.cfg['eval_frac']}
                 --eval_dataset gsm8k_latex
                 --temperature 0.7 --top_p 1.0
                 --runs_root /content/drive/MyDrive/RL_Practice_Files/eval_runs/rl_evals
