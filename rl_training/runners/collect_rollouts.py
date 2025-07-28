@@ -143,7 +143,7 @@ class RolloutCollector:
         while len(buffer) < need:
             # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
             
-            # Hard coded amount assuming G=8            
+            # Hard coded amount assuming G=6            
             take = min(8, need - len(buffer))           # don't overshoot buffer.
             #take = min(self.B, need - len(buffer))           # don't overshoot buffer.
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
@@ -214,18 +214,29 @@ class RolloutCollector:
                     ids_trim = ids_full[:cut]                # (T_keep)
                     gid_rows.append(ids_trim)
 
-                # -- teacher-forcing forward pass once per prompt-group ------
-                #   Stack -> (G, T_max) ; right-pad *before* TF so shape is rectangular
+                # -- teacher-forcing forward pass with **prompt context** ----
+                #   1) pad completions so they form a rectangle  (G, T_g_max)
                 g_padded = torch.nn.utils.rnn.pad_sequence(
                     gid_rows, batch_first=True,
                     padding_value=self.tokenizer.pad_token_id
-                )
-                lp_tf, ent_tf = teacher_forcing_logprobs(
-                    self.policy, g_padded, self.tokenizer.pad_token_id
-                )                                             # lists length G
+                )                                             # (G, T_g_max)
 
-                lp_rows  = [row for row in lp_tf]     # each len = T_keep-1
-                ent_rows = [row for row in ent_tf]
+                #   2) repeat the *left-padded* prompt (T_p) G times
+                p_row    = prompt_ids[b]                      # (T_p,)
+                p_repeat = p_row.unsqueeze(0).expand(self.G, -1)
+
+                #   3) concat → (G, T_p + T_g_max)  then TF once
+                full_inp = torch.cat([p_repeat, g_padded], dim=1)
+                lp_full, ent_full = teacher_forcing_logprobs(
+                    self.policy, full_inp, self.tokenizer.pad_token_id
+                )                                             # lp  (G, L-1)
+
+                #   4) slice **only** the completion part
+                lp_rows, ent_rows = [], []
+                for g in range(self.G):
+                    Lg = gid_rows[g].size(0)                  # true length of gen g
+                    lp_rows.append(lp_full[g, -Lg:])          # log-p of each gen token
+                    ent_rows.append(ent_full[g, -Lg:])        # entropy same span
 
 
                 # 4) pad AFTER trimming so all G sequences line up
