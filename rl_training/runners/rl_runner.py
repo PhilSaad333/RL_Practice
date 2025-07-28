@@ -26,6 +26,7 @@ class RLRunner:
     def __init__(self, cfg_path: str, lora_ckpt: str):
         # ---------- I/O ---------------------------------------------------
         cfg = yaml.safe_load(open(cfg_path))
+        self.cfg = cfg
         stamp     = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.dir  = RUN_ROOT / f"run_{stamp}"
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -83,7 +84,7 @@ class RLRunner:
     # ---------------- main training loop ------------------------------
     def train(self, total_updates: int = 1000):
         """total_updates == number of *optimizer* steps (same definition GRPO uses)."""
-        K         = self.collector.cfg["ppo_epochs"]
+        K         = self.cfg["ppo_epochs"]
         ga_steps  = self.accum                     # == cfg["grad_accum_steps"]
         B         = self.collector.batch_size      # == cfg["microbatch_size"]
 
@@ -153,10 +154,10 @@ class RLRunner:
         # --------- periodic evaluation, *blocking* ----------
         if not final and self.cfg.get("eval_every", 0) \
                 and self.step_id % self.cfg["eval_every"] == 0:
-            self._run_eval(self.cfg, save_dir)
+            self._run_eval(save_dir)
 
     # ---------------- NEW -----------------------------------
-    def _run_eval(self, cfg, ckpt_dir: pathlib.Path):
+    def _run_eval(self, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
 
         # 1) free GPU RAM from the training model
