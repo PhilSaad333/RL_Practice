@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json, math, pathlib, datetime, yaml, torch, shutil, gc
 import os, textwrap
+from subprocess import run as run_sync
 from collections import defaultdict
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import trange
