@@ -13,7 +13,8 @@ max_new_tokens    : 128
 temperature       : 1.0
 #top_p             : 0.95 #remove 
 
-eval_every: 48        # ← run eval every 48 optimiser steps
+eval_every: 24        # ← run eval every 48 optimiser steps
+eval_frac: 1.0
 eval_cfg:             # (reserved for future – temperature, top-p, etc.)
   temperature: 0.7
   top_p: 1.0
@@ -26,8 +27,8 @@ reject_all_zero   : true
 reject_all_max    : true
 
 reward_fns:
-  - tag_pref
-  #- tag_math_correct
+  #- tag_pref
+  - tag_math_correct
 
 scheduler:
   name          : mix_passrate

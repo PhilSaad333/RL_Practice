@@ -172,7 +172,7 @@ class RLRunner:
                 --ft_dataset gsm8k_latex
                 --ckpt_path {ckpt_dir}
                 --ckpt_step {self.step_id}
-                --batch_size 12
+                --batch_size 8
                 --subset_frac {self.cfg['eval_frac']}
                 --eval_dataset gsm8k_latex
                 --temperature 0.7 --top_p 1.0
