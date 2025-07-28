@@ -14,6 +14,7 @@ MODEL_REGISTRY = {
     "gemma2b":     "google/gemma-2b-it",
     "orcamath":    "microsoft/orca-math-7b",          # eval-only
     "codellama7b": "codellama/CodeLlama-7b-hf"
+    "qwen2":       "Qwen/Qwen2-0.5B"
 }
 
 def _is_local(path_like: str) -> bool:
