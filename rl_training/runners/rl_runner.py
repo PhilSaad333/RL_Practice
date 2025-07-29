@@ -42,7 +42,8 @@ class RLRunner:
         bnb = BitsAndBytesConfig(load_in_4bit=True,
                                  bnb_4bit_use_double_quant=True,
                                  bnb_4bit_compute_dtype=torch.bfloat16)
-        base = AutoModelForCausalLM.from_pretrained("microsoft/phi-2",
+        backbone_id = cfg["backbone"]
+        base = AutoModelForCausalLM.from_pretrained(backbone_id,
                                                     torch_dtype=torch.bfloat16,
                                                     quantization_config=bnb)
         base.gradient_checkpointing_enable()
@@ -50,7 +51,7 @@ class RLRunner:
         base.config.use_cache = False
 
         self.model = PeftModel.from_pretrained(base, lora_ckpt).to("cuda")
-        self.tok   = AutoTokenizer.from_pretrained("microsoft/phi-2")
+        self.tok   = AutoTokenizer.from_pretrained(backbone_id)
         if self.tok.pad_token_id is None:
             # safest practice is to duplicate eos so you don't expand embeddings
             self.tok.pad_token = self.tok.eos_token 
@@ -168,7 +169,7 @@ class RLRunner:
         # 2) build eval command
         cmd = textwrap.dedent(f"""
             python -m evals.eval_runner
-                --backbone phi2
+                --backbone {self.cfg['eval_backbone']}
                 --ft_dataset gsm8k_latex
                 --ckpt_path {ckpt_dir}
                 --ckpt_step {self.step_id}
