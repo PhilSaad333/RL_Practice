@@ -136,7 +136,6 @@ class RolloutCollector:
             r"\n</think>\n<answer>\n[\s\S]+?\n</answer>$"    # fast format check
         )
 
-
         # ----------------------------------------------------------------------
         bar = tqdm(total=need, desc="Collecting rollouts", leave=False)
 
@@ -144,7 +143,7 @@ class RolloutCollector:
             # ── 1) sample a *mini-batch* of B prompts ─────────────────────────
             
             # Hard coded amount assuming G=6            
-            take = min(8, need - len(buffer))           # don't overshoot buffer.
+            take = min(self.cfg.get('rollout_batch_size', self.B), need - len(buffer))           # don't overshoot buffer.
             #take = min(self.B, need - len(buffer))           # don't overshoot buffer.
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
                 self.prompt_sampler,
@@ -174,6 +173,13 @@ class RolloutCollector:
             gen_ids  = full_ids[:, :, prompt_ids.shape[1]:]              # (B, G, T_g)
             scores   = [s.view(take, self.G, -1) for s in gen_out.scores]
 
+            # Compute logprobs of ALL out sequences
+            all_lp = self.policy.compute_transition_scores(
+                gen_out.sequences,
+                gen_out.scores,
+                normalize_logits=True
+            )
+
             before = len(buffer)
 
             # ── 3) loop *per prompt-group*  (keeps old reward / accept logic) ──
@@ -202,6 +208,7 @@ class RolloutCollector:
 
                 lp_rows, ent_rows, gid_rows = [], [], []
                 keep_max = 0
+
                 for g in range(self.G):
                     ids_full = g_ids[g]                      # (T_raw,)
                     # 1) find first "</answer>"
@@ -214,38 +221,28 @@ class RolloutCollector:
                     ids_trim = ids_full[:cut]                # (T_keep)
                     gid_rows.append(ids_trim)
 
-                # -- teacher-forcing forward pass with **prompt context** ----
-                #   1) pad completions so they form a rectangle  (G, T_g_max)
-                g_padded = torch.nn.utils.rnn.pad_sequence(
-                    gid_rows, batch_first=True,
-                    padding_value=self.tokenizer.pad_token_id
-                )                                             # (G, T_g_max)
 
-                #   2) repeat the *left-padded* prompt (T_p) G times
-                p_row    = prompt_ids[b]                      # (T_p,)
-                p_repeat = p_row.unsqueeze(0).expand(self.G, -1)
-
-                #   3) concat → (G, T_p + T_g_max)  then TF once
-                full_inp = torch.cat([p_repeat, g_padded], dim=1)
-                lp_full, ent_full = teacher_forcing_logprobs(
-                    self.policy, full_inp, self.tokenizer.pad_token_id
-                )                                             # lp  (G, L-1)
-
-                #   4) slice **only** the completion part
-                lp_rows, ent_rows = [], []
-                for g in range(self.G):
-                    Lg = gid_rows[g].size(0)                  # true length of gen g
-                    lp_rows.append(lp_full[g, -Lg:])          # log-p of each gen token
-                    ent_rows.append(ent_full[g, -Lg:])        # entropy same span
+                # -- log-probs & entropy via transition scores -------------
+                trans_lp = self.policy.compute_transition_scores(
+                    gen_out.sequences[b*self.G:(b+1)*self.G],
+                    gen_out.scores,
+                    normalize_logits = True
+                )                                        # (G,Lg_max_trim)
+                lp_rows = [trans_lp[g, :gid_rows[g].size(0)]
+                           for g in range(self.G)]
+                # entropy: use scores directly (one softmax per step)
+                ent_rows = [(-torch.softmax(gen_out.scores[t], -1)
+                               * torch.log_softmax(gen_out.scores[t], -1)
+                              ).sum(-1)[b*self.G:(b+1)*self.G]
+                              for t in range(len(gen_out.scores))]
+                ent_rows = [torch.stack([ent_rows[t][g]
+                                         for t in range(len(ent_rows))])
+                            for g in range(self.G)]
 
 
-                # 4) pad AFTER trimming so all G sequences line up
-                pad = lambda lst: torch.nn.utils.rnn.pad_sequence(
-                    lst, batch_first=True, padding_value=0.0
-                )
 
-                lp_t   = pad(lp_rows)        # shape (G, keep_max)
-                ent_t  = pad(ent_rows)
+                lp_t  = pad(lp_rows)      # pad with **0.0** (ignored later)
+                ent_t = pad(ent_rows)
                 g_ids  = pad(gid_rows).to(g_ids.device)                                               # (G, T_g_max_b)
 
 
@@ -324,7 +321,15 @@ class RolloutCollector:
 # ──────────────────────────────────────────────────────────────────────────────
 # helper utilities
 # ──────────────────────────────────────────────────────────────────────────────
-def _token_stats(gen_ids: Tensor, scores: Sequence[Tensor]):
+def _token_stats(gen_ids, scores):
+    logp = model.compute_transition_scores(gen_ids, scores, normalize_logits=True)
+    probs = logp.exp()
+    ent = -(probs * logp).tolist()
+    return logp.tolist(), ent.tolist()
+
+
+
+def _token_stats_old(gen_ids: Tensor, scores: Sequence[Tensor]):
     """Compute per-token log-prob and entropy for each generated sequence."""
     logprobs: List[List[float]] = []
     entropies: List[List[float]] = []
@@ -386,14 +391,4 @@ def _next_prompt_batch(sampler, tokenizer, device, B):
         texts.append(q if q.rstrip().endswith("<think>") else q + "\n<think>\n")
     batch = tokenizer(texts, return_tensors="pt", padding=True)
     return ids, texts, batch["input_ids"].to(device), batch["attention_mask"].to(device)
-
-@torch.inference_mode()
-def teacher_forcing_logprobs(model, ids, pad_id):
-    # ids : (G, T) on current device
-    attn   = (ids != pad_id)
-    logits = model(ids, attention_mask=attn).logits           # (G, T, V)
-    lp     = logits[:, :-1].log_softmax(-1).gather(            #  Make sure to shift
-                 -1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)     # (G, T-1)
-    ent    = -(logits.softmax(-1) * logits.log_softmax(-1)).sum(-1)
-    return lp, ent                                            # tensors, no padding
 
