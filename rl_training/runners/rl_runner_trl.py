@@ -1,6 +1,7 @@
 # rl_training/runners/rl_training_trl.py
 import os, sys, re, argparse, torch
 from pathlib import Path
+import copy
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel, prepare_model_for_kbit_training
@@ -27,7 +28,7 @@ def make_hf_dataset(split: str = "train"):
 # ----------------------------- Reward Function -----------------------------
 # ---------------------------------------------------------------------------
 
-def tag_math_correct(completions, ground_truth, **kwargs):
+def tag_math_correct(prompts, completions, ground_truth, **kwargs):
     rewards = []
     for comp, gold in zip(completions, ground_truth):
         m = ANSWER_RE.search(comp)
@@ -84,8 +85,8 @@ def main():
     base.config.use_cache = False
 
     # 2) attach LoRA adapter *directory that contains adapter_config.json*
-    lora_dir = "/content/drive/MyDrive/RL_Practice_Files/finetuned/phi2_gsm8k_latex_lora/checkpoint-394"
-    model = PeftModel.from_pretrained(base, lora_dir, is_trainable=True)
+    #lora_dir = "/content/drive/MyDrive/RL_Practice_Files/finetuned/phi2_gsm8k_latex_lora/checkpoint-394"
+    model = PeftModel.from_pretrained(base, args.lora_ckpt, is_trainable=True)
 
     # 3) sanity-check
     model.print_trainable_parameters() 
@@ -122,8 +123,11 @@ def main():
     )
 
     # ----------------------------- Trainer ---------------------------------
+    model.train()           # allow gradients
+    ref_model = copy.deepcopy(model).eval()
     trainer = GRPOTrainer(
         model=model,
+        reference_model=ref_model,
         processing_class=tok,
         args=cfg,
         train_dataset=train_ds,
