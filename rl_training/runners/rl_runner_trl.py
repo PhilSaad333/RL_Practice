@@ -117,7 +117,7 @@ def main():
         max_prompt_length=256,
         max_completion_length=128,
 
-        beta=0.05,        # KL weight
+        beta=0.0,        # KL weight
         epsilon=0.2,      # PPO clip
         epsilon_high=0.5, # asymmetric upper clip
     )
