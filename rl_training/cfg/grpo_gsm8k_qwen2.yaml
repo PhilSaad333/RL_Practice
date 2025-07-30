@@ -15,8 +15,8 @@ lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 rollout_batch_size: 8 # number of prompts per batch in rollout collection
 num_generations   : 6 #8   # G: number of generations per prompt
 buffer_size       : 16 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
-microbatch_size   : 2   # B: prompts used for each gradient checkpointing steps
-grad_accum_steps  : 4 #8   # ga_steps: total number of prompts per update batch = ga_step*B
+microbatch_size   : 4   # B: prompts used for each gradient checkpointing steps
+grad_accum_steps  : 2 #8   # ga_steps: total number of prompts per update batch = ga_step*B
 ppo_epochs        : 2 #3   # K: number of updates per rollout-collection step.
 max_new_tokens    : 128
 temperature       : 0.7
@@ -43,7 +43,7 @@ scheduler:
   name          : mix_passrate
   dataset_name  : gsm8k_latex
   split         : "train"
-  ema_alpha     : 0.05
+  ema_alpha     : 0.01
   boundaries    : [0.2, 0.8]
   sample_weights: [4, 3, 1]
 

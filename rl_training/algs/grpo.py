@@ -127,16 +127,36 @@ class GRPO(RLAlgorithm):
         kl_term           = kl_per_prompt.mean()
 
 
-        # ratio statistics as indirect way to check if this is all working right
-        clip    = 8.0
 
-        ratio_mean_val      = ratios.mean().item()      # take scalar now
-        ratio_median_val    = ratios.median().item()
-        ratio_p90_val       = ratios.quantile(0.90).item()
-        ratio_p99_val       = ratios.quantile(0.99).item()
-        ratio_max_val       = ratios.max().item()
-        ratio_clip_frac_val = (log_r.abs() > clip).float().mean().item()
-        logr_std_val        = log_r.std().item()
+        # ratio statistics over *non-pad* tokens only
+        clip = 8.0
+        mask = gen_mask.bool()                          # (B,G,T_g) True for real tokens
+
+        flat_ratios = ratios[mask]                      # 1D tensor of all valid ratios
+        if flat_ratios.numel() > 0:
+            ratio_mean_val   = flat_ratios.mean().item()
+            ratio_median_val = flat_ratios.median().item()
+            ratio_p90_val    = flat_ratios.quantile(0.90).item()
+            ratio_p99_val    = flat_ratios.quantile(0.99).item()
+            ratio_max_val    = flat_ratios.max().item()
+        else:
+            # no valid tokens? unlikely, but safe fallback
+            ratio_mean_val = ratio_median_val = ratio_p90_val = ratio_p99_val = ratio_max_val = 0.0
+
+        # clip-fraction and log-ratio std also over real tokens
+        flat_logr = log_r[mask]
+        if flat_logr.numel() > 0:
+            ratio_clip_frac_val = (flat_logr.abs() > clip).float().mean().item()
+            logr_std_val        = flat_logr.std().item()
+        else:
+            ratio_clip_frac_val = logr_std_val = 0.0
+
+
+
+
+
+
+
 
         kl_val         = kl_term.item()
         entropy_val    = entropy.item()
