@@ -62,7 +62,7 @@ class GRPO(RLAlgorithm):
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self.cfg["bf16"]):
             logits = self.policy(seq_flat, attention_mask=attn_mask).logits
 
-        logp_all  = F.log_softmax(logits, dim=-1)                         # (BG,T_tot,V)
+        logp_all = F.log_softmax(logits.to(torch.float16), dim=-1).to(torch.float16)     # (BG,T_tot,V)
         targets   = seq_flat[:, 1:]                                       # (BG,T_tot-1)
 
 
@@ -88,7 +88,7 @@ class GRPO(RLAlgorithm):
         if self.cfg["kl_beta"] > 0:
             with torch.no_grad():
                 ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
-            ref_lp_all = F.log_softmax(ref_logits, -1)
+            ref_lp_all = F.log_softmax(ref_logits.to(torch.float16), dim=-1).to(torch.float16)
             ref_lp_tok = ref_lp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
             ref_logp   = ref_lp_tok[:, -T_g:].view(B, G, T_g)            # aligned slice
             delta_lp   = new_logp - ref_logp
