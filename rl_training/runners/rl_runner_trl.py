@@ -3,7 +3,7 @@ import os, sys, re, argparse, torch
 from pathlib import Path
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from peft import PeftModel
+from peft import PeftModel, prepare_model_for_kbit_training
 from trl import GRPOConfig, GRPOTrainer
 
 # ---------------------------------------------------------------------------
