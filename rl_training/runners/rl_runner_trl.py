@@ -52,7 +52,7 @@ def main():
                    help="Path to the saved LoRA checkpoint directory.")
     p.add_argument("--out_dir",          type=str, required=True,
                    help="Where to write checkpoints / TB logs.")
-    p.add_argument("--max_steps",        type=int, default=10,
+    p.add_argument("--max_steps",        type=int, default=20,
                    help="Maximum total training steps (overrides epochs if set).")
     p.add_argument("--num_train_epochs", type=int, default=2,
                    help="Number of full-data epochs to train (TRL flag `--num_train_epochs`).")
@@ -60,9 +60,9 @@ def main():
                    help="Learning rate for the optimizer.")
     p.add_argument("--num_gens",         type=int, default=6,
                    help="Num completions per prompt (G).")
-    p.add_argument("--batch_size",       type=int, default=6,
+    p.add_argument("--batch_size",       type=int, default=12,
                    help="Prompts per device per generation step.")
-    p.add_argument("--accum",            type=int, default=2,
+    p.add_argument("--accum",            type=int, default=16,
                    help="Gradient-accumulation steps.")
     args = p.parse_args()
 
