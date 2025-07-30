@@ -1,68 +1,66 @@
-./.gitignore
-./evals/utils_io.py
-./evals/metrics/passk.py
-./evals/metrics/__init__.py
-./evals/metrics/response_len.py
-./evals/metrics/entropy.py
-./evals/metrics/tag_format.py
-./evals/inspect_repl.py
-./evals/__init__.py
-./evals/evaluator.py
-./evals/records.py
-./evals/eval_runner.py
-./models/__init__.py
-./rl_training/algs/base.py
-./rl_training/algs/grpo.py
-./rl_training/cfg/grpo_gsm8k.yaml
-./rl_training/rewards/tag_math_correct.py
-./rl_training/rewards/__init__.py
-./rl_training/rewards/dummy_zero.py
-./rl_training/runners/rl_runner.py
-./rl_training/runners/collect_rollouts.py
-./rl_training/runners/eval_callback.py
-./rl_training/schedulers/mix_passrate.py
-./rl_training/utils/rollout_buffer.py
-./README.md
-./main.py
-./__init__.py
-./configs/sft_gsm8k_tinyllama.yaml
-./configs/_template_sft.yaml
-./configs/sft_phi2.yaml
-./configs/sft_math_phi2.yaml
-./env.txt
-./.git/packed-refs
-./.git/index
-./.git/config
-./.git/logs/refs/remotes/origin/HEAD
-./.git/logs/refs/heads/main
-./.git/logs/HEAD
-./.git/hooks/pre-receive.sample
-./.git/hooks/pre-merge-commit.sample
-./.git/hooks/fsmonitor-watchman.sample
-./.git/hooks/commit-msg.sample
-./.git/hooks/update.sample
-./.git/hooks/prepare-commit-msg.sample
-./.git/hooks/pre-push.sample
-./.git/hooks/post-update.sample
-./.git/hooks/pre-commit.sample
-./.git/hooks/applypatch-msg.sample
-./.git/hooks/pre-rebase.sample
-./.git/hooks/pre-applypatch.sample
-./.git/hooks/push-to-checkout.sample
-./.git/objects/pack/pack-27982be9ca79ab88ef7af35a54a4c5fd000b18d0.pack
-./.git/objects/pack/pack-27982be9ca79ab88ef7af35a54a4c5fd000b18d0.idx
-./.git/refs/remotes/origin/HEAD
-./.git/refs/heads/main
-./.git/description
-./.git/shallow
-./.git/HEAD
-./.git/info/exclude
-./rlp_datasets/__pycache__/mathmix.cpython-311.pyc
-./rlp_datasets/__pycache__/registry.cpython-311.pyc
-./rlp_datasets/math.py
-./rlp_datasets/gsm8k.py
-./rlp_datasets/mathmix.py
-./rlp_datasets/registry.py
-./rlp_datasets/local_paths.py
-./fine_tuning/sft.py
-./fine_tuning/__init__.py
+├── env.txt
+├── evals
+│   ├── analyses
+│   │   ├── high_entropy_tokens.py
+│   │   ├── __init__.py
+│   │   └── plot_summary_metrics.py
+│   ├── cli.py
+│   ├── eval_runner.py
+│   ├── evaluator.py
+│   ├── __init__.py
+│   ├── inspect_repl.py
+│   ├── metrics
+│   │   ├── entropy.py
+│   │   ├── __init__.py
+│   │   ├── passk.py
+│   │   ├── response_len.py
+│   │   └── tag_format.py
+│   ├── records.py
+│   └── utils_io.py
+├── fine_tuning
+│   ├── configs
+│   │   ├── sft_gsm8k_qwen2.yaml
+│   │   ├── sft_gsm8k_tinyllama.yaml
+│   │   ├── sft_math_phi2.yaml
+│   │   └── _template_sft.yaml
+│   ├── __init__.py
+│   └── sft.py
+├── __init__.py
+├── main.py
+├── models
+│   └── __init__.py
+├── README.md
+├── rlp_datasets
+│   ├── gsm8k_latex.py
+│   ├── gsm8k.py
+│   ├── __init__.py
+│   ├── local_paths.py
+│   ├── mathmix.py
+│   ├── math.py
+│   ├── registry.py
+│   └── short.py
+└── rl_training
+    ├── algs
+    │   ├── base.py
+    │   ├── drgrpo.py
+    │   └── grpo.py
+    ├── cfg
+    │   ├── grpo_gsm8k_phi2.yaml
+    │   ├── grpo_gsm8k_qwen2.yaml
+    │   └── testconfig.yaml
+    ├── rewards
+    │   ├── dummy_zero.py
+    │   ├── __init__.py
+    │   ├── tag_math_correct.py
+    │   └── tag_pref.py
+    ├── runners
+    │   ├── collect_rollouts_old.py
+    │   ├── collect_rollouts.py
+    │   ├── eval_callback.py
+    │   ├── rl_runner.py
+    │   └── rl_runner_trl.py
+    ├── schedulers
+    │   └── mix_passrate.py
+    └── utils
+        ├── eval_ckpt.py
+        └── rollout_buffer.py
