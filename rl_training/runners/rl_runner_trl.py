@@ -82,7 +82,7 @@ def main():
     base.gradient_checkpointing_enable()
     base.config.use_cache = False
 
-    model = PeftModel.from_pretrained(base, args.lora_ckpt)
+    model = PeftModel.from_pretrained(base, args.lora_ckpt, is_trainable=True,)
     model.print_trainable_parameters()
 
     tok = AutoTokenizer.from_pretrained("microsoft/phi-2")
