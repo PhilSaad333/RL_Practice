@@ -123,11 +123,8 @@ def main():
     )
 
     # ----------------------------- Trainer ---------------------------------
-    model.train()           # allow gradients
-    ref_model = copy.deepcopy(model).eval()
     trainer = GRPOTrainer(
         model=model,
-        reference_model=ref_model,
         processing_class=tok,
         args=cfg,
         train_dataset=train_ds,
