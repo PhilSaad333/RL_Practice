@@ -12,7 +12,7 @@ lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 
 
 # -------------- rollout collector ---------------- #
-rollout_batch_size: 10 # number of prompts per batch in rollout collection
+rollout_batch_size: 8 # number of prompts per batch in rollout collection
 num_generations   : 8 #8   # G: number of generations per prompt
 
 buffer_size       : 2048 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
@@ -49,7 +49,7 @@ scheduler:
   split         : "train"
   ema_alpha     : 0.01
   boundaries    : [0.2, 0.8]
-  sample_weights: [4, 3, 1]
+  sample_weights: [1, 1, 1]
 
 # ------------------ trainer (GRPO) --------------- #
 lr               : 1.0e-5
