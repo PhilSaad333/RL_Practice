@@ -73,7 +73,8 @@ class RLRunner:
         # ---------- subsystems ------------------------------------------
         self.collector = RolloutCollector(self.model, self.tok, cfg,
                                           out_dir=self.dir, device="cuda")
-        self.algo      = GRPO(self.model, cfg, pad_id=self.tok.pad_token_id)
+        ratio_log = self.dir / "ratios.jsonl"                  
+        self.algo      = GRPO(self.model, cfg, pad_id=self.tok.pad_token_id, ratio_log_path=ratio_log)
         self.accum = cfg["grad_accum_steps"]
 
         self.buffer_size = cfg["buffer_size"] # multiple of self.accum * self.collector.batch_size

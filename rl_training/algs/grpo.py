@@ -1,5 +1,6 @@
 # rl_training/algs/grpo.py
 from __future__ import annotations
+import json, pathlib
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
@@ -10,7 +11,15 @@ from .base import RLAlgorithm, RolloutBatch
 
 
 class GRPO(RLAlgorithm):
-    def __init__(self, policy, cfg, *, pad_id: int | None = None):
+    def __init__(
+        self,
+        policy, 
+        cfg, 
+        *, 
+        pad_id: int | None = None,
+        ratio_log_path: str | pathlib.Path | None = None,
+        ):
+
         super().__init__(policy, cfg)
         total_updates   = cfg["total_steps"] 
         warmup_steps    = int(0.05 * total_updates) 
@@ -26,9 +35,11 @@ class GRPO(RLAlgorithm):
         self._accum_ctr   = 0
         self.cfg = cfg
         self.device = None # set in step
-
-        # for debug
         self.actual_opt_step = 0
+
+        # if path is None → feature disabled (default in unit tests)
+        self._ratio_log_path = pathlib.Path(ratio_log_path) \
+                               if ratio_log_path else None   # CHANGE
 
     def step(self, rollouts: RolloutBatch, ref_model, *, sync_grads: bool = True) -> dict[str, float]:
         B, G, T_g = rollouts.gen_ids.shape
@@ -64,7 +75,13 @@ class GRPO(RLAlgorithm):
         ratios = torch.exp((new_logp - old_logp).clamp(-80, 80)) * gen_mask
         log_r   = (new_logp - old_logp) * gen_mask # for metrics
 
-
+        # -------------- (optional) save full ratio list -------------
+        # CHANGE: write once per *optimizer* step (when sync_grads=True)
+        if sync_grads and self._ratio_log_path is not None:
+            flat = ratios[gen_mask.bool()].detach().cpu().tolist()
+            rec  = {"step": self.actual_opt_step, "ratios": flat}
+            with self._ratio_log_path.open("a") as fh:
+                fh.write(json.dumps(rec) + "\n")
 
 
         # -------------- KL term ----------------
