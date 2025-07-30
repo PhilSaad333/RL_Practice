@@ -17,11 +17,11 @@ from math_verify import parse, verify
 
 ANSWER_RE = re.compile(r"<answer>\s*([\s\S]*?)\s*</answer>", re.MULTILINE)
 
-def make_hf_dataset(split: str = "train"):
+def make_hf_dataset(split="train"):
     examples = build_gsm8k(split)
     return Dataset.from_dict({
-        "prompt":       [ex.question for ex in examples],
-        "ground_truth": [ex.answer   for ex in examples],
+        "prompt": [ex.question + "\n<think>\n" for ex in examples],
+        "ground_truth": [ex.answer for ex in examples],
     })
 
 # ---------------------------------------------------------------------------
