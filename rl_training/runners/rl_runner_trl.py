@@ -67,23 +67,28 @@ def main():
     args = p.parse_args()
 
     # ---------------------- Model & Tokenizer ------------------------------
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-    )
+    # 1) load base in 4-bit
+    bnb_cfg = BitsAndBytesConfig(load_in_4bit=True,
+                                bnb_4bit_compute_dtype=torch.bfloat16,
+                                bnb_4bit_quant_type="nf4",
+                                bnb_4bit_use_double_quant=True)
+
     base = AutoModelForCausalLM.from_pretrained(
         "microsoft/phi-2",
-        quantization_config=bnb,
         torch_dtype=torch.bfloat16,
+        quantization_config=bnb_cfg,
         device_map="auto",
     )
+    base = prepare_model_for_kbit_training(base)   # <-- BEFORE adding LoRA
     base.gradient_checkpointing_enable()
     base.config.use_cache = False
 
-    model = PeftModel.from_pretrained(base, args.lora_ckpt, is_trainable=True,)
-    model.print_trainable_parameters()
+    # 2) attach LoRA adapter *directory that contains adapter_config.json*
+    lora_dir = "/content/drive/MyDrive/RL_Practice_Files/finetuned/phi2_gsm8k_latex_lora/checkpoint-394"
+    model = PeftModel.from_pretrained(base, lora_dir, is_trainable=True)
+
+    # 3) sanity-check
+    model.print_trainable_parameters() 
 
     tok = AutoTokenizer.from_pretrained("microsoft/phi-2")
     tok.pad_token = tok.eos_token
