@@ -119,7 +119,7 @@ def main():
     # ----------------------------- Trainer ---------------------------------
     trainer = GRPOTrainer(
         model=model,
-        tokenizer=tok,
+        processing_class=tok,
         args=cfg,
         train_dataset=train_ds,
         reward_funcs=tag_math_correct,
