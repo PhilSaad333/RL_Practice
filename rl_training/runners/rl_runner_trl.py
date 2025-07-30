@@ -126,6 +126,8 @@ def main():
     )
 
     # ---------------------------- Training ---------------------------------
+    from transformers.utils import logging
+    logging.set_verbosity_error()
     trainer.train()
     trainer.save_model(args.out_dir)
 
