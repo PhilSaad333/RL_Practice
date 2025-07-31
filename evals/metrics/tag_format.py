@@ -7,6 +7,7 @@ TAG_RGX = re.compile(r"<think>.*?</think>\s*<answer>.*?</answer>", re.S)
 
 def has_good_tags(txt: str) -> bool:
     """Return True if a single generated string `txt` has the <think>…</think><answer>…</answer> pattern."""
+    txt = '<think>\n' + txt.split('<think>')[-1].strip()
     return bool(TAG_RGX.search(txt))
 
 def tag_format_metrics(records: List[EvalRecord]) -> List[Dict]:
