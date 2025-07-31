@@ -7,3 +7,4 @@ import rlp_datasets.math
 import rlp_datasets.mathmix
 import rlp_datasets.short
 import rlp_datasets.gsm8k_latex
+import rlp_datasets.gsm8k_r1_template
