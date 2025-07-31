@@ -53,6 +53,14 @@ class RLRunner:
         base.config.use_cache = False
 
         self.model = PeftModel.from_pretrained(base, lora_ckpt).to("cuda")
+
+        self.model.enable_input_require_grads()          # ← ADD ME
+
+
+        trainable = sum(p.requires_grad for p in self.model.parameters())
+        print(f"Trainable params: {trainable}") 
+
+
         self.tok   = AutoTokenizer.from_pretrained(backbone_id)
         if self.tok.pad_token_id is None:
             # safest practice is to duplicate eos so you don't expand embeddings
