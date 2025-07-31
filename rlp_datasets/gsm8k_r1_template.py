@@ -52,7 +52,7 @@ def build_gsm8k(split: str = "train") -> list[Example]:
             ds.append(json.loads(line))
     return filter_lens([_parse_one(rec, split) for rec in ds])
 
-DATASET_REGISTRY["gsm8k_latex"] = build_gsm8k
+DATASET_REGISTRY["gsm8k_r1_template"] = build_gsm8k
 
 
 
