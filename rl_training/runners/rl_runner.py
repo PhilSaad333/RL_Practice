@@ -79,7 +79,7 @@ class RLRunner:
         # frozen model for KL
         self.ref_model = deepcopy(self.model).eval().requires_grad_(False)
         #DEBUG
-        self.ref_model.to("cpu")
+        #self.ref_model.to("cpu")
         # ensure pads match
         self.ref_model.config.pad_token_id = self.model.config.pad_token_id
 
