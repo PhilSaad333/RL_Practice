@@ -59,14 +59,22 @@ class DRGRPO(RLAlgorithm):
 
         attn_mask  = (seq_flat != pad_id).long()
 
+        print('About to do forward pass')
+
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self.cfg["bf16"]):
             logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+
+        print('Forward pass successful')
 
         logp_all = F.log_softmax(logits.to(torch.float16), dim=-1).to(torch.float16)     # (BG,T_tot,V)
         targets   = seq_flat[:, 1:]                                       # (BG,T_tot-1)
 
+        print('Computed logp_all')
+
         logp_tok  = logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         new_logp  = logp_tok[:, -T_g:].view(B, G, T_g)          # last T_g tokens
+
+        print('Computed new_logp')
 
         old_logp  = rollouts.logprobs                          # (B,G,T_g)
         gen_mask  = (rollouts.gen_ids != pad_id).float()       # (B,G,T_g)
@@ -81,11 +89,15 @@ class DRGRPO(RLAlgorithm):
             with self._ratio_log_path.open("a") as fh:
                 fh.write(json.dumps(rec) + "\n")
 
+        print('About to compute entropy')
+
         # Compute entropy for logging
         probs_gen = torch.exp(logp_all[:, -T_g:])               # only gen slice
         H_gen     = -(probs_gen * logp_all[:, -T_g:]).sum(-1)  # (BG,T_g)
         ent_tok   = H_gen.view(B, G, T_g) * gen_mask
         entropy   = ent_tok.sum() / (gen_mask.sum() + 1e-8)
+
+        print('computed entropy')
 
         # To-Do:
         # Add variations here related to clipping
@@ -160,6 +172,8 @@ class DRGRPO(RLAlgorithm):
 
         # Optimization  with gradient checkpointing
 
+        print('About to compute gradients')
+
         maybe = (
             self.policy.no_sync
             if (hasattr(self.policy, "no_sync") and not sync_grads)
@@ -167,6 +181,7 @@ class DRGRPO(RLAlgorithm):
         )
         with maybe():
             loss.backward()
+            print('Did backwards')
 
         if sync_grads:                          # ← step *only* when caller says so
             clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
@@ -175,6 +190,7 @@ class DRGRPO(RLAlgorithm):
             self.opt.zero_grad(set_to_none=True)
             self.actual_opt_step += 1
             #print(f"Actual Opt Steps = {self.actual_opt_step}")
+            print('Did opt step')
 
         loss_val  = loss.detach().float().item()
 
