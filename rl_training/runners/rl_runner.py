@@ -55,10 +55,9 @@ class RLRunner:
         #base.enable_input_require_grads()
         base.config.use_cache = False
 
-        self.model = PeftModel.from_pretrained(base, lora_ckpt).to("cuda")
+        self.model = PeftModel.from_pretrained(base, lora_ckpt, is_trainable=True).to("cuda")
 
-        self.model.enable_input_require_grads()          # ← ADD ME
-
+        #self.model.enable_input_require_grads()          # ← ADD ME
 
         trainable = sum(p.requires_grad for p in self.model.parameters())
         print(f"Trainable params: {trainable}") 
