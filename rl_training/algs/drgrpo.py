@@ -82,9 +82,9 @@ class DRGRPO(RLAlgorithm):
                 fh.write(json.dumps(rec) + "\n")
 
         # Compute entropy for logging
-        probs_all = torch.exp(logp_all)
-        H_all     = -(probs_all * logp_all).sum(-1)            # (BG,T_tot)
-        ent_tok   = H_all[:, -T_g:].view(B, G, T_g) * gen_mask
+        probs_gen = torch.exp(logp_all[:, -T_g:])               # only gen slice
+        H_gen     = -(probs_gen * logp_all[:, -T_g:]).sum(-1)  # (BG,T_g)
+        ent_tok   = H_gen.view(B, G, T_g) * gen_mask
         entropy   = ent_tok.sum() / (gen_mask.sum() + 1e-8)
 
         # To-Do:
@@ -98,18 +98,11 @@ class DRGRPO(RLAlgorithm):
                                     1 + clip_p) * adv.unsqueeze(-1)
         token_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
 
-
-        # per-prompt normalisation
-        # Change to DRGRPO-type normalization
-        # this means replacing normalization of 1/tokens_per_prompt
-        # with 1/(G*max_response_len)
-        # tokens_per_prompt = gen_mask.sum(dim=(1,2))
-        # clean this up!
-        tokens_per_gen = gen_mask.sum(dim=2) #(B,G)
-        max_lens, _ = torch.max(tokens_per_gen, dim=-1)   # (B)
-        loss_per_prompt   = token_loss.sum(dim=(1,2)) / (G * max_lens + 1e-8)
-        kl_per_prompt     = kl_per_tok.sum(dim=(1,2)) / (tokens_per_prompt + 1e-8)
-        loss              = (loss_per_prompt.mean() * scale)
+        # ---- per-prompt normalisation (Dr-GRPO) -------------
+        tokens_per_gen = gen_mask.sum(dim=2)             # (B,G)
+        max_lens, _    = torch.max(tokens_per_gen, dim=-1)  # (B)
+        loss_per_prompt = token_loss.sum(dim=(1,2)) / (G * max_lens + 1e-8)
+        loss            = loss_per_prompt.mean() * scale
 
 
         # ratio statistics over *non-pad* tokens only
@@ -136,22 +129,16 @@ class DRGRPO(RLAlgorithm):
             ratio_clip_frac_val = logr_std_val = 0.0
 
 
+        entropy_val = entropy.item()
 
-
-
-
-
-
-        kl_val         = kl_term.item()
-        entropy_val    = entropy.item()
-
-
-        del logits, logp_all
+        # ---- free big policy tensors before ref forward ----
+        del logits, logp_all, probs_gen, H_gen
+        torch.cuda.empty_cache()
 
         # ── metric-only KL divergence ─────────────────────────────
-        with torch.no_grad(), self.autocast:
+        with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self.cfg["bf16"]):
             ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
-        ref_logp_all  = F.log_softmax(ref_logits, dim=-1)
+        ref_logp_all  = F.log_softmax(ref_logits.to(torch.float16), dim=-1)
         ref_logp_tok  = ref_logp_all[..., :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         ref_logp      = ref_logp_tok[:, -T_g:].view(B, G, T_g)
 
@@ -160,15 +147,8 @@ class DRGRPO(RLAlgorithm):
         kl_mean       = (kl_per_tok.sum() / (gen_mask.sum() + 1e-8)).item()
         # ──────────────────────────────────────────────────────────
 
-
-
-        # keep only what you still need for back-prop
-        del logp_tok, old_logp, new_logp, ratios, token_loss
-        del surr1, surr2, kl_per_tok, delta_lp          # large BG × T_g tensors
-        del probs_all, H_all, ent_tok                   # entropy scratch
-
-        if self.cfg["kl_beta"] > 0:
-            del ref_logits, ref_lp_all, ref_lp_tok, ref_logp
+        del seq_flat, attn_mask, targets
++       del ent_tok, ref_logits, ref_logp_all, ref_logp_tok, ref_logp, kl_per_tok
         torch.cuda.empty_cache()
 
 

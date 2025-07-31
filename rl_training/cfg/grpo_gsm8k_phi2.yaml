@@ -47,9 +47,9 @@ scheduler:
 lr               : 2.0e-5
 clip_eps         : 0.2
 clip_+           : 0.2 #asymmetric clipping
-kl_beta          : 0.05
-kl_target        : 0.1
-max_kl           : 0.15
+#kl_beta          : 0.05
+#kl_target        : 0.1
+#max_kl           : 0.15
 ent_coef         : 0.0            # future entropy bonus knob
 grad_clip        : 1.0
 bf16             : true
