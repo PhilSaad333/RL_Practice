@@ -64,5 +64,5 @@ bf16             : true
 gradient_checkpointing : true
 
 save_every: 25
-total_steps: 100
+total_steps: 50
 
