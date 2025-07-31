@@ -3,9 +3,10 @@
 # Anything in this file is passed verbatim to RolloutCollector via cfg.
 # The GRPO trainer will later read the same file and use only what it needs.
 
-
-backbone: microsoft/phi-2
-eval_backbone: phi2
+backbone: Qwen/Qwen2-0.5B
+eval_backbone: qwen2
+#backbone: microsoft/phi-2
+#eval_backbone: phi2
 
 # -------------- rollout collector ---------------- #
 rollout_batch_size: 8
