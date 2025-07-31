@@ -65,7 +65,6 @@ class DRGRPO(RLAlgorithm):
         logp_all = F.log_softmax(logits.to(torch.float16), dim=-1).to(torch.float16)     # (BG,T_tot,V)
         targets   = seq_flat[:, 1:]                                       # (BG,T_tot-1)
 
-
         logp_tok  = logp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         new_logp  = logp_tok[:, -T_g:].view(B, G, T_g)          # last T_g tokens
 
@@ -76,32 +75,17 @@ class DRGRPO(RLAlgorithm):
         log_r   = (new_logp - old_logp) * gen_mask # for metrics
 
         # -------------- save full ratio list -------------
-        # CHANGE: write once per *optimizer* step (when sync_grads=True)
         if sync_grads and self._ratio_log_path is not None:
             flat = ratios[gen_mask.bool()].detach().cpu().tolist()
             rec  = {"step": self.actual_opt_step, "ratios": flat}
             with self._ratio_log_path.open("a") as fh:
                 fh.write(json.dumps(rec) + "\n")
 
-
-        # -------------- KL term ----------------
-        if self.cfg["kl_beta"] > 0:
-            with torch.no_grad():
-                ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
-            ref_lp_all = F.log_softmax(ref_logits.to(torch.float16), dim=-1).to(torch.float16)
-            ref_lp_tok = ref_lp_all[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-            ref_logp   = ref_lp_tok[:, -T_g:].view(B, G, T_g)            # aligned slice
-            delta_lp   = new_logp - ref_logp
-            kl_per_tok = (torch.exp(delta_lp) + delta_lp - 1.0) * gen_mask * self.cfg["kl_beta"]
-        else:
-            kl_per_tok = torch.zeros_like(new_logp)
-
         # Compute entropy for logging
         probs_all = torch.exp(logp_all)
         H_all     = -(probs_all * logp_all).sum(-1)            # (BG,T_tot)
         ent_tok   = H_all[:, -T_g:].view(B, G, T_g) * gen_mask
         entropy   = ent_tok.sum() / (gen_mask.sum() + 1e-8)
-
 
         # To-Do:
         # Add variations here related to clipping
@@ -112,11 +96,7 @@ class DRGRPO(RLAlgorithm):
         surr1 = ratios * adv.unsqueeze(-1)
         surr2 = torch.clamp(ratios, 1 - clip_m,
                                     1 + clip_p) * adv.unsqueeze(-1)
-        ppo_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
-
-        # add kl term per token
-        kl_per_tok = kl_per_tok * gen_mask
-        token_loss = ppo_loss - kl_per_tok
+        token_loss = -torch.min(surr1, surr2) * gen_mask                 # (B,G,T_g)
 
 
         # per-prompt normalisation
@@ -130,8 +110,6 @@ class DRGRPO(RLAlgorithm):
         loss_per_prompt   = token_loss.sum(dim=(1,2)) / (G * max_lens + 1e-8)
         kl_per_prompt     = kl_per_tok.sum(dim=(1,2)) / (tokens_per_prompt + 1e-8)
         loss              = (loss_per_prompt.mean() * scale)
-        kl_term           = kl_per_prompt.mean()
-
 
 
         # ratio statistics over *non-pad* tokens only
@@ -170,6 +148,20 @@ class DRGRPO(RLAlgorithm):
 
         del logits, logp_all
 
+        # ── metric-only KL divergence ─────────────────────────────
+        with torch.no_grad(), self.autocast:
+            ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
+        ref_logp_all  = F.log_softmax(ref_logits, dim=-1)
+        ref_logp_tok  = ref_logp_all[..., :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        ref_logp      = ref_logp_tok[:, -T_g:].view(B, G, T_g)
+
+        delta_lp      = new_logp - ref_logp                      # shape (B,G,T_g)
+        kl_per_tok    = (delta_lp.exp() + delta_lp - 1.0) * gen_mask
+        kl_mean       = (kl_per_tok.sum() / (gen_mask.sum() + 1e-8)).item()
+        # ──────────────────────────────────────────────────────────
+
+
+
         # keep only what you still need for back-prop
         del logp_tok, old_logp, new_logp, ratios, token_loss
         del surr1, surr2, kl_per_tok, delta_lp          # large BG × T_g tensors
@@ -205,7 +197,7 @@ class DRGRPO(RLAlgorithm):
         return {
             "loss"            : loss_val,
             "entropy"         : entropy_val,
-            "kl"              : kl_val,
+            "kl"              : kl_mean,
             "ratio_mean"      : ratio_mean_val,
             "ratio_median"    : ratio_median_val,
             "ratio_p90"       : ratio_p90_val,
