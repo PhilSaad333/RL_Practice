@@ -1,4 +1,4 @@
-# rl_training/algs/grpo.py
+# rl_training/algs/dr_grpo.py
 from __future__ import annotations
 import json, pathlib
 import torch
@@ -25,11 +25,19 @@ class DRGRPO(RLAlgorithm):
         warmup_steps    = int(0.05 * total_updates) 
         self.opt    = torch.optim.AdamW(policy.parameters(),
                               lr=cfg["lr"], weight_decay=0.01)
-        self.lr_sched = get_cosine_schedule_with_warmup(
-            self.opt,
-            num_warmup_steps = warmup_steps,
-            num_training_steps = total_updates,
+        if cfg["lr_scheduler"] == "cosine":
+            self.lr_sched = get_cosine_schedule_with_warmup(
+                self.opt,
+                num_warmup_steps = warmup_steps,
+                num_training_steps = total_updates,
+            )                                 # cosine ↓ to 0  :contentReference[oaicite:1]{index=1}
+        elif cfg["lr_scheduler"] in ("const", "constant"):
+            self.lr_sched = get_constant_schedule_with_warmup(
+                self.opt,
+                num_warmup_steps = warmup_steps,           # flat after warm-up  :contentReference[oaicite:2]{index=2}
             )
+        else:
+            self.lr_sched = None                           # truly fixed LR
         self.pad_id = pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
         self.accum_steps  = cfg["grad_accum_steps"]
         self._accum_ctr   = 0
@@ -176,7 +184,8 @@ class DRGRPO(RLAlgorithm):
         if sync_grads:                          # ← step *only* when caller says so
             clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
             self.opt.step()
-            self.lr_sched.step()
+            if self.lr_sched:
+                self.lr_sched.step()
             self.opt.zero_grad(set_to_none=True)
             self.actual_opt_step += 1
             #print(f"Actual Opt Steps = {self.actual_opt_step}")

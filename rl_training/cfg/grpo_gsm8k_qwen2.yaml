@@ -53,7 +53,7 @@ scheduler:
   sample_weights: [1, 1, 1]
 
 # ------------------ trainer (GRPO) --------------- #
-lr               : 1.0e-5
+lr               : 1.0e-6
 clip_eps         : 0.2
 clip_+           : 0.2 #asymmetric clipping
 
@@ -62,6 +62,8 @@ grad_clip        : 1.0
 bf16             : true
 
 gradient_checkpointing : true
+
+lr_scheduler: "const" # 'const' or 'cosine'
 
 save_every: 25
 total_steps: 50
