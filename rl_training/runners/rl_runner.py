@@ -69,8 +69,7 @@ class RLRunner:
         # ensure pads match
         self.ref_model.config.pad_token_id = self.model.config.pad_token_id
         
-        # DEBUG
-        self.ref_model.to("cpu")
+
 
 
 
@@ -78,7 +77,7 @@ class RLRunner:
         self.collector = RolloutCollector(self.model, self.tok, cfg,
                                           out_dir=self.dir, device="cuda")
         ratio_log = self.dir / "ratios.jsonl"
-        
+
         # Just stick with DRGRPO for now, add option later after fixing up ordinary grpo                  
         self.algo      = DRGRPO(self.model, cfg, pad_id=self.tok.pad_token_id, ratio_log_path=ratio_log)
         self.accum = cfg["grad_accum_steps"]
@@ -100,6 +99,9 @@ class RLRunner:
 
         outer_loops = math.ceil(total_updates / K)
         p_per_outer = self.buffer_size
+        
+        # DEBUG
+        self.ref_model.to("cpu")
 
         for _ in trange(outer_loops, desc="outer collect loops"):
             rb = self.collector.collect_batch(batch_prompts=p_per_outer)
