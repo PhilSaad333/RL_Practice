@@ -12,9 +12,9 @@ lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 
 
 # -------------- rollout collector ---------------- #
-rollout_batch_size: 12 # number of prompts per batch in rollout collection
+rollout_batch_size: 8 # number of prompts per batch in rollout collection
 
-num_generations   : 6 #8   # G: number of generations per prompt
+num_generations   : 8 #8   # G: number of generations per prompt
 
 buffer_size       : 128 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
 microbatch_size   : 2   # B: prompts used for each gradient checkpointing steps

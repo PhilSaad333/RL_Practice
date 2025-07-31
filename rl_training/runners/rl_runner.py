@@ -106,7 +106,7 @@ class RLRunner:
         """total_updates == number of *optimizer* steps (same definition GRPO uses)."""
         K         = self.cfg["ppo_epochs"]
         ga_steps  = self.accum                     # == cfg["grad_accum_steps"]
-        B         = self.collector.batch_size      # == cfg["microbatch_size"]
+        B         = self.cfg["microbatch_size"]      # == cfg["microbatch_size"]
 
         outer_loops = math.ceil(total_updates / K)
         p_per_outer = self.buffer_size
