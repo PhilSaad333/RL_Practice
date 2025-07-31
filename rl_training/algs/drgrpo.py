@@ -75,7 +75,7 @@ class DRGRPO(RLAlgorithm):
         ratios = torch.exp((new_logp - old_logp).clamp(-80, 80)) * gen_mask
         log_r   = (new_logp - old_logp) * gen_mask # for metrics
 
-        # -------------- (optional) save full ratio list -------------
+        # -------------- save full ratio list -------------
         # CHANGE: write once per *optimizer* step (when sync_grads=True)
         if sync_grads and self._ratio_log_path is not None:
             flat = ratios[gen_mask.bool()].detach().cpu().tolist()
@@ -120,8 +120,14 @@ class DRGRPO(RLAlgorithm):
 
 
         # per-prompt normalisation
-        tokens_per_prompt = gen_mask.sum(dim=(1,2))                       # (B)
-        loss_per_prompt   = token_loss.sum(dim=(1,2)) / (tokens_per_prompt + 1e-8)
+        # Change to DRGRPO-type normalization
+        # this means replacing normalization of 1/tokens_per_prompt
+        # with 1/(G*max_response_len)
+        # tokens_per_prompt = gen_mask.sum(dim=(1,2))
+        # clean this up!
+        tokens_per_gen = gen_mask.sum(dim=2) #(B,G)
+        max_lens, _ = torch.max(tokens_per_gen, dim=-1)   # (B)
+        loss_per_prompt   = token_loss.sum(dim=(1,2)) / (G * max_lens + 1e-8)
         kl_per_prompt     = kl_per_tok.sum(dim=(1,2)) / (tokens_per_prompt + 1e-8)
         loss              = (loss_per_prompt.mean() * scale)
         kl_term           = kl_per_prompt.mean()
