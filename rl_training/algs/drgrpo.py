@@ -135,6 +135,8 @@ class DRGRPO(RLAlgorithm):
         del logits, logp_all, probs_gen, H_gen
         torch.cuda.empty_cache()
 
+
+        """
         # ── metric-only KL divergence ─────────────────────────────
         with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self.cfg["bf16"]):
             ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
@@ -146,9 +148,13 @@ class DRGRPO(RLAlgorithm):
         kl_per_tok    = (delta_lp.exp() + delta_lp - 1.0) * gen_mask
         kl_mean       = (kl_per_tok.sum() / (gen_mask.sum() + 1e-8)).item()
         # ──────────────────────────────────────────────────────────
+        """
 
         del seq_flat, attn_mask, targets
-        del ent_tok, ref_logits, ref_logp_all, ref_logp_tok, ref_logp, kl_per_tok
+        del ent_tok
+
+        # DEBUG
+        # del ent_tok, ref_logits, ref_logp_all, ref_logp_tok, ref_logp, kl_per_tok
         torch.cuda.empty_cache()
 
 
@@ -177,7 +183,7 @@ class DRGRPO(RLAlgorithm):
         return {
             "loss"            : loss_val,
             "entropy"         : entropy_val,
-            "kl"              : kl_mean,
+            #"kl"              : kl_mean,
             "ratio_mean"      : ratio_mean_val,
             "ratio_median"    : ratio_median_val,
             "ratio_p90"       : ratio_p90_val,
