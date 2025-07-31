@@ -13,7 +13,7 @@ from rl_training.algs.drgrpo import DRGRPO
 from rl_training.algs.base import RolloutBatch
 from transformers import (AutoTokenizer, AutoModelForCausalLM,
                           BitsAndBytesConfig)
-from peft import PeftModel
+from peft import PeftModel, prepare_model_for_kbit_training
 from copy import deepcopy
 
 
@@ -47,6 +47,9 @@ class RLRunner:
         base = AutoModelForCausalLM.from_pretrained(backbone_id,
                                                     torch_dtype=torch.bfloat16,
                                                     quantization_config=bnb)
+        
+        base = prepare_model_for_kbit_training(base)   # <-- BEFORE adding LoRA
+                                            
         base.gradient_checkpointing_enable()
         # DEBUG
         #base.enable_input_require_grads()
@@ -54,7 +57,7 @@ class RLRunner:
 
         self.model = PeftModel.from_pretrained(base, lora_ckpt).to("cuda")
 
-        self.model.enable_input_require_grads()          # ← ADD ME
+        #self.model.enable_input_require_grads()          # ← ADD ME
 
 
         trainable = sum(p.requires_grad for p in self.model.parameters())
@@ -79,9 +82,6 @@ class RLRunner:
         self.ref_model.to("cpu")
         # ensure pads match
         self.ref_model.config.pad_token_id = self.model.config.pad_token_id
-
-
-
 
 
         # ---------- subsystems ------------------------------------------
