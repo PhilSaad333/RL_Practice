@@ -165,8 +165,7 @@ class DRGRPO(RLAlgorithm):
 
         del seq_flat, attn_mask, targets
         del ent_tok
-
-        del ent_tok, ref_logits, ref_logp_all, ref_logp_tok, ref_logp, kl_per_tok
+        del ref_logits, ref_logp_all, ref_logp_tok, ref_logp, kl_per_tok
         torch.cuda.empty_cache()
 
 
