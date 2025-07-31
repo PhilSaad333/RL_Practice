@@ -14,6 +14,18 @@ tokenizer = AutoTokenizer.from_pretrained(
     add_prefix_space=False
 )
 
+def prompt_template(question: str) -> str:
+    template = (
+        "You are solving math problems. Respond by reasoning through the problem "
+        "then providing a final answer. Enclose the reasoning process within <think> </think> "
+        "and the answer within <answer> </answer> tags, i.e., <think> reasoning process here </think> "
+        "<answer> answer here </answer>.\n"
+        f"Question: {question}\nResponse: <think>"
+    )
+    return template
+
+
+
 def text_ntokens(text: str) -> int:
     return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
@@ -31,7 +43,7 @@ def _parse_one(rec: dict, split: str) -> Example:
     ans = text.split('<answer>')[-1].split('</answer>')[0].strip()
 
     meta = dict(dataset="gsm8k_latex", split=split)
-    return Example(text=text, question=q, answer=ans, meta=meta)
+    return Example(text=text, question=prompt_template(q), answer=ans, meta=meta)
 
 def build_gsm8k(split: str = "train") -> list[Example]:
     ds = []
