@@ -57,10 +57,11 @@ class RLRunner:
 
         self.model = PeftModel.from_pretrained(base, lora_ckpt, is_trainable=True).to("cuda")
 
-        #self.model.enable_input_require_grads()          # ← ADD ME
+        self.model.enable_input_require_grads()
 
         trainable = sum(p.requires_grad for p in self.model.parameters())
-        print(f"Trainable params: {trainable}") 
+        print(f"Trainable params (manual): {trainable}") 
+        self.model.print_trainable_parameters()
 
 
         self.tok   = AutoTokenizer.from_pretrained(backbone_id)
@@ -112,6 +113,10 @@ class RLRunner:
         
         for _ in trange(outer_loops, desc="outer collect loops"):
             rb = self.collector.collect_batch(batch_prompts=p_per_outer)
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
             self._train_one_buffer(rb, K, ga_steps, B)
             del rb               # free references to all batch tensors
             torch.cuda.empty_cache()
