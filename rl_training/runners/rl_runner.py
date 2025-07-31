@@ -48,7 +48,8 @@ class RLRunner:
                                                     torch_dtype=torch.bfloat16,
                                                     quantization_config=bnb)
         base.gradient_checkpointing_enable()
-        base.enable_input_require_grads()
+        # DEBUG
+        #base.enable_input_require_grads()
         base.config.use_cache = False
 
         self.model = PeftModel.from_pretrained(base, lora_ckpt).to("cuda")
@@ -66,9 +67,11 @@ class RLRunner:
 
         # frozen model for KL
         self.ref_model = deepcopy(self.model).eval().requires_grad_(False)
+        #DEBUG
+        self.ref_model.to("cpu")
         # ensure pads match
         self.ref_model.config.pad_token_id = self.model.config.pad_token_id
-        
+
 
 
 
@@ -100,9 +103,6 @@ class RLRunner:
         outer_loops = math.ceil(total_updates / K)
         p_per_outer = self.buffer_size
         
-        # DEBUG
-        self.ref_model.to("cpu")
-
         for _ in trange(outer_loops, desc="outer collect loops"):
             rb = self.collector.collect_batch(batch_prompts=p_per_outer)
             self._train_one_buffer(rb, K, ga_steps, B)

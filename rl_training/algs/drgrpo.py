@@ -43,6 +43,7 @@ class DRGRPO(RLAlgorithm):
 
     def step(self, rollouts: RolloutBatch, ref_model, *, sync_grads: bool = True) -> dict[str, float]:
         B, G, T_g = rollouts.gen_ids.shape
+        print(f'B: {B}, G: {G}, T_g: {T_g}')
         device    = rollouts.gen_ids.device
         self.device = device
         pad_id    = self.pad_id
