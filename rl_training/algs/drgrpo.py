@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from contextlib import nullcontext
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup
 from .base import RLAlgorithm, RolloutBatch
 
 
