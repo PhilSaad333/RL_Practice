@@ -1,4 +1,5 @@
 # testconfig.yaml   –  starter settings for smoke-tests
+
 # ----------------------------------------------------
 # Anything in this file is passed verbatim to RolloutCollector via cfg.
 # The GRPO trainer will later read the same file and use only what it needs.

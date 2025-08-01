@@ -156,13 +156,65 @@ class RolloutCollector:
             gen_ids  = full_ids[:, :, prompt_ids.size(1):]               # (B,G,T_gen_pad)
 
             # If we requested output_scores, keep them; otherwise set None
-            scores = [s.view(take, self.G, -1) for s in gen_out.scores] if self.entropy_mode == "full" else None
+            #scores = [s.view(take, self.G, -1) for s in gen_out.scores] if self.entropy_mode == "full" else None
 
             if self.entropy_mode == "full":
                 # current fast path: one call to compute_transition_scores
                 all_lp = self.policy.compute_transition_scores(
                     gen_out.sequences, gen_out.scores, normalize_logits=True
                 )  # (B*G, Lgen_trim)
+
+
+            # -------------------------------------------------------------------------
+            # NEW fast-but-memory-lite path (entropy_mode = "none" or "lite")
+            # -------------------------------------------------------------------------
+            else:
+                seqs_flat   = gen_out.sequences.view(take * self.G, -1)          # (BG, L_full)
+                scores_full = gen_out.scores                                     # list[L_gen] of (BG, vocab)
+
+                lp_list     : list[torch.Tensor] = []
+                ent_list    : list[torch.Tensor] = []            # will stay zeros if entropy_mode == "none"
+                keep_lens   : list[int]           = []
+
+                mb = self.tf_micro_batch or 8                    # default 8
+                P  = prompt_ids.size(1)                          # padded prompt length
+
+                for start_idx in range(0, seqs_flat.size(0), mb):
+                    end_idx   = min(start_idx + mb, seqs_flat.size(0))
+                    rows      = slice(start_idx, end_idx)
+
+                    # --- slice micro-batch data -------------------------------------------------
+                    seqs_mb   = seqs_flat[rows]                                 # (mb, L_full)
+                    # gather the corresponding score slices for every generation step
+                    scores_mb = [s[rows] for s in scores_full]                  # list[L_gen] of (mb, vocab)
+
+                    # --- log-probabilities via transition-scores -------------------------------
+                    lp_mb = self.policy.compute_transition_scores(
+                        seqs_mb, scores_mb, normalize_logits=True               # (mb, L_gen_trim)
+                    )                                                           # log-probs only for generated tokens
+
+                    # lp_mb gives one log-prob per *generated* token, i.e. shape = (mb, L_gen_trim)
+                    # For each row, store and remember its true length.
+                    for r in range(lp_mb.size(0)):
+                        lp_seq = lp_mb[r].detach().cpu()        # (L_gen_trim,)
+                        lp_seq[lp_seq == float("-inf")] = 0.0   # safety clamp
+
+                        lp_list.append(lp_seq)
+                        keep_lens.append(lp_seq.size(0))
+
+                        # entropy placeholder (all zeros) – replace with real calc later if desired
+                        if self.entropy_mode != "none":
+                            ent_list.append(torch.zeros_like(lp_seq))
+
+                # -------------------------------------------------------------------------
+                # lp_list / ent_list / keep_lens now match the “full” path’s shapes
+                # (one 1-D tensor per prompt-generation)
+
+
+
+
+
+            """
             else:
                 # ram‑lite or no entropy: compute log‑probs (and entropies) via teacher forcing
                 seqs_flat = gen_out.sequences.view(take * self.G, -1)
@@ -177,6 +229,12 @@ class RolloutCollector:
                     stop_tag=TAG_STOP,
                 )
                 # lp_list/ent_list/keep_lens are Python lists; we'll index them below
+            """
+
+
+
+
+
 
             before = len(buffer)
 
