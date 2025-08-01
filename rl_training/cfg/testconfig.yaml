@@ -15,7 +15,7 @@ lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 rollout_batch_size: 16           # number of prompts per batch in rollout collection
 rollout_entropy_mode: "none"    # "full", "lite" or "none"
 tf_micro_batch: 8               # micro‑batch size for teacher forcing when lite/none
-optimizer_entropy: "none"       # "full" or "none"
+optimizer_entropy: "full"       # "full" or "none"
 
 
 num_generations   : 8 #8   # G: number of generations per prompt
