@@ -124,7 +124,7 @@ class DRGRPO(RLAlgorithm):
         adv = self._compute_advantage(rollouts.reward)  # (B, G)
 
         # ------------- 2) forward & gather log-probs --------------------------
-        new_logp = self._policy_logp(seq_flat, attn_mask, targets_tok, T_g).view(
+        new_logp = self._policy_logp(seq_flat, attn_mask, targets_tok, B, G, T_g).view(
             B, G, T_g
         )
         old_logp = rollouts.logprobs  # (B, G, T_g)
@@ -218,6 +218,8 @@ class DRGRPO(RLAlgorithm):
         seq_flat: torch.Tensor,
         attn_mask: torch.Tensor,
         targets_tok: torch.Tensor,
+        B: int,
+        G: int,
         T_g: int,
     ) -> torch.Tensor:
         """
