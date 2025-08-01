@@ -23,11 +23,11 @@ grad_accum_steps  : 128 #8   # ga_steps: total number of prompts per update batc
 # Above gives effective batch size 256 prompts, 8 gens per prompt, 8 steps per epoch
 
 ppo_epochs        : 1 #3   # K: number of updates per rollout-collection step.
-max_new_tokens    : 128
+max_new_tokens    : 256
 temperature       : 0.7
 #top_p             : 0.95 #remove 
 
-eval_every: 25        # ← run eval every 24 optimiser steps - after each rollout batch
+eval_every: 16        # ← run eval every 24 optimiser steps - after each rollout batch
 eval_frac: 1.0        
 eval_batch_size: 128
 eval_temperature: 0.7
@@ -54,7 +54,7 @@ lr               : 1.0e-6
 clip_eps         : 0.2
 clip_+           : 0.2 #asymmetric clipping
 
-cfg["kl_beta"]   : 0.05 # If zero only computes KL with no grad for logging
+cfg["kl_beta"]   : 0.0 # If zero only computes KL with no grad for logging
 
 ent_coef         : 0.0            # future entropy bonus knob
 grad_clip        : 1.0
@@ -64,6 +64,6 @@ gradient_checkpointing : true
 
 lr_scheduler: "const" # 'const' or 'cosine'
 
-save_every: 25
-total_steps: 50
+save_every: 32
+total_steps: 32
 
