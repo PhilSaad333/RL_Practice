@@ -51,7 +51,7 @@ class RolloutBuffer:
             yield idx[i : i+B]
 
     def get_batch(self, idx, device=None):
-        sub = RolloutBuffer(capacity=len(idx))
+        sub = RolloutBuffer(capacity=len(idx), pad_id=self._pad_id)
         for j in idx:  # copy refs, no padding work
             sub._prompts.append(self._prompts[j])
             sub._gens.append(self._gens[j])
