@@ -28,7 +28,7 @@ grad_accum_steps  : 32 #8   # ga_steps: total number of prompts per update batch
 # Above gives effective batch size 256 prompts, 8 gens per prompt, 8 steps per epoch
 
 ppo_epochs        : 1 #3   # K: number of updates per rollout-collection step.
-max_new_tokens    : 192
+max_new_tokens    : 128
 temperature       : 0.7
 #top_p             : 0.95 #remove 
 
