@@ -160,7 +160,6 @@ class RolloutCollector:
 
             if self.entropy_mode == "full":
                 # current fast path: one call to compute_transition_scores
-                print('shouldnt be here')
                 all_lp = self.policy.compute_transition_scores(
                     gen_out.sequences, gen_out.scores, normalize_logits=True
                 )  # (B*G, Lgen_trim)
@@ -177,19 +176,6 @@ class RolloutCollector:
                     compute_entropy=(self.entropy_mode != "none"),
                 )
                 # lp_list/ent_list/keep_lens are Python lists; we'll index them below
-
-
-
-
-
-
-
-
-            # -------- 3) log-probs ENTIRE mini-batch (perf) ------------
-            # CHANGE: one call, then slice rows inside per-prompt loop
-            all_lp = self.policy.compute_transition_scores(
-                gen_out.sequences, gen_out.scores, normalize_logits=True
-            )                                                             # (B*G, Lgen_trim)
 
             before = len(buffer)
 
