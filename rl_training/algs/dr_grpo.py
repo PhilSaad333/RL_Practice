@@ -82,6 +82,9 @@ class DRGRPO(RLAlgorithm):
             pathlib.Path(ratio_log_path) if ratio_log_path else None
         )
 
+        self.compute_entropy = cfg.get("optimizer_entropy", "full").lower() != "none"
+
+
     # --------------------------------------------------------------- public step #
 
     @torch.no_grad()
@@ -227,12 +230,13 @@ class DRGRPO(RLAlgorithm):
         # Rescale by temperature
         logits = logits / self.cfg.get("temperature", 1.0)
         logp_all = F.log_softmax(logits.to(torch.float16), dim=-1)
-        probs_all = torch.exp(logp_all)
-
-        # Compute entropy here
-        ent_tok_all = -(probs_all * logp_all).sum(-1)   # (BG, T_total-1)
-        self._last_entropy = ent_tok_all[:, -T_g:].view(B, G, T_g)
-
+        if self.compute_entropy:
+            probs_all = torch.exp(logp_all)
+            ent_tok_all = -(probs_all * logp_all).sum(-1)  # (BG, T_total-1)
+            self._last_entropy = ent_tok_all[:, -T_g:].view(B, G, T_g)
+        else:
+            self._last_entropy = torch.zeros((seq_flat.size(0), T_g),
+                                            device=logp_all.device, dtype=torch.float16)
         return (
             logp_all[:, :-1]
             .gather(-1, targets_tok.unsqueeze(-1))
