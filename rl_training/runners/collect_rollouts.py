@@ -224,6 +224,7 @@ class RolloutCollector:
                         ids_trim = ids_full[:cut]
                         gid_rows.append(ids_trim)
                         lp_seq = torch.tensor(lp_list[row_off + g], device=self.device)
+                        lp_seq[lp_seq == float("-inf")] = 0.0
                         lp_rows.append(lp_seq)
 
                 # compute entropies
