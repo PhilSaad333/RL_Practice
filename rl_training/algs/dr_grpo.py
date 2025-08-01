@@ -129,6 +129,13 @@ class DRGRPO(RLAlgorithm):
         )
         old_logp = rollouts.logprobs  # (B, G, T_g)
 
+        if torch.isinf(old_logp).any() or torch.isnan(old_logp).any():
+            bad = torch.nonzero(~torch.isfinite(old_logp))
+            print("‼️ old_logp contains non-finite values at", bad[:5], "…")
+        if torch.isinf(new_logp).any() or torch.isnan(new_logp).any():
+            bad = torch.nonzero(~torch.isfinite(new_logp))
+            print("‼️ new_logp contains non-finite values at", bad[:5], "…")
+
         # ------------- 3) PPO clipped loss & entropy -------------------------
         ratios, token_loss = self._ppo_surrogate(
             new_logp, old_logp, adv, gen_mask

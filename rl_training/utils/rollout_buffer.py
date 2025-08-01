@@ -29,7 +29,7 @@ class RolloutBuffer:
       tokens, and the trainer masks out padded generation tokens by length.
     """
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, pad_id: int):
         self.capacity = capacity
         self._prompts: List[torch.LongTensor] = []
         self._gens: List[torch.LongTensor] = []
@@ -38,7 +38,7 @@ class RolloutBuffer:
         self._tag_correct: List[torch.FloatTensor] = []
         self._think_len: List[torch.IntTensor] = []
         self._G: int | None = None
-
+        self._pad_id: int = pad_id
 
 
 
@@ -117,7 +117,7 @@ class RolloutBuffer:
         # Apparently pad_sequence doesn't allow left-padding so must do it manually
         T_max = max(p.size(0) for p in self._prompts)          # longest prompt length
         padded_prompts = torch.stack(
-            [F.pad(p, (T_max - p.size(0), 0), value=0)         # pad (left, right)
+            [F.pad(p, (T_max - p.size(0), 0), value=self._pad_id)         # pad (left, right)
             for p in self._prompts],
             dim=0                                              # (B, T_max)
         )
@@ -125,14 +125,14 @@ class RolloutBuffer:
         # ------------ pad generations --------------------------------------------
         # Each element in self._gens is (G, T_gen_i); we pad on dim=1, then stack.
         gens_padded_per_prompt = [
-            pad_sequence(list(g), batch_first=True, padding_value=0)      # (G, T_gen_max_i)
+            pad_sequence(list(g), batch_first=True, padding_value=self._pad_id)      # (G, T_gen_max_i)
             for g in self._gens
         ]
         # find global T_gen_max
         T_gen_max = max(g.shape[1] for g in gens_padded_per_prompt)
         # final pad so every prompt has the same T_gen_max
         gens_padded_per_prompt = [
-            torch.nn.functional.pad(g, (0, T_gen_max - g.shape[1]))       # pad rhs
+            torch.nn.functional.pad(g, (0, T_gen_max - g.shape[1]), value=self._pad_id)       # pad rhs
             for g in gens_padded_per_prompt
         ]
         padded_gens = torch.stack(gens_padded_per_prompt, dim=0)          # (B, G, T_gen_max)

@@ -124,7 +124,7 @@ class RolloutCollector:
     @torch.inference_mode()
     def collect_batch(self, batch_prompts: int | None = None) -> RolloutBatch:
         need   = batch_prompts or self.batch_size
-        buffer = RolloutBuffer(capacity=need)
+        buffer = RolloutBuffer(capacity=need, pad_id=self.pad_id)
         ans_pat = re.compile(r"\n</think>\n<answer>\n[\s\S]+?\n</answer>$")
 
         bar = tqdm(total=need, desc="Collecting rollouts", leave=False)
@@ -174,6 +174,7 @@ class RolloutCollector:
                     self.tf_micro_batch,
                     temperature=self.cfg["temperature"],
                     compute_entropy=(self.entropy_mode != "none"),
+                    stop_tag=TAG_STOP,
                 )
                 # lp_list/ent_list/keep_lens are Python lists; we'll index them below
 
@@ -294,6 +295,10 @@ class RolloutCollector:
                     ) for g in range(self.G)
                 ]
                 _append_jsonl(self._trace_file, samples)
+
+
+                assert torch.isfinite(lp_t).all(), "non-finite old log-probs detected"
+
 
                 # -------- 7) push to RolloutBuffer ---------------------
                 if accept and len(buffer) < need:

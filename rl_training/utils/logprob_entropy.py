@@ -18,6 +18,7 @@ def compute_logprobs_and_entropy(
     *,
     temperature: float = 1.0,
     compute_entropy: bool = True,
+    stop_tag: str="</answer>",
 ) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]], List[int]]:
     """
     Arguments
@@ -44,7 +45,7 @@ def compute_logprobs_and_entropy(
         prompt_lens = att[:, :prompt_len].sum(-1)
         gen_lens    = seq_lens - prompt_lens
 
-    tag_ids = tokenizer("", add_special_tokens=False).input_ids
+    tag_ids = tokenizer(stop_tag, add_special_tokens=False).input_ids
     L_tag = len(tag_ids)
     tag_tensor = torch.tensor(tag_ids, device=seqs.device) if L_tag > 0 else None
 
