@@ -144,6 +144,8 @@ class DRGRPO(RLAlgorithm):
                 enabled=self.cfg["bf16"], dtype=torch.bfloat16
             ):
                 ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
+            
+            ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
 
             ref_lp = (
                 F.log_softmax(ref_logits.to(torch.float16), dim=-1)[..., :-1]
@@ -236,7 +238,7 @@ class DRGRPO(RLAlgorithm):
             .gather(-1, targets_tok.unsqueeze(-1))
             .squeeze(-1)[:, -T_g:]
         )
-        
+
     # -- PPO loss --------------------------------------------------------------
 
     def _ppo_surrogate(
@@ -285,6 +287,8 @@ class DRGRPO(RLAlgorithm):
             enabled=self.cfg["bf16"], dtype=torch.bfloat16
         ):
             ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
+
+        ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
 
         ref_logp = (
             F.log_softmax(ref_logits.to(torch.float16), dim=-1)[..., :-1]
