@@ -147,7 +147,7 @@ class RolloutCollector:
                 temperature          = self.cfg["temperature"],
                 pad_token_id         = self.pad_id,
                 logits_processor     = self.logits_processor,
-                output_scores        = (self.entropy_mode == "full"),
+                output_scores        = True #(self.entropy_mode == "full"),
                 return_dict_in_generate = True,
             )
 
