@@ -141,6 +141,7 @@ def generate_with_logprobs(
         blk = seqs_flat[i : i + tf_micro_batch]           # [mb, T_full]
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
             logits = model(blk).logits                    # [mb, T_full, V]
+        logits = logits / gen_cfg.get("temperature", 1.0)
         log_p = logits.log_softmax(-1)                    # on GPU
 
         # causal-LM shift (labels are next-token ids)

@@ -1,3 +1,4 @@
+.
 ├── env.txt
 ├── evals
 │   ├── analyses
@@ -33,16 +34,28 @@
 ├── rlp_datasets
 │   ├── gsm8k_latex.py
 │   ├── gsm8k.py
+│   ├── gsm8k_r1_template.py
 │   ├── __init__.py
 │   ├── local_paths.py
 │   ├── mathmix.py
 │   ├── math.py
+│   ├── __pycache__
+│   │   ├── gsm8k.cpython-311.pyc
+│   │   ├── gsm8k_latex.cpython-311.pyc
+│   │   ├── gsm8k_r1_template.cpython-311.pyc
+│   │   ├── __init__.cpython-311.pyc
+│   │   ├── local_paths.cpython-311.pyc
+│   │   ├── math.cpython-311.pyc
+│   │   ├── mathmix.cpython-311.pyc
+│   │   ├── registry.cpython-311.pyc
+│   │   └── short.cpython-311.pyc
 │   ├── registry.py
 │   └── short.py
 └── rl_training
     ├── algs
     │   ├── base.py
-    │   ├── drgrpo.py
+    │   ├── drgrpo_old.py
+    │   ├── dr_grpo.py
     │   └── grpo.py
     ├── cfg
     │   ├── grpo_gsm8k_phi2.yaml
@@ -54,7 +67,6 @@
     │   ├── tag_math_correct.py
     │   └── tag_pref.py
     ├── runners
-    │   ├── collect_rollouts_old.py
     │   ├── collect_rollouts.py
     │   ├── eval_callback.py
     │   ├── rl_runner.py
