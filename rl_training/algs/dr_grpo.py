@@ -43,6 +43,8 @@ class DRGRPO(RLAlgorithm):
     ):
         super().__init__(policy, cfg)
 
+        self.cfg = cfg
+        
         total_updates = cfg["total_steps"]
         warmup_steps = int(0.05 * total_updates)
 
@@ -217,6 +219,9 @@ class DRGRPO(RLAlgorithm):
         """
         with torch.cuda.amp.autocast(enabled=self.cfg["bf16"], dtype=torch.bfloat16):
             logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+
+        # Rescale by temperature
+        logits = logits / self.cfg.get("temperature", 1.0)
 
         logp_all = F.log_softmax(logits.to(torch.float16), dim=-1)
         return (
