@@ -17,8 +17,8 @@ rollout_batch_size: 8 # number of prompts per batch in rollout collection
 num_generations   : 8 #8   # G: number of generations per prompt
 
 buffer_size       : 128 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
-microbatch_size   : 2   # B: prompts used for each gradient checkpointing steps
-grad_accum_steps  : 64 #8   # ga_steps: total number of prompts per update batch = ga_step*B
+microbatch_size   : 1   # B: prompts used for each gradient checkpointing steps
+grad_accum_steps  : 128 #8   # ga_steps: total number of prompts per update batch = ga_step*B
 
 # Above gives effective batch size 256 prompts, 8 gens per prompt, 8 steps per epoch
 
@@ -28,12 +28,9 @@ temperature       : 0.7
 #top_p             : 0.95 #remove 
 
 eval_every: 25        # ← run eval every 24 optimiser steps - after each rollout batch
-eval_frac: 0.3        # smaller for now
-eval_cfg:             # (reserved for future – temperature, top-p, etc.)
-  temperature: 0.7
-  top_p: 1.0
-  batch_size: 12
-  subset_frac: 1.0
+eval_frac: 1.0        
+eval_batch_size: 128
+eval_temperature: 0.7
 
 
 reward_var_thresh : 0.01
@@ -46,7 +43,7 @@ reward_fns:
 
 scheduler:
   name          : mix_passrate
-  dataset_name  : gsm8k_latex
+  dataset_name  : gsm8k_r1_template
   split         : "train"
   ema_alpha     : 0.01
   boundaries    : [0.2, 0.8]
@@ -56,6 +53,8 @@ scheduler:
 lr               : 1.0e-6
 clip_eps         : 0.2
 clip_+           : 0.2 #asymmetric clipping
+
+cfg["kl_beta"]   : 0.05 # If zero only computes KL with no grad for logging
 
 ent_coef         : 0.0            # future entropy bonus knob
 grad_clip        : 1.0

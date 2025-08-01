@@ -8,8 +8,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import trange
 from rl_training.runners.collect_rollouts import RolloutCollector
 from rl_training.runners.eval_callback import EvalCallback
-from rl_training.algs.grpo import GRPO
-from rl_training.algs.drgrpo import DRGRPO
+#from rl_training.algs.grpo import GRPO
+from rl_training.algs.dr_grpo import DRGRPO
 from rl_training.algs.base import RolloutBatch
 from transformers import (AutoTokenizer, AutoModelForCausalLM,
                           BitsAndBytesConfig)
@@ -191,13 +191,13 @@ class RLRunner:
         cmd = textwrap.dedent(f"""
             python -m evals.eval_runner
                 --backbone {self.cfg['eval_backbone']}
-                --ft_dataset gsm8k_latex
+                --ft_dataset {self.cfg["scheduler"]["dataset_name"]}
                 --ckpt_path {ckpt_dir}
                 --ckpt_step {self.step_id}
-                --batch_size 8
-                --subset_frac {self.cfg['eval_frac']}
-                --eval_dataset gsm8k_latex
-                --temperature 0.7 --top_p 1.0
+                --batch_size {self.cfg.get('eval_batch_size',8)}
+                --subset_frac {self.cfg.get('eval_frac',1.0)}
+                --eval_dataset {self.cfg["scheduler"]["dataset_name"]}
+                --temperature {self.cfg.get('eval_temperature',0.7)} --top_p 1.0
                 --runs_root /content/drive/MyDrive/RL_Practice_Files/eval_runs/rl_evals
         """).split()
 

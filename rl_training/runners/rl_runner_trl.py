@@ -12,7 +12,7 @@ from trl import GRPOConfig, GRPOTrainer
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
-from rlp_datasets.gsm8k_latex import build_gsm8k     # type: ignore
+from rlp_datasets.gsm8k_r1_template import build_gsm8k     # type: ignore
 from math_verify import parse, verify
 
 ANSWER_RE = re.compile(r"<answer>\s*([\s\S]*?)\s*</answer>", re.MULTILINE)
@@ -20,7 +20,7 @@ ANSWER_RE = re.compile(r"<answer>\s*([\s\S]*?)\s*</answer>", re.MULTILINE)
 def make_hf_dataset(split="train"):
     examples = build_gsm8k(split)
     return Dataset.from_dict({
-        "prompt": [ex.question + "\n<think>\n" for ex in examples],
+        "prompt": [ex.question.split('<think>')[0].strip() +"\n<think>\n" for ex in examples],
         "ground_truth": [ex.answer for ex in examples],
     })
 
@@ -53,15 +53,15 @@ def main():
                    help="Path to the saved LoRA checkpoint directory.")
     p.add_argument("--out_dir",          type=str, required=True,
                    help="Where to write checkpoints / TB logs.")
-    p.add_argument("--max_steps",        type=int, default=20,
+    p.add_argument("--max_steps",        type=int, default=5,
                    help="Maximum total training steps (overrides epochs if set).")
-    p.add_argument("--num_train_epochs", type=int, default=2,
+    p.add_argument("--num_train_epochs", type=int, default=0,
                    help="Number of full-data epochs to train (TRL flag `--num_train_epochs`).")
-    p.add_argument("--lr",               type=float, default=2e-5,
+    p.add_argument("--lr",               type=float, default=1e-6,
                    help="Learning rate for the optimizer.")
-    p.add_argument("--num_gens",         type=int, default=6,
+    p.add_argument("--num_gens",         type=int, default=8,
                    help="Num completions per prompt (G).")
-    p.add_argument("--batch_size",       type=int, default=12,
+    p.add_argument("--batch_size",       type=int, default=2,
                    help="Prompts per device per generation step.")
     p.add_argument("--accum",            type=int, default=16,
                    help="Gradient-accumulation steps.")
@@ -75,7 +75,7 @@ def main():
                                 bnb_4bit_use_double_quant=True)
 
     base = AutoModelForCausalLM.from_pretrained(
-        "microsoft/phi-2",
+        "Qwen/Qwen2-0.5B",
         torch_dtype=torch.bfloat16,
         quantization_config=bnb_cfg,
         device_map="auto",
@@ -91,7 +91,7 @@ def main():
     # 3) sanity-check
     model.print_trainable_parameters() 
 
-    tok = AutoTokenizer.from_pretrained("microsoft/phi-2")
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
     tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
