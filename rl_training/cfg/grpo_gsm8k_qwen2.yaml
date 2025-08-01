@@ -31,7 +31,7 @@ max_new_tokens    : 128
 temperature       : 0.7
 #top_p             : 0.95 #remove 
 
-eval_every: 16        # ← run eval every 24 optimiser steps - after each rollout batch
+eval_every: 32        # ← run eval every 24 optimiser steps - after each rollout batch
 eval_frac: 1.0        
 eval_batch_size: 128
 eval_temperature: 0.7
@@ -69,5 +69,5 @@ gradient_checkpointing : true
 lr_scheduler: "const" # 'const' or 'cosine'
 
 save_every: 32
-total_steps: 32
+total_steps: 96
 
