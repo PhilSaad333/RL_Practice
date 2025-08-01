@@ -125,7 +125,7 @@ class RolloutCollector:
     def collect_batch(self, batch_prompts: int | None = None) -> RolloutBatch:
         need   = batch_prompts or self.batch_size
         buffer = RolloutBuffer(capacity=need, pad_id=self.pad_id)
-        ans_pat = re.compile(r"\n</think>\n<answer>\n[\s\S]+?\n</answer>$")
+        ans_pat = re.compile(r"</think>\s*<answer>\s*(.*?)\s*</answer>\s*$",re.DOTALL)
 
         bar = tqdm(total=need, desc="Collecting rollouts", leave=False)
 
