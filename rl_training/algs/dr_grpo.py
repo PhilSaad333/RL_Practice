@@ -244,7 +244,7 @@ class DRGRPO(RLAlgorithm):
             ent_tok_all = -(probs_all * logp_all).sum(-1)  # (BG, T_total-1)
             self._last_entropy = ent_tok_all[:, -T_g:].view(B, G, T_g)
         else:
-            self._last_entropy = torch.zeros((seq_flat.size(0), T_g),
+            self._last_entropy = torch.zeros((B, G, T_g),
                                             device=logp_all.device, dtype=torch.float16)
         return (
             logp_all[:, :-1]
