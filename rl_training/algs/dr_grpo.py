@@ -130,7 +130,9 @@ class DRGRPO(RLAlgorithm):
         ratios, token_loss = self._ppo_surrogate(
             new_logp, old_logp, adv, gen_mask
         )
-        entropy = self._token_entropy(seq_flat, attn_mask, T_g, gen_mask)
+
+        entropy  = (self._last_entropy * gen_mask).sum() / (gen_mask.sum() + 1e-8)
+
 
         loss = token_loss * (1.0 / self.accum_steps)  # scale for grad-accum
 
@@ -222,30 +224,19 @@ class DRGRPO(RLAlgorithm):
 
         # Rescale by temperature
         logits = logits / self.cfg.get("temperature", 1.0)
-
         logp_all = F.log_softmax(logits.to(torch.float16), dim=-1)
+        probs_all = torch.exp(logp_all)
+
+        # Compute entropy here
+        ent_tok_all = -(probs_all * logp_all).sum(-1)   # (BG, T_total-1)
+        self._last_entropy = ent_tok_all[:, -T_g:].view(B, G, T_g)
+
         return (
             logp_all[:, :-1]
             .gather(-1, targets_tok.unsqueeze(-1))
             .squeeze(-1)[:, -T_g:]
         )
-
-    def _token_entropy(
-        self,
-        seq_flat: torch.Tensor,
-        attn_mask: torch.Tensor,
-        T_g: int,
-        gen_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return mean token entropy over generated tokens (scalar tensor)."""
-        with torch.cuda.amp.autocast(enabled=self.cfg["bf16"], dtype=torch.bfloat16):
-            logits = self.policy(seq_flat, attention_mask=attn_mask).logits
-
-        logp = F.log_softmax(logits.to(torch.float16), dim=-1)[:, -T_g:]
-        probs = torch.exp(logp)
-        ent_tok = -(probs * logp).sum(-1).view_as(gen_mask) * gen_mask
-        return ent_tok.sum() / (gen_mask.sum() + 1e-8)
-
+        
     # -- PPO loss --------------------------------------------------------------
 
     def _ppo_surrogate(
