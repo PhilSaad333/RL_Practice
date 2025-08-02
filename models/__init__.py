@@ -15,7 +15,8 @@ MODEL_REGISTRY = {
     "orcamath":    "microsoft/orca-math-7b",          # eval-only
     "codellama7b": "codellama/CodeLlama-7b-hf",
     "qwen2":       "Qwen/Qwen2-0.5B",
-    "qwen2_5":     "Qwen/Qwen2.5-1.5B",
+    "qwen2_5_15":     "Qwen/Qwen2.5-1.5B",
+    "qwen2_5_05":     "Qwen/Qwen2.5-0.5B",
 }
 
 def _is_local(path_like: str) -> bool:
