@@ -29,6 +29,6 @@ def passk_metrics(records: List[EvalRecord], k_vals=(1, 2, 4, 8)) -> List[Dict]:
             "pass_rate": sum(flags)/(max(k_vals))
             }
         for k in k_vals:
-            row[f"pass@{k}"] = int(any(flags[:k]))       # Codex metric
+            row[f"pass@{k}"] = int(any(flags[:k]))
         rows.append(row)
     return rows

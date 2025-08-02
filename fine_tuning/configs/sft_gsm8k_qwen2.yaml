@@ -1,5 +1,5 @@
 inherit: _template_sft.yaml      # keeps common knobs
-backbone: Qwen/Qwen2-0.5B        # 🤗 hub id
+backbone: Qwen/Qwen2.5-1.5B        # 🤗 hub id
 dataset:  gsm8k_r1_template     # your pre-processed split
 
 # output

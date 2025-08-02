@@ -59,6 +59,7 @@ class Evaluator:
         from evals.metrics.passk import passk_metrics
         from evals.metrics.response_len import response_len_metrics
         from evals.metrics.entropy import entropy_metrics
+        from evals.metrics.max_correct_len import max_correct_len_metric
         self.metric_fns    = [
             tag_format_metrics,
             passk_metrics,
