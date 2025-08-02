@@ -1,0 +1,24 @@
+
+inherit: _template_sft.yaml      # keeps common knobs
+backbone: "google/gemma-2b-it"        # 🤗 hub id
+dataset:  gsm8k_r1_template     # your pre-processed split
+
+# output
+output_dir: "/content/drive/MyDrive/RL_Practice_Files/finetuned/gemma_gsm8k_lora"
+
+# LoRA + QLoRA
+quantized: true      # 4-bit
+lora_r: 64
+lora_alpha: 128
+
+# optimiser & schedule
+batch_size: 12
+grad_accum: 3
+epochs: 1
+lr: 2e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+
+# seq-length & packing
+max_seq_len: 512
+packing: false       # keep CoT examples separate
