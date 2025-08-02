@@ -58,7 +58,7 @@ lr               : 1.0e-6
 clip_eps         : 0.2
 clip_+           : 0.2 #asymmetric clipping
 
-cfg["kl_beta"]   : 0.0 # If zero only computes KL with no grad for logging
+cfg["kl_beta"]   : 0.05 # If zero only computes KL with no grad for logging
 
 ent_coef         : 0.0            # future entropy bonus knob
 grad_clip        : 1.0

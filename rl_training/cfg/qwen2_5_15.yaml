@@ -31,7 +31,7 @@ max_new_tokens    : 200
 temperature       : 0.7
 #top_p             : 0.95 #remove 
 
-eval_every: 16        
+eval_every: 8        
 eval_frac: 1.0        
 eval_batch_size: 128
 eval_temperature: 0.7
@@ -51,14 +51,14 @@ scheduler:
   split         : "train"
   ema_alpha     : 0.01
   boundaries    : [0.2, 0.8]
-  sample_weights: [1, 1, 1]
+  sample_weights: [4, 3, 1]
 
 # ------------------ trainer (GRPO) --------------- #
 lr               : 1.0e-6
 clip_eps         : 0.2
 clip_+           : 0.2 #asymmetric clipping
 
-cfg["kl_beta"]   : 0.0 # If zero only computes KL with no grad for logging
+cfg["kl_beta"]   : 0.05 # If zero only computes KL with no grad for logging
 
 ent_coef         : 0.0            # future entropy bonus knob
 grad_clip        : 1.0
@@ -68,5 +68,5 @@ gradient_checkpointing : true
 
 lr_scheduler: "const" # 'const' or 'cosine'
 
-save_every: 16
+save_every: 8
 total_steps: 48
