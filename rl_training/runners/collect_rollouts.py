@@ -19,7 +19,6 @@ from rl_training.utils.rollout_buffer import RolloutBuffer, RolloutBatch
 from rl_training.rewards import get_reward_fns
 from importlib import import_module
 
-
 TAG_STOP = "</answer>"
 
 # --------------------------------------------------------------------------
@@ -116,6 +115,15 @@ class RolloutCollector:
         self.entropy_mode: str = cfg.get("rollout_entropy_mode", "full").lower()
         self.tf_micro_batch: int = cfg.get("tf_micro_batch", 4)
 
+        # VLLM stuff
+        llm = LLM(model="your-model-id", trust_remote_code=True, dtype="bfloat16")
+        sampling_params = SamplingParams(
+            temperature=cfg["temperature"],
+            top_p=cfg["top_p"],
+            max_tokens=cfg["max_new_tokens"],
+            logprobs=1,            # return logprob for each sampled token
+        )
+
 
 
     # ------------------------------------------------------------------
@@ -132,7 +140,7 @@ class RolloutCollector:
         while len(buffer) < need:
 
             # -------- 1) sample prompt mini-batch ----------------------
-            take = min(self.batch_size, need - len(buffer))   # CHANGE
+            take = self.batch_size      # used to be min(self.batch_size, need-len(buffer))
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
                 self.prompt_sampler, self.tokenizer, self.device, take
             )                                                  # prompt_ids: [B, T_p]
@@ -240,6 +248,8 @@ class RolloutCollector:
 
             # -------- 4) iterate over prompt-groups --------------------
             for b in range(take):
+                if len(buffer) >= need:
+                    break
                 pid     = pids[b]
                 q_text  = ptxts[b]
                 g_ids_b = gen_ids[b]                                      # (G, T_gen_pad)
