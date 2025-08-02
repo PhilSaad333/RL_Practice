@@ -31,7 +31,7 @@ import tyro
 from pathlib import Path
 from evals.records import EvalRecord
 from evals.evaluator import Evaluator
-from evals.metrics import tag_format, passk, response_len, entropy
+from evals.metrics import tag_format, passk, response_len, entropy, max_correct_len
 from transformers import GenerationConfig
 from tqdm.auto import tqdm
 

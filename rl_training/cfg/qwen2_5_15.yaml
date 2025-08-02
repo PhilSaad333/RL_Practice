@@ -20,9 +20,9 @@ optimizer_entropy: "none"       # "full" or "none"
 
 num_generations   : 8 #8   # G: number of generations per prompt
 
-buffer_size       : 32 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
+buffer_size       : 128 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
 microbatch_size   : 1   # B: prompts used for each gradient checkpointing steps
-grad_accum_steps  : 32 #8   # ga_steps: total number of prompts per update batch = ga_step*B
+grad_accum_steps  : 128 #8   # ga_steps: total number of prompts per update batch = ga_step*B
 
 # Above gives effective batch size 256 prompts, 8 gens per prompt, 8 steps per epoch
 
