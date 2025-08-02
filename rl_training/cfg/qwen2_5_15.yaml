@@ -51,7 +51,7 @@ scheduler:
   split         : "train"
   ema_alpha     : 0.01
   boundaries    : [0.2, 0.8]
-  sample_weights: [4, 3, 1]
+  sample_weights: [4, 3, 1]  #(hard, normal, easy)
 
 # ------------------ trainer (GRPO) --------------- #
 lr               : 1.0e-6
@@ -66,7 +66,7 @@ bf16             : true
 
 gradient_checkpointing : true
 
-lr_scheduler: "const" # 'const' or 'cosine'
+lr_scheduler: "none" # 'const' or 'cosine'
 
 save_every: 8
-total_steps: 48
+total_steps: 32
