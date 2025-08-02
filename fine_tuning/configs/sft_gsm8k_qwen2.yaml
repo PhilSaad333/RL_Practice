@@ -3,7 +3,7 @@ backbone: Qwen/Qwen2.5-1.5B        # 🤗 hub id
 dataset:  gsm8k_r1_template     # your pre-processed split
 
 # output
-output_dir: "/content/drive/MyDrive/RL_Practice_Files/finetuned/qwen2_gsm8k_lora"
+output_dir: "/content/drive/MyDrive/RL_Practice_Files/finetuned/qwen2_5_gsm8k_lora"
 
 # LoRA + QLoRA
 quantized: true      # 4-bit
