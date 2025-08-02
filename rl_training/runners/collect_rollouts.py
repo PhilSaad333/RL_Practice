@@ -115,14 +115,6 @@ class RolloutCollector:
         self.entropy_mode: str = cfg.get("rollout_entropy_mode", "full").lower()
         self.tf_micro_batch: int = cfg.get("tf_micro_batch", 4)
 
-        # VLLM stuff
-        llm = LLM(model="your-model-id", trust_remote_code=True, dtype="bfloat16")
-        sampling_params = SamplingParams(
-            temperature=cfg["temperature"],
-            top_p=cfg["top_p"],
-            max_tokens=cfg["max_new_tokens"],
-            logprobs=1,            # return logprob for each sampled token
-        )
 
 
 
