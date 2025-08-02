@@ -333,7 +333,7 @@ class RolloutCollector:
                     dtype=torch.float32, device=self.device
                 )
                 t_len = torch.tensor(
-                    [_count_think_tokens(t, self.tokenizer) for t in full_txts],
+                    [_count_think_tokens(t, self.tokenizer) for t in g_txts],
                     dtype=torch.int32, device=self.device
                 )
 
@@ -398,9 +398,9 @@ def _accept_prompt_group(
 
 
 def _count_think_tokens(text: str, tok: PreTrainedTokenizerBase) -> int:
-    if "<think>" not in text or "</think>" not in text:
+    if "</think>" not in text:
         return 0
-    inner = text.split("<think>", 1)[1].split("</think>", 1)[0]
+    inner = text.split("</think>", 1)[0].strip()
     return len(tok(inner, add_special_tokens=False).input_ids)
 
 
