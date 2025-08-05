@@ -32,7 +32,7 @@ temperature       : 0.7
 #top_p             : 0.95 #remove 
 
 eval_every: 2        
-eval_frac: 1.0        
+eval_frac: 0.05        
 eval_batch_size: 128
 eval_temperature: 0.7
 
