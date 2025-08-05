@@ -165,7 +165,7 @@ class RolloutCollector:
             )                                                  # prompt_ids: [B, T_p]
 
             # -------- 2) batched generation ---------------------------
-            gen_out = self.policy.generate(
+            gen_out = self.policy.module.generate(
                 prompt_ids,
                 attention_mask       = attn,
                 do_sample            = True,
@@ -187,7 +187,7 @@ class RolloutCollector:
 
             if self.entropy_mode == "full":
                 # current fast path: one call to compute_transition_scores
-                all_lp = self.policy.compute_transition_scores(
+                all_lp = self.policy.module.compute_transition_scores(
                     gen_out.sequences, gen_out.scores, normalize_logits=True
                 )  # (B*G, Lgen_trim)
 
@@ -216,7 +216,7 @@ class RolloutCollector:
                     scores_mb = [s[rows] for s in scores_full]                  # list[L_gen] of (mb, vocab)
 
                     # --- log-probabilities via transition-scores -------------------------------
-                    lp_mb = self.policy.compute_transition_scores(
+                    lp_mb = self.policy.module.compute_transition_scores(
                         seqs_mb, scores_mb, normalize_logits=True               # (mb, L_gen_trim)
                     )                                                           # log-probs only for generated tokens
 
