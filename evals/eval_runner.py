@@ -51,7 +51,8 @@ def main(backbone: str = "phi2",
          top_p: float = 1.0,
          num_return_sequences: int = 8,
          max_new_tokens: int = 256,
-         runs_root: str = "eval_runs",):
+         runs_root: runs_root: str = os.environ.get("EVAL_RUNS_ROOT", "eval_runs"),
+         ):
 
 
     model, tok, prompts, golds, stopper = load_everything(
@@ -82,7 +83,12 @@ def main(backbone: str = "phi2",
 
 
     recs = []
-    for start in tqdm(range(0, len(prompts), batch_size), desc="Generating Records"):
+    for start in tqdm(
+        range(0, len(prompts), batch_size),
+        desc="Generating Records",
+        disable=not sys.stdout.isatty()
+        ):
+        
         batch_prompts = prompts[start : start + batch_size]
         gens, lps, ents = generate_with_logprobs(
             model, tok, batch_prompts, cfg, stopper
@@ -104,6 +110,7 @@ def main(backbone: str = "phi2",
     # metadata
     tag = f"T{temperature}_P{top_p}_R{num_return_sequences}"
 
+    os.makedirs(runs_root, exist_ok=True)
     evaluator = Evaluator(
         backbone=backbone,
         ft_dataset=ft_dataset,

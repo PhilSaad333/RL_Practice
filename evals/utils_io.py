@@ -23,6 +23,10 @@ from rlp_datasets import DATASET_REGISTRY
 TAG_RGX  = re.compile(r"<think>.*?</think>\s*<answer>.*?</answer>", re.S)
 TAG_STOP = "</answer>"
 
+DATA_ROOT = os.environ.get("DATA_ROOT", "./datasets")
+CKPT_ROOT = os.environ.get("CKPT_ROOT", "./checkpoints")
+
+
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │ Custom stopping criterion: stop after "</answer>"                        │
@@ -73,10 +77,13 @@ def load_everything(
     tok.pad_token = tok.eos_token
 
     if ckpt_path:
+        ckpt_path = os.path.expanduser(ckpt_path)
+        if not os.path.isabs(ckpt_path):
+            ckpt_path = os.path.join(CKPT_ROOT, ckpt_path)
         model = PeftModel.from_pretrained(model, ckpt_path)
 
     # -------- dataset --------
-    ds_test = DATASET_REGISTRY[eval_dataset]("test")
+    ds_test = DATASET_REGISTRY[eval_dataset]("test", root=DATA_ROOT)
 
     prompts = [ex.question for ex in ds_test]
     golds   = [ex.answer for ex in ds_test]

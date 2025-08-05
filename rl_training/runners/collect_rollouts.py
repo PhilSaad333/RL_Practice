@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Sequence
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence as pad
 from tqdm.auto import tqdm
@@ -18,6 +19,11 @@ from rl_training.utils.logprob_entropy import compute_logprobs_and_entropy
 from rl_training.utils.rollout_buffer import RolloutBuffer, RolloutBatch
 from rl_training.rewards import get_reward_fns
 from importlib import import_module
+
+
+
+
+
 
 TAG_STOP = "</answer>"
 
@@ -78,8 +84,13 @@ class RolloutCollector:
     ):
         self.policy     = policy
         self.tokenizer  = tokenizer
-        self.device     = device or policy.device
         self.cfg        = cfg
+
+
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        trace_name = f"rollouts_rank{self.rank}.jsonl"
+        self._trace_file = out_dir / trace_name
+
 
         assert tokenizer.padding_side == "left"
         self.pad_id     = tokenizer.pad_token_id
@@ -127,7 +138,12 @@ class RolloutCollector:
         buffer = RolloutBuffer(capacity=need, pad_id=self.pad_id)
         ans_pat = re.compile(r"</think>\s*<answer>\s*(.*?)\s*</answer>\s*$",re.DOTALL)
 
-        bar = tqdm(total=need, desc="Collecting rollouts", leave=False)
+        bar = tqdm(
+            total=need,
+            desc="Collecting rollouts",
+            leave=False,
+            disable=(self.rank != 0),
+        )
 
         while len(buffer) < need:
 
@@ -166,7 +182,7 @@ class RolloutCollector:
 
 
             # -------------------------------------------------------------------------
-            # NEW fast-but-memory-lite path (entropy_mode = "none" or "lite")
+            # NEW fast-but-memory-lite path (entropy_mode = "none")
             # -------------------------------------------------------------------------
             else:
                 seqs_flat   = gen_out.sequences.view(take * self.G, -1)          # (BG, L_full)
@@ -209,31 +225,6 @@ class RolloutCollector:
                 # -------------------------------------------------------------------------
                 # lp_list / ent_list / keep_lens now match the “full” path’s shapes
                 # (one 1-D tensor per prompt-generation)
-
-
-
-
-
-            """
-            else:
-                # ram‑lite or no entropy: compute log‑probs (and entropies) via teacher forcing
-                seqs_flat = gen_out.sequences.view(take * self.G, -1)
-                lp_list, ent_list, keep_lens = compute_logprobs_and_entropy(
-                    self.policy,
-                    self.tokenizer,
-                    seqs_flat,
-                    prompt_ids.size(1),
-                    self.tf_micro_batch,
-                    temperature=self.cfg["temperature"],
-                    compute_entropy=(self.entropy_mode != "none"),
-                    stop_tag=TAG_STOP,
-                )
-                # lp_list/ent_list/keep_lens are Python lists; we'll index them below
-            """
-
-
-
-
 
 
             before = len(buffer)
@@ -404,8 +395,12 @@ def _count_think_tokens(text: str, tok: PreTrainedTokenizerBase) -> int:
     return len(tok(inner, add_special_tokens=False).input_ids)
 
 
-def _append_jsonl(file: Path, records: List[GenSample]):
-    with file.open("a") as fh:
+def _append_jsonl(file_path: Path, records: List[GenSample]):
+    # skip logging on non-zero ranks
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    with open(file_path, "a") as fh:
         for r in records:
             fh.write(json.dumps(asdict(r)) + "\n")
 

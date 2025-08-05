@@ -1,0 +1,32 @@
+# ── core ───────────────────────────────────────────────
+torch==2.5.1+cu124           --extra-index-url https://download.pytorch.org/whl/cu124
+torchvision==0.20.1+cu124    --extra-index-url https://download.pytorch.org/whl/cu124
+torchaudio==2.5.1+cu124      --extra-index-url https://download.pytorch.org/whl/cu124
+
+transformers==4.53.0         # latest stable (matches your Colab):contentReference[oaicite:4]{index=4}
+peft==0.10.0                 # your Colab pin:contentReference[oaicite:5]{index=5}
+trl==0.8.6
+accelerate==1.9.0
+bitsandbytes==0.43.2         # CUDA 11–12.5 support:contentReference[oaicite:6]{index=6}
+
+# ── math-verify + parser runtime ───────────────────────
+math-verify[antlr4_9_3]==0.1.6
+antlr4-python3-runtime==4.9.3
+
+# ── CLI / config helpers ───────────────────────────────
+tyro==0.6.0
+omegaconf==2.2.3
+
+# ── Hugging Face dataset stack (Colab has these) ───────
+datasets>=2.19.0
+evaluate>=0.4.2
+huggingface_hub>=0.23.0
+sentencepiece>=0.2.0
+pyarrow>=15.0.2
+tqdm>=4.66.4
+pandas>=2.2.2
+numpy>=1.26.4
+
+# ── optional vision extras you installed ───────────────
+timm==0.9.16
+einops>=0.7.0
