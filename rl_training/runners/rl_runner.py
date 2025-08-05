@@ -59,7 +59,7 @@ class RLRunner:
         model = model.to(self.local_rank)
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[self.local_rank], output_device=self.local_rank)
-        model.enable_input_require_grads()
+        model.module.enable_input_require_grads()
         self.model = model
 
         self.tok = AutoTokenizer.from_pretrained(self.cfg["backbone"])

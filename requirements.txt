@@ -34,3 +34,5 @@ numpy>=1.26.4
 # ── optional vision extras ──────────────────────────────────────
 timm==0.9.16
 einops>=0.7.0
+
+tensorboard>=2.20.0

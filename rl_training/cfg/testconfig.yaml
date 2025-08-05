@@ -9,7 +9,7 @@
 backbone: Qwen/Qwen2.5-1.5B
 eval_backbone: qwen2_5_15
 #lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
-
+lora_ckpt: /home/ubuntu/RL_Practice/checkpoints/checkpoint-156
 
 # -------------- rollout collector ---------------- #
 rollout_batch_size: 8           # number of prompts per batch in rollout collection
