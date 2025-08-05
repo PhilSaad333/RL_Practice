@@ -10,7 +10,7 @@ accelerate==1.9.0
 bitsandbytes==0.43.2
 
 # ── math-verify + parser runtime ───────────────────────
-math-verify[antlr4_9_3]==0.1.6
+math-verify[antlr4_9_3]==0.8.0
 antlr4-python3-runtime==4.9.3
 
 # ── CLI / config helpers ───────────────────────────────
