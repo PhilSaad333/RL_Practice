@@ -55,12 +55,14 @@ class RLRunner:
         base.gradient_checkpointing_enable()
         base.config.use_cache = False
 
+
         model = PeftModel.from_pretrained(base, lora_ckpt, is_trainable=True)
+        model.enable_input_require_grads()              # <── move here
         model = model.to(self.local_rank)
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[self.local_rank], output_device=self.local_rank)
-        model.module.enable_input_require_grads()
+                    model, device_ids=[self.local_rank], output_device=self.local_rank)
         self.model = model
+
 
         self.tok = AutoTokenizer.from_pretrained(self.cfg["backbone"])
         if self.tok.pad_token_id is None:
