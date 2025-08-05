@@ -1,23 +1,27 @@
-# ── core ───────────────────────────────────────────────
-torch==2.5.1+cu124           --extra-index-url https://download.pytorch.org/whl/cu124
-torchvision==0.20.1+cu124    --extra-index-url https://download.pytorch.org/whl/cu124
-torchaudio==2.5.1+cu124      --extra-index-url https://download.pytorch.org/whl/cu124
+# ── CUDA wheels index ─────────────────────────────────────────
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# ── core ───────────────────────────────────────────────────────
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
 
 transformers==4.53.0
 peft==0.10.0
 trl==0.8.6
 accelerate==1.9.0
 bitsandbytes==0.43.2
+pyyaml                         # for `import yaml`
 
-# ── math-verify + parser runtime ───────────────────────
+# ── math-verify + parser runtime ───────────────────────────────
 math-verify[antlr4_9_3]==0.8.0
 antlr4-python3-runtime==4.9.3
 
-# ── CLI / config helpers ───────────────────────────────
+# ── CLI / config helpers ───────────────────────────────────────
 tyro==0.6.0
 omegaconf==2.2.3
 
-# ── Hugging Face dataset stack (Colab has these) ───────
+# ── Hugging Face dataset stack ────────────────────────────────
 datasets>=2.19.0
 evaluate>=0.4.2
 huggingface_hub>=0.23.0
@@ -27,6 +31,6 @@ tqdm>=4.66.4
 pandas>=2.2.2
 numpy>=1.26.4
 
-# ── optional vision extras you installed ───────────────
+# ── optional vision extras ──────────────────────────────────────
 timm==0.9.16
 einops>=0.7.0
