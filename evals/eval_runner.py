@@ -29,6 +29,7 @@ to run:
 
 import tyro
 from pathlib import Path
+import os, sys
 from evals.records import EvalRecord
 from evals.evaluator import Evaluator
 from evals.metrics import tag_format, passk, response_len, entropy, max_correct_len
@@ -51,7 +52,7 @@ def main(backbone: str = "phi2",
          top_p: float = 1.0,
          num_return_sequences: int = 8,
          max_new_tokens: int = 256,
-         runs_root: runs_root: str = os.environ.get("EVAL_RUNS_ROOT", "eval_runs"),
+         runs_root: str = os.environ.get("EVAL_RUNS_ROOT", "eval_runs"),
          ):
 
 
@@ -88,7 +89,7 @@ def main(backbone: str = "phi2",
         desc="Generating Records",
         disable=not sys.stdout.isatty()
         ):
-        
+
         batch_prompts = prompts[start : start + batch_size]
         gens, lps, ents = generate_with_logprobs(
             model, tok, batch_prompts, cfg, stopper
