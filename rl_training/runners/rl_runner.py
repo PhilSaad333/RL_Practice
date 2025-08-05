@@ -1,7 +1,7 @@
 # rl_training/runners/rl_runner.py
 from __future__ import annotations
 
-import os, json, math, gc, datetime, pathlib, shutil, textwrap, yaml, torch
+import os, json, math, gc, datetime, pathlib, shutil, textwrap, yaml, torch, copy
 import torch.distributed as dist
 from collections import defaultdict
 from subprocess import run as run_sync
@@ -72,7 +72,8 @@ class RLRunner:
         self.pad_id = self.tok.pad_token_id
         self.tok.padding_side = "left"
 
-        self.ref_model = torch.clone(self.model.module).eval().requires_grad_(False)
+        self.ref_model = copy.deepcopy(self.model.module).eval().requires_grad_(False)
+
         self.collector = RolloutCollector(self.model, self.tok, self.cfg,
                                           out_dir=self.dir,
                                           device=f"cuda:{self.local_rank}")
