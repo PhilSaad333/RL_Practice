@@ -3,11 +3,11 @@ torch==2.5.1+cu124           --extra-index-url https://download.pytorch.org/whl/
 torchvision==0.20.1+cu124    --extra-index-url https://download.pytorch.org/whl/cu124
 torchaudio==2.5.1+cu124      --extra-index-url https://download.pytorch.org/whl/cu124
 
-transformers==4.53.0         # latest stable (matches your Colab):contentReference[oaicite:4]{index=4}
-peft==0.10.0                 # your Colab pin:contentReference[oaicite:5]{index=5}
+transformers==4.53.0
+peft==0.10.0
 trl==0.8.6
 accelerate==1.9.0
-bitsandbytes==0.43.2         # CUDA 11–12.5 support:contentReference[oaicite:6]{index=6}
+bitsandbytes==0.43.2
 
 # ── math-verify + parser runtime ───────────────────────
 math-verify[antlr4_9_3]==0.1.6
