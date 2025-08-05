@@ -92,6 +92,17 @@ class RolloutCollector:
         self._trace_file = out_dir / trace_name
 
 
+        # ─── Make sure self.device actually exists ──────────────────────
+        # If the caller passed a device string or torch.device, use that;
+        # otherwise fall back to CPU (or change to CUDA if you prefer).
+        if device is None:
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(device)
+
+
+
+
         assert tokenizer.padding_side == "left"
         self.pad_id     = tokenizer.pad_token_id
         self.G          = cfg["num_generations"]
