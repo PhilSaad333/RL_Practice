@@ -15,9 +15,13 @@ from transformers import (AutoTokenizer, AutoModelForCausalLM,
                           BitsAndBytesConfig)
 from peft import PeftModel, prepare_model_for_kbit_training
 from copy import deepcopy
+import torch.distributed as dist
 
 
-RUN_ROOT = pathlib.Path("/content/drive/MyDrive/RL_Practice_Files/rl_runs")
+
+RUN_ROOT = pathlib.Path(
+    os.environ.get("RUN_ROOT", "./rl_runs")
+)
 
 def slice_batch(rb: RolloutBatch, sl: slice) -> RolloutBatch:
     return RolloutBatch(prompt_ids = rb.prompt_ids[sl],
@@ -27,6 +31,18 @@ def slice_batch(rb: RolloutBatch, sl: slice) -> RolloutBatch:
 
 class RLRunner:
     def __init__(self, cfg_path: str, lora_ckpt: str):
+
+        # -------- Stuff for multi gpu -----------------------------------
+        # 1) Init the process group
+        dist.init_process_group(backend="nccl")
+
+        # 2) Figure out this process’s GPU index
+        local_rank = int(os.getenv("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        self.local_rank = local_rank
+        self.rank = dist.get_rank()
+
+
         # ---------- I/O ---------------------------------------------------
         cfg = yaml.safe_load(open(cfg_path))
         self.cfg = cfg
@@ -35,33 +51,51 @@ class RLRunner:
         self.dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(cfg_path, self.dir / "config.yaml")       # save config
 
-        self.tb   = SummaryWriter(log_dir=str(self.dir))
+        if self.rank == 0:
+            self.tb = SummaryWriter(str(self.dir))
+        else:
+            self.tb = None
+
         self.save_every = cfg.get("save_every", 100) #updated
         self.step_id    = 0
 
-        # ---------- load model + adapters -------------------------------
-        bnb = BitsAndBytesConfig(load_in_4bit=True,
-                                 bnb_4bit_use_double_quant=True,
-                                 bnb_4bit_compute_dtype=torch.bfloat16)
+        # --------- load model -------------------------------------------------
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
         backbone_id = cfg["backbone"]
-        base = AutoModelForCausalLM.from_pretrained(backbone_id,
-                                                    torch_dtype=torch.bfloat16,
-                                                    quantization_config=bnb)
-        
-        base = prepare_model_for_kbit_training(base)   # <-- BEFORE adding LoRA
-                                            
+        base = AutoModelForCausalLM.from_pretrained(
+            backbone_id,
+            torch_dtype=torch.bfloat16,
+            quantization_config=bnb,
+        )
+        # prepare for 4-bit LoRA training
+        base = prepare_model_for_kbit_training(base)
+
         base.gradient_checkpointing_enable()
-        # DEBUG
-        #base.enable_input_require_grads()
         base.config.use_cache = False
 
-        self.model = PeftModel.from_pretrained(base, lora_ckpt, is_trainable=True).to("cuda")
+        model = PeftModel.from_pretrained(
+            base,
+            lora_ckpt,
+            is_trainable=True,
+        )
 
-        self.model.enable_input_require_grads()
+        model = model.to(local_rank)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+        )
 
-        trainable = sum(p.requires_grad for p in self.model.parameters())
-        print(f"Trainable params (manual): {trainable}") 
-        self.model.print_trainable_parameters()
+        model.enable_input_require_grads()
+
+        self.model = model
+
+        # for debug
+        #self.model.print_trainable_parameters()
 
 
         self.tok   = AutoTokenizer.from_pretrained(backbone_id)
@@ -86,7 +120,7 @@ class RLRunner:
 
         # ---------- subsystems ------------------------------------------
         self.collector = RolloutCollector(self.model, self.tok, cfg,
-                                          out_dir=self.dir, device="cuda")
+                                          out_dir=self.dir, device=f"cuda:{self.local_rank}")
         ratio_log = self.dir / "ratios.jsonl"
 
         # Just stick with DRGRPO for now, add option later after fixing up ordinary grpo                  
@@ -111,7 +145,7 @@ class RLRunner:
         outer_loops = math.ceil(total_updates / K)
         p_per_outer = self.buffer_size
         
-        for _ in trange(outer_loops, desc="outer collect loops"):
+        for _ in trange(outer_loops, desc="outer collect loops", disable=(self.rank != 0)):
             rb = self.collector.collect_batch(batch_prompts=p_per_outer)
 
             torch.cuda.empty_cache()
@@ -157,6 +191,8 @@ class RLRunner:
 
 
     def _log(self, d):
+        if self.rank != 0:
+            return
         json_out = {"step": self.step_id, **d}
         with open(self.dir / "train_log.jsonl", "a") as f:
             f.write(json.dumps(json_out) + "\n")
@@ -168,19 +204,21 @@ class RLRunner:
 
     def _save_ckpt(self, final: bool = False):
         tag = f"{self.step_id}" if not final else "final"
-        save_dir = self.dir / f"checkpoint-{tag}"
-        self.model.save_pretrained(save_dir)        # adapter-only ✔️ :contentReference[oaicite:8]{index=8}
-        # optional merged full model
-        #merged = self.model.merge_and_unload()      # combines LoRA → dense  :contentReference[oaicite:9]{index=9}
-        #merged.save_pretrained(save_dir / "merged")
-        print(f"saved model to {save_dir}")
-        # kick off an eval if requested
-        # --------- periodic evaluation, *blocking* ----------
-        if not final and self.cfg.get("eval_every", 0) \
-                and self.step_id % self.cfg["eval_every"] == 0:
-            self._run_eval(save_dir)
 
-    # ---------------- NEW -----------------------------------
+        save_dir = self.dir / f"step_{self.step_id}"
+        if self.rank == 0:
+            # Only rank 0 writes the checkpoint
+            self.model.module.save_pretrained(save_dir)
+            print(f"saved model to {save_dir}")
+        # barrier: wait for save to finish
+        torch.distributed.barrier()
+
+        # Evaluation: only rank 0 runs it, others wait
+        if self.rank == 0:
+            self._run_eval(save_dir)
+        torch.distributed.barrier()
+
+
     def _run_eval(self, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
 
@@ -202,7 +240,13 @@ class RLRunner:
         """).split()
 
         env = os.environ.copy()
-        env["TOKENIZERS_PARALLELISM"] = "false"   # keeps HF quiet
+        env["CUDA_VISIBLE_DEVICES"] = "0"
+        # Improve to follow cmd structure from above
+        subprocess.run(
+            ["python", "evals/eval_runner.py", "--ckpt", str(save_dir), "--runs_root", str(self.eval_root)],
+            env=env,
+            check=True,
+        )
 
         # 3) run *synchronously* (blocks until eval finishes)
         run_sync(cmd, env=env, check=True)

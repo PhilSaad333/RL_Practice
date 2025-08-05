@@ -66,7 +66,7 @@ bf16             : true
 
 gradient_checkpointing : true
 
-lr_scheduler: "none" # 'const' or 'cosine'
+lr_scheduler: "const" # 'const' or 'cosine'
 
 save_every: 8
 total_steps: 32
