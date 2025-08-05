@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 
 
 #BASE = '/content/drive/MyDrive/RL_Practice_Files/datasets'
-BASE =  '/home/ubuntu/RL_Practice/datasets'
+BASE =  '/home/ubuntu/dataset'
 
 # Explicitly using qwen2 tokenizer
 tokenizer = AutoTokenizer.from_pretrained(

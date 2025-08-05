@@ -112,7 +112,7 @@ def generate_with_logprobs(
 
     amp_dtype = torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
-        out = model.generate(
+        out = model.module.generate(
             **enc,
             generation_config       = gen_cfg,
             logits_processor        = stop_crit, # now using logits processor
