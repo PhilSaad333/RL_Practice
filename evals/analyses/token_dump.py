@@ -228,4 +228,4 @@ def main(args: Args):
     print(f"[✓] wrote {len(prompts)} prompts → {dump_path}")
 
 if __name__ == "__main__":
-    tyro.cli(main, tyro.conf.Args(parser_kwargs={"description": __doc__}))
+    tyro.cli(main, description=__doc__)
