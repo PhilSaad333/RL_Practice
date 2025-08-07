@@ -97,7 +97,7 @@ def load_model_and_tok(args: Args):
 def prepare_prompts(args: Args) -> Sequence[str]:
     """Load prompts and optionally subsample."""
 
-    ds = DATASET_REGISTRY[args.eval_dataset](split=args.split, root=args.DATA_ROOT)
+    ds = DATASET_REGISTRY[args.eval_dataset](split=args.split, root=args.data_root)
 
     total = len(ds)
     ids   = list(range(total))
