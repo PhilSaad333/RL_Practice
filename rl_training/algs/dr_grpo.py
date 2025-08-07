@@ -158,12 +158,12 @@ class DRGRPO(RLAlgorithm):
             ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
 
             ref_lp = (
-                F.log_softmax(ref_logits.to(torch.float16), dim=-1)[..., :-1]
+                F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
                 .gather(-1, targets_tok.unsqueeze(-1))
                 .squeeze(-1)[..., -T_g:]
             ).view(B, G, T_g)
 
-            delta_lp = new_logp - ref_lp
+            delta_lp = (new_logp - ref_lp).clamp(-80, 80)
             kl_per_tok = (delta_lp.exp() + delta_lp - 1.0) * gen_mask
             kl_mean = kl_per_tok.sum() / (gen_mask.sum() + 1e-8)
 
@@ -238,7 +238,12 @@ class DRGRPO(RLAlgorithm):
 
         # Rescale by temperature
         logits = logits / self.cfg.get("temperature", 1.0)
-        logp_all = F.log_softmax(logits.to(torch.float16), dim=-1)
+
+        # careful about precision because of some nan issues
+        logp_all = F.log_softmax(logits.float(), dim=-1)   # float32 kernel
+        logp_all = logp_all.to(torch.bfloat16 if self.cfg["bf16"] else torch.float32)\
+        logp_all = torch.clamp(logp_all,
+                    min=torch.finfo(logp_all.dtype).min + 1e-4)
         if self.compute_entropy:
             probs_all = torch.exp(logp_all)
             ent_tok_all = -(probs_all * logp_all).sum(-1)  # (BG, T_total-1)
@@ -304,12 +309,12 @@ class DRGRPO(RLAlgorithm):
         ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
 
         ref_logp = (
-            F.log_softmax(ref_logits.to(torch.float16), dim=-1)[..., :-1]
+            F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
             .gather(-1, targets_tok.unsqueeze(-1))
             .squeeze(-1)[..., -T_g:]
             .view_as(new_logp)
         )
-        delta_lp = new_logp.detach() - ref_logp
+        delta_lp = (new_logp.detach() - ref_lp).clamp(-80, 80)
         kl_per_tok = (delta_lp.exp() + delta_lp - 1.0) * gen_mask
         return (kl_per_tok.sum() / (gen_mask.sum() + 1e-8)).item()
 
