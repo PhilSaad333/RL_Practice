@@ -36,7 +36,9 @@ from transformers import (
     GenerationConfig,
 )
 from peft import PeftModel
+from math_verify import parse, verify
 from rlp_datasets import DATASET_REGISTRY
+from evals.metrics.tag_format import has_good_tags
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +50,6 @@ class Args:
     ckpt_path: str = ""
     eval_dataset: str = "openai/gsm8k"
     split: str = "test"
-    data_root = os.environ.get("DATA_ROOT", "./datasets/processed")
     subset_frac: float = 1.0
     max_prompts: Optional[int] = None
     # --- generation ---------------------------------------------------------
@@ -109,7 +110,8 @@ def prepare_prompts(args: Args) -> Sequence[str]:
         ids = ids[: args.max_prompts]
 
     prompts = [ds[int(i)].question for i in ids]
-    return prompts
+    golds = [ds[int(i)].answer for i in ids]
+    return prompts, golds
 
 
 def write_jsonl_gz(path: pathlib.Path, rows, compresslevel: int = 6):
@@ -143,12 +145,14 @@ def topk_or_topp(log_probs: torch.Tensor, *, k: int, p: float):
         return top_idx, top_lp
 
 
-def process_batch(model, tok, batch_prompts: Sequence[str], args: Args):
+def process_batch(model, tok, batch_data: Sequence[dict], args: Args):
     """
     Generate completions *with scores*, then compute per-token statistics.
 
     Returns an iterable of dicts, one per generated sequence.
     """
+    batch_prompts = batch_data['prompts']
+    batch_golds = batch_data['golds']
     enc = tok(
         list(batch_prompts),
         return_tensors="pt",
@@ -195,6 +199,9 @@ def process_batch(model, tok, batch_prompts: Sequence[str], args: Args):
         toks      = sampled_tok_ids[b, :gen_len].tolist()
         lp_s      = lp_sampled[b, :gen_len].tolist()
 
+        gen_text = tok.decode(toks, skip_special_tokens=True)
+        r = reward(gen_text, batch_golds[b])
+
         # top-k / top-p per position – vectorised then sliced
         idxs, lps = topk_or_topp(
             log_probs[b, :gen_len],
@@ -207,9 +214,19 @@ def process_batch(model, tok, batch_prompts: Sequence[str], args: Args):
             "lp_sampled": lp_s,
             "topk_idx": idxs.cpu().tolist(),
             "topk_lp":  lps.cpu().tolist(),
+            "gen_text": gen_text,
+            "reward": r,
         }
         rows.append(row)
     return rows
+
+def reward(gen_text, gold):
+    gold_expr = parse(f"${gold}$")
+    if not has_good_tags(gen_text):
+        return 0.0
+    pred = gen_text.split("</answer>")[0].split("<answer>")[-1].strip()
+    correct = verify(gold_expr, parse(f"${pred}$"))
+    return 1.0 if correct else 0.0
 
 
 def main(args: Args):
@@ -217,11 +234,12 @@ def main(args: Args):
     random.seed(args.seed)
 
     model, tok    = load_model_and_tok(args)
-    prompts       = prepare_prompts(args)
+    prompts, golds   = prepare_prompts(args)
     dump_path     = args.out_dir / "dump.jsonl.gz"
 
     for i in tqdm(range(0, len(prompts), args.batch_size)):
-        batch = prompts[i : i + args.batch_size]
+        batch = {'prompts': prompts[i : i + args.batch_size],
+        'golds': golds[i : i + args.batch_size]}
         rows  = process_batch(model, tok, batch, args)
         write_jsonl_gz(dump_path, rows, compresslevel=args.compresslevel)
 
