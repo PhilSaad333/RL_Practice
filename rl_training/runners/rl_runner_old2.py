@@ -1,7 +1,7 @@
 # rl_training/runners/rl_runner.py
 from __future__ import annotations
 
-import os, json, math, gc, datetime, pathlib, shutil, textwrap, yaml, torch, copy
+import os, json, math, gc, datetime, pathlib, shutil, yaml, torch, copy
 import torch.distributed as dist
 from collections import defaultdict
 from subprocess import run as run_sync
@@ -24,14 +24,25 @@ def slice_batch(rb: RolloutBatch, sl: slice) -> RolloutBatch:
                         reward=rb.reward[sl],
                         logprobs=rb.logprobs[sl])
 
+def _unwrap(model):
+    # Changed 8/11: helper for DDP/unwrapped access
+    return model.module if hasattr(model, "module") else model  # Changed 8/11
+
 
 class RLRunner:
     def __init__(self, cfg_path: str, lora_ckpt: str):
         # ─── distributed init ────────────────────────────────────────────
-        dist.init_process_group("nccl")
-        self.local_rank = int(os.getenv("LOCAL_RANK", 0))
-        torch.cuda.set_device(self.local_rank)
-        self.rank = dist.get_rank()
+        # Changed 8/11: make DDP optional (works in single-GPU Colab)
+        if os.environ.get("WORLD_SIZE", "1") != "1":
+            dist.init_process_group(backend=os.environ.get("DIST_BACKEND", "nccl"))  # Changed 8/11
+            self.local_rank = int(os.getenv("LOCAL_RANK", 0))
+            torch.cuda.set_device(self.local_rank)
+            self.rank = dist.get_rank()
+            self.ddp = True  # Changed 8/11
+        else:
+            self.local_rank = 0
+            self.rank = 0
+            self.ddp = False  # Changed 8/11
 
         # ─── I/O setup ───────────────────────────────────────────────────
         self.cfg = yaml.safe_load(open(cfg_path))
@@ -51,32 +62,34 @@ class RLRunner:
         base = AutoModelForCausalLM.from_pretrained(self.cfg["backbone"],
                                                     torch_dtype=torch.bfloat16,
                                                     quantization_config=bnb)
-        base = prepare_model_for_kbit_training(base)
+        base = prepare_model_for_kbit_training(base)  # PEFT/QLoRA prep  # (PEFT docs)  # Changed 8/11
         base.gradient_checkpointing_enable()
         base.config.use_cache = False
 
-
         model = PeftModel.from_pretrained(base, lora_ckpt, is_trainable=True)
-        model.enable_input_require_grads()              # <── move here
-        model = model.to(self.local_rank)
-        model = torch.nn.parallel.DistributedDataParallel(
-                    model, device_ids=[self.local_rank], output_device=self.local_rank)
+        model.enable_input_require_grads()
+        model = model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        if self.ddp:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[self.local_rank], output_device=self.local_rank
+            )  # Changed 8/11
         self.model = model
-
 
         self.tok = AutoTokenizer.from_pretrained(self.cfg["backbone"])
         if self.tok.pad_token_id is None:
             self.tok.pad_token = self.tok.eos_token
-        if self.model.module.config.pad_token_id is None:
-            self.model.module.config.pad_token_id = self.tok.pad_token_id
+        if _unwrap(self.model).config.pad_token_id is None:
+            _unwrap(self.model).config.pad_token_id = self.tok.pad_token_id
         self.pad_id = self.tok.pad_token_id
         self.tok.padding_side = "left"
 
-        self.ref_model = copy.deepcopy(self.model.module).eval().requires_grad_(False)
+        # Changed 8/11: build ref model robustly for single or multi-GPU
+        self.ref_model = copy.deepcopy(_unwrap(self.model)).eval().requires_grad_(False)  # Changed 8/11
+        self.ref_model = self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")  # Changed 8/11
 
         self.collector = RolloutCollector(self.model, self.tok, self.cfg,
                                           out_dir=self.dir,
-                                          device=f"cuda:{self.local_rank}")
+                                          device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
         self.algo = DRGRPO(self.model, self.cfg, pad_id=self.pad_id,
                            ratio_log_path=self.dir / "ratios.jsonl")
         self.accum = self.cfg["grad_accum_steps"]
@@ -107,7 +120,7 @@ class RLRunner:
             micro_cnt = 0
             for idx in rb.iter_minibatches(B, shuffle=True):
                 sync = ((micro_cnt + 1) % ga_steps == 0)
-                mb = rb.get_batch(idx, device=f"cuda:{self.local_rank}")
+                mb = rb.get_batch(idx, device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
                 stats = self.algo.step(mb, self.ref_model, sync_grads=sync)
                 for k, v in stats.items():
                     stats_sum[k] += v
@@ -136,12 +149,14 @@ class RLRunner:
         tag = f"{self.step_id}" if not final else "final"
         save_dir = self.dir / f"step_{tag}"
         if self.rank == 0:
-            self.model.module.save_pretrained(save_dir)
+            _unwrap(self.model).save_pretrained(save_dir)  # Changed 8/11
             print(f"saved model to {save_dir}")
-        dist.barrier()
+        if self.ddp:
+            dist.barrier()  # Changed 8/11
         if self.rank == 0:
             self._run_eval(save_dir)
-        dist.barrier()
+        if self.ddp:
+            dist.barrier()  # Changed 8/11
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
@@ -165,7 +180,7 @@ class RLRunner:
         run_sync(cmd, env=env, check=True)
 
         torch.cuda.empty_cache(); gc.collect()
-        self.model.to(f"cuda:{self.local_rank}")
+        self.model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
         print(f"[Eval] finished, resuming training.")
 
 # ─── CLI ────────────────────────────────────────────────────────────────────

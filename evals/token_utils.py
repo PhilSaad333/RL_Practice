@@ -24,8 +24,8 @@ def load_dump(path: str | pathlib.Path) -> Iterator[Dict[str, Any]]:
 
 # --- token ↔ text helpers --------------------------------------------------
 
-def seq_to_text(tok_ids: Sequence[int], tokenizer: PreTrainedTokenizerBase) -> str:
-    return tokenizer.decode(tok_ids, skip_special_tokens=True)
+#def seq_to_text(tok_ids: Sequence[int], tokenizer: PreTrainedTokenizerBase) -> str:
+#    return tokenizer.decode(tok_ids, skip_special_tokens=True)
 
 def highlight_token(
     text: str,
@@ -80,5 +80,4 @@ def get_outlier_tokens(
     # attach human-readable text:
     for score, row in keep:
         row["stat"] = score
-        row["gen_text"] = seq_to_text(row["tok_ids"], tokenizer)
     return [row for _, row in keep]

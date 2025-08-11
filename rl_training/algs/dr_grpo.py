@@ -19,19 +19,8 @@ from .base import RLAlgorithm, RolloutBatch
 
 class DRGRPO(RLAlgorithm):
     """
-    Drop-in replacement of the original DR-GRPO implementation, rewritten for clarity
-    and configurability.
-
-    Key changes
-    -----------
-    • All computation is split into helper methods that do *one* thing.
-    • Optional KL penalty: if ``cfg["kl_beta"] > 0`` the KL term is computed with
-      gradients and *added* to the total loss.  Otherwise it is computed only for
-      logging, exactly as before (no autograd, no extra memory).
-    • `step()` is now a linear, easy-to-read orchestration routine.
+    Clear, modular PPO/GRPO-style updater with optional differentiable KL.
     """
-
-    # --------------------------------------------------------------------- init #
 
     def __init__(
         self,
@@ -42,9 +31,8 @@ class DRGRPO(RLAlgorithm):
         ratio_log_path: str | pathlib.Path | None = None,
     ):
         super().__init__(policy, cfg)
-
         self.cfg = cfg
-        
+
         total_updates = cfg["total_steps"]
         warmup_steps = int(0.05 * total_updates)
 
@@ -66,26 +54,18 @@ class DRGRPO(RLAlgorithm):
                     self.opt, num_warmup_steps=warmup_steps
                 )
             case _:
-                self.lr_sched = None  # truly fixed LR
+                self.lr_sched = None
 
-        self.pad_id = (
-            pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
-        )
-
+        self.pad_id = pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
         self.accum_steps: int = cfg["grad_accum_steps"]
         self._accum_ctr: int = 0
         self.actual_opt_step: int = 0
-        self.device = None  # filled in during `step`
+        self.device = None
 
-        # Optional ratio logging
-        self._ratio_log_path = (
-            pathlib.Path(ratio_log_path) if ratio_log_path else None
-        )
+        self._ratio_log_path = pathlib.Path(ratio_log_path) if ratio_log_path else None
 
-        self.compute_entropy = cfg.get("optimizer_entropy", "full").lower() != "none"
-
-
-    # --------------------------------------------------------------- public step #
+        # Always compute sampled entropy (cheap and correct estimator)  # Changed 8/11
+        self.compute_entropy = True  # Changed 8/11
 
     @torch.no_grad()
     def _compute_advantage(self, rewards: torch.Tensor) -> torch.Tensor:
@@ -102,31 +82,16 @@ class DRGRPO(RLAlgorithm):
     ) -> Dict[str, float]:
         """
         One optimisation step (or gradient-accumulation micro-step).
-
-        Order of operations:
-        1. Flatten sequences and masks
-        2. Run policy forward pass → token log-probs
-        3. Compute PPO-style clipped policy loss
-        4. (Optionally) compute differentiable KL penalty
-        5. Back-prop / optimizer / scheduler
-        6. Return logging metrics
         """
         self.device = rollouts.gen_ids.device
         B, G, T_g = rollouts.gen_ids.shape
 
-        # ------------- 1) prepare tensors & advantages ------------------------
-        (
-            seq_flat,
-            attn_mask,
-            targets_tok,
-            gen_mask,
-        ) = self._build_sequences(rollouts)
+        # 1) prepare tensors & advantages
+        seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
         adv = self._compute_advantage(rollouts.reward)  # (B, G)
 
-        # ------------- 2) forward & gather log-probs --------------------------
-        new_logp = self._policy_logp(seq_flat, attn_mask, targets_tok, B, G, T_g).view(
-            B, G, T_g
-        )
+        # 2) forward & gather log-probs
+        new_logp = self._policy_logp(seq_flat, attn_mask, targets_tok, B, G, T_g).view(B, G, T_g)
         old_logp = rollouts.logprobs  # (B, G, T_g)
 
         if torch.isinf(old_logp).any() or torch.isnan(old_logp).any():
@@ -136,90 +101,70 @@ class DRGRPO(RLAlgorithm):
             bad = torch.nonzero(~torch.isfinite(new_logp))
             print("‼️ new_logp contains non-finite values at", bad[:5], "…")
 
-        # ------------- 3) PPO clipped loss & entropy -------------------------
-        ratios, token_loss = self._ppo_surrogate(
-            new_logp, old_logp, adv, gen_mask
-        )
+        # 3) PPO clipped loss & entropy (entropy from sampled tokens)
+        ratios, token_loss = self._ppo_surrogate(new_logp, old_logp, adv, gen_mask)
 
-        entropy  = (self._last_entropy * gen_mask).sum() / (gen_mask.sum() + 1e-8)
+        # sampled entropy per token = -log p(sampled token)
+        entropy = (-(new_logp) * gen_mask).sum() / (gen_mask.sum() + 1e-8)  # Changed 8/11
+        self._last_entropy = (-(new_logp)).detach()                          # Changed 8/11
 
+        loss = token_loss * (1.0 / self.accum_steps)
 
-        loss = token_loss * (1.0 / self.accum_steps)  # scale for grad-accum
-
-        # ------------- 4) optional KL penalty ---------------------------------
-        kl_mean = 0.0  # default
+        # 4) optional differentiable KL (stable on-policy estimator)
+        kl_mean = 0.0
         if self.cfg.get("kl_beta", 0.0) > 0.0:
-            # differentiable KL            (ref forward *without* grad)
-            with torch.no_grad(), torch.cuda.amp.autocast(
-                enabled=self.cfg["bf16"], dtype=torch.bfloat16
-            ):
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
                 ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
-            
             ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
 
-            ref_lp = (
-                F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
-                .gather(-1, targets_tok.unsqueeze(-1))
-                .squeeze(-1)[..., -T_g:]
-            ).view(B, G, T_g)
+            # log-softmax in float32 for stability
+            ref_logp_all = F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
+            ref_logp = ref_logp_all.gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[..., -T_g:].view(B, G, T_g)
 
-            delta_lp = (new_logp - ref_lp).clamp(-80, 80)
-            kl_per_tok = (delta_lp.exp() + delta_lp - 1.0) * gen_mask
-            kl_mean = kl_per_tok.sum() / (gen_mask.sum() + 1e-8)
+            # KL(pi||ref) sample estimator = E_pi[logpi - logref]
+            kl_tok = ((new_logp - ref_logp) * gen_mask)
+            kl_mean = kl_tok.sum() / (gen_mask.sum() + 1e-8)
 
             loss = loss + self.cfg["kl_beta"] * kl_mean
         else:
-            # metric-only KL (identical to old behaviour)
-            kl_mean = self._kl_metric_only(
-                seq_flat, attn_mask, targets_tok, new_logp, ref_model, gen_mask, T_g
-            )
+            kl_mean = self._kl_metric_only(seq_flat, attn_mask, targets_tok, new_logp, ref_model, gen_mask, T_g)
 
-        # ------------- 5) log ratios (optional) ------------------------------
+        # 5) optional ratio logging
         self._maybe_log_ratios(ratios, gen_mask)
 
-        # ------------- 6) optimise -------------------------------------------
+        # 6) optimise
         self._backward_and_step(loss, sync_grads)
 
-        # ------------- 7) metrics dict ---------------------------------------
+        # 7) metrics
         metrics: Dict[str, float] = {
-            "loss": loss.detach().float().item(),
-            "entropy": entropy.item(),
-            "kl": kl_mean if isinstance(kl_mean, float) else kl_mean.item(),
-            "r_mean": rollouts.reward.mean(dim=(0, 1)).item(),
-            "tag_correct": rollouts.tag_correct.float().mean(dim=(0, 1)).item(),
-            "think_len": rollouts.think_len.float().mean(dim=(0, 1)).item(),
+            "loss": float(loss.detach().item()),
+            "entropy": float(entropy.item()),
+            "kl": float(kl_mean if isinstance(kl_mean, float) else kl_mean.item()),
+            "r_mean": float(rollouts.reward.mean(dim=(0, 1)).item()),
+            "tag_correct": float(rollouts.tag_correct.float().mean(dim=(0, 1)).item()),
+            "think_len": float(rollouts.think_len.float().mean(dim=(0, 1)).item()),
         }
         metrics.update(self._ratio_stats(ratios, gen_mask))
+
+        # Added 8/11: placeholder for entropy-formula probes (no-op for now)
+        # self._log_entropy_probes(new_logp, adv, gen_mask)  # Added 8/11
+
         return metrics
 
-    # ----------------------------------------------------------- helper methods #
-
     # -- sequence prep ---------------------------------------------------------
-
-    def _build_sequences(
-        self, rollouts: RolloutBatch
+    def _build_sequences(self, rollouts: RolloutBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Return (seq_flat, attn_mask, targets_tok, gen_mask).
-        Shapes:
-            seq_flat   : (B × G, T_total)
-            attn_mask  : (B × G, T_total)
-            targets_tok: (B × G, T_total - 1)
-            gen_mask   : (B, G, T_g)
-        """
         B, G, T_g = rollouts.gen_ids.shape
         prompt_rep = rollouts.prompt_ids.unsqueeze(1).expand(-1, G, -1)
         seq_ids = torch.cat((prompt_rep, rollouts.gen_ids), dim=-1)  # (B, G, T_total)
 
         seq_flat = seq_ids.reshape(B * G, -1)
         attn_mask = (seq_flat != self.pad_id).long()
-
         targets_tok = seq_flat[:, 1:]  # teacher forcing targets
         gen_mask = (rollouts.gen_ids != self.pad_id).float()  # (B, G, T_g)
         return seq_flat, attn_mask, targets_tok, gen_mask
 
     # -- forward passes --------------------------------------------------------
-
     def _policy_logp(
         self,
         seq_flat: torch.Tensor,
@@ -229,36 +174,22 @@ class DRGRPO(RLAlgorithm):
         G: int,
         T_g: int,
     ) -> torch.Tensor:
-        """
-        Run the *policy* model and return log-probs for generated slice
-        (BG, T_g) in float16.
-        """
-        with torch.cuda.amp.autocast(enabled=self.cfg["bf16"], dtype=torch.bfloat16):
+        """Return log p(sampled token) for generated slice (BG, T_g)."""
+        with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
             logits = self.policy(seq_flat, attention_mask=attn_mask).logits
 
-        # Rescale by temperature
         logits = logits / self.cfg.get("temperature", 1.0)
 
-        # careful about precision because of some nan issues
-        logp_all = F.log_softmax(logits.float(), dim=-1)   # float32 kernel
-        logp_all = logp_all.to(torch.bfloat16 if self.cfg["bf16"] else torch.float32)\
-        logp_all = torch.clamp(logp_all,
-                    min=torch.finfo(logp_all.dtype).min + 1e-4)
-        if self.compute_entropy:
-            probs_all = torch.exp(logp_all)
-            ent_tok_all = -(probs_all * logp_all).sum(-1)  # (BG, T_total-1)
-            self._last_entropy = ent_tok_all[:, -T_g:].view(B, G, T_g)
-        else:
-            self._last_entropy = torch.zeros((B, G, T_g),
-                                            device=logp_all.device, dtype=torch.float16)
-        return (
-            logp_all[:, :-1]
-            .gather(-1, targets_tok.unsqueeze(-1))
-            .squeeze(-1)[:, -T_g:]
-        )
+        # compute log-softmax in float32 for stability, then gather
+        logp_all = F.log_softmax(logits.float(), dim=-1)
+        # Gather next-token logprob, then slice the generated region
+        new_logp = logp_all[:, :-1].gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g:]
+        # clamp and sanitize
+        new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0)
+        new_logp = torch.clamp(new_logp, min=-80.0, max=0.0)  # logprob <= 0
+        return new_logp
 
     # -- PPO loss --------------------------------------------------------------
-
     def _ppo_surrogate(
         self,
         new_logp: torch.Tensor,
@@ -266,22 +197,17 @@ class DRGRPO(RLAlgorithm):
         adv: torch.Tensor,
         gen_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Return (ratios, loss_scalar_tensor).
-        Loss is *summed over tokens* then averaged as in the original paper.
-        """
+        """Return (ratios, loss_scalar)."""
         ratios = torch.exp((new_logp - old_logp).clamp(-80, 80)) * gen_mask
 
         clip_eps_neg = self.cfg["clip_eps"]
         clip_eps_pos = self.cfg.get("clip_+", self.cfg["clip_eps"])
 
         surr1 = ratios * adv.unsqueeze(-1)
-        surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv.unsqueeze(
-            -1
-        )
+        surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv.unsqueeze(-1)
         token_loss = -torch.min(surr1, surr2) * gen_mask  # (B, G, T_g)
 
-        # Dr-GRPO: normalise per-prompt by *max* gen length
+        # Dr-GRPO: normalise per-prompt by max gen length
         tokens_per_gen = gen_mask.sum(dim=2)  # (B, G)
         max_lens = tokens_per_gen.max(dim=-1).values  # (B,)
         loss_per_prompt = token_loss.sum(dim=(1, 2)) / (gen_mask.shape[1] * max_lens + 1e-8)
@@ -289,7 +215,6 @@ class DRGRPO(RLAlgorithm):
         return ratios, loss
 
     # -- KL helpers ------------------------------------------------------------
-
     def _kl_metric_only(
         self,
         seq_flat: torch.Tensor,
@@ -300,33 +225,22 @@ class DRGRPO(RLAlgorithm):
         gen_mask: torch.Tensor,
         T_g: int,
     ) -> float:
-        """Compute KL for logging (no grads)."""
-        with torch.no_grad(), torch.cuda.amp.autocast(
-            enabled=self.cfg["bf16"], dtype=torch.bfloat16
-        ):
+        """KL for logging (no grads): sample estimator E_pi[logpi - logref]."""
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
             ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
-
         ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
 
-        ref_logp = (
-            F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
-            .gather(-1, targets_tok.unsqueeze(-1))
-            .squeeze(-1)[..., -T_g:]
-            .view_as(new_logp)
-        )
-        delta_lp = (new_logp.detach() - ref_lp).clamp(-80, 80)
-        kl_per_tok = (delta_lp.exp() + delta_lp - 1.0) * gen_mask
-        return (kl_per_tok.sum() / (gen_mask.sum() + 1e-8)).item()
+        ref_logp_all = F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
+        ref_logp = ref_logp_all.gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[..., -T_g:]
+        ref_logp = ref_logp.view_as(new_logp)
+
+        kl_tok = ((new_logp - ref_logp) * gen_mask)
+        return float((kl_tok.sum() / (gen_mask.sum() + 1e-8)).item())
 
     # -- optimisation ----------------------------------------------------------
-
     def _backward_and_step(self, loss: torch.Tensor, sync_grads: bool) -> None:
         """Handle backward, gradient clipping, optimiser & scheduler."""
-        maybe = (
-            self.policy.no_sync
-            if (hasattr(self.policy, "no_sync") and not sync_grads)
-            else nullcontext
-        )
+        maybe = (self.policy.no_sync if (hasattr(self.policy, "no_sync") and not sync_grads) else nullcontext)
         with maybe():
             loss.backward()
 
@@ -339,7 +253,6 @@ class DRGRPO(RLAlgorithm):
             self.actual_opt_step += 1
 
     # -- ratio logging & stats -------------------------------------------------
-
     def _maybe_log_ratios(self, ratios: torch.Tensor, gen_mask: torch.Tensor) -> None:
         if self._ratio_log_path is None:
             return
@@ -348,26 +261,12 @@ class DRGRPO(RLAlgorithm):
         with self._ratio_log_path.open("a") as fh:
             fh.write(json.dumps(rec) + "\n")
 
-    def _ratio_stats(
-        self, ratios: torch.Tensor, gen_mask: torch.Tensor
-    ) -> Dict[str, float]:
-        """Compute various ratio statistics *over non-pad tokens only*."""
+    def _ratio_stats(self, ratios: torch.Tensor, gen_mask: torch.Tensor) -> Dict[str, float]:
         mask = gen_mask.bool()
         flat_ratios = ratios[mask]
         flat_logr = torch.log(ratios.clamp_min(1e-8))[mask]
-
         if flat_ratios.numel() == 0:
-            # unlikely but handle zero-length batch
-            return {k: 0.0 for k in (
-                "ratio_mean",
-                "ratio_median",
-                "ratio_p90",
-                "ratio_p99",
-                "ratio_max",
-                "ratio_clip_frac",
-                "logr_std",
-            )}
-
+            return {k: 0.0 for k in ("ratio_mean","ratio_median","ratio_p90","ratio_p99","ratio_max","ratio_clip_frac","logr_std")}
         stats = {
             "ratio_mean": flat_ratios.mean().item(),
             "ratio_median": flat_ratios.median().item(),
@@ -378,3 +277,8 @@ class DRGRPO(RLAlgorithm):
             "logr_std": flat_logr.std().item(),
         }
         return stats
+
+    # Placeholder for entropy-kernel study (wired later)  # Added 8/11
+    def _log_entropy_probes(self, new_logp: torch.Tensor, adv: torch.Tensor, gen_mask: torch.Tensor) -> None:
+        """(Added 8/11) Hook to compute/store S, SA etc. for later kernel analysis."""
+        pass

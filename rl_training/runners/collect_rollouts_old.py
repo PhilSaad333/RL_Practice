@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Sequence
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence as pad
 from tqdm.auto import tqdm
@@ -14,9 +15,14 @@ from transformers import (
     LogitsProcessor, LogitsProcessorList
 )
 
+from rl_training.utils.logprob_entropy import compute_logprobs_and_entropy
 from rl_training.utils.rollout_buffer import RolloutBuffer, RolloutBatch
 from rl_training.rewards import get_reward_fns
 from importlib import import_module
+
+
+
+
 
 
 TAG_STOP = "</answer>"
@@ -78,8 +84,24 @@ class RolloutCollector:
     ):
         self.policy     = policy
         self.tokenizer  = tokenizer
-        self.device     = device or policy.device
         self.cfg        = cfg
+
+
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        trace_name = f"rollouts_rank{self.rank}.jsonl"
+        self._trace_file = out_dir / trace_name
+
+
+        # ─── Make sure self.device actually exists ──────────────────────
+        # If the caller passed a device string or torch.device, use that;
+        # otherwise fall back to CPU (or change to CUDA if you prefer).
+        if device is None:
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(device)
+
+
+
 
         assert tokenizer.padding_side == "left"
         self.pad_id     = tokenizer.pad_token_id
@@ -111,6 +133,12 @@ class RolloutCollector:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._trace_file = self.out_dir / "rollouts.jsonl"
 
+        # RAM/entropy mode (default "full"): choose "lite" for micro‑batched teacher forcing or "none" to skip entropy.
+        self.entropy_mode: str = cfg.get("rollout_entropy_mode", "full").lower()
+        self.tf_micro_batch: int = cfg.get("tf_micro_batch", 4)
+
+
+
 
     # ------------------------------------------------------------------
     # main public API
@@ -118,21 +146,26 @@ class RolloutCollector:
     @torch.inference_mode()
     def collect_batch(self, batch_prompts: int | None = None) -> RolloutBatch:
         need   = batch_prompts or self.batch_size
-        buffer = RolloutBuffer(capacity=need)
-        ans_pat = re.compile(r"\n</think>\n<answer>\n[\s\S]+?\n</answer>$")
+        buffer = RolloutBuffer(capacity=need, pad_id=self.pad_id)
+        ans_pat = re.compile(r"</think>\s*<answer>\s*(.*?)\s*</answer>\s*$",re.DOTALL)
 
-        bar = tqdm(total=need, desc="Collecting rollouts", leave=False)
+        bar = tqdm(
+            total=need,
+            desc="Collecting rollouts",
+            leave=False,
+            disable=(self.rank != 0),
+        )
 
         while len(buffer) < need:
 
             # -------- 1) sample prompt mini-batch ----------------------
-            take = min(self.batch_size, need - len(buffer))   # CHANGE
+            take = self.batch_size      # used to be min(self.batch_size, need-len(buffer))
             pids, ptxts, prompt_ids, attn = _next_prompt_batch(
                 self.prompt_sampler, self.tokenizer, self.device, take
             )                                                  # prompt_ids: [B, T_p]
 
             # -------- 2) batched generation ---------------------------
-            gen_out = self.policy.generate(
+            gen_out = self.policy.module.generate(
                 prompt_ids,
                 attention_mask       = attn,
                 do_sample            = True,
@@ -141,25 +174,76 @@ class RolloutCollector:
                 temperature          = self.cfg["temperature"],
                 pad_token_id         = self.pad_id,
                 logits_processor     = self.logits_processor,
-                output_scores        = True,
+                output_scores        = True, #(self.entropy_mode == "full"),
                 return_dict_in_generate = True,
             )
 
             # reshape helper
             full_ids = gen_out.sequences.view(take, self.G, -1)          # (B,G,T_tot)
             gen_ids  = full_ids[:, :, prompt_ids.size(1):]               # (B,G,T_gen_pad)
-            scores   = [s.view(take, self.G, -1) for s in gen_out.scores]
 
-            # -------- 3) log-probs ENTIRE mini-batch (perf) ------------
-            # CHANGE: one call, then slice rows inside per-prompt loop
-            all_lp = self.policy.compute_transition_scores(
-                gen_out.sequences, gen_out.scores, normalize_logits=True
-            )                                                             # (B*G, Lgen_trim)
+            # If we requested output_scores, keep them; otherwise set None
+            #scores = [s.view(take, self.G, -1) for s in gen_out.scores] if self.entropy_mode == "full" else None
+
+            if self.entropy_mode == "full":
+                # current fast path: one call to compute_transition_scores
+                all_lp = self.policy.module.compute_transition_scores(
+                    gen_out.sequences, gen_out.scores, normalize_logits=True
+                )  # (B*G, Lgen_trim)
+
+
+            # -------------------------------------------------------------------------
+            # NEW fast-but-memory-lite path (entropy_mode = "none")
+            # -------------------------------------------------------------------------
+            else:
+                seqs_flat   = gen_out.sequences.view(take * self.G, -1)          # (BG, L_full)
+                scores_full = gen_out.scores                                     # list[L_gen] of (BG, vocab)
+
+                lp_list     : list[torch.Tensor] = []
+                ent_list    : list[torch.Tensor] = []            # will stay zeros if entropy_mode == "none"
+                keep_lens   : list[int]           = []
+
+                mb = self.tf_micro_batch or 8                    # default 8
+                P  = prompt_ids.size(1)                          # padded prompt length
+
+                for start_idx in range(0, seqs_flat.size(0), mb):
+                    end_idx   = min(start_idx + mb, seqs_flat.size(0))
+                    rows      = slice(start_idx, end_idx)
+
+                    # --- slice micro-batch data -------------------------------------------------
+                    seqs_mb   = seqs_flat[rows]                                 # (mb, L_full)
+                    # gather the corresponding score slices for every generation step
+                    scores_mb = [s[rows] for s in scores_full]                  # list[L_gen] of (mb, vocab)
+
+                    # --- log-probabilities via transition-scores -------------------------------
+                    lp_mb = self.policy.module.compute_transition_scores(
+                        seqs_mb, scores_mb, normalize_logits=True               # (mb, L_gen_trim)
+                    )                                                           # log-probs only for generated tokens
+
+                    # lp_mb gives one log-prob per *generated* token, i.e. shape = (mb, L_gen_trim)
+                    # For each row, store and remember its true length.
+                    for r in range(lp_mb.size(0)):
+                        lp_seq = lp_mb[r].detach().cpu()        # (L_gen_trim,)
+                        lp_seq[lp_seq == float("-inf")] = 0.0   # safety clamp
+
+                        lp_list.append(lp_seq)
+                        keep_lens.append(lp_seq.size(0))
+
+                        # entropy placeholder (all zeros) – replace with real calc later if desired
+                        if self.entropy_mode != "none":
+                            ent_list.append(torch.zeros_like(lp_seq))
+
+                # -------------------------------------------------------------------------
+                # lp_list / ent_list / keep_lens now match the “full” path’s shapes
+                # (one 1-D tensor per prompt-generation)
+
 
             before = len(buffer)
 
             # -------- 4) iterate over prompt-groups --------------------
             for b in range(take):
+                if len(buffer) >= need:
+                    break
                 pid     = pids[b]
                 q_text  = ptxts[b]
                 g_ids_b = gen_ids[b]                                      # (G, T_gen_pad)
@@ -179,39 +263,57 @@ class RolloutCollector:
                 # ~~~ trim token IDs + collect per-token stats ~~~
                 gid_rows, lp_rows, ent_rows = [], [], []
                 keep_max = 0
-                row_off  = b * self.G                                      # CHANGE: batch offset
+                row_off = b * self.G
 
                 for g in range(self.G):
-                    ids_full = g_ids_b[g]                                  # (T_raw,)
-                    # 1) first </answer>
-                    cut  = next((i+self.L_TAG for i in range(
-                                 ids_full.size(0)-self.L_TAG+1)
-                                 if torch.equal(ids_full[i:i+self.L_TAG],
-                                               self.TAG_TENS)),
-                                 ids_full.size(0))
-                    keep_max = max(keep_max, cut)
-                    ids_trim = ids_full[:cut]
-                    gid_rows.append(ids_trim)
+                    ids_full = g_ids_b[g]
+                    if self.entropy_mode == "full":
+                        # trim ids using original search and use all_lp
+                        cut  = next((i + self.L_TAG for i in range(ids_full.size(0) - self.L_TAG + 1)
+                                    if torch.equal(ids_full[i:i + self.L_TAG], self.TAG_TENS)),
+                                    ids_full.size(0))
+                        keep_max = max(keep_max, cut)
+                        ids_trim = ids_full[:cut]
+                        gid_rows.append(ids_trim)
+                        lp_seq = all_lp[row_off + g, :cut].clone()
+                        lp_seq[lp_seq == float("-inf")] = 0.0
+                        lp_rows.append(lp_seq)
+                    else:
+                        # ram‑lite / no entropy: use precomputed keep_lens and lp_list
+                        keep = keep_lens[row_off + g]
+                        cut  = keep  # number of generation tokens (no TAG length here)
+                        keep_max = max(keep_max, cut)
+                        ids_trim = ids_full[:cut]
+                        gid_rows.append(ids_trim)
+                        lp_seq = torch.tensor(lp_list[row_off + g], device=self.device)
+                        lp_seq[lp_seq == float("-inf")] = 0.0
+                        lp_rows.append(lp_seq)
 
-                    # 2) log-prob slice, squash -inf → 0
-                    lp_seq = all_lp[row_off+g, :cut].clone()
-                    lp_seq[lp_seq == float("-inf")] = 0.0                  # CHANGE
-                    lp_rows.append(lp_seq)
+                # compute entropies
+                if self.entropy_mode == "full":
+                    # original vectorised entropy computation:contentReference[oaicite:3]{index=3}
+                    ent_steps = [(-torch.softmax(gen_out.scores[t], -1) *
+                                torch.log_softmax(gen_out.scores[t], -1)).sum(-1)[row_off:row_off + self.G]
+                                for t in range(len(gen_out.scores))]
+                    ent_rows = [torch.stack([ent_steps[t][g] for t in range(len(ent_steps))])
+                                for g in range(self.G)]
+                elif self.entropy_mode == "lite":
+                    # ent_list contains per‑token entropies in CPU tensors
+                    ent_rows = [torch.tensor(ent_list[row_off + g], device=self.device) for g in range(self.G)]
+                else:
+                    # "none": no entropy → use empty tensors of appropriate length
+                    ent_rows = [torch.tensor([], device=self.device) for _ in range(self.G)]
 
-                # 3) entropy from step logits (vectorised)
-                #    ent_t per step: (B*G,); gather rows for this prompt
-                ent_steps = [(-torch.softmax(gen_out.scores[t], -1)
-                                * torch.log_softmax(gen_out.scores[t], -1)
-                             ).sum(-1)[row_off:row_off+self.G]             # (G,)
-                             for t in range(len(gen_out.scores))]
-                ent_rows = [torch.stack([ent_steps[t][g]
-                                          for t in range(len(ent_steps))])
-                             for g in range(self.G)]
-
-                # 4) pad to fixed-width tensors (G, keep_max)
+                # now pad everything to keep_max
                 g_ids_t = pad(gid_rows, batch_first=True, padding_value=self.pad_id)
                 lp_t    = pad(lp_rows,  batch_first=True, padding_value=0.0)
-                ent_t   = pad(ent_rows, batch_first=True, padding_value=0.0)
+                # ent_rows may be empty lists; pad gracefully by padding_value=0.0
+                if ent_rows and ent_rows[0].numel() > 0:
+                    ent_t = pad(ent_rows, batch_first=True, padding_value=0.0)
+                else:
+                    # create a zero tensor of shape (G, keep_max) for consistency
+                    ent_t = torch.zeros((self.G, keep_max), device=self.device, dtype=torch.float32)
+
 
                 # -------- 5) rewards & accept --------------------------
                 r_vec = torch.stack([fn(pid, g_txts) for fn in self.reward_fns]).sum(0)
@@ -233,7 +335,7 @@ class RolloutCollector:
                     dtype=torch.float32, device=self.device
                 )
                 t_len = torch.tensor(
-                    [_count_think_tokens(t, self.tokenizer) for t in full_txts],
+                    [_count_think_tokens(t, self.tokenizer) for t in g_txts],
                     dtype=torch.int32, device=self.device
                 )
 
@@ -249,13 +351,17 @@ class RolloutCollector:
                         tag_correct      = float(tag_ok[g]),
                         include_in_batch = bool(accept),
                         difficulty_tag   = diff_tag,
-                        token_entropy    = ent_t[g].tolist(),
+                        token_entropy = ent_t[g].tolist() if self.entropy_mode != "none" else [],
                         token_logprob    = lp_t[g].tolist(),   # padded 0.0 where pad tokens
                         generation_time_s= 0.0,
                         step_idx         = self._step_idx,
                     ) for g in range(self.G)
                 ]
                 _append_jsonl(self._trace_file, samples)
+
+
+                assert torch.isfinite(lp_t).all(), "non-finite old log-probs detected"
+
 
                 # -------- 7) push to RolloutBuffer ---------------------
                 if accept and len(buffer) < need:
@@ -294,14 +400,18 @@ def _accept_prompt_group(
 
 
 def _count_think_tokens(text: str, tok: PreTrainedTokenizerBase) -> int:
-    if "<think>" not in text or "</think>" not in text:
+    if "</think>" not in text:
         return 0
-    inner = text.split("<think>", 1)[1].split("</think>", 1)[0]
+    inner = text.split("</think>", 1)[0].strip()
     return len(tok(inner, add_special_tokens=False).input_ids)
 
 
-def _append_jsonl(file: Path, records: List[GenSample]):
-    with file.open("a") as fh:
+def _append_jsonl(file_path: Path, records: List[GenSample]):
+    # skip logging on non-zero ranks
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    with open(file_path, "a") as fh:
         for r in records:
             fh.write(json.dumps(asdict(r)) + "\n")
 
