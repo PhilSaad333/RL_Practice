@@ -1,10 +1,10 @@
-.
 ├── env.txt
 ├── evals
 │   ├── analyses
 │   │   ├── high_entropy_tokens.py
 │   │   ├── __init__.py
-│   │   └── plot_summary_metrics.py
+│   │   ├── plot_summary_metrics.py
+│   │   └── token_dump.py
 │   ├── cli.py
 │   ├── eval_runner.py
 │   ├── evaluator.py
@@ -13,13 +13,16 @@
 │   ├── metrics
 │   │   ├── entropy.py
 │   │   ├── __init__.py
+│   │   ├── max_correct_len.py
 │   │   ├── passk.py
 │   │   ├── response_len.py
 │   │   └── tag_format.py
 │   ├── records.py
+│   ├── token_utils.py
 │   └── utils_io.py
 ├── fine_tuning
 │   ├── configs
+│   │   ├── sft_gsm8k_gemma.yaml
 │   │   ├── sft_gsm8k_qwen2.yaml
 │   │   ├── sft_gsm8k_tinyllama.yaml
 │   │   ├── sft_math_phi2.yaml
@@ -31,6 +34,7 @@
 ├── models
 │   └── __init__.py
 ├── README.md
+├── requirements.txt
 ├── rlp_datasets
 │   ├── gsm8k_latex.py
 │   ├── gsm8k.py
@@ -39,27 +43,19 @@
 │   ├── local_paths.py
 │   ├── mathmix.py
 │   ├── math.py
-│   ├── __pycache__
-│   │   ├── gsm8k.cpython-311.pyc
-│   │   ├── gsm8k_latex.cpython-311.pyc
-│   │   ├── gsm8k_r1_template.cpython-311.pyc
-│   │   ├── __init__.cpython-311.pyc
-│   │   ├── local_paths.cpython-311.pyc
-│   │   ├── math.cpython-311.pyc
-│   │   ├── mathmix.cpython-311.pyc
-│   │   ├── registry.cpython-311.pyc
-│   │   └── short.cpython-311.pyc
+│   ├── processed
+│   │   ├── gsm8k_latex_test.jsonl
+│   │   └── gsm8k_latex_train.jsonl
 │   ├── registry.py
 │   └── short.py
 └── rl_training
     ├── algs
     │   ├── base.py
-    │   ├── drgrpo_old.py
-    │   ├── dr_grpo.py
-    │   └── grpo.py
+    │   └── dr_grpo.py
     ├── cfg
     │   ├── grpo_gsm8k_phi2.yaml
-    │   ├── grpo_gsm8k_qwen2.yaml
+    │   ├── qwen2_5_15.yaml
+    │   ├── qwen2.yaml
     │   └── testconfig.yaml
     ├── rewards
     │   ├── dummy_zero.py
@@ -67,12 +63,16 @@
     │   ├── tag_math_correct.py
     │   └── tag_pref.py
     ├── runners
+    │   ├── collect_rollouts_old.py
     │   ├── collect_rollouts.py
     │   ├── eval_callback.py
+    │   ├── rl_runner_old.py
     │   ├── rl_runner.py
     │   └── rl_runner_trl.py
     ├── schedulers
     │   └── mix_passrate.py
     └── utils
         ├── eval_ckpt.py
+        ├── local_paths.py
+        ├── logprob_entropy.py
         └── rollout_buffer.py

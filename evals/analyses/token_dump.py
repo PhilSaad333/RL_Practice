@@ -55,7 +55,7 @@ class Args:
     # --- generation ---------------------------------------------------------
     batch_size: int = 8
     max_new_tokens: int = 128
-    temperature: float = 1.0
+    temperature: float = 0.7
     top_k: int = 50                              # mutually exclusive with top_p
     top_p: float = 0.0
     # --- io -----------------------------------------------------------------

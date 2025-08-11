@@ -1,5 +1,5 @@
 """
-Lightweight helpers for analysing the JSONL-GZ dumps produced by
+Helpers for analysing the JSONL-GZ dumps produced by
 `evals/analyses/token_dump.py`.
 """
 from __future__ import annotations
@@ -45,7 +45,7 @@ def highlight_token(
 
 def autocorr(series: np.ndarray, k: int) -> float:
     """
-    Sample autocorrelation r_k with mean subtraction.  See numpy guide :contentReference[oaicite:10]{index=10}
+    Sample autocorrelation r_k with mean subtraction.
     """
     if k == 0:
         return 1.0
