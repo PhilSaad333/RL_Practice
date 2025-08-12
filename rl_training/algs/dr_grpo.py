@@ -365,9 +365,16 @@ class DRGRPO(RLAlgorithm):
         L_GA1 = 0.5 * ((A * S.pow(2)).sum())
         L_G1  = S.sum()
 
-        grads_GH1 = torch.autograd.grad(L_GH1, params, retain_graph=False, create_graph=False, allow_unused=True)
-        grads_GA1 = torch.autograd.grad(L_GA1, params, retain_graph=False, create_graph=False, allow_unused=True)
-        grads_G1  = torch.autograd.grad(L_G1,  params, retain_graph=False, create_graph=False, allow_unused=True)
+        # Changed 8/11: keep graph for first two grad calls
+        grads_GH1 = torch.autograd.grad(
+            L_GH1, params, retain_graph=True,  create_graph=False, allow_unused=True
+        )
+        grads_GA1 = torch.autograd.grad(
+            L_GA1, params, retain_graph=True,  create_graph=False, allow_unused=True
+        )
+        grads_G1  = torch.autograd.grad(
+            L_G1,  params, retain_graph=False, create_graph=False, allow_unused=True
+        )
 
         # Lazy-init accum dicts
         if self._probe_GH1 is None:
