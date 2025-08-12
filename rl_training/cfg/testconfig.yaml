@@ -67,3 +67,9 @@ lr_scheduler: "const" # 'const' or 'cosine'
 
 save_every: 16
 total_steps: 48
+
+
+entropy_probe:
+  every: 2
+  sketch_r: 0         # 0 = off for now
+  out_dir: entropy_probes
