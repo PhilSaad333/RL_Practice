@@ -14,7 +14,7 @@ lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 # -------------- rollout collector ---------------- #
 
 # ---- rollout collection ----
-rollout_batch_size: 128
+rollout_batch_size: 8
 num_generations: 8
 
 # Recompute logprobs: teacher-forcing forward micro-batch size
