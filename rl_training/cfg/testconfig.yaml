@@ -16,20 +16,20 @@ eval_backbone: qwen2_5_15
 # -------------- rollout collector ---------------- #
 
 # ---- rollout collection ----
-rollout_batch_size: 12
+rollout_batch_size: 10
 num_generations: 8
 
 # Recompute logprobs: teacher-forcing forward micro-batch size
-tf_micro_batch: 12
+tf_micro_batch: 10
 
 # Write rollouts.jsonl every N collect_batch() calls (0 = never)
 save_rollouts_every: 0
 
 
 
-buffer_size       : 128 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
+buffer_size       : 32 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
 microbatch_size   : 2   # B: prompts used for each gradient checkpointing steps
-grad_accum_steps  : 64 #8   # ga_steps: total number of prompts per update batch = ga_step*B
+grad_accum_steps  : 16 #8   # ga_steps: total number of prompts per update batch = ga_step*B
 
 # Above gives effective batch size 256 prompts, 8 gens per prompt, 8 steps per epoch
 
