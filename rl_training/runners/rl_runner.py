@@ -207,6 +207,7 @@ class RLRunner:
 
     def _probe_gns(self, rb):
         """Measure ||g||^2 at two prompt-batch sizes, estimate B_simple, log it."""
+        device = f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
         if self.rank != 0:
             return
         if not self.gns_cfg or int(self.gns_cfg.get("every", 0)) <= 0:
@@ -221,8 +222,6 @@ class RLRunner:
         N_prompts = rb.prompt_ids.shape[0]
         if N_prompts < max(B_small, B_large):
             return  # not enough to probe this time
-
-
 
         def _make_microbatches(idxs, micro_size, device):
             # Split prompt indices into chunks of size micro_size

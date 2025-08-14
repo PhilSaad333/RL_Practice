@@ -132,7 +132,8 @@ class DRGRPO(RLAlgorithm):
 
             # log-softmax in float32 for stability
             ref_logp_all = F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
-            ref_logp = ref_logp_all.gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[..., -T_g:].view(B, G, T_g)
+            ref_logp = ref_logp_all.gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[..., -T_g:].view_as(new_logp)
+
 
             # KL(pi||ref) sample estimator = E_pi[logpi - logref]
             kl_tok = ((new_logp - ref_logp) * gen_mask)
