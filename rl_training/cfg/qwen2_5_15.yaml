@@ -15,11 +15,11 @@ lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 # -------------- rollout collector ---------------- #
 
 # ---- rollout collection ----
-rollout_batch_size: 12
+rollout_batch_size: 10
 num_generations: 8
 
 # Recompute logprobs: teacher-forcing forward micro-batch size
-tf_micro_batch: 12
+tf_micro_batch: 10
 
 # Write rollouts.jsonl every N collect_batch() calls (0 = never)
 save_rollouts_every: 0

@@ -304,7 +304,13 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--cfg",  required=True, help="Path to YAML config")
     p.add_argument("--ckpt", required=True, help="Path to LoRA adapter checkpoint dir")
-    args = p.parse_args()
+    # tolerate torchrun/launch variants; ignored by our code
+    p.add_argument("--local-rank", type=int, default=0)
+    p.add_argument("--local_rank", type=int, default=0)
+    # parse *known* only, to ignore any other launcher args
+    args, _ = p.parse_known_args()
+
     cfg_dict = yaml.safe_load(open(args.cfg))
     runner = RLRunner(args.cfg, args.ckpt)
     runner.train(total_updates=cfg_dict["total_steps"])
+
