@@ -12,10 +12,18 @@ lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 
 
 # -------------- rollout collector ---------------- #
-rollout_batch_size: 8           # number of prompts per batch in rollout collection
-tf_micro_batch: 8               # micro‑batch size for teacher forcing when lite/none
 
-num_generations   : 8 #8   # G: number of generations per prompt
+# ---- rollout collection ----
+rollout_batch_size: 128
+num_generations: 8
+
+# Recompute logprobs: teacher-forcing forward micro-batch size
+tf_micro_batch: 8
+
+# Write rollouts.jsonl every N collect_batch() calls (0 = never)
+save_rollouts_every: 0
+
+
 
 buffer_size       : 128 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
 microbatch_size   : 1   # B: prompts used for each gradient checkpointing steps
@@ -65,7 +73,7 @@ gradient_checkpointing : true
 
 lr_scheduler: "const" # 'const' or 'cosine'
 
-save_every: 16
+save_every: 8
 total_steps: 48
 
 

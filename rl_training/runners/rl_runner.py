@@ -113,11 +113,22 @@ class RLRunner:
         B = self.cfg["microbatch_size"]
         outer_loops = math.ceil(total_updates / K)
 
-        for _ in trange(outer_loops, desc="outer collect loops",
-                        disable=(self.rank != 0)):
-            rb = self.collector.collect_batch(batch_prompts=self.buffer_size)
-            torch.cuda.empty_cache(); gc.collect()
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        per_rank = math.ceil(self.buffer_size / world)
+
+        for _ in trange(outer_loops, desc="outer collect loops", disable=(self.rank != 0)):
+            rb = self.collector.collect_batch(batch_prompts=per_rank)
+            # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
+
+
+
+
+#        for _ in trange(outer_loops, desc="outer collect loops",
+#                        disable=(self.rank != 0)):
+#            rb = self.collector.collect_batch(batch_prompts=self.buffer_size)
+#            torch.cuda.empty_cache(); gc.collect()
+#            self._train_one_buffer(rb, K, ga_steps, B)
             del rb
             torch.cuda.empty_cache(); gc.collect()
             if self.step_id % self.save_every == 0:
