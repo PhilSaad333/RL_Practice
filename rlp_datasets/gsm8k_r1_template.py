@@ -4,12 +4,12 @@ from rlp_datasets.registry import DATASET_REGISTRY, Example
 from transformers import AutoTokenizer
 
 
-BASE = '/content/drive/MyDrive/RL_Practice_Files/datasets'
-#BASE =  '/home/ubuntu/dataset'
+#BASE = '/content/drive/MyDrive/RL_Practice_Files/datasets'
+BASE =  '/home/ubuntu/dataset'
 
 # Explicitly using qwen2 tokenizer
 tokenizer = AutoTokenizer.from_pretrained(
-    "Qwen/Qwen2-0.5B",
+    "Qwen/Qwen2.5-1.5B",
     trust_remote_code=True,
     add_prefix_space=False
 )

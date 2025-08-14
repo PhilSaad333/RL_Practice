@@ -6,9 +6,11 @@
 
 
 # rl_configs/rl_qwen2.yaml
-backbone: Qwen/Qwen2-0.5B
-eval_backbone: qwen2
-lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
+#backbone: Qwen/Qwen2-0.5B
+backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
+#eval_backbone: qwen2
+#lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 
 
 # -------------- rollout collector ---------------- #
@@ -26,8 +28,8 @@ save_rollouts_every: 0
 
 
 buffer_size       : 128 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
-microbatch_size   : 1   # B: prompts used for each gradient checkpointing steps
-grad_accum_steps  : 128 #8   # ga_steps: total number of prompts per update batch = ga_step*B
+microbatch_size   : 2   # B: prompts used for each gradient checkpointing steps
+grad_accum_steps  : 64 #8   # ga_steps: total number of prompts per update batch = ga_step*B
 
 # Above gives effective batch size 256 prompts, 8 gens per prompt, 8 steps per epoch
 
