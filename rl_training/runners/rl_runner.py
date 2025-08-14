@@ -222,16 +222,34 @@ class RLRunner:
         if N_prompts < max(B_small, B_large):
             return  # not enough to probe this time
 
+
+
+        def _make_microbatches(idxs, micro_size, device):
+            # Split prompt indices into chunks of size micro_size
+            mbs = []
+            for s in range(0, len(idxs), micro_size):
+                mbs.append(rb.get_batch(idxs[s:s+micro_size], device=device))
+            return mbs
+
+        # how many prompts you can fit per microbatch on this GPU
+        micro_size = int(self.cfg.get("prompts_per_microbatch", 1))  # e.g., 1 on a single A100
+
+
         idx_small = random.sample(range(N_prompts), B_small)
         idx_large = random.sample(range(N_prompts), B_large)
 
-        device = f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
-        mb_small = rb.get_batch(idx_small, device=device)
-        mb_large = rb.get_batch(idx_large, device=device)
+        # build microbatches
+        mbs_small = _make_microbatches(idx_small, micro_size, device)
+        mbs_large = _make_microbatches(idx_large, micro_size, device)
 
-        # avoid DDP all-reduce inside the grad measurement
-        y_small = self.algo._grad_sq_norm_for_batch(mb_small, self.ref_model, avoid_ddp_allreduce=True)
-        y_large = self.algo._grad_sq_norm_for_batch(mb_large, self.ref_model, avoid_ddp_allreduce=True)
+        # measure grad^2 norm by emulating accumulation over K microbatches
+        y_small = self.algo._grad_sq_norm_for_effective_batch(
+            mbs_small, self.ref_model, avoid_ddp_allreduce=True
+        )
+        y_large = self.algo._grad_sq_norm_for_effective_batch(
+            mbs_large, self.ref_model, avoid_ddp_allreduce=True
+        )
+
 
         # EWMA for stability (Appendix A.1 suggests smoothing) 
         #   E[||g_B||^2] ≈ a + c/B  =>  solve from two points (B1,y1),(B2,y2)

@@ -69,11 +69,12 @@ class DRGRPO(RLAlgorithm):
         self.compute_entropy = True  # Changed 8/11
 
         # === Entropy-probe accumulators (per accumulation window) ===  # Added 8/11
+        self._probe_sumWS = 0.0   # Σ w S
+        self._probe_sumW  = 0.0   # Σ w
         self._probe_GH1 = None     # dict[param] = sum S * grad S
-        self._probe_GA1 = None     # dict[param] = sum SA * grad S
+        self._probe_GA1 = None     # dict[param] = sum A * grad S
         self._probe_G1  = None     # dict[param] = sum grad S
         self._probe_sumS  = 0.0    # scalar sum S over sequences
-        self._probe_sumSA = 0.0    # scalar sum S*A over sequences
         self._probe_N     = 0      # count sequences
         self._probe_S_list = []    # list of per-seq S for saving
         self._probe_A_list = []    # list of per-seq A for saving
@@ -314,6 +315,8 @@ class DRGRPO(RLAlgorithm):
         return pathlib.Path(".")
 
     def _probe_reset_window(self) -> None:  # Added 8/11
+        self._probe_sumWS = 0.0
+        self._probe_sumW  = 0.0
         self._probe_GH1 = None
         self._probe_GA1 = None
         self._probe_G1  = None
@@ -347,92 +350,88 @@ class DRGRPO(RLAlgorithm):
         new_logp = new_logp.view(B, G, T_g)
 
         # Per-seq S and A
-        S_seq = (new_logp * gen_mask).sum(dim=-1)            # (B,G)
-        A_seq = self._compute_advantage(rollouts.reward)     # (B,G)
+        S_seq = (new_logp * gen_mask).sum(dim=-1)            # (B,G), S = sum log p over generated tokens
+        A_seq = self._compute_advantage(rollouts.reward)     # (B,G)  (GRPO => centered per-prompt)
         tok_ent_mean = (-(new_logp) * gen_mask).sum(-1) / (gen_mask.sum(-1) + 1e-8)
 
-        # Flatten for scalar objectives
-        S = S_seq.reshape(-1)                                # (N,)
-        A = A_seq.reshape(-1)                                # (N,)
+        # ---- Dr-GRPO weights: w_{p,i} = 1 / (G * Lmax(p)) ----
+        tokens_per_gen = gen_mask.sum(dim=2)                 # (B,G)
+        Lmax = tokens_per_gen.max(dim=-1).values.clamp_min(1.0)   # (B,)
+        w_p = (1.0 / (G * Lmax)).unsqueeze(-1).expand_as(S_seq)   # (B,G)
+
+        # Flatten
+        S = S_seq.reshape(-1)                                 # (N,)
+        A = A_seq.reshape(-1)                                 # (N,)
+        w = w_p.reshape(-1)                                   # (N,)
         N = S.numel()
 
-        # Scalar objectives whose grads give the sums we need:
-        #  GH1 = Σ S ∇S  via grad of 0.5 * Σ S^2
-        #  GA1 = Σ SA ∇S via grad of 0.5 * Σ (A * S^2)
-        #  G1  = Σ ∇S    via grad of Σ S
+        # Weighted scalar objectives that produce the exact sums we need:
+        #   GH  = Σ w * S ∇S  via grad of 0.5 * Σ w * S^2
+        #   GA  = Σ w * A ∇S  via grad of Σ w * A * S
+        #   G1  = Σ w     ∇S  via grad of Σ w * S
         params = self._trainable_params()
-        L_GH1 = 0.5 * (S.pow(2).sum())
-        L_GA1 = 0.5 * ((A * S.pow(2)).sum())
-        L_G1  = S.sum()
+        L_GH = 0.5 * (w * S.pow(2)).sum()
+        L_GA = (w * A * S).sum()
+        L_G1 = (w * S).sum()
 
-        # Changed 8/11: keep graph for first two grad calls
-        grads_GH1 = torch.autograd.grad(
-            L_GH1, params, retain_graph=True,  create_graph=False, allow_unused=True
-        )
-        grads_GA1 = torch.autograd.grad(
-            L_GA1, params, retain_graph=True,  create_graph=False, allow_unused=True
-        )
-        grads_G1  = torch.autograd.grad(
-            L_G1,  params, retain_graph=False, create_graph=False, allow_unused=True
-        )
+        # Gradients
+        grads_GH = torch.autograd.grad(L_GH, params, retain_graph=True,  create_graph=False, allow_unused=True)
+        grads_GA = torch.autograd.grad(L_GA, params, retain_graph=True,  create_graph=False, allow_unused=True)
+        grads_G1 = torch.autograd.grad(L_G1, params, retain_graph=False, create_graph=False, allow_unused=True)
 
-        # Lazy-init accum dicts
+        # Lazy-init accum dicts (unchanged)
         if self._probe_GH1 is None:
-            self._probe_GH1 = {}
-            self._probe_GA1 = {}
-            self._probe_G1  = {}
+            self._probe_GH1, self._probe_GA1, self._probe_G1 = {}, {}, {}
             for p in params:
-                shape = p.shape
-                dev   = p.device
-                self._probe_GH1[p] = torch.zeros(shape, device=dev, dtype=torch.float32)
-                self._probe_GA1[p] = torch.zeros(shape, device=dev, dtype=torch.float32)
-                self._probe_G1[p]  = torch.zeros(shape, device=dev, dtype=torch.float32)
+                dev, dtype, shape = p.device, torch.float32, p.shape
+                self._probe_GH1[p] = torch.zeros(shape, device=dev, dtype=dtype)
+                self._probe_GA1[p] = torch.zeros(shape, device=dev, dtype=dtype)
+                self._probe_G1[p]  = torch.zeros(shape, device=dev, dtype=dtype)
 
-        # Accumulate (cast to fp32 for numeric stability)
-        for p, gH1, gA1, g1 in zip(params, grads_GH1, grads_GA1, grads_G1):
-            if gH1 is not None:
-                self._probe_GH1[p] += gH1.detach().to(torch.float32)
-            if gA1 is not None:
-                self._probe_GA1[p] += gA1.detach().to(torch.float32)
-            if g1 is not None:
-                self._probe_G1[p]  += g1.detach().to(torch.float32)
+        for p, gH, gA, g1 in zip(params, grads_GH, grads_GA, grads_G1):
+            if gH is not None: self._probe_GH1[p] += gH.detach().to(torch.float32)
+            if gA is not None: self._probe_GA1[p] += gA.detach().to(torch.float32)
+            if g1 is not None: self._probe_G1[p]  += g1.detach().to(torch.float32)
 
-        # Scalar sums and per-seq arrays for logging
-        self._probe_sumS  += float(S.sum().item())
-        self._probe_sumSA += float((S * A).sum().item())
-        self._probe_N     += int(N)
+        # Weighted sums for centering/normalization
+        self._probe_sumWS  += float((w * S).sum().item())   # Σ w S
+        self._probe_sumW   += float(w.sum().item())         # Σ w
+        self._probe_N      += int(N)
         self._probe_S_list.append(S_seq.detach().cpu())
         self._probe_A_list.append(A_seq.detach().cpu())
         self._probe_tokent_list.append(tok_ent_mean.detach().cpu())
+
 
     def _probe_finalize_and_log(self, probe_cfg: dict) -> None:  # Added 8/11
         """On the syncing microbatch, turn accumulators into centered g_H, g_A,
         compute g_H^T P g_A from Adam state, save artifacts, then reset window.
         """
-        if self._probe_GH1 is None:  # nothing accumulated
+        if self._probe_GH1 is None:
             return
 
-        meanS  = self._probe_sumS  / max(self._probe_N, 1)
-        meanSA = self._probe_sumSA / max(self._probe_N, 1)
+        # Weighted mean of S for centering: S̄ = (Σ w S)/(Σ w)
+        meanS = (self._probe_sumWS / max(self._probe_sumW, 1e-8))
+        sumW  = self._probe_sumW
 
-        dot = 0.0
-        normH = 0.0
-        normA = 0.0
+        dot = normH = normA = 0.0
         lr_vals = []
 
-        # Centered vectors using the three sums:
-        # g_H = GH1 - meanS * G1,  g_A = GA1 - meanSA * G1
         for group in self.opt.param_groups:
             eps = float(group.get("eps", 1e-8))
             lr_vals.append(float(group.get("lr", 0.0)))
             for p in group["params"]:
                 if p not in self._probe_GH1:
                     continue
-                gH = self._probe_GH1[p] - meanS  * self._probe_G1[p]
-                gA = self._probe_GA1[p] - meanSA * self._probe_G1[p]
+                # gH = GH - S̄ * G1  (centered)
+                gH = self._probe_GH1[p] - meanS * self._probe_G1[p]
+                # gA = GA            (no centering; GRPO A is already baseline-subtracted per prompt)
+                gA = self._probe_GA1[p]
 
                 state = self.opt.state.get(p, {})
-                v = state.get("exp_avg_sq", None)   # Adam second moment buffer  # Added 8/11
+                v = state.get("exp_avg_sq", None)
+
+                # Note here we use a biased estimator of \sum_i E_t[(S(t)-Sbar) K(t,t_i') A(t_i')]
+                # To remove bias we should replace the sum over all t_i and sampled t = t_j with the sum for i != j
                 if v is None:
                     inv = 1.0 / eps
                     dot   += (gH * gA).sum().item() * inv
@@ -444,8 +443,17 @@ class DRGRPO(RLAlgorithm):
                     normH += (gH * gH / denom).sum().item()
                     normA += (gA * gA / denom).sum().item()
 
+
         avg_lr = float(np.mean(lr_vals)) if lr_vals else 0.0
-        deltaH_pred = -(avg_lr * dot)
+
+        # Unnormalized inner product in the Adam metric:
+        gH_P_gA_sum = float(dot)
+
+        # Normalized to product of expectations:
+        gH_P_gA_mean = float(dot) / max(sumW * sumW, 1e-8)
+
+        deltaH_pred_adam = -(avg_lr * gH_P_gA_mean)
+
 
         # Save artifacts (only every N steps; we’re already in the gated path)
         run_dir = self._run_dir_from_ratio_path()
@@ -463,20 +471,23 @@ class DRGRPO(RLAlgorithm):
         np.save(step_dir / "entropy_tok_mean.npy", Et_all)
 
         # Meta and scalars
+        pred = {
+            "gH_P_gA_sum": gH_P_gA_sum,
+            "gH_P_gA_mean": gH_P_gA_mean,
+            "norm_gH_P": float(np.sqrt(max(normH, 0.0))),
+            "norm_gA_P": float(np.sqrt(max(normA, 0.0))),
+            "deltaH_first_order_adam_mean": float(deltaH_pred_adam),
+        }
+        (step_dir / "deltaH_pred.json").write_text(json.dumps(pred, indent=2))
+
         meta = {
             "step": int(self.actual_opt_step),
             "N": int(self._probe_N),
             "avg_lr": avg_lr,
+            "sumW": sumW,
         }
         (step_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-        pred = {
-            "gH_P_gA": float(dot),
-            "norm_gH_P": float(np.sqrt(max(normH, 0.0))),
-            "norm_gA_P": float(np.sqrt(max(normA, 0.0))),
-            "deltaH_first_order_adam": float(deltaH_pred),
-        }
-        (step_dir / "deltaH_pred.json").write_text(json.dumps(pred, indent=2))
 
         # Reset accumulators for next window
         self._probe_reset_window()
@@ -571,4 +582,26 @@ class DRGRPO(RLAlgorithm):
         # clear grads so training step isn't affected
         self.opt.zero_grad(set_to_none=True)
         return total
+
+
+    def _grad_sq_norm_for_effective_batch(self, microbatches, ref_model, *, avoid_ddp_allreduce=True):
+        self.opt.zero_grad(set_to_none=True)
+
+        ctx = self.policy.no_sync() if avoid_ddp_allreduce and hasattr(self.policy, "no_sync") else nullcontext()
+        with ctx, torch.enable_grad():
+            scale = 1.0 / max(len(microbatches), 1)      # ← 1/K
+            for mb in microbatches:                      # ← K microbatches
+                loss = self._loss_for_batch(mb, ref_model) * scale
+                loss.backward()                          # accumulate grads
+
+        # sum of squared grads over trainable params
+        total = 0.0
+        for p in self._trainable_params():
+            if p.grad is not None:
+                g = p.grad.detach().double()
+                total += float((g * g).sum().item())
+        self.opt.zero_grad(set_to_none=True)
+        return total
+
+
 
