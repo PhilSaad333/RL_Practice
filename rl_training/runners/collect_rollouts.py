@@ -161,6 +161,7 @@ class RolloutCollector:
                 eos_token_id         = self.tokenizer.eos_token_id,
                 logits_processor     = self.logits_processor,
                 return_dict_in_generate=True,
+                output_scores=True,
                 synced_gpus          = bool(dist.is_initialized()),
             )
             gen_time = time.time() - t0
