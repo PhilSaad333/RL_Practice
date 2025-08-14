@@ -55,6 +55,16 @@ class RLRunner:
         self.save_every = self.cfg.get("save_every", 100)
         self.step_id = 0
 
+        # -----GNS----------------------------------------------------------
+        self.gns_cfg = self.cfg.get("gns_probe", {})
+        self._gns_state = {
+            "ema_y_small": None, "ema_y_large": None,
+            "B_small": int(self.gns_cfg.get("small_B", 8)),
+            "B_large": int(self.gns_cfg.get("large_B", 64)),
+            "ema": float(self.gns_cfg.get("ema", 0.9)),
+        }
+
+
         # ─── model & tokenizer ───────────────────────────────────────────
         bnb = BitsAndBytesConfig(load_in_4bit=True,
                                  bnb_4bit_use_double_quant=True,
@@ -134,6 +144,17 @@ class RLRunner:
         print(f"stats: {stats_avg}")
         self._log(stats_avg)
 
+        # run the GNS probe every N optimiser steps using the current buffer
+        every = int(self.gns_cfg.get("every", 0))
+        if every > 0 and (self.step_id % every == 0):
+            try:
+                self._probe_gns(rb)
+            except Exception as e:
+                print(f"[GNS] probe failed: {e}")
+
+
+
+
     # ─── utils ────────────────────────────────────────────────────────────
     def _log(self, d):
         if self.rank != 0:
@@ -182,6 +203,73 @@ class RLRunner:
         torch.cuda.empty_cache(); gc.collect()
         self.model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
         print(f"[Eval] finished, resuming training.")
+
+
+    def _probe_gns(self, rb):
+        """Measure ||g||^2 at two prompt-batch sizes, estimate B_simple, log it."""
+        if self.rank != 0:
+            return
+        if not self.gns_cfg or int(self.gns_cfg.get("every", 0)) <= 0:
+            return
+
+        import random
+        B_small = self._gns_state["B_small"]
+        B_large = self._gns_state["B_large"]
+        ema = self._gns_state["ema"]
+
+        # sample prompt indices (without replacement) from the current rollout buffer
+        N_prompts = rb.prompt_ids.shape[0]
+        if N_prompts < max(B_small, B_large):
+            return  # not enough to probe this time
+
+        idx_small = random.sample(range(N_prompts), B_small)
+        idx_large = random.sample(range(N_prompts), B_large)
+
+        device = f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
+        mb_small = rb.get_batch(idx_small, device=device)
+        mb_large = rb.get_batch(idx_large, device=device)
+
+        # avoid DDP all-reduce inside the grad measurement
+        y_small = self.algo._grad_sq_norm_for_batch(mb_small, self.ref_model, avoid_ddp_allreduce=True)
+        y_large = self.algo._grad_sq_norm_for_batch(mb_large, self.ref_model, avoid_ddp_allreduce=True)
+
+        # EWMA for stability (Appendix A.1 suggests smoothing) 
+        #   E[||g_B||^2] ≈ a + c/B  =>  solve from two points (B1,y1),(B2,y2)
+        es = self._gns_state["ema_y_small"]
+        el = self._gns_state["ema_y_large"]
+        es = (ema * es + (1 - ema) * y_small) if es is not None else y_small
+        el = (ema * el + (1 - ema) * y_large) if el is not None else y_large
+        self._gns_state["ema_y_small"], self._gns_state["ema_y_large"] = es, el
+
+        B1, y1 = float(B_small), float(es)
+        B2, y2 = float(B_large), float(el)
+        if abs(B1 - B2) < 1e-9:
+            return
+
+        # Solve:
+        #   a = (B1*y1 - B2*y2) / (B1 - B2)
+        #   c = B1*B2*(y2 - y1) / (B1 - B2)
+        a_hat = (B1 * y1 - B2 * y2) / (B1 - B2)
+        c_hat = (B1 * B2) * (y2 - y1) / (B1 - B2)
+        B_simple = float("nan")
+        if a_hat > 0 and c_hat > 0:
+            B_simple = c_hat / a_hat
+
+        rec = {
+            "gns_y_small": y_small, "gns_y_large": y_large,
+            "gns_y_small_ema": es, "gns_y_large_ema": el,
+            "gns_B_small": B_small, "gns_B_large": B_large,
+            "gns_a_hat": a_hat, "gns_c_hat": c_hat,
+            "gns_B_simple": B_simple
+        }
+        # file + TB
+        self._log(rec)
+
+
+
+
+
+
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

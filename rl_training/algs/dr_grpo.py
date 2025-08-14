@@ -484,3 +484,91 @@ class DRGRPO(RLAlgorithm):
     # Placeholder left here so external calls don’t break older imports  # Added 8/11
     def _log_entropy_probes(self, *args, **kwargs) -> None:
         return  # no-op
+
+
+    # === GNS helpers =============================================================
+    def _loss_for_batch(self, rollouts: "RolloutBatch", ref_model) -> torch.Tensor:
+        """
+        Build the same PPO/GRPO loss as in step(), but:
+        - no grad accumulation scaling,
+        - no optimiser step, just returns the scalar loss.
+        """
+        device = rollouts.gen_ids.device
+        B, G, T_g = rollouts.gen_ids.shape
+
+        # 1) prep + advantages
+        seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
+        adv = self._compute_advantage(rollouts.reward)  # (B, G)
+
+        # 2) log-probs
+        with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+            logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+        logits = logits / self.cfg.get("temperature", 1.0)
+        logp_all = F.log_softmax(logits.float(), dim=-1)
+        new_logp = logp_all[:, :-1].gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g:]
+        new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+        new_logp = new_logp.view(B, G, T_g)
+
+        old_logp = rollouts.logprobs  # (B, G, T_g)
+
+        # 3) PPO surrogate (same as _ppo_surrogate but returns the mean loss)
+        ratios = torch.exp((new_logp - old_logp).clamp(-80, 80)) * gen_mask
+        clip_eps_neg = self.cfg["clip_eps"]
+        clip_eps_pos = self.cfg.get("clip_+", self.cfg["clip_eps"])
+        surr1 = ratios * adv.unsqueeze(-1)
+        surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv.unsqueeze(-1)
+        token_loss = -torch.min(surr1, surr2) * gen_mask  # (B, G, T_g)
+        tokens_per_gen = gen_mask.sum(dim=2)              # (B, G)
+        max_lens = tokens_per_gen.max(dim=-1).values      # (B,)
+        loss_per_prompt = token_loss.sum(dim=(1, 2)) / (gen_mask.shape[1] * max_lens + 1e-8)
+        loss = loss_per_prompt.mean()
+
+        # 4) optional differentiable KL (same beta as training)
+        beta = float(self.cfg.get("kl_beta", 0.0))
+        if beta > 0.0:
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+                ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
+            ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
+            ref_logp_all = F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
+            ref_logp = ref_logp_all.gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[..., -T_g:].view_as(new_logp)
+            kl_tok = ((new_logp - ref_logp) * gen_mask)
+            kl_mean = kl_tok.sum() / (gen_mask.sum() + 1e-8)
+            loss = loss + beta * kl_mean
+
+        return loss
+
+    @torch.no_grad()
+    def _grad_sq_norm_for_batch(self, rollouts: "RolloutBatch", ref_model, *, avoid_ddp_allreduce: bool = True) -> float:
+        """
+        Compute sum of squared gradients for the mean loss on `rollouts`.
+        Does NOT step the optimiser. Optionally suppresses DDP all-reduce.
+        """
+        # zero grads
+        self.opt.zero_grad(set_to_none=True)
+
+        # we need grads, so disable no_grad inside
+        for p in self.policy.parameters():
+            if p.grad is not None:
+                p.grad = None
+
+        ctx = nullcontext()
+        if avoid_ddp_allreduce and hasattr(self.policy, "no_sync"):
+            ctx = self.policy.no_sync()
+
+        with ctx:
+            # enable grads locally
+            with torch.enable_grad():
+                loss = self._loss_for_batch(rollouts, ref_model)
+                loss.backward()
+
+        # grad^2 norm over trainable params (LoRA etc.)
+        total = 0.0
+        for p in self._trainable_params():
+            if p.grad is not None:
+                g = p.grad.detach()
+                if torch.isfinite(g).all():
+                    total += float((g.double() * g.double()).sum().item())
+        # clear grads so training step isn't affected
+        self.opt.zero_grad(set_to_none=True)
+        return total
+
