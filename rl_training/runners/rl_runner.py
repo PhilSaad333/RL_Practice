@@ -172,7 +172,7 @@ class RLRunner:
         # run the GNS probe every N optimiser steps using the current buffer
         every = int(self.gns_cfg.get("every", 0))
         if every > 0 and (self.step_id % every == 0) and self.rank == 0:
-            # Only rank 0 participates in GNS probe and its barriers
+            # Only rank 0 runs GNS probe - no barriers needed since it's rank-specific
             try:
                 print(f"[DEBUG] Rank {self.rank} starting GNS probe")
                 self._probe_gns(rb)
@@ -182,12 +182,6 @@ class RLRunner:
         elif every > 0 and (self.step_id % every == 0):
             # Other ranks just note that GNS probe step is happening
             print(f"[DEBUG] Rank {self.rank} skipping GNS probe (rank 0 only)")
-        
-        # Synchronize all ranks after GNS probe section
-        if every > 0 and (self.step_id % every == 0) and self.ddp:
-            print(f"[DEBUG] Rank {self.rank} entering post-GNS-section barrier")
-            dist.barrier()
-            print(f"[DEBUG] Rank {self.rank} exited post-GNS-section barrier")
 
 
 
