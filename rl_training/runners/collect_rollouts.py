@@ -149,7 +149,7 @@ class RolloutCollector:
             old_cache = getattr(m.config, "use_cache", False)
             m.config.use_cache = True
 
-            print(f"[DEBUG] Rank {self.rank}: Starting generation, synced_gpus={bool(dist.is_initialized())}")
+            print(f"[DEBUG] Rank {self.rank}: Starting generation, synced_gpus=False")
             t0 = time.time()
             gen_out = m.generate(
                 prompt_ids,

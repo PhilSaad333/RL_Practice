@@ -124,6 +124,15 @@ class RLRunner:
 
         for _ in trange(outer_loops, desc="outer collect loops", disable=(self.rank != 0)):
             rb = self.collector.collect_batch(batch_prompts=per_rank)
+            # Synchronize after rollout collection to prevent barrier race conditions
+            if self.ddp:
+                try:
+                    dist.barrier(timeout=datetime.timedelta(minutes=10))
+                    if self.rank == 0:
+                        print(f"[DEBUG] All ranks completed rollout collection")
+                except Exception as e:
+                    print(f"[Rank {self.rank}] Barrier timeout after collection: {e}")
+                    # Continue anyway to prevent total deadlock
             # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
 
@@ -190,11 +199,21 @@ class RLRunner:
             _unwrap(self.model).save_pretrained(save_dir)  # Changed 8/11
             print(f"saved model to {save_dir}")
         if self.ddp:
-            dist.barrier()  # Changed 8/11
+            try:
+                # Timeout after 10 minutes to prevent infinite hanging
+                dist.barrier(timeout=datetime.timedelta(minutes=10))
+            except Exception as e:
+                print(f"[Rank {self.rank}] Barrier timeout before eval: {e}")
+                # Continue anyway to prevent total deadlock
         if self.rank == 0 and self.cfg.get("eval_every", 1) > 0 and (final or self.step_id % self.cfg.get("eval_every", 1) == 0):
             self._run_eval(save_dir)
         if self.ddp:
-            dist.barrier()  # Changed 8/11
+            try:
+                # Timeout after 10 minutes to prevent infinite hanging
+                dist.barrier(timeout=datetime.timedelta(minutes=10))
+            except Exception as e:
+                print(f"[Rank {self.rank}] Barrier timeout after eval: {e}")
+                # Continue anyway to prevent total deadlock
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
