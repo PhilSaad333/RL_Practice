@@ -351,8 +351,10 @@ class RLRunner:
             "gns_a_hat": a_hat, "gns_c_hat": c_hat,
             "gns_B_simple": B_simple
         }
-        # file + TB
+        # file + TB (add debugging around logging which might cause DDP hang)
+        print(f"[GNS DEBUG] Rank {self.rank} about to log GNS results: {rec}")
         self._log(rec)
+        print(f"[GNS DEBUG] Rank {self.rank} completed logging GNS results")
 
 
 
