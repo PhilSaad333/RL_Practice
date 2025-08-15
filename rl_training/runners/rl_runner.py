@@ -149,39 +149,52 @@ class RLRunner:
         self._save_ckpt(final=True)
 
     def _train_one_buffer(self, rb, K, ga_steps, B):
-        print(f"[DEBUG] Rank {self.rank} entered _train_one_buffer with {len(rb)} prompts")
+        print(f"[DEBUG] Rank {self.rank} entered _train_one_buffer with {len(rb)} prompts, K={K}, ga_steps={ga_steps}, B={B}")
         stats_sum, total_mb_cnt = defaultdict(float), 0
-        for _ in range(K):
+        for epoch in range(K):
+            print(f"[DEBUG] Rank {self.rank} starting PPO epoch {epoch+1}/{K}")
             micro_cnt = 0
             for idx in rb.iter_minibatches(B, shuffle=True):
+                print(f"[DEBUG] Rank {self.rank} processing microbatch {micro_cnt+1}, idx={len(idx)} samples")
                 sync = ((micro_cnt + 1) % ga_steps == 0)
+                print(f"[DEBUG] Rank {self.rank} microbatch {micro_cnt+1}: sync_grads={sync} (step_id will be {self.step_id + (1 if sync else 0)})")
                 mb = rb.get_batch(idx, device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+                print(f"[DEBUG] Rank {self.rank} calling algo.step for microbatch {micro_cnt+1}")
                 stats = self.algo.step(mb, self.ref_model, sync_grads=sync)
+                print(f"[DEBUG] Rank {self.rank} completed algo.step for microbatch {micro_cnt+1}")
                 for k, v in stats.items():
                     stats_sum[k] += v
                 micro_cnt += 1
                 total_mb_cnt += 1
                 if sync:
                     self.step_id += 1
+                    print(f"[DEBUG] Rank {self.rank} incremented step_id to {self.step_id}")
                 del mb, stats
                 torch.cuda.empty_cache()
+            print(f"[DEBUG] Rank {self.rank} completed PPO epoch {epoch+1}/{K}")
         stats_avg = {k: v / total_mb_cnt for k, v in stats_sum.items()}
+        print(f"[DEBUG] Rank {self.rank} computed stats_avg, about to log")
         print(f"stats: {stats_avg}")
+        print(f"[DEBUG] Rank {self.rank} calling _log with stats")
         self._log(stats_avg)
+        print(f"[DEBUG] Rank {self.rank} completed _log, moving to probe section")
 
         # run the GNS probe every N optimiser steps using the current buffer
         every = int(self.gns_cfg.get("every", 0))
+        print(f"[DEBUG] Rank {self.rank} checking GNS probe: every={every}, step_id={self.step_id}, modulo={self.step_id % every if every > 0 else 'N/A'}")
         if every > 0 and (self.step_id % every == 0) and self.rank == 0:
             # Only rank 0 runs GNS probe - no barriers needed since it's rank-specific
             try:
-                print(f"[DEBUG] Rank {self.rank} starting GNS probe")
+                print(f"[DEBUG] Rank {self.rank} STARTING GNS probe (step_id={self.step_id})")
                 self._probe_gns(rb)
-                print(f"[DEBUG] Rank {self.rank} completed GNS probe")
+                print(f"[DEBUG] Rank {self.rank} COMPLETED GNS probe (step_id={self.step_id})")
             except Exception as e:
                 print(f"[GNS] probe failed: {e}")
         elif every > 0 and (self.step_id % every == 0):
             # Other ranks just note that GNS probe step is happening
-            print(f"[DEBUG] Rank {self.rank} skipping GNS probe (rank 0 only)")
+            print(f"[DEBUG] Rank {self.rank} skipping GNS probe (rank 0 only, step_id={self.step_id})")
+        else:
+            print(f"[DEBUG] Rank {self.rank} no GNS probe this step (step_id={self.step_id})")
 
 
 
@@ -235,26 +248,35 @@ class RLRunner:
 
     def _probe_gns(self, rb):
         """Measure ||g||^2 at two prompt-batch sizes, estimate B_simple, log it."""
+        print(f"[GNS DEBUG] Rank {self.rank} entered _probe_gns")
         device = f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
         if self.rank != 0:
+            print(f"[GNS DEBUG] Rank {self.rank} exiting _probe_gns (not rank 0)")
             return
         if not self.gns_cfg or int(self.gns_cfg.get("every", 0)) <= 0:
+            print(f"[GNS DEBUG] Rank {self.rank} exiting _probe_gns (config disabled)")
             return
+        print(f"[GNS DEBUG] Rank {self.rank} starting GNS probe computation")
 
         import random
         B_small = self._gns_state["B_small"]
         B_large = self._gns_state["B_large"]
         ema = self._gns_state["ema"]
+        print(f"[GNS DEBUG] B_small={B_small}, B_large={B_large}, ema={ema}")
 
         # sample prompt indices (without replacement) from the current rollout buffer
         N_prompts = len(rb)
+        print(f"[GNS DEBUG] N_prompts={N_prompts}, need max({B_small}, {B_large})={max(B_small, B_large)}")
         if N_prompts < max(B_small, B_large):
+            print(f"[GNS DEBUG] Not enough prompts for probe, exiting")
             return  # not enough to probe this time
 
-        # index prompts we’ll use for the two effective batches
+        # index prompts we'll use for the two effective batches
+        print(f"[GNS DEBUG] Sampling prompt indices")
         import random
         idx_small = random.sample(range(N_prompts), B_small)
         idx_large = random.sample(range(N_prompts), B_large)
+        print(f"[GNS DEBUG] Sampled {len(idx_small)} small indices, {len(idx_large)} large indices")
 
 
         # helper: split a list of prompt indices into microbatches that fit in VRAM
@@ -265,16 +287,22 @@ class RLRunner:
             return mbs
 
         micro_size = int(self.cfg.get("prompts_per_microbatch", 1))
+        print(f"[GNS DEBUG] Creating microbatches with micro_size={micro_size}")
         mbs_small = _make_microbatches(idx_small, micro_size)
         mbs_large = _make_microbatches(idx_large, micro_size)
+        print(f"[GNS DEBUG] Created {len(mbs_small)} small microbatches, {len(mbs_large)} large microbatches")
 
         # emulate grad accumulation to measure ||g||^2 for the two effective batches
+        print(f"[GNS DEBUG] Computing gradient norm for small batch")
         y_small = self.algo._grad_sq_norm_for_effective_batch(
             mbs_small, self.ref_model, avoid_ddp_allreduce=True
         )
+        print(f"[GNS DEBUG] Computed y_small={y_small}")
+        print(f"[GNS DEBUG] Computing gradient norm for large batch")
         y_large = self.algo._grad_sq_norm_for_effective_batch(
             mbs_large, self.ref_model, avoid_ddp_allreduce=True
         )
+        print(f"[GNS DEBUG] Computed y_large={y_large}")
 
 
         # EWMA for stability (Appendix A.1 suggests smoothing) 
