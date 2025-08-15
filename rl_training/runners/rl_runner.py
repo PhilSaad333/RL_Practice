@@ -146,27 +146,11 @@ class RLRunner:
             # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
             
-            # Aggressive memory cleanup after training
-            print(f"[DEBUG] Rank {self.rank} starting aggressive memory cleanup")
-            del rb
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-            # Memory monitoring after cleanup
+            # Memory monitoring after cleanup (rb is cleaned up inside _train_one_buffer)
             if torch.cuda.is_available():
                 mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
                 print(f"[MEMORY] Rank {self.rank} GPU memory after cleanup: {mem_after_cleanup:.2f}GB")
-
-
-
-
-#        for _ in trange(outer_loops, desc="outer collect loops",
-#                        disable=(self.rank != 0)):
-#            rb = self.collector.collect_batch(batch_prompts=self.buffer_size)
-#            torch.cuda.empty_cache(); gc.collect()
-#            self._train_one_buffer(rb, K, ga_steps, B)
-            del rb
-            torch.cuda.empty_cache(); gc.collect()
+            
             if self.step_id % self.save_every == 0:
                 self._save_ckpt()
         self._save_ckpt(final=True)
@@ -218,6 +202,12 @@ class RLRunner:
             print(f"[DEBUG] Rank {self.rank} skipping GNS probe (rank 0 only, step_id={self.step_id})")
         else:
             print(f"[DEBUG] Rank {self.rank} no GNS probe this step (step_id={self.step_id})")
+        
+        # Cleanup rollout buffer and force garbage collection
+        print(f"[DEBUG] Rank {self.rank} starting aggressive memory cleanup in _train_one_buffer")
+        del rb
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 
