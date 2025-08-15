@@ -163,7 +163,7 @@ class RolloutCollector:
                 logits_processor     = self.logits_processor,
                 return_dict_in_generate=True,
                 output_scores=True,
-                synced_gpus          = bool(dist.is_initialized()),
+                synced_gpus          = False,  # Disabled to prevent distributed deadlocks
             )
             gen_time = time.time() - t0
             print(f"[DEBUG] Rank {self.rank}: Completed generation, took {gen_time:.2f}s")
