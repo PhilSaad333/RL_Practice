@@ -27,9 +27,9 @@ save_rollouts_every: 0
 
 
 
-buffer_size       : 128 #32 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
+buffer_size       : 32 #32 #2048   # total number of prompts in buffer (multiple of microbatch_size*grad_accum_steps)
 microbatch_size   : 4   # B: prompts used for each gradient checkpointing steps
-grad_accum_steps  : 32   # redundant i think? is buffer_size/microbatch_size if ppo_epochs=1   ga_steps: total number of prompts per update batch = ga_step*B
+grad_accum_steps  : 8   # redundant i think? is buffer_size/microbatch_size if ppo_epochs=1   ga_steps: total number of prompts per update batch = ga_step*B
 
 # Above gives effective batch size 256 prompts, 8 gens per prompt, 8 steps per epoch
 
@@ -88,5 +88,5 @@ entropy_probe:
 gns_probe:
   every: 1          # Testing both probes together
   small_B: 8         # prompts in the small batch
-  large_B: 64        # prompts in the large batch
+  large_B: 48         # prompts in the large batch (reduced, should put back at 64 after testing)
   ema: 0.9           # EWMA smoothing for norm^2 measurements
