@@ -161,6 +161,17 @@ class RLRunner:
                 finally:
                     self._pending_gns_data = None  # Clear saved data
             
+            # Process saved evaluation data after cleanup (Option 2: Buffer Data Preservation)
+            if hasattr(self, '_pending_eval_data') and self._pending_eval_data is not None:
+                print(f"[DEBUG] Rank {self.rank} processing delayed evaluation (step_id={self._pending_eval_data['step_id']})")
+                try:
+                    self._run_eval(self._pending_eval_data['save_dir'])
+                    print(f"[DEBUG] Rank {self.rank} COMPLETED delayed evaluation (step_id={self._pending_eval_data['step_id']})")
+                except Exception as e:
+                    print(f"[EVAL] delayed evaluation failed: {e}")
+                finally:
+                    self._pending_eval_data = None  # Clear saved data
+            
             # Memory monitoring after cleanup (rb is cleaned up inside _train_one_buffer)
             if torch.cuda.is_available():
                 mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
@@ -169,6 +180,17 @@ class RLRunner:
             if self.step_id % self.save_every == 0:
                 self._save_ckpt()
         self._save_ckpt(final=True)
+        
+        # Process final evaluation if scheduled (Option 2: Buffer Data Preservation)
+        if hasattr(self, '_pending_eval_data') and self._pending_eval_data is not None:
+            print(f"[DEBUG] Rank {self.rank} processing final delayed evaluation (step_id={self._pending_eval_data['step_id']})")
+            try:
+                self._run_eval(self._pending_eval_data['save_dir'])
+                print(f"[DEBUG] Rank {self.rank} COMPLETED final delayed evaluation (step_id={self._pending_eval_data['step_id']})")
+            except Exception as e:
+                print(f"[EVAL] final delayed evaluation failed: {e}")
+            finally:
+                self._pending_eval_data = None  # Clear saved data
 
     def _train_one_buffer(self, rb, K, ga_steps, B):
         print(f"[DEBUG] Rank {self.rank} entered _train_one_buffer with {len(rb)} prompts, K={K}, ga_steps={ga_steps}, B={B}")
@@ -248,9 +270,20 @@ class RLRunner:
         if self.rank == 0:
             _unwrap(self.model).save_pretrained(save_dir)  # Changed 8/11
             print(f"saved model to {save_dir}")
-        # Evaluation disabled for distributed training to avoid barrier issues
-        # Can run evaluation later on saved checkpoints
-        print(f"[DEBUG] Rank {self.rank} skipping evaluation (disabled for distributed training)")
+            
+            # Save evaluation data for delayed processing (Option 2 pattern for eval)
+            eval_every = self.cfg.get("eval_every", 1)
+            if eval_every > 0 and (final or self.step_id % eval_every == 0):
+                print(f"[DEBUG] Rank {self.rank} scheduling delayed evaluation (step_id={self.step_id})")
+                self._pending_eval_data = {
+                    'save_dir': save_dir,
+                    'step_id': self.step_id,
+                    'is_final': final
+                }
+            else:
+                print(f"[DEBUG] Rank {self.rank} no evaluation scheduled this step (step_id={self.step_id})")
+        else:
+            print(f"[DEBUG] Rank {self.rank} skipping checkpoint save (rank 0 only)")
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
