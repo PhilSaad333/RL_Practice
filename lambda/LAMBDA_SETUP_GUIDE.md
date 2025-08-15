@@ -6,9 +6,18 @@ Complete guide for setting up and running RL training on Lambda Cloud GPU instan
 
 ### 1. Launch New Instance
 ```powershell
-# Start new H100 instance and run full setup
+# Start new instance and run full setup
 .\ssh_workflow.ps1 -InstanceIP <NEW_IP> -Action full-setup -S3UUID "8c7f7fd3-ba01-40d8-b3dd-92090e4b3b0a"
 ```
+
+**IMPORTANT:** Code syncing is done via git clone from GitHub, NOT file uploads. This ensures consistency and avoids file corruption issues.
+
+### Quick Setup Checklist for New Instance
+1. **Accept conda terms**: `~/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main`
+2. **Clone fresh code**: `rm -rf ~/RL_Practice && git clone https://github.com/PhilSaad333/RL_Practice.git`
+3. **Install dependencies**: `~/miniconda3/bin/conda activate rl && pip install -r requirements.txt`
+4. **Create initial LORA**: Use the LORA creation script (creates `/tmp/checkpoints/initial_lora`)
+5. **Verify tyro version**: Should be 0.9.28+ (auto-installed from requirements.txt)
 
 ### 2. Run Training
 ```powershell
@@ -55,6 +64,11 @@ Complete guide for setting up and running RL training on Lambda Cloud GPU instan
 1. **Training stuck on step 0**: Usually evaluation phase issue, use overnight_config.yaml with less frequent eval
 2. **CUDA OOM**: Reduce batch sizes in config file
 3. **S3 access denied**: Check S3UUID and credentials in workflow script
+4. **Conda terms of service error**: Run `~/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main`
+5. **Conda command not found**: Use full path `~/miniconda3/bin/conda` instead of just `conda`
+6. **eval_runner_fixed.py not found**: Fixed in codebase - was hardcoded wrong filename
+7. **tyro argument parsing error**: Upgrade tyro to 0.9.28+ fixes "too many values to unpack" error
+8. **eval_every=0 not respected**: Fixed in codebase - now properly skips evaluation when set to 0
 
 ### Log Locations
 - Training logs: `/tmp/rl_runs/run_YYYY-MM-DD_HH-MM-SS/`
