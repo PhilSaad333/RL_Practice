@@ -147,8 +147,20 @@ class RLRunner:
             self._train_one_buffer(rb, K, ga_steps, B)
             
             # ═══ SYNCHRONIZED PROBE PROCESSING (Option 2: Buffer Data Preservation) ═══
-            # Only rank 0 processes GNS probe while other ranks wait
-            if hasattr(self, '_pending_gns_data') and self._pending_gns_data is not None:
+            # Rank 0 determines if GNS probe needs processing and broadcasts to all ranks
+            has_gns_probe = False
+            if self.rank == 0:
+                has_gns_probe = hasattr(self, '_pending_gns_data') and self._pending_gns_data is not None
+            
+            # Broadcast probe status from rank 0 to all ranks in distributed mode
+            if self.ddp:
+                import torch
+                probe_tensor = torch.tensor([1 if has_gns_probe else 0], device=f"cuda:{self.local_rank}")
+                dist.broadcast(probe_tensor, src=0)
+                has_gns_probe = bool(probe_tensor.item())
+            
+            # Now all ranks know if GNS probe processing is needed
+            if has_gns_probe:
                 if self.rank == 0:
                     print(f"[DEBUG] Rank {self.rank} processing saved GNS probe data (step_id={self._pending_gns_data['step_id']})")
                     try:
@@ -164,7 +176,8 @@ class RLRunner:
                         self._pending_gns_data = None  # Clear saved data
                 else:
                     print(f"[DEBUG] Rank {self.rank} waiting for rank 0 to complete GNS probe")
-                    self._pending_gns_data = None  # Clear saved data on non-rank-0
+                    if hasattr(self, '_pending_gns_data'):
+                        self._pending_gns_data = None  # Clear any saved data on non-rank-0
                 
                 # Barrier: All ranks wait for rank 0 to finish GNS probe before proceeding
                 if self.ddp:
@@ -172,8 +185,19 @@ class RLRunner:
                     dist.barrier()
                     print(f"[DEBUG] Rank {self.rank} exited post-GNS-probe barrier")
             
-            # Only rank 0 processes evaluation while other ranks wait
-            if hasattr(self, '_pending_eval_data') and self._pending_eval_data is not None:
+            # Rank 0 determines if evaluation needs processing and broadcasts to all ranks
+            has_eval = False
+            if self.rank == 0:
+                has_eval = hasattr(self, '_pending_eval_data') and self._pending_eval_data is not None
+            
+            # Broadcast evaluation status from rank 0 to all ranks in distributed mode
+            if self.ddp:
+                eval_tensor = torch.tensor([1 if has_eval else 0], device=f"cuda:{self.local_rank}")
+                dist.broadcast(eval_tensor, src=0)
+                has_eval = bool(eval_tensor.item())
+            
+            # Now all ranks know if evaluation processing is needed
+            if has_eval:
                 if self.rank == 0:
                     print(f"[DEBUG] Rank {self.rank} processing delayed evaluation (step_id={self._pending_eval_data['step_id']})")
                     try:
@@ -185,7 +209,8 @@ class RLRunner:
                         self._pending_eval_data = None  # Clear saved data
                 else:
                     print(f"[DEBUG] Rank {self.rank} waiting for rank 0 to complete evaluation")
-                    self._pending_eval_data = None  # Clear saved data on non-rank-0
+                    if hasattr(self, '_pending_eval_data'):
+                        self._pending_eval_data = None  # Clear any saved data on non-rank-0
                 
                 # Barrier: All ranks wait for rank 0 to finish evaluation before proceeding
                 if self.ddp:
