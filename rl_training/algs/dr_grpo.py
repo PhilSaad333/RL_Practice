@@ -96,15 +96,26 @@ class DRGRPO(RLAlgorithm):
         """
         One optimisation step (or gradient-accumulation micro-step).
         """
+        # Debug distributed training hanging
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[ALGO DEBUG] Rank {rank} entered step(), sync_grads={sync_grads}")
+        
         self.device = rollouts.gen_ids.device
         B, G, T_g = rollouts.gen_ids.shape
+        print(f"[ALGO DEBUG] Rank {rank} got batch shape B={B}, G={G}, T_g={T_g}")
 
         # 1) prepare tensors & advantages
+        print(f"[ALGO DEBUG] Rank {rank} building sequences...")
         seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
+        print(f"[ALGO DEBUG] Rank {rank} computing advantages...")
         adv = self._compute_advantage(rollouts.reward)  # (B, G)
+        print(f"[ALGO DEBUG] Rank {rank} completed sequence prep and advantage computation")
 
         # 2) forward & gather log-probs
+        print(f"[ALGO DEBUG] Rank {rank} about to call _policy_logp...")
         new_logp = self._policy_logp(seq_flat, attn_mask, targets_tok, B, G, T_g).view(B, G, T_g)
+        print(f"[ALGO DEBUG] Rank {rank} completed _policy_logp call")
         old_logp = rollouts.logprobs  # (B, G, T_g)
 
         if torch.isinf(old_logp).any() or torch.isnan(old_logp).any():
@@ -202,8 +213,15 @@ class DRGRPO(RLAlgorithm):
         T_g: int,
     ) -> torch.Tensor:
         """Return log p(sampled token) for generated slice (BG, T_g)."""
+        # Debug distributed training hanging
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[POLICY DEBUG] Rank {rank} entered _policy_logp, seq_flat.shape={seq_flat.shape}")
+        
         with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+            print(f"[POLICY DEBUG] Rank {rank} about to call self.policy forward pass...")
             logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+            print(f"[POLICY DEBUG] Rank {rank} completed self.policy forward pass, logits.shape={logits.shape}")
 
         logits = logits / self.cfg.get("temperature", 1.0)
 

@@ -123,7 +123,18 @@ class RLRunner:
             print(f"Distributed collection: {world} ranks, buffer_size={self.buffer_size}, per_rank={per_rank}")
 
         for _ in trange(outer_loops, desc="outer collect loops", disable=(self.rank != 0)):
+            # Memory monitoring before collection
+            if torch.cuda.is_available():
+                mem_before = torch.cuda.memory_allocated() / 1024**3
+                print(f"[MEMORY] Rank {self.rank} GPU memory before collection: {mem_before:.2f}GB")
+            
             rb = self.collector.collect_batch(batch_prompts=per_rank)
+            
+            # Memory monitoring after collection
+            if torch.cuda.is_available():
+                mem_after_collect = torch.cuda.memory_allocated() / 1024**3
+                print(f"[MEMORY] Rank {self.rank} GPU memory after collection: {mem_after_collect:.2f}GB")
+            
             # Add barrier after collection to ensure both ranks finish before training
             if self.ddp:
                 print(f"[DEBUG] Rank {self.rank} entering post-collection barrier")
@@ -131,8 +142,20 @@ class RLRunner:
                 print(f"[DEBUG] Rank {self.rank} exited post-collection barrier")
             print(f"[DEBUG] Rank {self.rank} completed rollout collection")
             print(f"[DEBUG] Rank {self.rank} about to start training on buffer")
+            
             # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
+            
+            # Aggressive memory cleanup after training
+            print(f"[DEBUG] Rank {self.rank} starting aggressive memory cleanup")
+            del rb
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # Memory monitoring after cleanup
+            if torch.cuda.is_available():
+                mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
+                print(f"[MEMORY] Rank {self.rank} GPU memory after cleanup: {mem_after_cleanup:.2f}GB")
 
 
 
