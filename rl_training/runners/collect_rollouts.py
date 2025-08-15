@@ -149,7 +149,7 @@ class RolloutCollector:
             old_cache = getattr(m.config, "use_cache", False)
             m.config.use_cache = True
 
-            print(f"[DEBUG] Rank {self.rank}: Starting generation for prompt batch {b+1}/{take}")
+            print(f"[DEBUG] Rank {self.rank}: Starting generation, synced_gpus={bool(dist.is_initialized())}")
             t0 = time.time()
             gen_out = m.generate(
                 prompt_ids,
@@ -166,7 +166,7 @@ class RolloutCollector:
                 synced_gpus          = bool(dist.is_initialized()),
             )
             gen_time = time.time() - t0
-            print(f"[DEBUG] Rank {self.rank}: Completed generation for batch {b+1}/{take}, took {gen_time:.2f}s")
+            print(f"[DEBUG] Rank {self.rank}: Completed generation, took {gen_time:.2f}s")
 
             m.config.use_cache = old_cache
             if was_training: m.train()
@@ -207,6 +207,7 @@ class RolloutCollector:
             for b in range(take):
                 if len(buffer) >= need:
                     break
+                print(f"[DEBUG] Rank {self.rank}: Processing sample {b+1}/{take}, buffer has {len(buffer)}/{need}")
                 pid     = pids[b]
                 q_text  = ptxts[b]
                 g_ids_b = gen_ids[b]                                      # (G, T_gen_pad)
