@@ -80,13 +80,13 @@ total_steps: 48
 
 
 entropy_probe:
-  every: 1
+  every: 3          # Changed from 1 to avoid every-step probe issues
   sketch_r: 0         # 0 = off for now
   out_dir: entropy_probes
 
 
 gns_probe:
-  every: 1          # run the probe every N optimiser steps
+  every: 2          # Changed from 1 to avoid every-step probe issues
   small_B: 8         # prompts in the small batch
   large_B: 64        # prompts in the large batch
   ema: 0.9           # EWMA smoothing for norm^2 measurements
