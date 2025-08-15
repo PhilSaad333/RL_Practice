@@ -29,7 +29,7 @@ save_rollouts_every: 0
 
 buffer_size       : 32    # REDUCED for memory debugging - was 32
 microbatch_size   : 2    # REDUCED for memory debugging - was 4  
-grad_accum_steps  : 16    # REDUCED for memory debugging - was 8
+grad_accum_steps  : 8     # FIXED: 16 prompts/rank ÷ 2 microbatch_size = 8 microbatches
 
 # Above gives much smaller memory footprint for debugging
 
@@ -80,13 +80,13 @@ total_steps: 4
 
 
 entropy_probe:
-  every: 1          # RE-ENABLED for final test with memory optimization
+  every: 0          # DISABLED for eval debugging
   sketch_r: 0         # 0 = off for now
   out_dir: entropy_probes
 
 
 gns_probe:
-  every: 1          # RE-ENABLED for final test with memory optimization
+  every: 0          # DISABLED for eval debugging
   small_B: 8         # prompts in the small batch
   large_B: 16         # prompts in the large batch (sufficient for buffer_size=32)
   ema: 0.9           # EWMA smoothing for norm^2 measurements
