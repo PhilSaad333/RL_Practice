@@ -124,10 +124,13 @@ class RLRunner:
 
         for _ in trange(outer_loops, desc="outer collect loops", disable=(self.rank != 0)):
             rb = self.collector.collect_batch(batch_prompts=per_rank)
-            # Skip barrier for now - it's causing more deadlocks than it solves
-            # The checkpoint barriers should be sufficient
-            if self.rank == 0:
-                print(f"[DEBUG] Rank 0 completed rollout collection")
+            # Add barrier after collection to ensure both ranks finish before training
+            if self.ddp:
+                try:
+                    dist.barrier(timeout=datetime.timedelta(minutes=5))
+                except Exception as e:
+                    print(f"[Rank {self.rank}] Post-collection barrier failed: {e}")
+            print(f"[DEBUG] Rank {self.rank} completed rollout collection")
             # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
 
