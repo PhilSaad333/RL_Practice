@@ -232,6 +232,7 @@ class RLRunner:
             # Convert buffer to batch to access tensor data, then save minimal data needed for GNS probe
             batch = rb.to_batch(device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
             gns_saved_data = {
+                'prompt_ids': batch.prompt_ids.clone().detach(),
                 'gen_ids': batch.gen_ids.clone().detach(),
                 'logprobs': batch.logprobs.clone().detach(), 
                 'reward': batch.reward.clone().detach(),
@@ -430,6 +431,7 @@ class RLRunner:
         print(f"[GNS DEBUG] B_small={B_small}, B_large={B_large}, ema={ema}")
 
         # Extract saved data
+        prompt_ids = saved_data['prompt_ids']  # (N, T_p)
         gen_ids = saved_data['gen_ids']  # (N, G, T_g)
         logprobs = saved_data['logprobs']  # (N, G, T_g)
         reward = saved_data['reward']  # (N, G)
@@ -456,7 +458,7 @@ class RLRunner:
                 batch_idxs = idxs[s:s+micro_size]
                 # Create RolloutBatch objects from saved tensors
                 mb = RolloutBatch(
-                    prompt_ids=None,  # Not needed for GNS probe
+                    prompt_ids=prompt_ids[batch_idxs].to(device),
                     gen_ids=gen_ids[batch_idxs].to(device),
                     reward=reward[batch_idxs].to(device),
                     logprobs=logprobs[batch_idxs].to(device),
