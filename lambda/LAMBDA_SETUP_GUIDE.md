@@ -13,11 +13,27 @@ Complete guide for setting up and running RL training on Lambda Cloud GPU instan
 **IMPORTANT:** Code syncing is done via git clone from GitHub, NOT file uploads. This ensures consistency and avoids file corruption issues.
 
 ### Quick Setup Checklist for New Instance
-1. **Accept conda terms**: `~/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main`
+1. **Accept conda terms**: `~/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && ~/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r`
 2. **Clone fresh code**: `rm -rf ~/RL_Practice && git clone https://github.com/PhilSaad333/RL_Practice.git`
 3. **Install dependencies**: `~/miniconda3/bin/conda activate rl && pip install -r requirements.txt`
-4. **Create initial LORA**: Use the LORA creation script (creates `/tmp/checkpoints/initial_lora`)
-5. **Verify tyro version**: Should be 0.9.28+ (auto-installed from requirements.txt)
+4. **Set up S3 credentials**: Create `~/.lambda_s3.env` with AWS credentials from Setup.txt
+5. **Sync finetuned checkpoints**: Use correct S3 UUID `9e733b11-9ff3-41c4-9328-29990fa02ade`
+6. **Verify tyro version**: Should be 0.9.28+ (auto-installed from requirements.txt)
+
+### S3 Credentials Setup (Critical!)
+```bash
+cat > ~/.lambda_s3.env <<'EOF'
+export AWS_ACCESS_KEY_ID=5EB1FPPIRA9S0BYBA8Q9
+export AWS_SECRET_ACCESS_KEY=xSNViz9kasErzaa3l9iSh3RTa9ne6fMWOQETkJ8p
+export AWS_REGION=us-east-3
+export S3_ENDPOINT_URL=https://files.us-east-3.lambda.ai
+export AWS_EC2_METADATA_DISABLED=true
+EOF
+chmod 600 ~/.lambda_s3.env
+
+# Sync Lord Krang's finetuned checkpoints:
+source ~/.lambda_s3.env && rclone copy lambda_east3:9e733b11-9ff3-41c4-9328-29990fa02ade/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156 /tmp/checkpoints --ignore-checksum --size-only --transfers=4 --checkers=4 --progress
+```
 
 ### 2. Run Training
 ```powershell
