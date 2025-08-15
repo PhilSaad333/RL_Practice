@@ -337,10 +337,11 @@ class RLRunner:
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
-        self.model.to("cpu"); torch.cuda.empty_cache(); gc.collect()
+        # Don't move model to CPU - eval subprocess loads its own model copy
+        torch.cuda.empty_cache(); gc.collect()
 
         cmd = [
-            "python", "-m", "evals.eval_runner",
+            "/home/ubuntu/miniconda3/envs/rl/bin/python", "-m", "evals.eval_runner",
             "--backbone", self.cfg["eval_backbone"],
             "--ft-dataset", self.cfg["scheduler"]["dataset_name"],
             "--ckpt-path", str(ckpt_dir),
@@ -357,7 +358,7 @@ class RLRunner:
         run_sync(cmd, env=env, check=True)
 
         torch.cuda.empty_cache(); gc.collect()
-        self.model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        # Model stays on GPU - no need to move back
         print(f"[Eval] finished, resuming training.")
 
 
