@@ -47,7 +47,7 @@ def _parse_one(rec: dict, split: str) -> Example:
     meta = dict(dataset="gsm8k_latex", split=split)
     return Example(text=text, question=prompt_template(q), answer=ans, meta=meta)
 
-def build_gsm8k(split: str = "train") -> list[Example]:
+def build_gsm8k(split: str = "train", root: str = None) -> list[Example]:
     ds = []
     with open(os.path.join(BASE, f"gsm8k_latex_{split}.jsonl"), 'r') as f:
         for line in f:
