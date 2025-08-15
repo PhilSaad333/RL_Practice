@@ -18,6 +18,11 @@ from transformers import (
 from .base import RLAlgorithm, RolloutBatch
 
 
+def _unwrap(model):
+    """Helper for DDP/unwrapped access"""
+    return model.module if hasattr(model, "module") else model
+
+
 class DRGRPO(RLAlgorithm):
     """
     Clear, modular PPO/GRPO-style updater with optional differentiable KL.
@@ -349,7 +354,9 @@ class DRGRPO(RLAlgorithm):
         self._probe_tokent_list.clear()
 
     def _trainable_params(self):  # Added 8/11
-        return [p for p in self.policy.parameters() if isinstance(p, torch.nn.Parameter) and p.requires_grad]
+        # Use unwrapped model to get parameters without DDP wrapper
+        unwrapped_policy = _unwrap(self.policy)
+        return [p for p in unwrapped_policy.parameters() if isinstance(p, torch.nn.Parameter) and p.requires_grad]
 
     def _probe_accumulate_microbatch(self, rollouts: RolloutBatch) -> None:  # Added 8/11
         """
@@ -361,9 +368,11 @@ class DRGRPO(RLAlgorithm):
         seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
         B, G, T_g = rollouts.gen_ids.shape
 
-        # Forward fresh (don’t rely on training graph)
+        # Forward fresh (don't rely on training graph)
+        # Use unwrapped model to bypass DDP for entropy probe
+        unwrapped_policy = _unwrap(self.policy)
         with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
-            logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+            logits = unwrapped_policy(seq_flat, attention_mask=attn_mask).logits
         logits = logits / self.cfg.get("temperature", 1.0)
         logp_all = F.log_softmax(logits.float(), dim=-1)
         new_logp = logp_all[:, :-1].gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g:]
@@ -543,9 +552,12 @@ class DRGRPO(RLAlgorithm):
 
         # 2) log-probs
         print(f"[GNS DEBUG] _loss_for_batch: starting forward pass")
+        # Use unwrapped model to bypass DDP for GNS probe
+        unwrapped_policy = _unwrap(self.policy)
+        print(f"[GNS DEBUG] _loss_for_batch: using unwrapped model, type={type(unwrapped_policy)}")
         with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
             print(f"[GNS DEBUG] _loss_for_batch: calling policy forward pass with seq_flat.shape={seq_flat.shape}")
-            logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+            logits = unwrapped_policy(seq_flat, attention_mask=attn_mask).logits
             print(f"[GNS DEBUG] _loss_for_batch: completed policy forward pass, logits.shape={logits.shape}")
         logits = logits / self.cfg.get("temperature", 1.0)
         logp_all = F.log_softmax(logits.float(), dim=-1)
