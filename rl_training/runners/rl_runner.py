@@ -146,31 +146,52 @@ class RLRunner:
             # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
             
-            # Process saved GNS probe data after cleanup (Option 2: Buffer Data Preservation)
+            # ═══ SYNCHRONIZED PROBE PROCESSING (Option 2: Buffer Data Preservation) ═══
+            # Only rank 0 processes GNS probe while other ranks wait
             if hasattr(self, '_pending_gns_data') and self._pending_gns_data is not None:
-                print(f"[DEBUG] Rank {self.rank} processing saved GNS probe data (step_id={self._pending_gns_data['step_id']})")
-                try:
-                    # Wrap GNS probe in no_sync to prevent DDP hanging during gradient computation
-                    from contextlib import nullcontext
-                    ctx = self.model.no_sync() if hasattr(self.model, "no_sync") else nullcontext()
-                    with ctx:
-                        self._probe_gns_from_saved_data(self._pending_gns_data)
-                    print(f"[DEBUG] Rank {self.rank} COMPLETED delayed GNS probe (step_id={self._pending_gns_data['step_id']})")
-                except Exception as e:
-                    print(f"[GNS] delayed probe failed: {e}")
-                finally:
-                    self._pending_gns_data = None  # Clear saved data
+                if self.rank == 0:
+                    print(f"[DEBUG] Rank {self.rank} processing saved GNS probe data (step_id={self._pending_gns_data['step_id']})")
+                    try:
+                        # Wrap GNS probe in no_sync to prevent DDP hanging during gradient computation
+                        from contextlib import nullcontext
+                        ctx = self.model.no_sync() if hasattr(self.model, "no_sync") else nullcontext()
+                        with ctx:
+                            self._probe_gns_from_saved_data(self._pending_gns_data)
+                        print(f"[DEBUG] Rank {self.rank} COMPLETED delayed GNS probe (step_id={self._pending_gns_data['step_id']})")
+                    except Exception as e:
+                        print(f"[GNS] delayed probe failed: {e}")
+                    finally:
+                        self._pending_gns_data = None  # Clear saved data
+                else:
+                    print(f"[DEBUG] Rank {self.rank} waiting for rank 0 to complete GNS probe")
+                    self._pending_gns_data = None  # Clear saved data on non-rank-0
+                
+                # Barrier: All ranks wait for rank 0 to finish GNS probe before proceeding
+                if self.ddp:
+                    print(f"[DEBUG] Rank {self.rank} entering post-GNS-probe barrier")
+                    dist.barrier()
+                    print(f"[DEBUG] Rank {self.rank} exited post-GNS-probe barrier")
             
-            # Process saved evaluation data after cleanup (Option 2: Buffer Data Preservation)
+            # Only rank 0 processes evaluation while other ranks wait
             if hasattr(self, '_pending_eval_data') and self._pending_eval_data is not None:
-                print(f"[DEBUG] Rank {self.rank} processing delayed evaluation (step_id={self._pending_eval_data['step_id']})")
-                try:
-                    self._run_eval(self._pending_eval_data['save_dir'])
-                    print(f"[DEBUG] Rank {self.rank} COMPLETED delayed evaluation (step_id={self._pending_eval_data['step_id']})")
-                except Exception as e:
-                    print(f"[EVAL] delayed evaluation failed: {e}")
-                finally:
-                    self._pending_eval_data = None  # Clear saved data
+                if self.rank == 0:
+                    print(f"[DEBUG] Rank {self.rank} processing delayed evaluation (step_id={self._pending_eval_data['step_id']})")
+                    try:
+                        self._run_eval(self._pending_eval_data['save_dir'])
+                        print(f"[DEBUG] Rank {self.rank} COMPLETED delayed evaluation (step_id={self._pending_eval_data['step_id']})")
+                    except Exception as e:
+                        print(f"[EVAL] delayed evaluation failed: {e}")
+                    finally:
+                        self._pending_eval_data = None  # Clear saved data
+                else:
+                    print(f"[DEBUG] Rank {self.rank} waiting for rank 0 to complete evaluation")
+                    self._pending_eval_data = None  # Clear saved data on non-rank-0
+                
+                # Barrier: All ranks wait for rank 0 to finish evaluation before proceeding
+                if self.ddp:
+                    print(f"[DEBUG] Rank {self.rank} entering post-evaluation barrier")
+                    dist.barrier()
+                    print(f"[DEBUG] Rank {self.rank} exited post-evaluation barrier")
             
             # Memory monitoring after cleanup (rb is cleaned up inside _train_one_buffer)
             if torch.cuda.is_available():
