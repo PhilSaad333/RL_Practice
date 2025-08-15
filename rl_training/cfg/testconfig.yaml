@@ -75,18 +75,18 @@ gradient_checkpointing : true
 
 lr_scheduler: "const" # 'const' or 'cosine'
 
-save_every: 8
-total_steps: 48
+save_every: 1
+total_steps: 2
 
 
 entropy_probe:
-  every: 0          # Disabled to test if probes cause hanging
+  every: 0          # Disabled for GNS-only test
   sketch_r: 0         # 0 = off for now
   out_dir: entropy_probes
 
 
 gns_probe:
-  every: 0          # Disabled to test if probes cause hanging
+  every: 1          # Testing GNS probe only
   small_B: 8         # prompts in the small batch
   large_B: 64        # prompts in the large batch
   ema: 0.9           # EWMA smoothing for norm^2 measurements
