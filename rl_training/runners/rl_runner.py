@@ -185,7 +185,7 @@ class RLRunner:
             print(f"saved model to {save_dir}")
         if self.ddp:
             dist.barrier()  # Changed 8/11
-        if self.rank == 0:
+        if self.rank == 0 and self.cfg.get("eval_every", 1) > 0 and (final or self.step_id % self.cfg.get("eval_every", 1) == 0):
             self._run_eval(save_dir)
         if self.ddp:
             dist.barrier()  # Changed 8/11
