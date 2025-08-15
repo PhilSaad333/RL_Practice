@@ -127,10 +127,13 @@ class RLRunner:
             # Add barrier after collection to ensure both ranks finish before training
             if self.ddp:
                 try:
-                    dist.barrier(timeout=datetime.timedelta(minutes=5))
+                    print(f"[DEBUG] Rank {self.rank} entering post-collection barrier")
+                    dist.barrier()
+                    print(f"[DEBUG] Rank {self.rank} exited post-collection barrier")
                 except Exception as e:
                     print(f"[Rank {self.rank}] Post-collection barrier failed: {e}")
             print(f"[DEBUG] Rank {self.rank} completed rollout collection")
+            print(f"[DEBUG] Rank {self.rank} about to start training on buffer")
             # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
 
@@ -149,8 +152,7 @@ class RLRunner:
         self._save_ckpt(final=True)
 
     def _train_one_buffer(self, rb, K, ga_steps, B):
-        if self.rank == 0:
-            print(f"[DEBUG] Starting training on buffer with {len(rb)} prompts")
+        print(f"[DEBUG] Rank {self.rank} entered _train_one_buffer with {len(rb)} prompts")
         stats_sum, total_mb_cnt = defaultdict(float), 0
         for _ in range(K):
             micro_cnt = 0
@@ -176,17 +178,23 @@ class RLRunner:
             # Add barrier before GNS probe to sync both ranks
             if self.ddp:
                 try:
-                    dist.barrier(timeout=datetime.timedelta(minutes=5))
+                    print(f"[DEBUG] Rank {self.rank} entering pre-GNS barrier")
+                    dist.barrier()
+                    print(f"[DEBUG] Rank {self.rank} exited pre-GNS barrier")
                 except Exception as e:
                     print(f"[Rank {self.rank}] Pre-GNS barrier failed: {e}")
             try:
+                print(f"[DEBUG] Rank {self.rank} starting GNS probe")
                 self._probe_gns(rb)
+                print(f"[DEBUG] Rank {self.rank} completed GNS probe")
             except Exception as e:
                 print(f"[GNS] probe failed: {e}")
             # Add barrier after GNS probe to ensure rank 0 finishes before continuing
             if self.ddp:
                 try:
-                    dist.barrier(timeout=datetime.timedelta(minutes=5))
+                    print(f"[DEBUG] Rank {self.rank} entering post-GNS barrier")
+                    dist.barrier()
+                    print(f"[DEBUG] Rank {self.rank} exited post-GNS barrier")
                 except Exception as e:
                     print(f"[Rank {self.rank}] Post-GNS barrier failed: {e}")
 
@@ -213,7 +221,7 @@ class RLRunner:
         if self.ddp:
             try:
                 # Timeout after 10 minutes to prevent infinite hanging
-                dist.barrier(timeout=datetime.timedelta(minutes=10))
+                dist.barrier()
             except Exception as e:
                 print(f"[Rank {self.rank}] Barrier timeout before eval: {e}")
                 # Continue anyway to prevent total deadlock
@@ -222,7 +230,7 @@ class RLRunner:
         if self.ddp:
             try:
                 # Timeout after 10 minutes to prevent infinite hanging
-                dist.barrier(timeout=datetime.timedelta(minutes=10))
+                dist.barrier()
             except Exception as e:
                 print(f"[Rank {self.rank}] Barrier timeout after eval: {e}")
                 # Continue anyway to prevent total deadlock
