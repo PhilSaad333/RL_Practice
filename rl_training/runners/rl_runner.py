@@ -235,6 +235,8 @@ class RLRunner:
                 'gen_ids': batch.gen_ids.clone().detach(),
                 'logprobs': batch.logprobs.clone().detach(), 
                 'reward': batch.reward.clone().detach(),
+                'tag_correct': batch.tag_correct.clone().detach(),
+                'think_len': batch.think_len.clone().detach(),
                 'step_id': self.step_id
             }
             print(f"[DEBUG] Rank {self.rank} saved GNS data: gen_ids.shape={gns_saved_data['gen_ids'].shape}")
@@ -431,6 +433,8 @@ class RLRunner:
         gen_ids = saved_data['gen_ids']  # (N, G, T_g)
         logprobs = saved_data['logprobs']  # (N, G, T_g)
         reward = saved_data['reward']  # (N, G)
+        tag_correct = saved_data['tag_correct']  # (N, G)
+        think_len = saved_data['think_len']  # (N, G)
         
         N_prompts = gen_ids.shape[0]
         print(f"[GNS DEBUG] N_prompts={N_prompts}, need max({B_small}, {B_large})={max(B_small, B_large)}")
@@ -455,7 +459,9 @@ class RLRunner:
                     prompt_ids=None,  # Not needed for GNS probe
                     gen_ids=gen_ids[batch_idxs].to(device),
                     reward=reward[batch_idxs].to(device),
-                    logprobs=logprobs[batch_idxs].to(device)
+                    logprobs=logprobs[batch_idxs].to(device),
+                    tag_correct=tag_correct[batch_idxs].to(device),
+                    think_len=think_len[batch_idxs].to(device)
                 )
                 mbs.append(mb)
             return mbs
