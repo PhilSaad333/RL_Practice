@@ -173,10 +173,22 @@ class RLRunner:
         # run the GNS probe every N optimiser steps using the current buffer
         every = int(self.gns_cfg.get("every", 0))
         if every > 0 and (self.step_id % every == 0):
+            # Add barrier before GNS probe to sync both ranks
+            if self.ddp:
+                try:
+                    dist.barrier(timeout=datetime.timedelta(minutes=5))
+                except Exception as e:
+                    print(f"[Rank {self.rank}] Pre-GNS barrier failed: {e}")
             try:
                 self._probe_gns(rb)
             except Exception as e:
                 print(f"[GNS] probe failed: {e}")
+            # Add barrier after GNS probe to ensure rank 0 finishes before continuing
+            if self.ddp:
+                try:
+                    dist.barrier(timeout=datetime.timedelta(minutes=5))
+                except Exception as e:
+                    print(f"[Rank {self.rank}] Post-GNS barrier failed: {e}")
 
 
 
