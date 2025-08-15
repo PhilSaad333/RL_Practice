@@ -124,15 +124,10 @@ class RLRunner:
 
         for _ in trange(outer_loops, desc="outer collect loops", disable=(self.rank != 0)):
             rb = self.collector.collect_batch(batch_prompts=per_rank)
-            # Synchronize after rollout collection to prevent barrier race conditions
-            if self.ddp:
-                try:
-                    dist.barrier(timeout=datetime.timedelta(minutes=10))
-                    if self.rank == 0:
-                        print(f"[DEBUG] All ranks completed rollout collection")
-                except Exception as e:
-                    print(f"[Rank {self.rank}] Barrier timeout after collection: {e}")
-                    # Continue anyway to prevent total deadlock
+            # Skip barrier for now - it's causing more deadlocks than it solves
+            # The checkpoint barriers should be sufficient
+            if self.rank == 0:
+                print(f"[DEBUG] Rank 0 completed rollout collection")
             # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
 
@@ -151,6 +146,8 @@ class RLRunner:
         self._save_ckpt(final=True)
 
     def _train_one_buffer(self, rb, K, ga_steps, B):
+        if self.rank == 0:
+            print(f"[DEBUG] Starting training on buffer with {len(rb)} prompts")
         stats_sum, total_mb_cnt = defaultdict(float), 0
         for _ in range(K):
             micro_cnt = 0
