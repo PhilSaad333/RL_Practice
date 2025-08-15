@@ -146,6 +146,21 @@ class RLRunner:
             # each rank trains on its shard; DDP averages grads for you
             self._train_one_buffer(rb, K, ga_steps, B)
             
+            # Process saved GNS probe data after cleanup (Option 2: Buffer Data Preservation)
+            if hasattr(self, '_pending_gns_data') and self._pending_gns_data is not None:
+                print(f"[DEBUG] Rank {self.rank} processing saved GNS probe data (step_id={self._pending_gns_data['step_id']})")
+                try:
+                    # Wrap GNS probe in no_sync to prevent DDP hanging during gradient computation
+                    from contextlib import nullcontext
+                    ctx = self.model.no_sync() if hasattr(self.model, "no_sync") else nullcontext()
+                    with ctx:
+                        self._probe_gns_from_saved_data(self._pending_gns_data)
+                    print(f"[DEBUG] Rank {self.rank} COMPLETED delayed GNS probe (step_id={self._pending_gns_data['step_id']})")
+                except Exception as e:
+                    print(f"[GNS] delayed probe failed: {e}")
+                finally:
+                    self._pending_gns_data = None  # Clear saved data
+            
             # Memory monitoring after cleanup (rb is cleaned up inside _train_one_buffer)
             if torch.cuda.is_available():
                 mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
@@ -186,28 +201,27 @@ class RLRunner:
         self._log(stats_avg)
         print(f"[DEBUG] Rank {self.rank} completed _log, moving to probe section")
 
-        # run the GNS probe every N optimiser steps using the current buffer
+        # Save GNS probe data before cleanup for later processing (Option 2: Buffer Data Preservation)
         every = int(self.gns_cfg.get("every", 0))
         print(f"[DEBUG] Rank {self.rank} checking GNS probe: every={every}, step_id={self.step_id}, modulo={self.step_id % every if every > 0 else 'N/A'}")
+        gns_saved_data = None
         if every > 0 and (self.step_id % every == 0) and self.rank == 0:
-            # Only rank 0 runs GNS probe - no barriers needed since it's rank-specific
-            try:
-                print(f"[DEBUG] Rank {self.rank} STARTING GNS probe (step_id={self.step_id})")
-                # Wrap GNS probe in no_sync to prevent DDP hanging during gradient computation
-                from contextlib import nullcontext
-                ctx = self.model.no_sync() if hasattr(self.model, "no_sync") else nullcontext()
-                with ctx:
-                    self._probe_gns(rb)
-                print(f"[DEBUG] Rank {self.rank} COMPLETED GNS probe (step_id={self.step_id})")
-            except Exception as e:
-                print(f"[GNS] probe failed: {e}")
+            print(f"[DEBUG] Rank {self.rank} saving GNS probe data before cleanup (step_id={self.step_id})")
+            # Save minimal data needed for GNS probe - clone to avoid issues after rb deletion
+            gns_saved_data = {
+                'gen_ids': rb.gen_ids.clone().detach(),
+                'logprobs': rb.logprobs.clone().detach(), 
+                'reward': rb.reward.clone().detach(),
+                'step_id': self.step_id
+            }
+            print(f"[DEBUG] Rank {self.rank} saved GNS data: gen_ids.shape={gns_saved_data['gen_ids'].shape}")
         elif every > 0 and (self.step_id % every == 0):
-            # Other ranks just note that GNS probe step is happening
-            print(f"[DEBUG] Rank {self.rank} skipping GNS probe (rank 0 only, step_id={self.step_id})")
+            print(f"[DEBUG] Rank {self.rank} skipping GNS probe data save (rank 0 only, step_id={self.step_id})")
         else:
             print(f"[DEBUG] Rank {self.rank} no GNS probe this step (step_id={self.step_id})")
         
-        # No barrier needed - ranks will naturally sync at next collection phase
+        # Store GNS data for later processing (after cleanup)
+        self._pending_gns_data = gns_saved_data
         # Cleanup rollout buffer and force garbage collection
         print(f"[DEBUG] Rank {self.rank} starting aggressive memory cleanup in _train_one_buffer")
         del rb
@@ -360,7 +374,105 @@ class RLRunner:
 
 
 
+    def _probe_gns_from_saved_data(self, saved_data):
+        """Measure ||g||^2 using saved tensor data instead of RolloutBuffer (Option 2 implementation)."""
+        print(f"[GNS DEBUG] Rank {self.rank} entered _probe_gns_from_saved_data")
+        device = f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
+        if self.rank != 0:
+            print(f"[GNS DEBUG] Rank {self.rank} exiting _probe_gns_from_saved_data (not rank 0)")
+            return
+        if not self.gns_cfg or int(self.gns_cfg.get("every", 0)) <= 0:
+            print(f"[GNS DEBUG] Rank {self.rank} exiting _probe_gns_from_saved_data (config disabled)")
+            return
+        print(f"[GNS DEBUG] Rank {self.rank} starting GNS probe computation from saved data")
 
+        import random
+        B_small = self._gns_state["B_small"]
+        B_large = self._gns_state["B_large"]
+        ema = self._gns_state["ema"]
+        print(f"[GNS DEBUG] B_small={B_small}, B_large={B_large}, ema={ema}")
+
+        # Extract saved data
+        gen_ids = saved_data['gen_ids']  # (N, G, T_g)
+        logprobs = saved_data['logprobs']  # (N, G, T_g)
+        reward = saved_data['reward']  # (N, G)
+        
+        N_prompts = gen_ids.shape[0]
+        print(f"[GNS DEBUG] N_prompts={N_prompts}, need max({B_small}, {B_large})={max(B_small, B_large)}")
+        if N_prompts < max(B_small, B_large):
+            print(f"[GNS DEBUG] Not enough prompts for probe, exiting")
+            return
+
+        # Sample prompt indices for the two effective batches
+        print(f"[GNS DEBUG] Sampling prompt indices")
+        idx_small = random.sample(range(N_prompts), B_small)
+        idx_large = random.sample(range(N_prompts), B_large)
+        print(f"[GNS DEBUG] Sampled {len(idx_small)} small indices, {len(idx_large)} large indices")
+
+        # Helper: create microbatches from saved tensor data
+        def _make_microbatches_from_tensors(idxs, micro_size):
+            from rl_training.algs.base import RolloutBatch
+            mbs = []
+            for s in range(0, len(idxs), micro_size):
+                batch_idxs = idxs[s:s+micro_size]
+                # Create RolloutBatch objects from saved tensors
+                mb = RolloutBatch(
+                    prompt_ids=None,  # Not needed for GNS probe
+                    gen_ids=gen_ids[batch_idxs].to(device),
+                    reward=reward[batch_idxs].to(device),
+                    logprobs=logprobs[batch_idxs].to(device)
+                )
+                mbs.append(mb)
+            return mbs
+
+        micro_size = int(self.cfg.get("prompts_per_microbatch", 1))
+        print(f"[GNS DEBUG] Creating microbatches with micro_size={micro_size}")
+        mbs_small = _make_microbatches_from_tensors(idx_small, micro_size)
+        mbs_large = _make_microbatches_from_tensors(idx_large, micro_size)
+        print(f"[GNS DEBUG] Created {len(mbs_small)} small microbatches, {len(mbs_large)} large microbatches")
+
+        # Compute gradient norms for the two effective batches (same as original method)
+        print(f"[GNS DEBUG] Computing gradient norm for small batch")
+        y_small = self.algo._grad_sq_norm_for_effective_batch(
+            mbs_small, self.ref_model, avoid_ddp_allreduce=True
+        )
+        print(f"[GNS DEBUG] Computed y_small={y_small}")
+        print(f"[GNS DEBUG] Computing gradient norm for large batch")
+        y_large = self.algo._grad_sq_norm_for_effective_batch(
+            mbs_large, self.ref_model, avoid_ddp_allreduce=True
+        )
+        print(f"[GNS DEBUG] Computed y_large={y_large}")
+
+        # EWMA for stability (same as original method)
+        es = self._gns_state["ema_y_small"]
+        el = self._gns_state["ema_y_large"]
+        es = (ema * es + (1 - ema) * y_small) if es is not None else y_small
+        el = (ema * el + (1 - ema) * y_large) if el is not None else y_large
+        self._gns_state["ema_y_small"], self._gns_state["ema_y_large"] = es, el
+
+        B1, y1 = float(B_small), float(es)
+        B2, y2 = float(B_large), float(el)
+        if abs(B1 - B2) < 1e-9:
+            return
+
+        # Solve for B_simple (same as original method)
+        a_hat = (B1 * y1 - B2 * y2) / (B1 - B2)
+        c_hat = (B1 * B2) * (y2 - y1) / (B1 - B2)
+        B_simple = float("nan")
+        if a_hat > 0 and c_hat > 0:
+            B_simple = c_hat / a_hat
+
+        rec = {
+            "gns_y_small": y_small, "gns_y_large": y_large,
+            "gns_y_small_ema": es, "gns_y_large_ema": el,
+            "gns_B_small": B_small, "gns_B_large": B_large,
+            "gns_a_hat": a_hat, "gns_c_hat": c_hat,
+            "gns_B_simple": B_simple
+        }
+        # file + TB (add debugging around logging which might cause DDP hang)
+        print(f"[GNS DEBUG] Rank {self.rank} about to log GNS results: {rec}")
+        self._log(rec)
+        print(f"[GNS DEBUG] Rank {self.rank} completed logging GNS results")
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
