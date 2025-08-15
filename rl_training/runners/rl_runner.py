@@ -197,15 +197,15 @@ class RLRunner:
         cmd = [
             "python", "-m", "evals.eval_runner",
             "--backbone", self.cfg["eval_backbone"],
-            "--ft_dataset", self.cfg["scheduler"]["dataset_name"],
-            "--ckpt_path", str(ckpt_dir),
-            "--ckpt_step", str(self.step_id),
-            "--batch_size", str(self.cfg.get("eval_batch_size", 8)),
-            "--subset_frac", str(self.cfg.get("eval_frac", 1.0)),
-            "--eval_dataset", self.cfg["scheduler"]["dataset_name"],
+            "--ft-dataset", self.cfg["scheduler"]["dataset_name"],
+            "--ckpt-path", str(ckpt_dir),
+            "--ckpt-step", str(self.step_id),
+            "--batch-size", str(self.cfg.get("eval_batch_size", 8)),
+            "--subset-frac", str(self.cfg.get("eval_frac", 1.0)),
+            "--eval-dataset", self.cfg["scheduler"]["dataset_name"],
             "--temperature", str(self.cfg.get("eval_temperature", 0.7)),
-            "--top_p", "1.0",
-            "--runs_root", str(self.dir.parent / "eval_runs")
+            "--top-p", "1.0",
+            "--runs-root", str(self.dir.parent / "eval_runs")
         ]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = "0"
