@@ -193,7 +193,11 @@ class RLRunner:
             # Only rank 0 runs GNS probe - no barriers needed since it's rank-specific
             try:
                 print(f"[DEBUG] Rank {self.rank} STARTING GNS probe (step_id={self.step_id})")
-                self._probe_gns(rb)
+                # Wrap GNS probe in no_sync to prevent DDP hanging during gradient computation
+                from contextlib import nullcontext
+                ctx = self.model.no_sync() if hasattr(self.model, "no_sync") else nullcontext()
+                with ctx:
+                    self._probe_gns(rb)
                 print(f"[DEBUG] Rank {self.rank} COMPLETED GNS probe (step_id={self.step_id})")
             except Exception as e:
                 print(f"[GNS] probe failed: {e}")
