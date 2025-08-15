@@ -176,6 +176,8 @@ class DRGRPO(RLAlgorithm):
         do_probe = int(probe_cfg.get("every", 0)) > 0
         if do_probe and self._is_main_process():
             self._probe_accumulate_microbatch(rollouts)             # Added 8/11
+            # Clear gradients after entropy probe to prevent DDP hanging in GNS probe
+            self.opt.zero_grad(set_to_none=True)
             if sync_grads:
                 # only log/save every N steps
                 every = int(probe_cfg.get("every", 0))
