@@ -5,7 +5,9 @@ from transformers import AutoTokenizer
 
 
 #BASE = '/content/drive/MyDrive/RL_Practice_Files/datasets'
-BASE =  '/home/ubuntu/dataset'
+#BASE =  '/home/ubuntu/dataset'  # old path
+import pathlib
+BASE = str(pathlib.Path(__file__).parent / "processed")
 
 # Explicitly using qwen2 tokenizer
 tokenizer = AutoTokenizer.from_pretrained(

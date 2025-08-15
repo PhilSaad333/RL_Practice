@@ -1,0 +1,137 @@
+=============================
+ MASTER SETUP INSTRUCTIONS
+ For Lambda RL Training (Persistent rl_runs)
+=============================
+
+YOU NEED:
+- Your SSH private key at:  C:\Users\phils\.ssh\lambda_new
+- The script files:
+    • bootstrap.sh  (on the Lambda instance)
+    • windows_port_forward.ps1  (on your Windows PC)
+- Your Lambda S3 "filesystem" UUID (example: 9e733b11-9ff3-41c4-9328-29990fa02ade)
+
+──────────────────────────────
+A) START A NEW LAMBDA SESSION
+──────────────────────────────
+1) In the Lambda console, launch a GPU instance.
+2) Attach a local filesystem named: localfs
+   → It will be available on the instance at: /lambda/nfs/localfs
+
+──────────────────────────────
+B) FIRST LOGIN (WINDOWS → INSTANCE)
+──────────────────────────────
+PowerShell on Windows:
+ssh -i "$env:USERPROFILE\.ssh\lambda_new" ubuntu@<INSTANCE_IP>
+
+──────────────────────────────
+C) ONE-TIME: CREATE S3 ENV FILE (DO THIS ONCE PER IMAGE)
+──────────────────────────────
+(on the instance)
+
+cat > ~/.lambda_s3.env <<'EOF'
+export AWS_ACCESS_KEY_ID=5EB1FPPIRA9S0BYBA8Q9
+export AWS_SECRET_ACCESS_KEY=xSNViz9kasErzaa3l9iSh3RTa9ne6fMWOQETkJ8p
+export AWS_REGION=us-east-3
+export S3_ENDPOINT_URL=https://files.us-east-3.lambda.ai
+export AWS_EC2_METADATA_DISABLED=true
+EOF
+chmod 600 ~/.lambda_s3.env
+
+Notes:
+- Replace placeholders with your real keys (no quotes needed).
+- Keep this file private (chmod 600).
+- In each new shell, load it with:
+  source ~/.lambda_s3.env
+
+──────────────────────────────
+D) RUN THE BOOTSTRAP SCRIPT
+──────────────────────────────
+(on the instance)
+
+# Make sure the script is present and executable:
+chmod +x ~/bootstrap.sh
+
+# Minimal run (single-GPU, TensorBoard on 16006):
+S3_UUID=<YOUR_UUID> LOCAL_FS_NAME=localfs TB_PORT=16006 ./bootstrap.sh
+
+What this does:
+- Ensures Miniconda + creates/activates env "rl"
+- Clones/refreshes RL_Practice + pip install -r requirements.txt
+- Configures rclone with your S3 endpoint and env credentials
+- Copies your chosen checkpoint subtree from S3 to /lambda/nfs/localfs/...
+- Sets RUN_ROOT=/lambda/nfs/localfs/rl_runs  (persistent logs!)
+- Starts TensorBoard in tmux at 127.0.0.1:16006
+- Installs nvtop for GPU monitoring
+
+OPTION: To also auto-start training:
+S3_UUID=<YOUR_UUID> LOCAL_FS_NAME=localfs TB_PORT=16006 START_TRAIN=1 ./bootstrap.sh
+
+──────────────────────────────
+E) VIEW TENSORBOARD (WINDOWS)
+──────────────────────────────
+1) In PowerShell on your Windows PC, run:
+
+cd "C:\Users\phils\Downloads\lambda_setup"
+
+
+.\windows_port_forward.ps1 -InstanceIP <INSTANCE_IP> -LocalPort 16006 -RemotePort 16006
+
+2) Open your browser to:
+http://localhost:16006
+
+Keep the PowerShell window open while using TensorBoard.
+
+──────────────────────────────
+F) MANUAL TRAINING (IF NOT USING START_TRAIN=1)
+──────────────────────────────
+(on the instance)
+# Every new terminal:
+eval "$($HOME/miniconda3/bin/conda shell.bash hook)" && conda activate rl
+source ~/.lambda_s3.env
+
+# Paths:
+RUN_ROOT is already set to: /lambda/nfs/localfs/rl_runs
+Checkpoints are under:      /lambda/nfs/localfs/<whatever you copied>
+
+# Launch training:
+cd ~/RL_Practice
+torchrun --nproc_per_node=1 -m rl_training.runners.rl_runner \
+  --cfg rl_training/cfg/testconfig.yaml \
+  --ckpt /lambda/nfs/localfs/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156
+
+──────────────────────────────
+G) MONITORING & TMUX
+──────────────────────────────
+- GPU live view:   nvtop
+- Lightweight view:
+  watch -n 1 -- 'nvidia-smi --query-gpu=timestamp,index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory --format=csv'
+
+tmux:
+- Attach TensorBoard session:  tmux attach -t tb
+- Attach training session:     tmux attach -t train
+- Detach (keep running):       Ctrl-b then d
+- Kill when done:              tmux kill-session -t tb ; tmux kill-session -t train
+
+──────────────────────────────
+H) SHUTDOWN CHECKLIST
+──────────────────────────────
+1) Stop training (Ctrl-C in the tmux pane or kill-session).
+2) Stop TensorBoard (kill-session 'tb' or Ctrl-C inside it).
+3) Close the Windows SSH tunnel (Ctrl-C in the port-forward window).
+4) Terminate the Lambda instance in the console if you’re done.
+
+──────────────────────────────
+TROUBLESHOOTING QUICK HITS
+──────────────────────────────
+- "conda: command not found" → run:
+  eval "$($HOME/miniconda3/bin/conda shell.bash hook)" && conda activate rl
+
+- "permission denied (publickey)" → confirm:
+  ssh -i "$env:USERPROFILE\.ssh\lambda_new" ubuntu@<INSTANCE_IP>
+
+- TensorBoard “port in use” → pick a new port:
+  Rerun bootstrap with TB_PORT=16007 and forward 16007 locally.
+
+- rclone complains about metadata service → ensure you sourced:
+  source ~/.lambda_s3.env
+  (file includes: export AWS_EC2_METADATA_DISABLED=true)
