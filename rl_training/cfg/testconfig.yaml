@@ -80,13 +80,13 @@ total_steps: 2
 
 
 entropy_probe:
-  every: 0          # DISABLED for debugging DDP hang
+  every: 1          # RE-ENABLED for final test with memory optimization
   sketch_r: 0         # 0 = off for now
   out_dir: entropy_probes
 
 
 gns_probe:
-  every: 0          # DISABLED for debugging DDP hang
+  every: 1          # RE-ENABLED for final test with memory optimization
   small_B: 8         # prompts in the small batch
-  large_B: 16         # prompts in the large batch (reduced for debugging with small buffer)
+  large_B: 16         # prompts in the large batch (sufficient for buffer_size=32)
   ema: 0.9           # EWMA smoothing for norm^2 measurements
