@@ -526,16 +526,25 @@ class DRGRPO(RLAlgorithm):
         - no grad accumulation scaling,
         - no optimiser step, just returns the scalar loss.
         """
+        print(f"[GNS DEBUG] _loss_for_batch: starting")
         device = rollouts.gen_ids.device
         B, G, T_g = rollouts.gen_ids.shape
+        print(f"[GNS DEBUG] _loss_for_batch: batch shape B={B}, G={G}, T_g={T_g}")
 
         # 1) prep + advantages
+        print(f"[GNS DEBUG] _loss_for_batch: calling _build_sequences")
         seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
+        print(f"[GNS DEBUG] _loss_for_batch: completed _build_sequences, seq_flat.shape={seq_flat.shape}")
+        print(f"[GNS DEBUG] _loss_for_batch: calling _compute_advantage")
         adv = self._compute_advantage(rollouts.reward)  # (B, G)
+        print(f"[GNS DEBUG] _loss_for_batch: completed _compute_advantage")
 
         # 2) log-probs
+        print(f"[GNS DEBUG] _loss_for_batch: starting forward pass")
         with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+            print(f"[GNS DEBUG] _loss_for_batch: calling policy forward pass with seq_flat.shape={seq_flat.shape}")
             logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+            print(f"[GNS DEBUG] _loss_for_batch: completed policy forward pass, logits.shape={logits.shape}")
         logits = logits / self.cfg.get("temperature", 1.0)
         logp_all = F.log_softmax(logits.float(), dim=-1)
         new_logp = logp_all[:, :-1].gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g:]
@@ -607,14 +616,22 @@ class DRGRPO(RLAlgorithm):
 
 
     def _grad_sq_norm_for_effective_batch(self, microbatches, ref_model, *, avoid_ddp_allreduce=True):
+        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: starting with {len(microbatches)} microbatches")
         self.opt.zero_grad(set_to_none=True)
 
         ctx = self.policy.no_sync() if avoid_ddp_allreduce and hasattr(self.policy, "no_sync") else nullcontext()
+        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: entering grad computation context")
         with ctx, torch.enable_grad():
             scale = 1.0 / max(len(microbatches), 1)      # ← 1/K
-            for mb in microbatches:                      # ← K microbatches
+            print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: scale={scale}, starting microbatch loop")
+            for i, mb in enumerate(microbatches):                      # ← K microbatches
+                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: processing microbatch {i+1}/{len(microbatches)}")
+                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: calling _loss_for_batch for mb {i+1}")
                 loss = self._loss_for_batch(mb, ref_model) * scale
+                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: got loss={loss.item():.6f}, calling backward for mb {i+1}")
                 loss.backward()                          # accumulate grads
+                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: completed backward for mb {i+1}")
+        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: exited grad computation context")
 
         # sum of squared grads over trainable params
         total = 0.0
