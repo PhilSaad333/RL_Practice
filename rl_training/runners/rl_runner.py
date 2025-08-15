@@ -207,12 +207,7 @@ class RLRunner:
         else:
             print(f"[DEBUG] Rank {self.rank} no GNS probe this step (step_id={self.step_id})")
         
-        # Add barrier after GNS probe section to sync ranks before cleanup
-        if self.ddp and every > 0 and (self.step_id % every == 0):
-            print(f"[DEBUG] Rank {self.rank} entering post-GNS-probe barrier")
-            dist.barrier()
-            print(f"[DEBUG] Rank {self.rank} exited post-GNS-probe barrier")
-        
+        # No barrier needed - ranks will naturally sync at next collection phase
         # Cleanup rollout buffer and force garbage collection
         print(f"[DEBUG] Rank {self.rank} starting aggressive memory cleanup in _train_one_buffer")
         del rb
