@@ -229,14 +229,16 @@ class RLRunner:
         gns_saved_data = None
         if every > 0 and (self.step_id % every == 0) and self.rank == 0:
             print(f"[DEBUG] Rank {self.rank} saving GNS probe data before cleanup (step_id={self.step_id})")
-            # Save minimal data needed for GNS probe - clone to avoid issues after rb deletion
+            # Convert buffer to batch to access tensor data, then save minimal data needed for GNS probe
+            batch = rb.to_batch(device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
             gns_saved_data = {
-                'gen_ids': rb.gen_ids.clone().detach(),
-                'logprobs': rb.logprobs.clone().detach(), 
-                'reward': rb.reward.clone().detach(),
+                'gen_ids': batch.gen_ids.clone().detach(),
+                'logprobs': batch.logprobs.clone().detach(), 
+                'reward': batch.reward.clone().detach(),
                 'step_id': self.step_id
             }
             print(f"[DEBUG] Rank {self.rank} saved GNS data: gen_ids.shape={gns_saved_data['gen_ids'].shape}")
+            del batch  # Clean up the temporary batch
         elif every > 0 and (self.step_id % every == 0):
             print(f"[DEBUG] Rank {self.rank} skipping GNS probe data save (rank 0 only, step_id={self.step_id})")
         else:
