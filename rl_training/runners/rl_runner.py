@@ -126,12 +126,9 @@ class RLRunner:
             rb = self.collector.collect_batch(batch_prompts=per_rank)
             # Add barrier after collection to ensure both ranks finish before training
             if self.ddp:
-                try:
-                    print(f"[DEBUG] Rank {self.rank} entering post-collection barrier")
-                    dist.barrier()
-                    print(f"[DEBUG] Rank {self.rank} exited post-collection barrier")
-                except Exception as e:
-                    print(f"[Rank {self.rank}] Post-collection barrier failed: {e}")
+                print(f"[DEBUG] Rank {self.rank} entering post-collection barrier")
+                dist.barrier()
+                print(f"[DEBUG] Rank {self.rank} exited post-collection barrier")
             print(f"[DEBUG] Rank {self.rank} completed rollout collection")
             print(f"[DEBUG] Rank {self.rank} about to start training on buffer")
             # each rank trains on its shard; DDP averages grads for you
@@ -177,12 +174,9 @@ class RLRunner:
         if every > 0 and (self.step_id % every == 0):
             # Add barrier before GNS probe to sync both ranks
             if self.ddp:
-                try:
-                    print(f"[DEBUG] Rank {self.rank} entering pre-GNS barrier")
-                    dist.barrier()
-                    print(f"[DEBUG] Rank {self.rank} exited pre-GNS barrier")
-                except Exception as e:
-                    print(f"[Rank {self.rank}] Pre-GNS barrier failed: {e}")
+                print(f"[DEBUG] Rank {self.rank} entering pre-GNS barrier")
+                dist.barrier()
+                print(f"[DEBUG] Rank {self.rank} exited pre-GNS barrier")
             try:
                 print(f"[DEBUG] Rank {self.rank} starting GNS probe")
                 self._probe_gns(rb)
@@ -191,12 +185,9 @@ class RLRunner:
                 print(f"[GNS] probe failed: {e}")
             # Add barrier after GNS probe to ensure rank 0 finishes before continuing
             if self.ddp:
-                try:
-                    print(f"[DEBUG] Rank {self.rank} entering post-GNS barrier")
-                    dist.barrier()
-                    print(f"[DEBUG] Rank {self.rank} exited post-GNS barrier")
-                except Exception as e:
-                    print(f"[Rank {self.rank}] Post-GNS barrier failed: {e}")
+                print(f"[DEBUG] Rank {self.rank} entering post-GNS barrier")
+                dist.barrier()
+                print(f"[DEBUG] Rank {self.rank} exited post-GNS barrier")
 
 
 
@@ -219,21 +210,15 @@ class RLRunner:
             _unwrap(self.model).save_pretrained(save_dir)  # Changed 8/11
             print(f"saved model to {save_dir}")
         if self.ddp:
-            try:
-                # Timeout after 10 minutes to prevent infinite hanging
-                dist.barrier()
-            except Exception as e:
-                print(f"[Rank {self.rank}] Barrier timeout before eval: {e}")
-                # Continue anyway to prevent total deadlock
+            print(f"[DEBUG] Rank {self.rank} entering pre-eval barrier")
+            dist.barrier()
+            print(f"[DEBUG] Rank {self.rank} exited pre-eval barrier")
         if self.rank == 0 and self.cfg.get("eval_every", 1) > 0 and (final or self.step_id % self.cfg.get("eval_every", 1) == 0):
             self._run_eval(save_dir)
         if self.ddp:
-            try:
-                # Timeout after 10 minutes to prevent infinite hanging
-                dist.barrier()
-            except Exception as e:
-                print(f"[Rank {self.rank}] Barrier timeout after eval: {e}")
-                # Continue anyway to prevent total deadlock
+            print(f"[DEBUG] Rank {self.rank} entering post-eval barrier")
+            dist.barrier()
+            print(f"[DEBUG] Rank {self.rank} exited post-eval barrier")
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
