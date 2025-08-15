@@ -80,13 +80,13 @@ total_steps: 2
 
 
 entropy_probe:
-  every: 0          # Disabled for GNS-only test
+  every: 1          # Testing entropy probe only
   sketch_r: 0         # 0 = off for now
   out_dir: entropy_probes
 
 
 gns_probe:
-  every: 1          # Testing GNS probe only
+  every: 0          # Disabled for entropy-only test
   small_B: 8         # prompts in the small batch
   large_B: 64        # prompts in the large batch
   ema: 0.9           # EWMA smoothing for norm^2 measurements
