@@ -60,7 +60,7 @@ def main(backbone: str = "phi2",
         backbone, 
         eval_dataset,
         ckpt_path=ckpt_path,     # apply LoRA adapters if non-null
-        quantized=True,          # or pass through CLI flag
+        quantized=False,         # Disabled for distributed training compatibility
     )
 
     step_id = int(ckpt_step) if ckpt_step else int(Path(ckpt_path).name.rsplit("-", 1)[-1])
@@ -132,4 +132,20 @@ def main(backbone: str = "phi2",
     evaluator.run()
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backbone", type=str, default="phi2")
+    parser.add_argument("--ft_dataset", type=str, default="gsm8k")
+    parser.add_argument("--ckpt_path", type=str, default=None)
+    parser.add_argument("--ckpt_step", type=str, default=None)
+    parser.add_argument("--eval_dataset", type=str, default="gsm8k")
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--subset_frac", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--num_return_sequences", type=int, default=8)
+    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--runs_root", type=str, default=os.environ.get("EVAL_RUNS_ROOT", "eval_runs"))
+    
+    args = parser.parse_args()
+    main(**vars(args))
