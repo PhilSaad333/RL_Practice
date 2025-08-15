@@ -182,6 +182,12 @@ class RLRunner:
         elif every > 0 and (self.step_id % every == 0):
             # Other ranks just note that GNS probe step is happening
             print(f"[DEBUG] Rank {self.rank} skipping GNS probe (rank 0 only)")
+        
+        # Synchronize all ranks after GNS probe section
+        if every > 0 and (self.step_id % every == 0) and self.ddp:
+            print(f"[DEBUG] Rank {self.rank} entering post-GNS-section barrier")
+            dist.barrier()
+            print(f"[DEBUG] Rank {self.rank} exited post-GNS-section barrier")
 
 
 
