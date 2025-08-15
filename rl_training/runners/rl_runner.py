@@ -114,7 +114,13 @@ class RLRunner:
         outer_loops = math.ceil(total_updates / K)
 
         world = dist.get_world_size() if dist.is_initialized() else 1
-        per_rank = math.ceil(self.buffer_size / world)
+        per_rank = self.buffer_size // world
+        # Handle remainder: rank 0 gets extra samples if buffer_size not evenly divisible
+        if self.rank == 0:
+            per_rank += self.buffer_size % world
+        
+        if self.rank == 0:
+            print(f"Distributed collection: {world} ranks, buffer_size={self.buffer_size}, per_rank={per_rank}")
 
         for _ in trange(outer_loops, desc="outer collect loops", disable=(self.rank != 0)):
             rb = self.collector.collect_batch(batch_prompts=per_rank)
