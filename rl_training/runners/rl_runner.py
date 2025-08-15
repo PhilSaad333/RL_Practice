@@ -203,16 +203,9 @@ class RLRunner:
         if self.rank == 0:
             _unwrap(self.model).save_pretrained(save_dir)  # Changed 8/11
             print(f"saved model to {save_dir}")
-        if self.ddp:
-            print(f"[DEBUG] Rank {self.rank} entering pre-eval barrier")
-            dist.barrier()
-            print(f"[DEBUG] Rank {self.rank} exited pre-eval barrier")
-        if self.rank == 0 and self.cfg.get("eval_every", 1) > 0 and (final or self.step_id % self.cfg.get("eval_every", 1) == 0):
-            self._run_eval(save_dir)
-        if self.ddp:
-            print(f"[DEBUG] Rank {self.rank} entering post-eval barrier")
-            dist.barrier()
-            print(f"[DEBUG] Rank {self.rank} exited post-eval barrier")
+        # Evaluation disabled for distributed training to avoid barrier issues
+        # Can run evaluation later on saved checkpoints
+        print(f"[DEBUG] Rank {self.rank} skipping evaluation (disabled for distributed training)")
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
         print(f"[Eval] starting eval for step {self.step_id} …")
