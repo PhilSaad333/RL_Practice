@@ -36,3 +36,4 @@ timm==0.9.16
 einops>=0.7.0
 
 tensorboard>=2.20.0
+colorama>=0.4.6
