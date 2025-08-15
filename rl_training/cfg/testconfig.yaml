@@ -38,7 +38,7 @@ max_new_tokens    : 200
 temperature       : 0.7
 #top_p             : 0.95 #remove 
 
-eval_every: 0        
+eval_every: 1        
 eval_frac: 0.01        
 eval_batch_size: 128
 eval_temperature: 0.7

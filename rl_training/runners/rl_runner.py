@@ -195,7 +195,7 @@ class RLRunner:
         self.model.to("cpu"); torch.cuda.empty_cache(); gc.collect()
 
         cmd = [
-            "python", "evals/eval_runner.py",
+            "python", "-m", "evals.eval_runner",
             "--backbone", self.cfg["eval_backbone"],
             "--ft_dataset", self.cfg["scheduler"]["dataset_name"],
             "--ckpt_path", str(ckpt_dir),
