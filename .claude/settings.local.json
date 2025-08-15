@@ -3,7 +3,8 @@
     "allow": [
       "Bash(powershell:*)",
       "Bash(scp:*)",
-      "Bash(ssh:*)"
+      "Bash(ssh:*)",
+      "Bash(git add:*)"
     ],
     "defaultMode": "acceptEdits"
   }

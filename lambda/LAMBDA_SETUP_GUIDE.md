@@ -1,0 +1,85 @@
+# Lambda Cloud GPU Training Setup Guide
+
+Complete guide for setting up and running RL training on Lambda Cloud GPU instances.
+
+## Quick Start Commands
+
+### 1. Launch New Instance
+```powershell
+# Start new H100 instance and run full setup
+.\ssh_workflow.ps1 -InstanceIP <NEW_IP> -Action full-setup -S3UUID "8c7f7fd3-ba01-40d8-b3dd-92090e4b3b0a"
+```
+
+### 2. Run Training
+```powershell
+# Start overnight training (100 steps)
+.\ssh_workflow.ps1 -InstanceIP <IP> -Action train -Config "rl_training/cfg/overnight_config.yaml"
+
+# Start test training (4 steps)  
+.\ssh_workflow.ps1 -InstanceIP <IP> -Action train -Config "rl_training/cfg/testconfig.yaml"
+```
+
+### 3. Monitor Training
+```powershell
+# Connect to training session
+.\ssh_workflow.ps1 -InstanceIP <IP> -Action connect
+
+# Start TensorBoard (runs on localhost:16006)
+.\ssh_workflow.ps1 -InstanceIP <IP> -Action tensorboard
+```
+
+## Configuration Files
+
+### testconfig.yaml (for testing)
+- 4 steps total
+- Eval every step
+- Save every step  
+- Good for debugging
+
+### overnight_config.yaml (for production)
+- 100 steps total
+- Eval every 20 steps
+- Save every 10 steps
+- Optimized for overnight runs
+
+## GPU Utilization Targets
+
+**2x H100 80GB Setup:**
+- Target: ~80% memory usage during rollout collection (~64GB per GPU)
+- Target: ~50% memory usage during optimization (~40GB per GPU)
+- Batch sizes: rollout_batch_size=40, buffer_size=64, microbatch_size=4
+
+## Troubleshooting
+
+### Common Issues
+1. **Training stuck on step 0**: Usually evaluation phase issue, use overnight_config.yaml with less frequent eval
+2. **CUDA OOM**: Reduce batch sizes in config file
+3. **S3 access denied**: Check S3UUID and credentials in workflow script
+
+### Log Locations
+- Training logs: `/tmp/rl_runs/run_YYYY-MM-DD_HH-MM-SS/`
+- Checkpoints: `/tmp/rl_runs/run_*/step_N/` 
+- TensorBoard events: `/tmp/rl_runs/run_*/events.out.tfevents.*`
+
+## Research Features
+
+### Entropy Dynamics
+- Configured in config under `entropy_probe:`
+- Currently disabled (`sketch_r: 0`)
+- Set `sketch_r > 0` to enable
+
+### Gradient Noise Scale  
+- Configured in config under `gns_probe:`
+- Runs every step by default (`every: 1`)
+- Measures gradient noise at different batch sizes
+- Results logged to train_log.jsonl
+
+## File Structure
+```
+lambda/
+├── ssh_workflow.ps1           # Main automation script
+├── LAMBDA_SETUP_GUIDE.md     # This guide
+└── (auto-generated)
+    ├── rclone_config.txt     # S3 configuration
+    └── debug_outputs/        # Debug logs
+```
