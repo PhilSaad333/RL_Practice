@@ -375,10 +375,13 @@ class DRGRPO(RLAlgorithm):
         L_GA = (w * A * S).sum()
         L_G1 = (w * S).sum()
 
-        # Gradients
-        grads_GH = torch.autograd.grad(L_GH, params, retain_graph=True,  create_graph=False, allow_unused=True)
-        grads_GA = torch.autograd.grad(L_GA, params, retain_graph=True,  create_graph=False, allow_unused=True)
-        grads_G1 = torch.autograd.grad(L_G1, params, retain_graph=False, create_graph=False, allow_unused=True)
+        # Gradients (avoid DDP sync like GNS probe to prevent distributed hanging)
+        from contextlib import nullcontext
+        ctx = self.policy.no_sync() if hasattr(self.policy, "no_sync") else nullcontext()
+        with ctx:
+            grads_GH = torch.autograd.grad(L_GH, params, retain_graph=True,  create_graph=False, allow_unused=True)
+            grads_GA = torch.autograd.grad(L_GA, params, retain_graph=True,  create_graph=False, allow_unused=True)
+            grads_G1 = torch.autograd.grad(L_G1, params, retain_graph=False, create_graph=False, allow_unused=True)
 
         # Lazy-init accum dicts (unchanged)
         if self._probe_GH1 is None:
