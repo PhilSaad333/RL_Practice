@@ -154,7 +154,6 @@ class RLRunner:
             
             # Broadcast probe status from rank 0 to all ranks in distributed mode
             if self.ddp:
-                import torch
                 probe_tensor = torch.tensor([1 if has_gns_probe else 0], device=f"cuda:{self.local_rank}")
                 dist.broadcast(probe_tensor, src=0)
                 has_gns_probe = bool(probe_tensor.item())
