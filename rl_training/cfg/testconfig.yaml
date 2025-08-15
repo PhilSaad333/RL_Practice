@@ -16,11 +16,11 @@ eval_backbone: qwen2_5_15
 # -------------- rollout collector ---------------- #
 
 # ---- rollout collection ----
-rollout_batch_size: 40
+rollout_batch_size: 32
 num_generations: 8
 
 # Recompute logprobs: teacher-forcing forward micro-batch size
-tf_micro_batch: 40
+tf_micro_batch: 16
 
 # Write rollouts.jsonl every N collect_batch() calls (0 = never)
 save_rollouts_every: 0
