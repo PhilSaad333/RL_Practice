@@ -346,38 +346,53 @@ class RLRunner:
             print(f"[DEBUG] Rank {self.rank} skipping checkpoint save (rank 0 only)")
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
-        print(f"[Eval] starting eval for step {self.step_id} …")
-        # Move model to CPU during eval to free GPU memory for evaluation subprocess
-        print(f"[Eval] Moving training model to CPU to free GPU memory...")
-        self.model.to("cpu")
-        self.ref_model.to("cpu")
-        torch.cuda.empty_cache(); gc.collect()
-
-        # Ensure absolute path for checkpoint directory
-        abs_ckpt_dir = os.path.abspath(ckpt_dir)
-        cmd = [
-            "/home/ubuntu/miniconda3/envs/rl/bin/python", "-m", "evals.eval_runner",
-            "--backbone", self.cfg["eval_backbone"],
-            "--ft-dataset", self.cfg["scheduler"]["dataset_name"],
-            "--ckpt-path", abs_ckpt_dir,
-            "--ckpt-step", str(self.step_id),
-            "--batch-size", str(self.cfg.get("eval_batch_size", 8)),
-            "--subset-frac", str(self.cfg.get("eval_frac", 1.0)),
-            "--eval-dataset", self.cfg["scheduler"]["dataset_name"],
-            "--temperature", str(self.cfg.get("eval_temperature", 0.7)),
-            "--top-p", "1.0",
-            "--runs-root", str(self.dir.parent / "eval_runs")
-        ]
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "0"
-        run_sync(cmd, env=env, check=True)
-
-        torch.cuda.empty_cache(); gc.collect()
-        # Move models back to GPU after evaluation
-        print(f"[Eval] Moving training model back to GPU...")
-        self.model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
-        self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
-        print(f"[Eval] finished, resuming training.")
+        print(f"[Eval] starting in-process eval for step {self.step_id} …")
+        
+        # Switch to in-process evaluation to avoid subprocess issues
+        try:
+            # Import evaluation functions
+            from evals.eval_runner import main as eval_main
+            
+            # Set up evaluation parameters
+            eval_args = {
+                'backbone': self.cfg["eval_backbone"],
+                'ft_dataset': self.cfg["scheduler"]["dataset_name"],
+                'ckpt_path': str(os.path.abspath(ckpt_dir)),
+                'ckpt_step': str(self.step_id),
+                'batch_size': self.cfg.get("eval_batch_size", 8),
+                'subset_frac': self.cfg.get("eval_frac", 1.0),
+                'eval_dataset': self.cfg["scheduler"]["dataset_name"],
+                'temperature': self.cfg.get("eval_temperature", 0.7),
+                'top_p': 1.0,
+                'num_return_sequences': 8,
+                'max_new_tokens': 256,
+                'runs_root': str(self.dir.parent / "eval_runs")
+            }
+            
+            print(f"[Eval] Running in-process evaluation with args: {eval_args}")
+            
+            # Move training models to CPU to free GPU memory  
+            print(f"[Eval] Moving training model to CPU...")
+            self.model.to("cpu")
+            self.ref_model.to("cpu")
+            torch.cuda.empty_cache(); gc.collect()
+            
+            # Run evaluation in-process
+            eval_main(**eval_args)
+            
+            print(f"[Eval] In-process evaluation completed successfully")
+            
+        except Exception as e:
+            print(f"[Eval] In-process evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Always move models back to GPU
+            torch.cuda.empty_cache(); gc.collect()
+            print(f"[Eval] Moving training model back to GPU...")
+            self.model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+            self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+            print(f"[Eval] finished, resuming training.")
 
 
     def _probe_gns(self, rb):
