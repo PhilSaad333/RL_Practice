@@ -102,8 +102,18 @@ class RLRunner:
                                           device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
         self.algo = DRGRPO(self.model, self.cfg, pad_id=self.pad_id,
                            ratio_log_path=self.dir / "ratios.jsonl")
-        self.accum = self.cfg["grad_accum_steps"]
+        
+        # Calculate grad_accum_steps automatically based on distributed setup
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.buffer_size = self.cfg["buffer_size"]
+        microbatch_size = self.cfg["microbatch_size"]
+        auto_grad_accum_steps = self.buffer_size // (world_size * microbatch_size)
+        
+        if self.rank == 0:
+            print(f"[AUTO CONFIG] buffer_size={self.buffer_size}, world_size={world_size}, microbatch_size={microbatch_size}")
+            print(f"[AUTO CONFIG] Calculated grad_accum_steps={auto_grad_accum_steps} (config had {self.cfg['grad_accum_steps']})")
+        
+        self.accum = auto_grad_accum_steps
         self.eval_cb = EvalCallback(self.dir, self.cfg)
 
     # ─── training loop ────────────────────────────────────────────────────
@@ -340,11 +350,13 @@ class RLRunner:
         # Don't move model to CPU - eval subprocess loads its own model copy
         torch.cuda.empty_cache(); gc.collect()
 
+        # Ensure absolute path for checkpoint directory
+        abs_ckpt_dir = os.path.abspath(ckpt_dir)
         cmd = [
             "/home/ubuntu/miniconda3/envs/rl/bin/python", "-m", "evals.eval_runner",
             "--backbone", self.cfg["eval_backbone"],
             "--ft-dataset", self.cfg["scheduler"]["dataset_name"],
-            "--ckpt-path", str(ckpt_dir),
+            "--ckpt-path", abs_ckpt_dir,
             "--ckpt-step", str(self.step_id),
             "--batch-size", str(self.cfg.get("eval_batch_size", 8)),
             "--subset-frac", str(self.cfg.get("eval_frac", 1.0)),
