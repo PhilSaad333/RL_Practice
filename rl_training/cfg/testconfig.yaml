@@ -8,7 +8,7 @@
 # rl_configs/rl_qwen2.yaml
 #backbone: Qwen/Qwen2-0.5B
 backbone: Qwen/Qwen2.5-1.5B
-eval_backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
 #eval_backbone: qwen2
 #lora_ckpt: /content/drive/.../qwen2_gsm8k_lora      # << your SFT output dir
 
