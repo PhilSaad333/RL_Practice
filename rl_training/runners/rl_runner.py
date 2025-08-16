@@ -15,7 +15,7 @@ from rl_training.algs.dr_grpo import DRGRPO
 from rl_training.algs.base import RolloutBatch
 from rl_training.runners.eval_callback import EvalCallback
 
-RUN_ROOT = pathlib.Path(os.environ.get("RUN_ROOT", "./rl_runs"))
+RUN_ROOT = pathlib.Path(os.environ.get("RUN_ROOT", "/lambda/nfs/localfs/rl_runs"))
 
 
 def slice_batch(rb: RolloutBatch, sl: slice) -> RolloutBatch:
@@ -49,6 +49,8 @@ class RLRunner:
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.dir = RUN_ROOT / f"run_{stamp}"
         self.dir.mkdir(parents=True, exist_ok=True)
+        # Ensure eval_runs directory also exists
+        (self.dir.parent / "eval_runs").mkdir(parents=True, exist_ok=True)
         shutil.copy(cfg_path, self.dir / "config.yaml")
 
         self.tb = SummaryWriter(str(self.dir)) if self.rank == 0 else None
