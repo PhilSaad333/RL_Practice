@@ -52,7 +52,7 @@ D) RUN THE BOOTSTRAP SCRIPT
 chmod +x ~/bootstrap.sh
 
 # Minimal run (single-GPU, TensorBoard on 16006):
-S3_UUID=<YOUR_UUID> LOCAL_FS_NAME=localfs TB_PORT=16006 ./bootstrap.sh
+S3_UUID=9e733b11-9ff3-41c4-9328-29990fa02ade LOCAL_FS_NAME=localfs TB_PORT=16006 ./bootstrap.sh
 
 What this does:
 - Ensures Miniconda + creates/activates env "rl"
@@ -64,7 +64,24 @@ What this does:
 - Installs nvtop for GPU monitoring
 
 OPTION: To also auto-start training:
-S3_UUID=<YOUR_UUID> LOCAL_FS_NAME=localfs TB_PORT=16006 START_TRAIN=1 ./bootstrap.sh
+S3_UUID=9e733b11-9ff3-41c4-9328-29990fa02ade LOCAL_FS_NAME=localfs TB_PORT=16006 START_TRAIN=1 ./bootstrap.sh
+
+CRITICAL FIXES (Aug 2025):
+If rclone fails with "XML syntax error" or "directory not found":
+1) Delete and recreate rclone config:
+   source ~/.lambda_s3.env
+   rclone config delete lambda_east3
+   echo -e "[lambda_east3]\ntype = s3\nprovider = Other\nenv_auth = true\nregion = us-east-3\nendpoint = https://files.us-east-3.lambda.ai" > ~/.config/rclone/rclone.conf
+
+2) Verify S3 access with: rclone ls lambda_east3: | head -5
+
+3) S3 filesystem structure:
+   lambda_east3:9e733b11-9ff3-41c4-9328-29990fa02ade/
+   └── checkpoints/
+       ├── qwen2_05_finetuned/checkpoint-156/        # Qwen2-0.5B model  
+       ├── qwen2_5_15_finetuned/
+       │   └── qwen2_5_15_gsm8k_lora/checkpoint-156/  # Qwen2.5-1.5B model ← USE THIS
+       └── *.zip archives
 
 ──────────────────────────────
 E) VIEW TENSORBOARD (WINDOWS)
@@ -129,9 +146,18 @@ TROUBLESHOOTING QUICK HITS
 - "permission denied (publickey)" → confirm:
   ssh -i "$env:USERPROFILE\.ssh\lambda_new" ubuntu@<INSTANCE_IP>
 
-- TensorBoard “port in use” → pick a new port:
+- TensorBoard "port in use" → pick a new port:
   Rerun bootstrap with TB_PORT=16007 and forward 16007 locally.
 
 - rclone complains about metadata service → ensure you sourced:
   source ~/.lambda_s3.env
   (file includes: export AWS_EC2_METADATA_DISABLED=true)
+
+- rclone "XML syntax error" or "directory not found" → see CRITICAL FIXES in section D
+
+- eval during training fails → FIXED! Aug 2025 debugging confirmed:
+  * Manual eval works: python -m evals.eval_runner --backbone qwen2_5_15 --ckpt-path ...
+  * In-process eval works during training with CPU shelving
+  * No model mismatch between training (Qwen2.5-1.5B) and eval
+  * grad_accum_steps automatically calculated: buffer_size / (world_size * microbatch_size)
+  * Step progression works correctly: 0→1→2→3

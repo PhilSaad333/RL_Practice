@@ -86,7 +86,21 @@ entropy_probe:
 
 
 gns_probe:
-  every: 0          # DISABLED for eval debugging
-  small_B: 8         # prompts in the small batch
-  large_B: 16         # prompts in the large batch (sufficient for buffer_size=32)
-  ema: 0.9           # EWMA smoothing for norm^2 measurements
+  enabled: false    # Enable/disable in-loop gradient noise scale tracking
+  # 
+  # The GNS probe estimates the critical batch size for training by measuring
+  # the ratio of gradient noise to signal. It runs with zero extra forward/backward
+  # passes, piggybacking on your existing training gradients.
+  #
+  # Metrics produced:
+  #   - gns_mu: Gradient noise scale (noise/signal ratio at micro-batch level)
+  #   - Bsimple_from_mu: Estimated critical batch size (where noise ≈ signal)
+  #   - gns_ess: Effective sample size (accounts for Dr-GRPO weighted losses)
+  #   - gns_consistency_ratio: Validation metric (should ≈ 1.0 after warmup)
+  #   - gns_G2: Global gradient squared norm
+  #   - gns_tr_sigma: Trace of gradient covariance
+  #
+  # Interpretation:
+  #   - If your batch size < Bsimple_from_mu: gradient noise is high, consider larger batches
+  #   - If your batch size >> Bsimple_from_mu: diminishing returns, could use smaller batches
+  #   - gns_ess < (B × G) shows impact of unequal Dr-GRPO weights on variance reduction

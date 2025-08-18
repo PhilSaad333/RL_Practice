@@ -1,0 +1,205 @@
+
+Title: Implementing an In-Loop Gradient Noise Scale (GNS) Estimator for Multi‑GPU Training (DDP)
+
+Audience: Engineer familiar with PyTorch DDP + gradient accumulation who will modify the existing RL codebase (dr_grpo / rl_runner).
+
+Goal
+----
+Add a *zero‑extra-forward/backward* estimator of the (simple) Gradient Noise Scale that runs every optimizer step as part of the ordinary training loop, works with 1–8 GPUs under torch.distributed (DDP), and adds negligible overhead. The estimator uses the micro‑batches you already backpropagate and a couple of scalar all‑reduces.
+
+Background (what we estimate)
+-----------------------------
+Let G = E[g] be the true gradient (vector), and Σ be the per‑example gradient covariance. The “simple” GNS is
+    B_simple = tr(Σ) / ||G||^2.
+
+For a batch size B (in *sequences*, not tokens), the classic identity is
+    E[ ||g_B||^2 ] = ||G||^2 + tr(Σ)/B.
+
+Within one optimizer step, with gradient accumulation over m micro‑batches per rank, define the *incremental micro‑gradient* g_i as the change in the accumulated .grad after the i‑th micro‑backward. Then
+    tr(Σ_micro) = E[ ||g_i||^2 ] − ||G||^2,
+and the “micro” noise scale is
+    gns_mu = tr(Σ_micro) / ||G||^2  =  (tr(Σ)/B_micro_global) / ||G||^2.
+
+Therefore, a per‑example (sequence‑level) proxy for the critical batch size is
+    B_simple (per‑example)  ≈  gns_mu * B_micro_global,
+where B_micro_global = (world_size * micro_batch_size_per_rank) or, with non‑uniform per‑example weights, the *effective* global micro‑batch size (see “Weighted losses” below).  [Ref: McCandlish et al., 2018; DDP semantics]
+
+
+High‑level plan
+---------------
+1) During your existing accumulation window:
+   - After each micro‑backward, read the current accumulated .grad buffers.
+   - Form the *incremental* micro‑gradient vector g_i = grad_snap − grad_snap_prev (for i=1, set g_1 = grad_snap).
+   - Accumulate a running scalar sum Σ_i ||g_i||^2 and a count m.
+2) On the last micro of the window (the one that **does** DDP sync), compute ||G||^2 from the already **all‑reduced** .grad.
+3) All‑reduce two scalars across ranks: (Σ_i ||g_i||^2, m). From these, compute
+       E||g||^2 = (Σ_i ||g_i||^2)_allr / m_allr,    tr(Σ_micro) = max(E||g||^2 − ||G||^2, 0).
+   Then
+       gns_mu = tr(Σ_micro) / ||G||^2,             B_simple_from_mu = gns_mu * B_micro_global.
+4) Log gns_mu and B_simple_from_mu; reset accumulators for the next window.
+5) (Optional) Also log a “consistency ratio” = (B_simple_from_mu / B_micro_global) / gns_mu, which should hover near 1 when averaging noise is adequate.
+
+Why this is correct and cheap
+-----------------------------
+- DDP averages gradients across ranks at the sync backward (i.e., after leaving no_sync): the .grad buffers hold the *global* mean gradient over all ranks for that step, so ||G||^2 is “free” to read there. You only need to all‑reduce two scalars (sum of micro squared norms, micro count). This adds negligible overhead compared to your usual all‑reduce of full gradient tensors.  [PyTorch DDP docs: no_sync, gradient averaging]
+- Because you already scale each micro‑loss by 1/grad_accum, both tr(Σ_micro) and ||G||^2 inherit the same scale; their ratio gns_mu is invariant to that choice.
+- Using *incremental* micro‑grads avoids storing all per‑micro .grad vectors. You only snapshot the flattened .grad once per micro and subtract the previous snapshot. Memory and time overhead are minimal.
+
+Step‑by‑step changes (concrete)
+-------------------------------
+Below, “DDP model” is your torch.nn.parallel.DistributedDataParallel‑wrapped module. “Trainable params” are the subset receiving gradients (e.g., LoRA adapters). The code is written so that it works whether you use no_sync() (recommended) or not; it only relies on the final micro being synchronized.
+
+1) Add fields to the trainer/state (e.g., DRGRPO.__init__):
+   - self._gns_sum_sq : float = 0.0        # Σ_i ||g_i||^2, local accumulator this window
+   - self._gns_m      : int   = 0          # number of local micro‑batches in this window
+   - self._gns_prev   : Optional[Tensor] = None   # previous flattened grad snapshot
+   - (optional) self._tmp_buf : torch.Tensor = torch.zeros(1, device=device)  # scratch
+
+2) Utility to compute the squared norm of the *incremental* micro‑gradient
+   (do not concatenate; sum per‑param squares to save memory):
+       def _micro_inc_sqnorm(self) -> float:
+           s = 0.0
+           for p in self._trainable_params():
+               if p.grad is None: continue
+               g = p.grad.detach().float()
+               s += float((g*g).sum().item())
+           return s
+   But we need the *increment*, so we snapshot the flattened grad vector (once) and form a difference:
+       def _grad_snapshot(self) -> torch.Tensor:
+           chunks = []
+           for p in self._trainable_params():
+               if p.grad is None: continue
+               chunks.append(p.grad.detach().float().flatten())
+           if not chunks: return torch.zeros(1, device="cpu")
+           return torch.cat(chunks).cpu()
+
+3) In your training step, immediately **after each micro loss.backward()** and before any optimizer step:
+       snap = self._grad_snapshot()          # current accumulated grad (local)
+       micro = snap if (self._gns_prev is None) else (snap - self._gns_prev)
+       self._gns_prev = snap
+       self._gns_sum_sq += float((micro.double()*micro.double()).sum().item())
+       self._gns_m += 1
+
+   If you use AMP with GradScaler, ensure grads are *unscaled* before reading them (see “Mixed precision” below).
+
+4) On the **sync micro** (the one where DDP all‑reduce occurs), *after* backward returns and before optimizer.step():
+   4.1 Compute ||G||^2 from the (global‑average) .grad that DDP wrote:
+       G2_local = 0.0
+       for p in self._trainable_params():
+           if p.grad is None: continue
+           g = p.grad.detach().float()
+           G2_local += float((g*g).sum().item())
+   4.2 All‑reduce the scalar totals across ranks (if dist.is_initialized):
+       totals = torch.tensor([self._gns_sum_sq, float(self._gns_m)], device=self.device, dtype=torch.float64)
+       if dist.is_initialized():
+           dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+       sum_sq_all = float(totals[0].item())
+       m_all      = max(1, int(totals[1].item()))
+       E_g2 = sum_sq_all / m_all
+       tr_sigma_micro = max(E_g2 - G2_local, 0.0)
+       gns_mu = tr_sigma_micro / max(G2_local, 1e-12)
+
+   4.3 Translate to a per‑example CBS proxy (sequences):
+       B_micro_global = (world_size if dist.is_initialized() else 1) * micro_batch_size_per_rank
+       # If using per‑example weights, replace by effective sample size (see below).
+       Bsimple_from_mu = gns_mu * B_micro_global
+
+   4.4 Log {"gns_mu": gns_mu, "Bsimple_from_mu": Bsimple_from_mu} and reset:
+       self._gns_sum_sq = 0.0; self._gns_m = 0; self._gns_prev = None
+
+5) Keep gradient clipping and optimizer.step() exactly where they are, but note that the GNS must be computed **before** clipping (clipping changes ||G||).
+
+Distributed‑training specifics (DDP)
+------------------------------------
+- Use DDP’s no_sync() on the first m−1 micro‑batches to avoid redundant gradient all‑reduces; leave the last micro without no_sync so DDP synchronizes there. Your .grad then holds the *global average* for the window, which we use for ||G||^2.  (This is the official pattern for accumulation under DDP.)
+- The estimator relies only on two cross‑rank scalar all‑reduces: Σ_i ||g_i||^2 and m. This is negligible extra communication.
+- If you ever migrate to FSDP (sharded parameters), ||G||^2 computed on a single rank would be *partial*. You’d need to all‑reduce per‑param sum of squares or gather shards before summing. (No change is needed for standard DDP.)
+
+Weighted losses (RL setting) and “effective batch size”
+------------------------------------------------------
+If per‑example losses carry unequal weights w_i (e.g., sequence‑length or advantage weighting), the variance of g_B depends on those weights. To express B_simple in units of *effective* sequences, compute the **Kish Effective Sample Size** (ESS) per micro‑batch and sum across ranks:
+    ESS = (Σ_i w_i)^2 / (Σ_i w_i^2).
+Then set
+    B_micro_global = (Σ_r ESS_r)   across ranks r
+when reporting Bsimple_from_mu = gns_mu * B_micro_global.
+This aligns the units with the true variance‑reducing power of the batch (down‑weights very uneven weights).
+
+Mixed precision and gradient scaling
+------------------------------------
+- If you use autocast alone (bf16), grads are in true scale; you can read .grad directly.
+- If you use torch.cuda.amp.GradScaler (fp16), you **must** call scaler.unscale_(optimizer) once per step before measuring, otherwise .grad is still scaled and both G2 and micro norms will be inflated. Only unscale **after** all micro‑backwards are done and **before** computing GNS; don’t call unscale_ more than once per step. (Unscale before clipping anyway.)
+
+Placement in the step
+---------------------
+Order for each optimizer step should be:
+  for each micro in window:
+      (optional no_sync) forward -> loss -> loss.backward()
+      (after backward) update Σ_i ||g_i||^2 and snapshot .grad
+  (exit no_sync)  # last micro syncs DDP
+  (if using GradScaler) scaler.unscale_(optimizer)    # once
+  compute ||G||^2 from .grad and finalize gns_mu, Bsimple_from_mu
+  (optional) gradient clipping
+  optimizer.step() (or scaler.step/scale update)
+  zero_grad()
+
+Validation, expectations, and alerts
+------------------------------------
+- Identity check: averaged over steps,   gns_mu  ≈  B_simple / B_micro_global.
+  You can log a “consistency ratio” = (Bsimple_from_mu / B_micro_global) / gns_mu; it should hover near ~1 after EMA smoothing.
+- Early in fine‑tuning, gns_mu is often small and grows as loss drops; in long pretraining runs, per‑example B_simple can grow to the tens‑thousands. Treat instantaneous values with caution; smooth with EMA across many steps.
+
+Performance and overhead
+------------------------
+- Extra compute: one pass summing grad squares per micro; one vector subtraction to form an incremental micro‑grad; both are memory‑bandwidth bound and negligible vs. FW/BW.
+- Extra comms: 2 scalars all‑reduced per step.
+- No extra forwards/backwards; no extra DDP synchronizations.
+
+Minimal pseudocode summary
+--------------------------
+# At init:
+self._gns_sum_sq = 0.0; self._gns_m = 0; self._gns_prev = None
+
+# In each micro (after loss.backward()):
+snap = concat([p.grad.flatten() for p in trainable if p.grad is not None])
+micro = snap if self._gns_prev is None else (snap - self._gns_prev)
+self._gns_prev = snap
+self._gns_sum_sq += ||micro||^2
+self._gns_m += 1
+
+# On last micro (after backward returns; grads are globally averaged by DDP):
+G2_local = sum_over_params( (p.grad**2).sum() )
+allreduce([self._gns_sum_sq, self._gns_m])  -> (sum_sq_all, m_all)
+E_g2 = sum_sq_all / m_all
+tr_sigma_micro = max(E_g2 - G2_local, 0)
+gns_mu = tr_sigma_micro / max(G2_local, 1e-12)
+
+B_micro_global = world_size * micro_batch_size_per_rank
+# or with weights: B_micro_global = sum_r ESS_r
+Bsimple_from_mu = gns_mu * B_micro_global
+
+log({"gns_mu": gns_mu, "Bsimple_from_mu": Bsimple_from_mu})
+self._gns_sum_sq = 0.0; self._gns_m = 0; self._gns_prev = None
+
+Common pitfalls
+---------------
+- Measuring after gradient clipping (don’t): clipping alters ||G||^2.
+- Forgetting to unscale AMP‑scaled grads before measuring (fp16 with GradScaler).
+- Reusing the *same* micro‑batch within a window (destroys variance estimate).
+- Not masking padding/prompt tokens in CLM losses (affects both mean and variance).
+- Assuming per‑GPU B_micro equals “effective” batch size when weights are highly unequal (use ESS).
+
+Deliverables to implement
+-------------------------
+1) Add the three private fields and two small helpers (_grad_snapshot, optional _micro_inc_sqnorm).
+2) Integrate the “after‑backward” snapshot + incremental norm accumulation in the training step.
+3) Add the finalization block on the sync micro to compute (gns_mu, Bsimple_from_mu), with 2‑scalar all‑reduce.
+4) (Optional) Add ESS computation when per‑example weights are used; pass in B_micro_global accordingly.
+5) Emit the new scalars via your metrics logger; document the identity check with EMA smoothing.
+
+References
+----------
+- McCandlish et al., “An Empirical Model of Large‑Batch Training,” 2018 (definitions of GNS, Appendix A identities).
+- PyTorch DDP: no_sync and gradient averaging semantics.
+- PyTorch AMP: autocast and GradScaler (unscale_ call constraints).
+- Effective Sample Size (Kish), weighted means.
+

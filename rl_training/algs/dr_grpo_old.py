@@ -6,6 +6,7 @@ import pathlib
 from contextlib import nullcontext
 from typing import Tuple, Dict
 
+import numpy as np                        # Added 8/11
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
@@ -17,21 +18,15 @@ from transformers import (
 from .base import RLAlgorithm, RolloutBatch
 
 
+def _unwrap(model):
+    """Helper for DDP/unwrapped access"""
+    return model.module if hasattr(model, "module") else model
+
+
 class DRGRPO(RLAlgorithm):
     """
-    Drop-in replacement of the original DR-GRPO implementation, rewritten for clarity
-    and configurability.
-
-    Key changes
-    -----------
-    • All computation is split into helper methods that do *one* thing.
-    • Optional KL penalty: if ``cfg["kl_beta"] > 0`` the KL term is computed with
-      gradients and *added* to the total loss.  Otherwise it is computed only for
-      logging, exactly as before (no autograd, no extra memory).
-    • `step()` is now a linear, easy-to-read orchestration routine.
+    Clear, modular PPO/GRPO-style updater with optional differentiable KL.
     """
-
-    # --------------------------------------------------------------------- init #
 
     def __init__(
         self,
@@ -40,12 +35,10 @@ class DRGRPO(RLAlgorithm):
         *,
         pad_id: int | None = None,
         ratio_log_path: str | pathlib.Path | None = None,
-        grad_log_path: str | pathlib.Path | None = None,
     ):
         super().__init__(policy, cfg)
-
         self.cfg = cfg
-        
+
         total_updates = cfg["total_steps"]
         warmup_steps = int(0.05 * total_updates)
 
@@ -67,30 +60,30 @@ class DRGRPO(RLAlgorithm):
                     self.opt, num_warmup_steps=warmup_steps
                 )
             case _:
-                self.lr_sched = None  # truly fixed LR
+                self.lr_sched = None
 
-        self.pad_id = (
-            pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
-        )
-
+        self.pad_id = pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
         self.accum_steps: int = cfg["grad_accum_steps"]
         self._accum_ctr: int = 0
         self.actual_opt_step: int = 0
-        self.device = None  # filled in during `step`
+        self.device = None
 
-        # Optional ratio logging
-        self._ratio_log_path = (
-            pathlib.Path(ratio_log_path) if ratio_log_path else None
-        )
-        # Optional gradient logging path
-        self._grad_log_path = (
-            pathlib.Path(grad_log_path) if grad_log_path else None
-        )
+        self._ratio_log_path = pathlib.Path(ratio_log_path) if ratio_log_path else None
 
-        #self.compute_entropy = cfg.get("optimizer_entropy", "full").lower() != "none"
+        # Always compute sampled entropy (cheap and correct estimator)  # Changed 8/11
+        self.compute_entropy = True  # Changed 8/11
 
-
-    # --------------------------------------------------------------- public step #
+        # === Entropy-probe accumulators (per accumulation window) ===  # Added 8/11
+        self._probe_sumWS = 0.0   # Σ w S
+        self._probe_sumW  = 0.0   # Σ w
+        self._probe_GH1 = None     # dict[param] = sum S * grad S
+        self._probe_GA1 = None     # dict[param] = sum A * grad S
+        self._probe_G1  = None     # dict[param] = sum grad S
+        self._probe_sumS  = 0.0    # scalar sum S over sequences
+        self._probe_N     = 0      # count sequences
+        self._probe_S_list = []    # list of per-seq S for saving
+        self._probe_A_list = []    # list of per-seq A for saving
+        self._probe_tokent_list = []  # mean token entropy per seq
 
     @torch.no_grad()
     def _compute_advantage(self, rewards: torch.Tensor) -> torch.Tensor:
@@ -107,31 +100,27 @@ class DRGRPO(RLAlgorithm):
     ) -> Dict[str, float]:
         """
         One optimisation step (or gradient-accumulation micro-step).
-
-        Order of operations:
-        1. Flatten sequences and masks
-        2. Run policy forward pass → token log-probs
-        3. Compute PPO-style clipped policy loss
-        4. (Optionally) compute differentiable KL penalty
-        5. Back-prop / optimizer / scheduler
-        6. Return logging metrics
         """
+        # Debug distributed training hanging
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[ALGO DEBUG] Rank {rank} entered step(), sync_grads={sync_grads}")
+        
         self.device = rollouts.gen_ids.device
         B, G, T_g = rollouts.gen_ids.shape
+        print(f"[ALGO DEBUG] Rank {rank} got batch shape B={B}, G={G}, T_g={T_g}")
 
-        # ------------- 1) prepare tensors & advantages ------------------------
-        (
-            seq_flat,
-            attn_mask,
-            targets_tok,
-            gen_mask,
-        ) = self._build_sequences(rollouts)
+        # 1) prepare tensors & advantages
+        print(f"[ALGO DEBUG] Rank {rank} building sequences...")
+        seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
+        print(f"[ALGO DEBUG] Rank {rank} computing advantages...")
         adv = self._compute_advantage(rollouts.reward)  # (B, G)
+        print(f"[ALGO DEBUG] Rank {rank} completed sequence prep and advantage computation")
 
-        # ------------- 2) forward & gather log-probs --------------------------
-        new_logp = self._policy_logp(seq_flat, attn_mask, targets_tok, B, G, T_g).view(
-            B, G, T_g
-        )
+        # 2) forward & gather log-probs
+        print(f"[ALGO DEBUG] Rank {rank} about to call _policy_logp...")
+        new_logp = self._policy_logp(seq_flat, attn_mask, targets_tok, B, G, T_g).view(B, G, T_g)
+        print(f"[ALGO DEBUG] Rank {rank} completed _policy_logp call")
         old_logp = rollouts.logprobs  # (B, G, T_g)
 
         if torch.isinf(old_logp).any() or torch.isnan(old_logp).any():
@@ -141,90 +130,86 @@ class DRGRPO(RLAlgorithm):
             bad = torch.nonzero(~torch.isfinite(new_logp))
             print("‼️ new_logp contains non-finite values at", bad[:5], "…")
 
-        # ------------- 3) PPO clipped loss & entropy -------------------------
-        ratios, token_loss = self._ppo_surrogate(
-            new_logp, old_logp, adv, gen_mask
-        )
+        # 3) PPO clipped loss & entropy (entropy from sampled tokens)
+        ratios, token_loss = self._ppo_surrogate(new_logp, old_logp, adv, gen_mask)
 
-        entropy  = (self._last_entropy * gen_mask).sum() / (gen_mask.sum() + 1e-8)
+        # sampled entropy per token = -log p(sampled token)
+        entropy = (-(new_logp) * gen_mask).sum() / (gen_mask.sum() + 1e-8)  # Changed 8/11
+        self._last_entropy = (-(new_logp)).detach()                          # Changed 8/11
 
+        loss = token_loss * (1.0 / self.accum_steps)
 
-        loss = token_loss * (1.0 / self.accum_steps)  # scale for grad-accum
-
-        # ------------- 4) optional KL penalty ---------------------------------
-        kl_mean = 0.0  # default
+        # 4) optional differentiable KL (stable on-policy estimator)
+        kl_mean = 0.0
         if self.cfg.get("kl_beta", 0.0) > 0.0:
-            # differentiable KL            (ref forward *without* grad)
-            with torch.no_grad(), torch.cuda.amp.autocast(
-                enabled=self.cfg["bf16"], dtype=torch.bfloat16
-            ):
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
                 ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
-            
             ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
 
-            ref_lp = (
-                F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
-                .gather(-1, targets_tok.unsqueeze(-1))
-                .squeeze(-1)[..., -T_g:]
-            ).view(B, G, T_g)
+            # log-softmax in float32 for stability
+            ref_logp_all = F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
+            ref_logp = ref_logp_all.gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[..., -T_g:].view_as(new_logp)
 
-            delta_lp = (new_logp - ref_lp).clamp(-80, 80)
-            kl_per_tok = (delta_lp.exp() + delta_lp - 1.0) * gen_mask
-            kl_mean = kl_per_tok.sum() / (gen_mask.sum() + 1e-8)
+
+            # KL(pi||ref) sample estimator = E_pi[logpi - logref]
+            kl_tok = ((new_logp - ref_logp) * gen_mask)
+            kl_mean = kl_tok.sum() / (gen_mask.sum() + 1e-8)
 
             loss = loss + self.cfg["kl_beta"] * kl_mean
         else:
-            # metric-only KL (identical to old behaviour)
-            kl_mean = self._kl_metric_only(
-                seq_flat, attn_mask, targets_tok, new_logp, ref_model, gen_mask, T_g
-            )
+            kl_mean = self._kl_metric_only(seq_flat, attn_mask, targets_tok, new_logp, ref_model, gen_mask, T_g)
 
-        # ------------- 5) log ratios (optional) ------------------------------
+        # 5) optional ratio logging
         self._maybe_log_ratios(ratios, gen_mask)
 
-        # ------------- 6) optimise -------------------------------------------
+        # 6) optimise
         self._backward_and_step(loss, sync_grads)
 
-        # ------------- 7) metrics dict ---------------------------------------
+        # 7) metrics
         metrics: Dict[str, float] = {
-            "loss": loss.detach().float().item(),
-            "entropy": entropy.item(),
-            "kl": kl_mean if isinstance(kl_mean, float) else kl_mean.item(),
-            "r_mean": rollouts.reward.mean(dim=(0, 1)).item(),
-            "tag_correct": rollouts.tag_correct.float().mean(dim=(0, 1)).item(),
-            "think_len": rollouts.think_len.float().mean(dim=(0, 1)).item(),
+            "loss": float(loss.detach().item()),
+            "entropy": float(entropy.item()),
+            "kl": float(kl_mean if isinstance(kl_mean, float) else kl_mean.item()),
+            "r_mean": float(rollouts.reward.mean(dim=(0, 1)).item()),
+            "tag_correct": float(rollouts.tag_correct.float().mean(dim=(0, 1)).item()),
+            "think_len": float(rollouts.think_len.float().mean(dim=(0, 1)).item()),
         }
         metrics.update(self._ratio_stats(ratios, gen_mask))
+
+        # ── Entropy probe: accumulate per microbatch, then finalize on step ──  # Added 8/11
+        probe_cfg = self.cfg.get("entropy_probe", {})
+        do_probe = int(probe_cfg.get("every", 0)) > 0
+        if do_probe and self._is_main_process():
+            self._probe_accumulate_microbatch(rollouts)             # Added 8/11
+            # Clear gradients after entropy probe to prevent DDP hanging in GNS probe
+            self.opt.zero_grad(set_to_none=True)
+            if sync_grads:
+                # only log/save every N steps
+                every = int(probe_cfg.get("every", 0))
+                if every > 0 and (self.actual_opt_step % every == 0):
+                    try:
+                        self._probe_finalize_and_log(probe_cfg)     # Added 8/11
+                    except Exception as e:
+                        print(f"[entropy_probe] skipped due to error: {e}")
+                else:
+                    self._probe_reset_window()                      # Added 8/11
+
         return metrics
 
-    # ----------------------------------------------------------- helper methods #
-
     # -- sequence prep ---------------------------------------------------------
-
-    def _build_sequences(
-        self, rollouts: RolloutBatch
+    def _build_sequences(self, rollouts: RolloutBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Return (seq_flat, attn_mask, targets_tok, gen_mask).
-        Shapes:
-            seq_flat   : (B × G, T_total)
-            attn_mask  : (B × G, T_total)
-            targets_tok: (B × G, T_total - 1)
-            gen_mask   : (B, G, T_g)
-        """
         B, G, T_g = rollouts.gen_ids.shape
         prompt_rep = rollouts.prompt_ids.unsqueeze(1).expand(-1, G, -1)
         seq_ids = torch.cat((prompt_rep, rollouts.gen_ids), dim=-1)  # (B, G, T_total)
 
         seq_flat = seq_ids.reshape(B * G, -1)
         attn_mask = (seq_flat != self.pad_id).long()
-
         targets_tok = seq_flat[:, 1:]  # teacher forcing targets
         gen_mask = (rollouts.gen_ids != self.pad_id).float()  # (B, G, T_g)
         return seq_flat, attn_mask, targets_tok, gen_mask
 
     # -- forward passes --------------------------------------------------------
-
     def _policy_logp(
         self,
         seq_flat: torch.Tensor,
@@ -234,36 +219,29 @@ class DRGRPO(RLAlgorithm):
         G: int,
         T_g: int,
     ) -> torch.Tensor:
-        """
-        Run the *policy* model and return log-probs for generated slice
-        (BG, T_g) in float16.
-        """
-        with torch.cuda.amp.autocast(enabled=self.cfg["bf16"], dtype=torch.bfloat16):
+        """Return log p(sampled token) for generated slice (BG, T_g)."""
+        # Debug distributed training hanging
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[POLICY DEBUG] Rank {rank} entered _policy_logp, seq_flat.shape={seq_flat.shape}")
+        
+        with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+            print(f"[POLICY DEBUG] Rank {rank} about to call self.policy forward pass...")
             logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+            print(f"[POLICY DEBUG] Rank {rank} completed self.policy forward pass, logits.shape={logits.shape}")
 
-        # Rescale by temperature
         logits = logits / self.cfg.get("temperature", 1.0)
 
-        # careful about precision because of some nan issues
-        logp_all = F.log_softmax(logits.float(), dim=-1)   # float32 kernel
-        logp_all = logp_all.to(torch.bfloat16 if self.cfg["bf16"] else torch.float32)\
-        logp_all = torch.clamp(logp_all,
-                    min=torch.finfo(logp_all.dtype).min + 1e-4)
-        if self.compute_entropy:
-            probs_all = torch.exp(logp_all)
-            ent_tok_all = -(probs_all * logp_all).sum(-1)  # (BG, T_total-1)
-            self._last_entropy = ent_tok_all[:, -T_g:].view(B, G, T_g)
-        else:
-            self._last_entropy = torch.zeros((B, G, T_g),
-                                            device=logp_all.device, dtype=torch.float16)
-        return (
-            logp_all[:, :-1]
-            .gather(-1, targets_tok.unsqueeze(-1))
-            .squeeze(-1)[:, -T_g:]
-        )
+        # compute log-softmax in float32 for stability, then gather
+        logp_all = F.log_softmax(logits.float(), dim=-1)
+        # Gather next-token logprob, then slice the generated region
+        new_logp = logp_all[:, :-1].gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g:]
+        # clamp and sanitize
+        new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0)
+        new_logp = torch.clamp(new_logp, min=-80.0, max=0.0)  # logprob <= 0
+        return new_logp
 
     # -- PPO loss --------------------------------------------------------------
-
     def _ppo_surrogate(
         self,
         new_logp: torch.Tensor,
@@ -271,22 +249,17 @@ class DRGRPO(RLAlgorithm):
         adv: torch.Tensor,
         gen_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Return (ratios, loss_scalar_tensor).
-        Loss is *summed over tokens* then averaged as in the original paper.
-        """
+        """Return (ratios, loss_scalar)."""
         ratios = torch.exp((new_logp - old_logp).clamp(-80, 80)) * gen_mask
 
         clip_eps_neg = self.cfg["clip_eps"]
         clip_eps_pos = self.cfg.get("clip_+", self.cfg["clip_eps"])
 
         surr1 = ratios * adv.unsqueeze(-1)
-        surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv.unsqueeze(
-            -1
-        )
+        surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv.unsqueeze(-1)
         token_loss = -torch.min(surr1, surr2) * gen_mask  # (B, G, T_g)
 
-        # Dr-GRPO: normalise per-prompt by *max* gen length
+        # Dr-GRPO: normalise per-prompt by max gen length
         tokens_per_gen = gen_mask.sum(dim=2)  # (B, G)
         max_lens = tokens_per_gen.max(dim=-1).values  # (B,)
         loss_per_prompt = token_loss.sum(dim=(1, 2)) / (gen_mask.shape[1] * max_lens + 1e-8)
@@ -294,7 +267,6 @@ class DRGRPO(RLAlgorithm):
         return ratios, loss
 
     # -- KL helpers ------------------------------------------------------------
-
     def _kl_metric_only(
         self,
         seq_flat: torch.Tensor,
@@ -305,33 +277,22 @@ class DRGRPO(RLAlgorithm):
         gen_mask: torch.Tensor,
         T_g: int,
     ) -> float:
-        """Compute KL for logging (no grads)."""
-        with torch.no_grad(), torch.cuda.amp.autocast(
-            enabled=self.cfg["bf16"], dtype=torch.bfloat16
-        ):
+        """KL for logging (no grads): sample estimator E_pi[logpi - logref]."""
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
             ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
-
         ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
 
-        ref_logp = (
-            F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
-            .gather(-1, targets_tok.unsqueeze(-1))
-            .squeeze(-1)[..., -T_g:]
-            .view_as(new_logp)
-        )
-        delta_lp = (new_logp.detach() - ref_lp).clamp(-80, 80)
-        kl_per_tok = (delta_lp.exp() + delta_lp - 1.0) * gen_mask
-        return (kl_per_tok.sum() / (gen_mask.sum() + 1e-8)).item()
+        ref_logp_all = F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
+        ref_logp = ref_logp_all.gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[..., -T_g:]
+        ref_logp = ref_logp.view_as(new_logp)
+
+        kl_tok = ((new_logp - ref_logp) * gen_mask)
+        return float((kl_tok.sum() / (gen_mask.sum() + 1e-8)).item())
 
     # -- optimisation ----------------------------------------------------------
-
     def _backward_and_step(self, loss: torch.Tensor, sync_grads: bool) -> None:
         """Handle backward, gradient clipping, optimiser & scheduler."""
-        maybe = (
-            self.policy.no_sync
-            if (hasattr(self.policy, "no_sync") and not sync_grads)
-            else nullcontext
-        )
+        maybe = (self.policy.no_sync if (hasattr(self.policy, "no_sync") and not sync_grads) else nullcontext)
         with maybe():
             loss.backward()
 
@@ -344,7 +305,6 @@ class DRGRPO(RLAlgorithm):
             self.actual_opt_step += 1
 
     # -- ratio logging & stats -------------------------------------------------
-
     def _maybe_log_ratios(self, ratios: torch.Tensor, gen_mask: torch.Tensor) -> None:
         if self._ratio_log_path is None:
             return
@@ -353,26 +313,12 @@ class DRGRPO(RLAlgorithm):
         with self._ratio_log_path.open("a") as fh:
             fh.write(json.dumps(rec) + "\n")
 
-    def _ratio_stats(
-        self, ratios: torch.Tensor, gen_mask: torch.Tensor
-    ) -> Dict[str, float]:
-        """Compute various ratio statistics *over non-pad tokens only*."""
+    def _ratio_stats(self, ratios: torch.Tensor, gen_mask: torch.Tensor) -> Dict[str, float]:
         mask = gen_mask.bool()
         flat_ratios = ratios[mask]
         flat_logr = torch.log(ratios.clamp_min(1e-8))[mask]
-
         if flat_ratios.numel() == 0:
-            # unlikely but handle zero-length batch
-            return {k: 0.0 for k in (
-                "ratio_mean",
-                "ratio_median",
-                "ratio_p90",
-                "ratio_p99",
-                "ratio_max",
-                "ratio_clip_frac",
-                "logr_std",
-            )}
-
+            return {k: 0.0 for k in ("ratio_mean","ratio_median","ratio_p90","ratio_p99","ratio_max","ratio_clip_frac","logr_std")}
         stats = {
             "ratio_mean": flat_ratios.mean().item(),
             "ratio_median": flat_ratios.median().item(),
@@ -383,3 +329,332 @@ class DRGRPO(RLAlgorithm):
             "logr_std": flat_logr.std().item(),
         }
         return stats
+
+    # === Entropy-probe helpers (accumulate & finalize) ========================  # Added 8/11
+    def _is_main_process(self) -> bool:  # Added 8/11
+        import torch.distributed as dist
+        return (not dist.is_initialized()) or (dist.get_rank() == 0)
+
+    def _run_dir_from_ratio_path(self) -> pathlib.Path:  # Added 8/11
+        if getattr(self, "_ratio_log_path", None) is not None:
+            return pathlib.Path(self._ratio_log_path).parent
+        return pathlib.Path(".")
+
+    def _probe_reset_window(self) -> None:  # Added 8/11
+        self._probe_sumWS = 0.0
+        self._probe_sumW  = 0.0
+        self._probe_GH1 = None
+        self._probe_GA1 = None
+        self._probe_G1  = None
+        self._probe_sumS = 0.0
+        self._probe_sumSA = 0.0
+        self._probe_N = 0
+        self._probe_S_list.clear()
+        self._probe_A_list.clear()
+        self._probe_tokent_list.clear()
+
+    def _trainable_params(self):  # Added 8/11
+        # Use unwrapped model to get parameters without DDP wrapper
+        unwrapped_policy = _unwrap(self.policy)
+        return [p for p in unwrapped_policy.parameters() if isinstance(p, torch.nn.Parameter) and p.requires_grad]
+
+    def _probe_accumulate_microbatch(self, rollouts: RolloutBatch) -> None:  # Added 8/11
+        """
+        Re-forward on this microbatch, compute:
+          GH1 += Σ S ∇S,  GA1 += Σ SA ∇S,  G1 += Σ ∇S
+        and accumulate S, A, token-entropy means for logging.
+        """
+        # (Re)build sequences
+        seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
+        B, G, T_g = rollouts.gen_ids.shape
+
+        # Forward fresh (don't rely on training graph)
+        # Use unwrapped model to bypass DDP for entropy probe
+        unwrapped_policy = _unwrap(self.policy)
+        with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+            logits = unwrapped_policy(seq_flat, attention_mask=attn_mask).logits
+        logits = logits / self.cfg.get("temperature", 1.0)
+        logp_all = F.log_softmax(logits.float(), dim=-1)
+        new_logp = logp_all[:, :-1].gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g:]
+        new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+        new_logp = new_logp.view(B, G, T_g)
+
+        # Per-seq S and A
+        S_seq = (new_logp * gen_mask).sum(dim=-1)            # (B,G), S = sum log p over generated tokens
+        A_seq = self._compute_advantage(rollouts.reward)     # (B,G)  (GRPO => centered per-prompt)
+        tok_ent_mean = (-(new_logp) * gen_mask).sum(-1) / (gen_mask.sum(-1) + 1e-8)
+
+        # ---- Dr-GRPO weights: w_{p,i} = 1 / (G * Lmax(p)) ----
+        tokens_per_gen = gen_mask.sum(dim=2)                 # (B,G)
+        Lmax = tokens_per_gen.max(dim=-1).values.clamp_min(1.0)   # (B,)
+        w_p = (1.0 / (G * Lmax)).unsqueeze(-1).expand_as(S_seq)   # (B,G)
+
+        # Flatten
+        S = S_seq.reshape(-1)                                 # (N,)
+        A = A_seq.reshape(-1)                                 # (N,)
+        w = w_p.reshape(-1)                                   # (N,)
+        N = S.numel()
+
+        # Weighted scalar objectives that produce the exact sums we need:
+        #   GH  = Σ w * S ∇S  via grad of 0.5 * Σ w * S^2
+        #   GA  = Σ w * A ∇S  via grad of Σ w * A * S
+        #   G1  = Σ w     ∇S  via grad of Σ w * S
+        params = self._trainable_params()
+        L_GH = 0.5 * (w * S.pow(2)).sum()
+        L_GA = (w * A * S).sum()
+        L_G1 = (w * S).sum()
+
+        # Gradients (avoid DDP sync like GNS probe to prevent distributed hanging)
+        from contextlib import nullcontext
+        ctx = self.policy.no_sync() if hasattr(self.policy, "no_sync") else nullcontext()
+        with ctx:
+            grads_GH = torch.autograd.grad(L_GH, params, retain_graph=True,  create_graph=False, allow_unused=True)
+            grads_GA = torch.autograd.grad(L_GA, params, retain_graph=True,  create_graph=False, allow_unused=True)
+            grads_G1 = torch.autograd.grad(L_G1, params, retain_graph=False, create_graph=False, allow_unused=True)
+
+        # Lazy-init accum dicts (unchanged)
+        if self._probe_GH1 is None:
+            self._probe_GH1, self._probe_GA1, self._probe_G1 = {}, {}, {}
+            for p in params:
+                dev, dtype, shape = p.device, torch.float32, p.shape
+                self._probe_GH1[p] = torch.zeros(shape, device=dev, dtype=dtype)
+                self._probe_GA1[p] = torch.zeros(shape, device=dev, dtype=dtype)
+                self._probe_G1[p]  = torch.zeros(shape, device=dev, dtype=dtype)
+
+        for p, gH, gA, g1 in zip(params, grads_GH, grads_GA, grads_G1):
+            if gH is not None: self._probe_GH1[p] += gH.detach().to(torch.float32)
+            if gA is not None: self._probe_GA1[p] += gA.detach().to(torch.float32)
+            if g1 is not None: self._probe_G1[p]  += g1.detach().to(torch.float32)
+
+        # Weighted sums for centering/normalization
+        self._probe_sumWS  += float((w * S).sum().item())   # Σ w S
+        self._probe_sumW   += float(w.sum().item())         # Σ w
+        self._probe_N      += int(N)
+        self._probe_S_list.append(S_seq.detach().cpu())
+        self._probe_A_list.append(A_seq.detach().cpu())
+        self._probe_tokent_list.append(tok_ent_mean.detach().cpu())
+
+
+    def _probe_finalize_and_log(self, probe_cfg: dict) -> None:  # Added 8/11
+        """On the syncing microbatch, turn accumulators into centered g_H, g_A,
+        compute g_H^T P g_A from Adam state, save artifacts, then reset window.
+        """
+        if self._probe_GH1 is None:
+            return
+
+        # Weighted mean of S for centering: S̄ = (Σ w S)/(Σ w)
+        meanS = (self._probe_sumWS / max(self._probe_sumW, 1e-8))
+        sumW  = self._probe_sumW
+
+        dot = normH = normA = 0.0
+        lr_vals = []
+
+        for group in self.opt.param_groups:
+            eps = float(group.get("eps", 1e-8))
+            lr_vals.append(float(group.get("lr", 0.0)))
+            for p in group["params"]:
+                if p not in self._probe_GH1:
+                    continue
+                # gH = GH - S̄ * G1  (centered)
+                gH = self._probe_GH1[p] - meanS * self._probe_G1[p]
+                # gA = GA            (no centering; GRPO A is already baseline-subtracted per prompt)
+                gA = self._probe_GA1[p]
+
+                state = self.opt.state.get(p, {})
+                v = state.get("exp_avg_sq", None)
+
+                # Note here we use a biased estimator of \sum_i E_t[(S(t)-Sbar) K(t,t_i') A(t_i')]
+                # To remove bias we should replace the sum over all t_i and sampled t = t_j with the sum for i != j
+                if v is None:
+                    inv = 1.0 / eps
+                    dot   += (gH * gA).sum().item() * inv
+                    normH += (gH * gH).sum().item() * inv
+                    normA += (gA * gA).sum().item() * inv
+                else:
+                    denom = v.sqrt().to(gH.dtype) + eps
+                    dot   += (gH * gA / denom).sum().item()
+                    normH += (gH * gH / denom).sum().item()
+                    normA += (gA * gA / denom).sum().item()
+
+
+        avg_lr = float(np.mean(lr_vals)) if lr_vals else 0.0
+
+        # Unnormalized inner product in the Adam metric:
+        gH_P_gA_sum = float(dot)
+
+        # Normalized to product of expectations:
+        gH_P_gA_mean = float(dot) / max(sumW * sumW, 1e-8)
+
+        deltaH_pred_adam = -(avg_lr * gH_P_gA_mean)
+
+
+        # Save artifacts (only every N steps; we’re already in the gated path)
+        run_dir = self._run_dir_from_ratio_path()
+        out_root = run_dir / probe_cfg.get("out_dir", "entropy_probes")
+        step_dir = out_root / f"step_{self.actual_opt_step}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save per-seq arrays
+        S_all  = torch.cat(self._probe_S_list, dim=0).numpy().astype(np.float32)
+        A_all  = torch.cat(self._probe_A_list, dim=0).numpy().astype(np.float32)
+        Et_all = torch.cat(self._probe_tokent_list, dim=0).numpy().astype(np.float32)
+
+        np.save(step_dir / "S.npy",  S_all)
+        np.save(step_dir / "A.npy",  A_all)
+        np.save(step_dir / "entropy_tok_mean.npy", Et_all)
+
+        # Meta and scalars
+        pred = {
+            "gH_P_gA_sum": gH_P_gA_sum,
+            "gH_P_gA_mean": gH_P_gA_mean,
+            "norm_gH_P": float(np.sqrt(max(normH, 0.0))),
+            "norm_gA_P": float(np.sqrt(max(normA, 0.0))),
+            "deltaH_first_order_adam_mean": float(deltaH_pred_adam),
+        }
+        (step_dir / "deltaH_pred.json").write_text(json.dumps(pred, indent=2))
+
+        meta = {
+            "step": int(self.actual_opt_step),
+            "N": int(self._probe_N),
+            "avg_lr": avg_lr,
+            "sumW": sumW,
+        }
+        (step_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+
+        # Reset accumulators for next window
+        self._probe_reset_window()
+
+    # Placeholder left here so external calls don’t break older imports  # Added 8/11
+    def _log_entropy_probes(self, *args, **kwargs) -> None:
+        return  # no-op
+
+
+    # === GNS helpers =============================================================
+    def _loss_for_batch(self, rollouts: "RolloutBatch", ref_model) -> torch.Tensor:
+        """
+        Build the same PPO/GRPO loss as in step(), but:
+        - no grad accumulation scaling,
+        - no optimiser step, just returns the scalar loss.
+        """
+        print(f"[GNS DEBUG] _loss_for_batch: starting")
+        device = rollouts.gen_ids.device
+        B, G, T_g = rollouts.gen_ids.shape
+        print(f"[GNS DEBUG] _loss_for_batch: batch shape B={B}, G={G}, T_g={T_g}")
+
+        # 1) prep + advantages
+        print(f"[GNS DEBUG] _loss_for_batch: calling _build_sequences")
+        seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
+        print(f"[GNS DEBUG] _loss_for_batch: completed _build_sequences, seq_flat.shape={seq_flat.shape}")
+        print(f"[GNS DEBUG] _loss_for_batch: calling _compute_advantage")
+        adv = self._compute_advantage(rollouts.reward)  # (B, G)
+        print(f"[GNS DEBUG] _loss_for_batch: completed _compute_advantage")
+
+        # 2) log-probs
+        print(f"[GNS DEBUG] _loss_for_batch: starting forward pass")
+        # Use unwrapped model to bypass DDP for GNS probe
+        unwrapped_policy = _unwrap(self.policy)
+        print(f"[GNS DEBUG] _loss_for_batch: using unwrapped model, type={type(unwrapped_policy)}")
+        with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+            print(f"[GNS DEBUG] _loss_for_batch: calling policy forward pass with seq_flat.shape={seq_flat.shape}")
+            logits = unwrapped_policy(seq_flat, attention_mask=attn_mask).logits
+            print(f"[GNS DEBUG] _loss_for_batch: completed policy forward pass, logits.shape={logits.shape}")
+        logits = logits / self.cfg.get("temperature", 1.0)
+        logp_all = F.log_softmax(logits.float(), dim=-1)
+        new_logp = logp_all[:, :-1].gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g:]
+        new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+        new_logp = new_logp.view(B, G, T_g)
+
+        old_logp = rollouts.logprobs  # (B, G, T_g)
+
+        # 3) PPO surrogate (same as _ppo_surrogate but returns the mean loss)
+        ratios = torch.exp((new_logp - old_logp).clamp(-80, 80)) * gen_mask
+        clip_eps_neg = self.cfg["clip_eps"]
+        clip_eps_pos = self.cfg.get("clip_+", self.cfg["clip_eps"])
+        surr1 = ratios * adv.unsqueeze(-1)
+        surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv.unsqueeze(-1)
+        token_loss = -torch.min(surr1, surr2) * gen_mask  # (B, G, T_g)
+        tokens_per_gen = gen_mask.sum(dim=2)              # (B, G)
+        max_lens = tokens_per_gen.max(dim=-1).values      # (B,)
+        loss_per_prompt = token_loss.sum(dim=(1, 2)) / (gen_mask.shape[1] * max_lens + 1e-8)
+        loss = loss_per_prompt.mean()
+
+        # 4) optional differentiable KL (same beta as training)
+        beta = float(self.cfg.get("kl_beta", 0.0))
+        if beta > 0.0:
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+                ref_logits = ref_model(seq_flat, attention_mask=attn_mask).logits
+            ref_logits = ref_logits / self.cfg.get("temperature", 1.0)
+            ref_logp_all = F.log_softmax(ref_logits.float(), dim=-1)[..., :-1]
+            ref_logp = ref_logp_all.gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[..., -T_g:].view_as(new_logp)
+            kl_tok = ((new_logp - ref_logp) * gen_mask)
+            kl_mean = kl_tok.sum() / (gen_mask.sum() + 1e-8)
+            loss = loss + beta * kl_mean
+
+        return loss
+
+    @torch.no_grad()
+    def _grad_sq_norm_for_batch(self, rollouts: "RolloutBatch", ref_model, *, avoid_ddp_allreduce: bool = True) -> float:
+        """
+        Compute sum of squared gradients for the mean loss on `rollouts`.
+        Does NOT step the optimiser. Optionally suppresses DDP all-reduce.
+        """
+        # zero grads
+        self.opt.zero_grad(set_to_none=True)
+
+        # we need grads, so disable no_grad inside
+        for p in self.policy.parameters():
+            if p.grad is not None:
+                p.grad = None
+
+        ctx = nullcontext()
+        if avoid_ddp_allreduce and hasattr(self.policy, "no_sync"):
+            ctx = self.policy.no_sync()
+
+        with ctx:
+            # enable grads locally
+            with torch.enable_grad():
+                loss = self._loss_for_batch(rollouts, ref_model)
+                loss.backward()
+
+        # grad^2 norm over trainable params (LoRA etc.)
+        total = 0.0
+        for p in self._trainable_params():
+            if p.grad is not None:
+                g = p.grad.detach()
+                if torch.isfinite(g).all():
+                    total += float((g.double() * g.double()).sum().item())
+        # clear grads so training step isn't affected
+        self.opt.zero_grad(set_to_none=True)
+        return total
+
+
+    def _grad_sq_norm_for_effective_batch(self, microbatches, ref_model, *, avoid_ddp_allreduce=True):
+        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: starting with {len(microbatches)} microbatches")
+        self.opt.zero_grad(set_to_none=True)
+
+        ctx = self.policy.no_sync() if avoid_ddp_allreduce and hasattr(self.policy, "no_sync") else nullcontext()
+        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: entering grad computation context")
+        with ctx, torch.enable_grad():
+            scale = 1.0 / max(len(microbatches), 1)      # ← 1/K
+            print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: scale={scale}, starting microbatch loop")
+            for i, mb in enumerate(microbatches):                      # ← K microbatches
+                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: processing microbatch {i+1}/{len(microbatches)}")
+                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: calling _loss_for_batch for mb {i+1}")
+                loss = self._loss_for_batch(mb, ref_model) * scale
+                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: got loss={loss.item():.6f}, calling backward for mb {i+1}")
+                loss.backward()                          # accumulate grads
+                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: completed backward for mb {i+1}")
+        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: exited grad computation context")
+
+        # sum of squared grads over trainable params
+        total = 0.0
+        for p in self._trainable_params():
+            if p.grad is not None:
+                g = p.grad.detach().double()
+                total += float((g * g).sum().item())
+        self.opt.zero_grad(set_to_none=True)
+        return total
+
+
+

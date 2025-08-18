@@ -31,8 +31,16 @@ export AWS_EC2_METADATA_DISABLED=true
 EOF
 chmod 600 ~/.lambda_s3.env
 
-# Sync Lord Krang's finetuned checkpoints:
-source ~/.lambda_s3.env && rclone copy lambda_east3:9e733b11-9ff3-41c4-9328-29990fa02ade/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156 /tmp/checkpoints --ignore-checksum --size-only --transfers=4 --checkers=4 --progress
+# CRITICAL: If rclone fails with XML syntax errors, recreate config:
+source ~/.lambda_s3.env
+rclone config delete lambda_east3
+echo -e "[lambda_east3]\ntype = s3\nprovider = Other\nenv_auth = true\nregion = us-east-3\nendpoint = https://files.us-east-3.lambda.ai" > ~/.config/rclone/rclone.conf
+
+# Verify S3 access and explore filesystem:
+rclone tree lambda_east3:9e733b11-9ff3-41c4-9328-29990fa02ade/checkpoints --max-depth=3
+
+# Sync Lord Krang's finetuned checkpoints (Qwen2.5-1.5B):
+rclone copy lambda_east3:9e733b11-9ff3-41c4-9328-29990fa02ade/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156 /lambda/nfs/localfs/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156 --ignore-checksum --size-only --transfers=8 --checkers=8 --progress
 ```
 
 ### 2. Run Training
@@ -85,6 +93,45 @@ source ~/.lambda_s3.env && rclone copy lambda_east3:9e733b11-9ff3-41c4-9328-2999
 6. **eval_runner_fixed.py not found**: Fixed in codebase - was hardcoded wrong filename
 7. **tyro argument parsing error**: Upgrade tyro to 0.9.28+ fixes "too many values to unpack" error
 8. **eval_every=0 not respected**: Fixed in codebase - now properly skips evaluation when set to 0
+
+### Critical Fixes (Aug 2025 Debugging Session)
+
+#### rclone S3 Access Issues
+**Problem**: `XML syntax error` or `directory not found` when accessing S3
+**Root Cause**: Malformed rclone configuration with backticks around parameters
+**Solution**: 
+```bash
+source ~/.lambda_s3.env
+rclone config delete lambda_east3
+echo -e "[lambda_east3]\ntype = s3\nprovider = Other\nenv_auth = true\nregion = us-east-3\nendpoint = https://files.us-east-3.lambda.ai" > ~/.config/rclone/rclone.conf
+```
+
+#### S3 Filesystem Structure
+**ALWAYS check the full directory structure before assuming paths:**
+```
+lambda_east3:9e733b11-9ff3-41c4-9328-29990fa02ade/
+└── checkpoints/
+    ├── qwen2_05_finetuned/checkpoint-156/        # Qwen2-0.5B model  
+    ├── qwen2_5_15_finetuned/
+    │   └── qwen2_5_15_gsm8k_lora/checkpoint-156/  # Qwen2.5-1.5B ← USE THIS
+    └── *.zip archives
+```
+
+#### Evaluation During Training - RESOLVED
+**Previous Issue**: Model mismatch between training and evaluation
+**Status**: ✅ COMPLETELY FIXED
+**Verification**: Aug 2025 debugging session confirmed:
+- Manual evaluation works: `python -m evals.eval_runner --backbone qwen2_5_15 --ckpt-path ...`
+- In-process evaluation works during training with CPU shelving for memory management
+- No model mismatch - both training and eval use Qwen2.5-1.5B correctly
+- Automatic grad_accum_steps calculation: `buffer_size / (world_size * microbatch_size)`
+- Step progression works correctly: 0→1→2→3
+- Metrics generation: Proper CSV files with pass rates, entropy, etc.
+
+#### Distributed Training Formulas
+**Single GPU**: `grad_accum_steps = buffer_size / microbatch_size = 32 / 2 = 16`
+**Dual GPU**: `grad_accum_steps = buffer_size / (world_size * microbatch_size) = 32 / (2 * 2) = 8`
+**General**: `microbatch_size × grad_accum_steps × N_gpus = buffer_size`
 
 ### Log Locations
 - Training logs: `/tmp/rl_runs/run_YYYY-MM-DD_HH-MM-SS/`

@@ -1,4 +1,13 @@
 # rl_training/algs/dr_grpo.py
+"""
+Dr-GRPO (Distributional Rejection GRPO) Algorithm Implementation
+
+This file contains:
+1. Core Dr-GRPO training logic
+2. Integrated diagnostic probes (GNS, Entropy)
+
+TODO: After testing, refactor probes into separate modules
+"""
 from __future__ import annotations
 
 import json
@@ -8,6 +17,7 @@ from typing import Tuple, Dict
 
 import numpy as np                        # Added 8/11
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from transformers import (
@@ -17,17 +27,28 @@ from transformers import (
 
 from .base import RLAlgorithm, RolloutBatch
 
+# ============================================================================
+# UTILITIES
+# ============================================================================
 
 def _unwrap(model):
     """Helper for DDP/unwrapped access"""
     return model.module if hasattr(model, "module") else model
 
 
+# ============================================================================
+# MAIN DR-GRPO ALGORITHM CLASS
+# ============================================================================
+
 class DRGRPO(RLAlgorithm):
     """
     Clear, modular PPO/GRPO-style updater with optional differentiable KL.
     """
 
+    # ------------------------------------------------------------------------
+    # INITIALIZATION
+    # ------------------------------------------------------------------------
+    
     def __init__(
         self,
         policy,
@@ -73,7 +94,11 @@ class DRGRPO(RLAlgorithm):
         # Always compute sampled entropy (cheap and correct estimator)  # Changed 8/11
         self.compute_entropy = True  # Changed 8/11
 
-        # === Entropy-probe accumulators (per accumulation window) ===  # Added 8/11
+        # ====================================================================
+        # PROBE INITIALIZATION SECTION
+        # ====================================================================
+        
+        # --- Entropy Probe Fields ---  # Added 8/11
         self._probe_sumWS = 0.0   # Σ w S
         self._probe_sumW  = 0.0   # Σ w
         self._probe_GH1 = None     # dict[param] = sum S * grad S
@@ -84,6 +109,21 @@ class DRGRPO(RLAlgorithm):
         self._probe_S_list = []    # list of per-seq S for saving
         self._probe_A_list = []    # list of per-seq A for saving
         self._probe_tokent_list = []  # mean token entropy per seq
+        
+        # --- GNS (Gradient Noise Scale) Probe Fields ---
+        self._gns_enabled = bool(cfg.get("gns_probe", {}).get("enabled", False))
+        if self._gns_enabled:
+            print(f"[GNS] In-loop gradient noise scale tracking ENABLED")
+        self._gns_sum_sq: float = 0.0        # Σ_i ||g_i||^2, local accumulator this window
+        self._gns_m: int = 0                 # number of local micro-batches in this window
+        self._gns_prev: torch.Tensor | None = None  # previous flattened grad snapshot
+        self._gns_ess_sum_w: float = 0.0     # Σ w_i for ESS computation
+        self._gns_ess_sum_w2: float = 0.0    # Σ w_i^2 for ESS computation
+        self._last_gns_metrics: Dict[str, float] = {}  # Store GNS metrics for logging
+
+    # ------------------------------------------------------------------------
+    # CORE TRAINING METHODS
+    # ------------------------------------------------------------------------
 
     @torch.no_grad()
     def _compute_advantage(self, rewards: torch.Tensor) -> torch.Tensor:
@@ -102,7 +142,6 @@ class DRGRPO(RLAlgorithm):
         One optimisation step (or gradient-accumulation micro-step).
         """
         # Debug distributed training hanging
-        import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
         print(f"[ALGO DEBUG] Rank {rank} entered step(), sync_grads={sync_grads}")
         
@@ -162,8 +201,8 @@ class DRGRPO(RLAlgorithm):
         # 5) optional ratio logging
         self._maybe_log_ratios(ratios, gen_mask)
 
-        # 6) optimise
-        self._backward_and_step(loss, sync_grads)
+        # 6) optimise (pass rollouts for ESS computation if GNS enabled)
+        self._backward_and_step(loss, sync_grads, rollouts if self._gns_enabled else None)
 
         # 7) metrics
         metrics: Dict[str, float] = {
@@ -175,8 +214,15 @@ class DRGRPO(RLAlgorithm):
             "think_len": float(rollouts.think_len.float().mean(dim=(0, 1)).item()),
         }
         metrics.update(self._ratio_stats(ratios, gen_mask))
+        
+        # Add GNS metrics if available
+        if self._last_gns_metrics:
+            metrics.update(self._last_gns_metrics)
 
-        # ── Entropy probe: accumulate per microbatch, then finalize on step ──  # Added 8/11
+        # ====================================================================
+        # ENTROPY PROBE SECTION (can be refactored out)
+        # ====================================================================
+        # Added 8/11
         probe_cfg = self.cfg.get("entropy_probe", {})
         do_probe = int(probe_cfg.get("every", 0)) > 0
         if do_probe and self._is_main_process():
@@ -196,6 +242,10 @@ class DRGRPO(RLAlgorithm):
 
         return metrics
 
+    # ------------------------------------------------------------------------
+    # CORE ALGORITHM HELPER METHODS
+    # ------------------------------------------------------------------------
+    
     # -- sequence prep ---------------------------------------------------------
     def _build_sequences(self, rollouts: RolloutBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -221,7 +271,6 @@ class DRGRPO(RLAlgorithm):
     ) -> torch.Tensor:
         """Return log p(sampled token) for generated slice (BG, T_g)."""
         # Debug distributed training hanging
-        import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
         print(f"[POLICY DEBUG] Rank {rank} entered _policy_logp, seq_flat.shape={seq_flat.shape}")
         
@@ -290,13 +339,54 @@ class DRGRPO(RLAlgorithm):
         return float((kl_tok.sum() / (gen_mask.sum() + 1e-8)).item())
 
     # -- optimisation ----------------------------------------------------------
-    def _backward_and_step(self, loss: torch.Tensor, sync_grads: bool) -> None:
+    def _backward_and_step(self, loss: torch.Tensor, sync_grads: bool, rollouts: RolloutBatch | None = None) -> None:
         """Handle backward, gradient clipping, optimiser & scheduler."""
         maybe = (self.policy.no_sync if (hasattr(self.policy, "no_sync") and not sync_grads) else nullcontext)
         with maybe():
             loss.backward()
+        
+        # ====================================================================
+        # GNS PROBE: Track incremental gradients after each micro-backward
+        # ====================================================================
+        if self._gns_enabled:
+            snap = self._grad_snapshot()  # current accumulated grad (local)
+            if self._gns_prev is None:
+                micro = snap
+            else:
+                micro = snap - self._gns_prev
+            self._gns_prev = snap
+            self._gns_sum_sq += float((micro.double() * micro.double()).sum().item())
+            self._gns_m += 1
+            
+            # Track ESS weights for this micro-batch
+            if rollouts is not None:
+                B, G, T_g = rollouts.gen_ids.shape
+                gen_mask = (rollouts.gen_ids != self.pad_id).float()
+                
+                # Compute Dr-GRPO weights: w_{p,i} = 1 / (G * L_max(p))
+                tokens_per_gen = gen_mask.sum(dim=2)  # (B, G)
+                L_max = tokens_per_gen.max(dim=-1).values.clamp_min(1.0)  # (B,)
+                
+                # Each generation has weight 1/(G * L_max(p))
+                for b in range(B):
+                    w = 1.0 / (G * L_max[b].item())
+                    # G generations with same weight for this prompt
+                    self._gns_ess_sum_w += G * w
+                    self._gns_ess_sum_w2 += G * w * w
 
         if sync_grads:
+            # ================================================================
+            # GNS PROBE: Compute and log gradient noise scale before opt step
+            # ================================================================
+            if self._gns_enabled:
+                self._compute_and_log_gns()
+                # Reset GNS accumulators for next window
+                self._gns_sum_sq = 0.0
+                self._gns_m = 0
+                self._gns_prev = None
+                self._gns_ess_sum_w = 0.0
+                self._gns_ess_sum_w2 = 0.0
+            
             clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
             self.opt.step()
             if self.lr_sched is not None:
@@ -330,9 +420,11 @@ class DRGRPO(RLAlgorithm):
         }
         return stats
 
-    # === Entropy-probe helpers (accumulate & finalize) ========================  # Added 8/11
+    # ========================================================================
+    # ENTROPY PROBE METHODS (TODO: refactor to separate module)
+    # ========================================================================
+    # Added 8/11
     def _is_main_process(self) -> bool:  # Added 8/11
-        import torch.distributed as dist
         return (not dist.is_initialized()) or (dist.get_rank() == 0)
 
     def _run_dir_from_ratio_path(self) -> pathlib.Path:  # Added 8/11
@@ -357,7 +449,86 @@ class DRGRPO(RLAlgorithm):
         # Use unwrapped model to get parameters without DDP wrapper
         unwrapped_policy = _unwrap(self.policy)
         return [p for p in unwrapped_policy.parameters() if isinstance(p, torch.nn.Parameter) and p.requires_grad]
+    
+    # ========================================================================
+    # GNS PROBE METHODS (TODO: refactor to separate module)
+    # ========================================================================
+    def _grad_snapshot(self) -> torch.Tensor:
+        """Snapshot current accumulated gradients as a flattened vector."""
+        chunks = []
+        for p in self._trainable_params():
+            if p.grad is None:
+                continue
+            chunks.append(p.grad.detach().float().flatten())
+        if not chunks:
+            return torch.zeros(1, device="cpu")
+        return torch.cat(chunks).cpu()
+    
+    def _micro_inc_sqnorm(self) -> float:
+        """Compute squared norm of incremental micro-gradient (unused but kept for reference)."""
+        s = 0.0
+        for p in self._trainable_params():
+            if p.grad is None:
+                continue
+            g = p.grad.detach().float()
+            s += float((g * g).sum().item())
+        return s
+    
+    def _compute_and_log_gns(self) -> None:
+        """Compute gradient noise scale and critical batch size on sync micro."""
+        # Compute ||G||^2 from the (global-average) .grad that DDP wrote
+        G2_local = 0.0
+        for p in self._trainable_params():
+            if p.grad is None:
+                continue
+            g = p.grad.detach().float()
+            G2_local += float((g * g).sum().item())
+        
+        # All-reduce the scalar totals across ranks (including ESS sums)
+        totals = torch.tensor([self._gns_sum_sq, float(self._gns_m), 
+                              self._gns_ess_sum_w, self._gns_ess_sum_w2], 
+                             device=self.device, dtype=torch.float64)
+        if dist.is_initialized():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        
+        sum_sq_all = float(totals[0].item())
+        m_all = max(1, int(totals[1].item()))
+        sum_w_all = float(totals[2].item())
+        sum_w2_all = float(totals[3].item())
+        
+        # Compute gradient noise scale metrics
+        E_g2 = sum_sq_all / m_all
+        tr_sigma_micro = max(E_g2 - G2_local, 0.0)
+        gns_mu = tr_sigma_micro / max(G2_local, 1e-12)
+        
+        # Compute Effective Sample Size (ESS) for weighted losses
+        # ESS = (Σ w)^2 / (Σ w^2)
+        if sum_w2_all > 0:
+            ess_global = (sum_w_all * sum_w_all) / sum_w2_all
+        else:
+            # Fallback to simple count if weights not tracked
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            micro_batch_size = self.cfg.get("micro_batch_size", 1)
+            num_generations = self.cfg.get("num_generations", 8)
+            ess_global = world_size * micro_batch_size * num_generations
+        
+        # Use ESS as the effective batch size for critical batch size computation
+        Bsimple_from_mu = gns_mu * ess_global
+        
+        # Store metrics for logging
+        self._last_gns_metrics = {
+            "gns_mu": gns_mu,
+            "Bsimple_from_mu": Bsimple_from_mu,
+            "gns_ess": ess_global,
+            "gns_consistency_ratio": (Bsimple_from_mu / ess_global) / max(gns_mu, 1e-12),
+            "gns_G2": G2_local,
+            "gns_tr_sigma": tr_sigma_micro,
+        }
 
+    # ========================================================================
+    # ENTROPY PROBE IMPLEMENTATION (complex, needs refactoring)
+    # ========================================================================
+    
     def _probe_accumulate_microbatch(self, rollouts: RolloutBatch) -> None:  # Added 8/11
         """
         Re-forward on this microbatch, compute:
