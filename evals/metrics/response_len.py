@@ -7,7 +7,7 @@ from evals.records import EvalRecord
 from transformers import AutoTokenizer
 
 # just use qwen tokenizer hard coded for now
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B", trust_remote_code=True)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B", trust_remote_code=True)
 pad_id = tok.pad_token_id
 
 def _count_think_tokens(text: str) -> int:
