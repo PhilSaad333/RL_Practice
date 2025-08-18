@@ -296,6 +296,11 @@ class RLRunner:
             print(f"[DEBUG] Rank {self.rank} skipping checkpoint save (rank 0 only)")
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
+        # Only run evaluation on rank 0 to avoid distributed issues
+        if self.rank != 0:
+            print(f"[Eval] Skipping evaluation on rank {self.rank} (rank 0 only)")
+            return
+            
         print(f"[Eval] starting in-process eval for step {self.step_id} …")
         
         # Switch to in-process evaluation to avoid subprocess issues
@@ -327,8 +332,19 @@ class RLRunner:
             self.ref_model.to("cpu")
             torch.cuda.empty_cache(); gc.collect()
             
-            # Run evaluation in-process (allows multi-GPU if available)
+            # Force evaluation to use only GPU 0 to avoid tensor size issues
+            import os
+            original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+            
+            # Run evaluation in-process (single GPU only)
             eval_main(**eval_args)
+            
+            # Restore original CUDA_VISIBLE_DEVICES
+            if original_cuda_visible is not None:
+                os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible
+            else:
+                os.environ.pop('CUDA_VISIBLE_DEVICES', None)
             
             print(f"[Eval] In-process evaluation completed successfully")
             
