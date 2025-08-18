@@ -24,7 +24,7 @@ def max_correct_len_metric(records: List[EvalRecord]) -> List[Dict]:
             if correct:
                 # compute len
                 # first extract c.o.t.
-                cot = g.split('</think>', 1)[0].strip
+                cot = g.split('</think>', 1)[0].strip()
                 max_l_cot = max(max_l_cot, len(tok(cot, add_special_tokens=False).input_ids))
         out.append({'max_l_cot': max_l_cot})
     return out
