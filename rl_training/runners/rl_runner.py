@@ -196,39 +196,6 @@ class RLRunner:
                     dist.barrier()
                     print(f"[DEBUG] Rank {self.rank} exited post-GNS-probe barrier")
             
-            # Rank 0 determines if evaluation needs processing and broadcasts to all ranks
-            has_eval = False
-            if self.rank == 0:
-                has_eval = hasattr(self, '_pending_eval_data') and self._pending_eval_data is not None
-            
-            # Broadcast evaluation status from rank 0 to all ranks in distributed mode
-            if self.ddp:
-                eval_tensor = torch.tensor([1 if has_eval else 0], device=f"cuda:{self.local_rank}")
-                dist.broadcast(eval_tensor, src=0)
-                has_eval = bool(eval_tensor.item())
-            
-            # Now all ranks know if evaluation processing is needed
-            if has_eval:
-                if self.rank == 0:
-                    print(f"[DEBUG] Rank {self.rank} processing delayed evaluation (step_id={self._pending_eval_data['step_id']})")
-                    try:
-                        self._run_eval(self._pending_eval_data['save_dir'])
-                        print(f"[DEBUG] Rank {self.rank} COMPLETED delayed evaluation (step_id={self._pending_eval_data['step_id']})")
-                    except Exception as e:
-                        print(f"[EVAL] delayed evaluation failed: {e}")
-                    finally:
-                        self._pending_eval_data = None  # Clear saved data
-                else:
-                    print(f"[DEBUG] Rank {self.rank} waiting for rank 0 to complete evaluation")
-                    if hasattr(self, '_pending_eval_data'):
-                        self._pending_eval_data = None  # Clear any saved data on non-rank-0
-                
-                # Barrier: All ranks wait for rank 0 to finish evaluation before proceeding
-                if self.ddp:
-                    print(f"[DEBUG] Rank {self.rank} entering post-evaluation barrier")
-                    dist.barrier()
-                    print(f"[DEBUG] Rank {self.rank} exited post-evaluation barrier")
-            
             # Memory monitoring after cleanup (rb is cleaned up inside _train_one_buffer)
             if torch.cuda.is_available():
                 mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
@@ -237,17 +204,6 @@ class RLRunner:
             if self.step_id % self.save_every == 0:
                 self._save_ckpt()
         self._save_ckpt(final=True)
-        
-        # Process final evaluation if scheduled (Option 2: Buffer Data Preservation)
-        if hasattr(self, '_pending_eval_data') and self._pending_eval_data is not None:
-            print(f"[DEBUG] Rank {self.rank} processing final delayed evaluation (step_id={self._pending_eval_data['step_id']})")
-            try:
-                self._run_eval(self._pending_eval_data['save_dir'])
-                print(f"[DEBUG] Rank {self.rank} COMPLETED final delayed evaluation (step_id={self._pending_eval_data['step_id']})")
-            except Exception as e:
-                print(f"[EVAL] final delayed evaluation failed: {e}")
-            finally:
-                self._pending_eval_data = None  # Clear saved data
 
     def _train_one_buffer(self, rb, K, ga_steps, B):
         print(f"[DEBUG] Rank {self.rank} entered _train_one_buffer with {len(rb)} prompts, K={K}, ga_steps={ga_steps}, B={B}")
@@ -333,17 +289,9 @@ class RLRunner:
             _unwrap(self.model).save_pretrained(save_dir)  # Changed 8/11
             print(f"saved model to {save_dir}")
             
-            # Save evaluation data for delayed processing (Option 2 pattern for eval)
-            eval_every = self.cfg.get("eval_every", 1)
-            if eval_every > 0 and (final or self.step_id % eval_every == 0):
-                print(f"[DEBUG] Rank {self.rank} scheduling delayed evaluation (step_id={self.step_id})")
-                self._pending_eval_data = {
-                    'save_dir': save_dir,
-                    'step_id': self.step_id,
-                    'is_final': final
-                }
-            else:
-                print(f"[DEBUG] Rank {self.rank} no evaluation scheduled this step (step_id={self.step_id})")
+            # Run evaluation immediately after saving checkpoint
+            print(f"[DEBUG] Rank {self.rank} running evaluation immediately (step_id={self.step_id})")
+            self._run_eval(save_dir)
         else:
             print(f"[DEBUG] Rank {self.rank} skipping checkpoint save (rank 0 only)")
 
