@@ -307,6 +307,7 @@ class RLRunner:
         try:
             # Import evaluation functions
             from evals.eval_runner import main as eval_main
+            import os  # Import os here for use in eval_args
             
             # Set up evaluation parameters
             eval_args = {
@@ -333,7 +334,6 @@ class RLRunner:
             torch.cuda.empty_cache(); gc.collect()
             
             # Force evaluation to use only GPU 0 to avoid tensor size issues
-            import os
             original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
             os.environ['CUDA_VISIBLE_DEVICES'] = '0'
             
