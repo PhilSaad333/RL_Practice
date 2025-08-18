@@ -379,8 +379,20 @@ class RLRunner:
             self.ref_model.to("cpu")
             torch.cuda.empty_cache(); gc.collect()
             
-            # Run evaluation in-process
-            eval_main(**eval_args)
+            # Force single-GPU evaluation to avoid distributed tensor issues
+            print(f"[Eval] Setting CUDA_VISIBLE_DEVICES to rank 0 GPU for evaluation...")
+            original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Force evaluation to use only GPU 0
+            
+            try:
+                # Run evaluation in-process on single GPU
+                eval_main(**eval_args)
+            finally:
+                # Restore original CUDA_VISIBLE_DEVICES
+                if original_cuda_visible:
+                    os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible
+                else:
+                    os.environ.pop('CUDA_VISIBLE_DEVICES', None)
             
             print(f"[Eval] In-process evaluation completed successfully")
             
