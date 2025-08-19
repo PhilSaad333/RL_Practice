@@ -1,0 +1,82 @@
+# testconfig_vllm.yaml - Test configuration with VLLM acceleration
+# Same as testconfig.yaml but with VLLM enabled for faster rollout collection
+
+# rl_configs/rl_qwen2.yaml
+backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
+
+# -------------- rollout collector ---------------- #
+
+# ---- rollout collection ----
+rollout_batch_size: 16
+num_generations: 8
+
+# Recompute logprobs: teacher-forcing forward micro-batch size
+tf_micro_batch: 8
+
+# Write rollouts.jsonl every N collect_batch() calls (0 = never)
+save_rollouts_every: 0
+
+# VLLM Configuration (new)
+use_vllm: true                    # Enable VLLM for faster generation
+vllm_reload_every: 5              # Reload VLLM engine every N steps
+vllm_tensor_parallel: 1           # Number of GPUs for VLLM (1 for single GPU)
+vllm_gpu_memory_utilization: 0.4  # Reserve memory for training (40% for VLLM, 60% for training)
+
+buffer_size       : 32    # REDUCED for memory debugging - was 32
+microbatch_size   : 2    # REDUCED for memory debugging - was 4  
+# grad_accum_steps automatically computed: buffer_size / (world_size * microbatch_size)
+# For 2 GPUs: 32 / (2 * 2) = 8 microbatches per GPU
+
+# Above gives much smaller memory footprint for debugging
+
+ppo_epochs        : 1 #3   # K: number of updates per rollout-collection step.
+max_new_tokens    : 100   # REDUCED for memory debugging - was 200
+temperature       : 0.7
+#top_p             : 0.95 #remove 
+
+eval_frac: 0.01        
+eval_batch_size: 64
+eval_temperature: 0.7
+
+reward_var_thresh : 0.01
+reject_all_zero   : true
+reject_all_max    : true
+
+reward_fns:
+  - tag_pref
+  #- tag_math_correct
+
+scheduler:
+  name          : mix_passrate
+  dataset_name  : gsm8k_r1_template
+  split         : "train"
+  ema_alpha     : 0.01
+  boundaries    : [0.2, 0.8]
+  sample_weights: [1, 1, 1]
+
+# ------------------ trainer (GRPO) --------------- #
+lr               : 1.0e-6
+clip_eps         : 0.2
+clip_+           : 0.2 #asymmetric clipping
+
+cfg["kl_beta"]   : 0.0 # If zero only computes KL with no grad for logging
+
+ent_coef         : 0.0            # future entropy bonus knob
+grad_clip        : 1.0
+bf16             : true
+
+gradient_checkpointing : true
+
+lr_scheduler: "const" # 'const' or 'cosine'
+
+save_every: 1
+total_steps: 2
+
+entropy_probe:
+  every: 0          # DISABLED for eval debugging
+  sketch_r: 0         # 0 = off for now
+  out_dir: entropy_probes
+
+gns_probe:
+  enabled: false    # Enable/disable in-loop gradient noise scale tracking

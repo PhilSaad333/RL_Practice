@@ -21,3 +21,10 @@ datasets/raw/
 # Data downloaded from Lambda instances
 data/
 !data/README.md
+
+# Claude Code specific files
+.claude/
+CLAUDE.md
+CLAUDE_GUIDE.md
+NEW_TRAINING_WORKFLOW.md
+lambda/
