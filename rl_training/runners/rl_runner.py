@@ -303,6 +303,7 @@ class RLRunner:
         
         # Synchronize all ranks before evaluation
         if hasattr(dist, 'is_initialized') and dist.is_initialized():
+            print(f"[Eval] Rank {self.rank} entering pre-eval barrier...")
             dist.barrier()
             print(f"[Eval] Rank {self.rank} passed pre-eval barrier")
         
@@ -317,36 +318,33 @@ class RLRunner:
             torch.cuda.empty_cache(); gc.collect()
             
             try:
-                # Build subprocess command for evaluation
-                cmd = [
-                    "python", "-m", "evals.eval_runner",
-                    "--backbone", self.cfg["eval_backbone"],
-                    "--eval-dataset", self.cfg["scheduler"]["dataset_name"],
-                    "--ckpt-path", str(ckpt_dir.absolute()),
-                    "--ckpt-step", str(self.step_id),
-                    "--batch-size", str(self.cfg.get("eval_batch_size", 8)),
-                    "--subset-frac", str(self.cfg.get("eval_frac", 1.0)),
-                    "--temperature", str(self.cfg.get("eval_temperature", 0.7)),
-                    "--top-p", "1.0",
-                    "--num-return-sequences", "8",
-                    "--max-new-tokens", "256",
-                    "--runs-root", str(self.dir.parent / "eval_runs")
-                ]
+                # Build subprocess command with conda activation
+                conda_cmd = (
+                    "source ~/miniconda3/etc/profile.d/conda.sh && "
+                    "conda activate rl && "
+                    "PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 python -m evals.eval_runner "
+                    f"--backbone {self.cfg['eval_backbone']} "
+                    f"--eval-dataset {self.cfg['scheduler']['dataset_name']} "
+                    f"--ckpt-path {str(ckpt_dir.absolute())} "
+                    f"--ckpt-step {str(self.step_id)} "
+                    f"--batch-size {str(self.cfg.get('eval_batch_size', 8))} "
+                    f"--subset-frac {str(self.cfg.get('eval_frac', 1.0))} "
+                    f"--temperature {str(self.cfg.get('eval_temperature', 0.7))} "
+                    f"--top-p 1.0 "
+                    f"--num-return-sequences 8 "
+                    f"--max-new-tokens 256 "
+                    f"--runs-root {str(self.dir.parent / 'eval_runs')}"
+                )
                 
-                print(f"[Eval] Running subprocess: {' '.join(cmd)}")
+                print(f"[Eval] Running subprocess with conda activation")
                 
-                # Run evaluation in clean subprocess (no distributed state)
-                env = os.environ.copy()
-                env['CUDA_VISIBLE_DEVICES'] = '0'  # Force single GPU
-                env['PYTHONPATH'] = '.'
-                
+                # Run evaluation in bash shell with conda environment
                 result = subprocess.run(
-                    cmd,
+                    ["bash", "-c", conda_cmd],
                     cwd=str(pathlib.Path.cwd()),
-                    env=env,
                     capture_output=True,
                     text=True,
-                    timeout=600  # 10 minute timeout
+                    timeout=300  # 5 minute timeout (reduced)
                 )
                 
                 if result.returncode == 0:
@@ -357,7 +355,7 @@ class RLRunner:
                     print(f"[Eval] stderr: {result.stderr}")
                     
             except subprocess.TimeoutExpired:
-                print(f"[Eval] Subprocess evaluation timed out after 10 minutes")
+                print(f"[Eval] Subprocess evaluation timed out after 5 minutes")
             except Exception as e:
                 print(f"[Eval] Subprocess evaluation failed: {e}")
                 import traceback
@@ -373,6 +371,7 @@ class RLRunner:
         
         # Synchronize all ranks after evaluation
         if hasattr(dist, 'is_initialized') and dist.is_initialized():
+            print(f"[Eval] Rank {self.rank} entering post-eval barrier...")
             dist.barrier()
             print(f"[Eval] Rank {self.rank} passed post-eval barrier")
             
