@@ -78,8 +78,8 @@ gradient_checkpointing : true
 
 lr_scheduler: "const" # 'const' or 'cosine'
 
-save_every: 2
-total_steps: 4
+save_every: 1
+total_steps: 2
 
 
 entropy_probe:
@@ -89,7 +89,7 @@ entropy_probe:
 
 
 gns_probe:
-  enabled: false    # Enable/disable in-loop gradient noise scale tracking
+  enabled: true     # Enable/disable in-loop gradient noise scale tracking
   # 
   # The GNS probe estimates the critical batch size for training by measuring
   # the ratio of gradient noise to signal. It runs with zero extra forward/backward
