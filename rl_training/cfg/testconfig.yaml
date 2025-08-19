@@ -18,9 +18,9 @@ num_generations: 8
 
 # VLLM settings (default: enabled for better performance)
 # Set use_vllm: false to use standard rollout collection instead
-use_vllm: true  # Enable VLLM for 2x H100 (160GB total)
+use_vllm: false  # Disabled due to dependency conflicts
 vllm_reload_every: 5                   # Reload model weights every N steps for online training
-vllm_gpu_memory_utilization: 0.4      # Reserve 40% GPU memory for VLLM, 60% for training (H100)
+vllm_gpu_memory_utilization: 0.25     # Reserve 25% GPU memory for VLLM, 75% for training
 
 # Recompute logprobs: teacher-forcing forward micro-batch size
 tf_micro_batch: 8
