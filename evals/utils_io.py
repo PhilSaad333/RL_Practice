@@ -105,7 +105,7 @@ def generate_with_logprobs(
     gen_cfg: GenerationConfig,
     stop_crit,
     *,
-    tf_micro_batch: int = 8,          # ← teacher-forcing chunk size
+    tf_micro_batch: int = 32,         # ← teacher-forcing chunk size
 ):
     # Here prompts are left-padded
     enc = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
