@@ -18,7 +18,7 @@ num_generations: 8
 
 # VLLM settings (default: enabled for better performance)
 # Set use_vllm: false to use standard rollout collection instead
-use_vllm: true
+use_vllm: false  # Disabled for A100 - CUDA multiprocessing conflict
 vllm_reload_every: 5                   # Reload model weights every N steps for online training
 vllm_gpu_memory_utilization: 0.25     # Reserve 25% GPU memory for VLLM, 75% for training
 
