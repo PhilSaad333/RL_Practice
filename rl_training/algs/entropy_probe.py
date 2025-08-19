@@ -78,7 +78,7 @@ class EntropyProbe:
         self,
         rollouts: Any,  # RolloutBatch 
         advantages: torch.Tensor,  # (B, G)
-        log_probs: torch.Tensor,   # (B, G, T_gen) sequence log probabilities
+        log_probs: torch.Tensor,   # (B, G) sequence-level log probabilities S(t) = log π(t)
         trainable_params: List[torch.nn.Parameter],
         optimizer: torch.optim.Optimizer,
         learning_rate: float,
@@ -92,7 +92,7 @@ class EntropyProbe:
         Args:
             rollouts: RolloutBatch with sequence data
             advantages: Computed advantages (B, G)
-            log_probs: Per-token log probabilities (B, G, T_gen)
+            log_probs: Sequence-level log probabilities S(t) = log π(t) (B, G)
             trainable_params: Model parameters with gradients
             optimizer: Adam optimizer (for conditioning factors)
             learning_rate: Current learning rate η
@@ -285,8 +285,9 @@ class EntropyProbe:
         B, G, T_gen = rollouts.gen_ids.shape
         gen_mask = (rollouts.gen_ids != pad_id).float()
         
-        # Compute sequence-level log probabilities S(t)
-        seq_log_probs = (log_probs * gen_mask).sum(dim=2)  # (B, G)
+        # log_probs is already sequence-level S(t) = log π(t) with shape (B, G)
+        # No need to sum over sequence dimension again
+        seq_log_probs = log_probs  # (B, G)
         
         self.current_step_sequences.clear()
         
