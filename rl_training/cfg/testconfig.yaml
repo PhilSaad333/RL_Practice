@@ -78,8 +78,8 @@ gradient_checkpointing : true
 
 lr_scheduler: "const" # 'const' or 'cosine'
 
-save_every: 8
-total_steps: 16
+save_every: 2
+total_steps: 4
 
 
 entropy_probe:
