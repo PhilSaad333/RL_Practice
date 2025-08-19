@@ -72,8 +72,8 @@ gradient_checkpointing: true
 lr_scheduler: "const"     # Constant learning rate
 
 # Checkpoint configuration
-save_every: 8             # Save checkpoint every N steps
-total_steps: 64           # Total training steps
+save_every: 2             # Save checkpoint every N steps
+total_steps: 4            # Total training steps (reduced for GNS testing)
 
 # -------------- Diagnostic Probes ---------------- #
 
