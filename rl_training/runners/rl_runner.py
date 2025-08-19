@@ -126,7 +126,8 @@ class RLRunner:
         
         if self.rank == 0:
             print(f"[AUTO CONFIG] buffer_size={self.buffer_size}, world_size={world_size}, microbatch_size={microbatch_size}")
-            print(f"[AUTO CONFIG] Calculated grad_accum_steps={auto_grad_accum_steps} (config had {self.cfg['grad_accum_steps']})")
+            config_grad_accum = self.cfg.get('grad_accum_steps', 'not specified')
+            print(f"[AUTO CONFIG] Calculated grad_accum_steps={auto_grad_accum_steps} (config had {config_grad_accum})")
         
         self.accum = auto_grad_accum_steps
         self.eval_cb = EvalCallback(self.dir, self.cfg)

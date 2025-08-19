@@ -26,7 +26,8 @@ save_rollouts_every: 0
 
 buffer_size       : 32    # REDUCED for memory debugging - was 32
 microbatch_size   : 2    # REDUCED for memory debugging - was 4  
-grad_accum_steps  : 8     # FIXED: 16 prompts/rank ÷ 2 microbatch_size = 8 microbatches
+# grad_accum_steps automatically computed: buffer_size / (world_size * microbatch_size)
+# For 2 GPUs: 32 / (2 * 2) = 8 microbatches per GPU
 
 # Above gives much smaller memory footprint for debugging
 
