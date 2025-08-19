@@ -89,7 +89,10 @@ entropy_probe:
 
 
 gns_probe:
-  enabled: true     # Enable/disable in-loop gradient noise scale tracking
+  enabled: true           # Track gradient noise for batch size optimization
+  window_size: 8          # Number of steps to store for variance computation
+  ema_alpha: 0.1          # EMA smoothing factor (0=no smoothing, 1=no memory)  
+  debug: true             # Print debug information for testing
   # 
   # The GNS probe estimates the critical batch size for training by measuring
   # the ratio of gradient noise to signal. It runs with zero extra forward/backward

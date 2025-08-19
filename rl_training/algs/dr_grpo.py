@@ -26,6 +26,7 @@ from transformers import (
 )
 
 from .base import RLAlgorithm, RolloutBatch
+from .gns_probe import GNSProbe
 
 # ============================================================================
 # UTILITIES
@@ -111,15 +112,14 @@ class DRGRPO(RLAlgorithm):
         self._probe_A_list = []    # list of per-seq A for saving
         self._probe_tokent_list = []  # mean token entropy per seq
         
-        # --- GNS (Gradient Noise Scale) Probe Fields ---
-        self._gns_enabled = bool(cfg.get("gns_probe", {}).get("enabled", False))
-        if self._gns_enabled:
-            print(f"[GNS] In-loop gradient noise scale tracking ENABLED")
-        self._gns_sum_sq: float = 0.0        # Σ_i ||g_i||^2, local accumulator this window
-        self._gns_m: int = 0                 # number of local micro-batches in this window
-        self._gns_prev: torch.Tensor | None = None  # previous flattened grad snapshot
-        self._gns_ess_sum_w: float = 0.0     # Σ w_i for ESS computation
-        self._gns_ess_sum_w2: float = 0.0    # Σ w_i^2 for ESS computation
+        # --- GNS (Gradient Noise Scale) Probe ---
+        gns_config = cfg.get("gns_probe", {})
+        self.gns_probe = GNSProbe(
+            window_size=gns_config.get("window_size", 8),
+            ema_alpha=gns_config.get("ema_alpha", 0.1),
+            enabled=gns_config.get("enabled", False),
+            debug=gns_config.get("debug", False)
+        )
         self._last_gns_metrics: Dict[str, float] = {}  # Store GNS metrics for logging
 
     # ------------------------------------------------------------------------
@@ -346,52 +346,31 @@ class DRGRPO(RLAlgorithm):
         with maybe():
             loss.backward()
         
-        # ====================================================================
-        # GNS PROBE: Track incremental gradients after each micro-backward
-        # ====================================================================
-        if self._gns_enabled:
-            snap = self._grad_snapshot()  # current accumulated grad (local)
-            if self._gns_prev is None:
-                micro = snap
-            else:
-                micro = snap - self._gns_prev
-            self._gns_prev = snap
-            micro_norm_sq = float((micro.double() * micro.double()).sum().item())
-            self._gns_sum_sq += micro_norm_sq
-            self._gns_m += 1
-            
-            # Debug: log micro gradient norms to understand what's happening
-            if self._gns_m <= 3 and dist.get_rank() == 0:
-                print(f"[GNS DEBUG] Micro {self._gns_m}: ||g_micro||^2 = {micro_norm_sq:.6e}, accumulated = {self._gns_sum_sq:.6e}")
-            
-            # Track ESS weights for this micro-batch
-            if rollouts is not None:
-                B, G, T_g = rollouts.gen_ids.shape
-                gen_mask = (rollouts.gen_ids != self.pad_id).float()
-                
-                # Compute Dr-GRPO weights: w_{p,i} = 1 / (G * L_max(p))
-                tokens_per_gen = gen_mask.sum(dim=2)  # (B, G)
-                L_max = tokens_per_gen.max(dim=-1).values.clamp_min(1.0)  # (B,)
-                
-                # Each generation has weight 1/(G * L_max(p))
-                for b in range(B):
-                    w = 1.0 / (G * L_max[b].item())
-                    # G generations with same weight for this prompt
-                    self._gns_ess_sum_w += G * w
-                    self._gns_ess_sum_w2 += G * w * w
-
         if sync_grads:
             # ================================================================
-            # GNS PROBE: Compute and log gradient noise scale before opt step
+            # GNS PROBE: Store gradient snapshot after full step
             # ================================================================
-            if self._gns_enabled:
-                self._compute_and_log_gns()
-                # Reset GNS accumulators for next window
-                self._gns_sum_sq = 0.0
-                self._gns_m = 0
-                self._gns_prev = None
-                self._gns_ess_sum_w = 0.0
-                self._gns_ess_sum_w2 = 0.0
+            if self.gns_probe.enabled:
+                # Compute Dr-GRPO weight for this step
+                dr_grpo_weight = 1.0  # Default weight
+                if rollouts is not None:
+                    B, G, T_g = rollouts.gen_ids.shape
+                    gen_mask = (rollouts.gen_ids != self.pad_id).float()
+                    
+                    # Compute total Dr-GRPO weight for this step
+                    tokens_per_gen = gen_mask.sum(dim=2)  # (B, G)
+                    L_max = tokens_per_gen.max(dim=-1).values.clamp_min(1.0)  # (B,)
+                    
+                    # Sum weights across all samples: Σ_b (G / (G * L_max[b])) = Σ_b (1 / L_max[b])
+                    dr_grpo_weight = float((1.0 / L_max).sum().item())
+                
+                # Store gradient snapshot
+                self.gns_probe.store_gradient(self._trainable_params(), dr_grpo_weight)
+                
+                # Compute metrics if we have enough data
+                if self.gns_probe.should_compute():
+                    buffer_size = self.cfg.get("buffer_size", 32)
+                    self._last_gns_metrics = self.gns_probe.compute_metrics(buffer_size)
             
             clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
             self.opt.step()
@@ -456,95 +435,6 @@ class DRGRPO(RLAlgorithm):
         unwrapped_policy = _unwrap(self.policy)
         return [p for p in unwrapped_policy.parameters() if isinstance(p, torch.nn.Parameter) and p.requires_grad]
     
-    # ========================================================================
-    # GNS PROBE METHODS (TODO: refactor to separate module)
-    # ========================================================================
-    def _grad_snapshot(self) -> torch.Tensor:
-        """Snapshot current accumulated gradients as a flattened vector."""
-        chunks = []
-        for p in self._trainable_params():
-            if p.grad is None:
-                continue
-            chunks.append(p.grad.detach().float().flatten())
-        if not chunks:
-            return torch.zeros(1, device="cpu")
-        return torch.cat(chunks).cpu()
-    
-    def _micro_inc_sqnorm(self) -> float:
-        """Compute squared norm of incremental micro-gradient (unused but kept for reference)."""
-        s = 0.0
-        for p in self._trainable_params():
-            if p.grad is None:
-                continue
-            g = p.grad.detach().float()
-            s += float((g * g).sum().item())
-        return s
-    
-    def _compute_and_log_gns(self) -> None:
-        """Compute gradient noise scale and critical batch size on sync micro."""
-        # Compute ||G||^2 from the (global-average) .grad that DDP wrote
-        G2_local = 0.0
-        for p in self._trainable_params():
-            if p.grad is None:
-                continue
-            g = p.grad.detach().float()
-            G2_local += float((g * g).sum().item())
-        
-        # Compute local gradient statistics BEFORE all-reduce
-        # Each device has its own microbatch gradients
-        E_g2_local = self._gns_sum_sq / max(self._gns_m, 1)
-        
-        # Compute local variance (each device's gradient noise)
-        tr_sigma_local = max(E_g2_local - G2_local, 0.0)
-        gns_mu_local = tr_sigma_local / max(G2_local, 1e-12)
-        
-        # Debug output
-        if dist.get_rank() == 0:
-            print(f"[GNS DEBUG] E[||g||^2]={E_g2_local:.6e}, ||G||^2={G2_local:.6e}, tr_sigma={tr_sigma_local:.6e}, m={self._gns_m}")
-        
-        # All-reduce the local statistics to get global averages
-        local_stats = torch.tensor([tr_sigma_local, gns_mu_local, G2_local,
-                                    self._gns_ess_sum_w, self._gns_ess_sum_w2], 
-                                   device=self.device, dtype=torch.float64)
-        if dist.is_initialized():
-            dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
-            world_size = dist.get_world_size()
-            # Average the variance and GNS across devices
-            tr_sigma_micro = float(local_stats[0].item()) / world_size
-            gns_mu = float(local_stats[1].item()) / world_size
-            G2_global = float(local_stats[2].item()) / world_size
-        else:
-            tr_sigma_micro = tr_sigma_local
-            gns_mu = gns_mu_local
-            G2_global = G2_local
-        
-        sum_w_all = float(local_stats[3].item())
-        sum_w2_all = float(local_stats[4].item())
-        
-        # Compute Effective Sample Size (ESS) for weighted losses
-        # ESS = (Σ w)^2 / (Σ w^2)
-        if sum_w2_all > 0:
-            ess_global = (sum_w_all * sum_w_all) / sum_w2_all
-        else:
-            # Fallback to simple count if weights not tracked
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
-            micro_batch_size = self.cfg.get("micro_batch_size", 1)
-            num_generations = self.cfg.get("num_generations", 8)
-            ess_global = world_size * micro_batch_size * num_generations
-        
-        # Use ESS as the effective batch size for critical batch size computation
-        Bsimple_from_mu = gns_mu * ess_global
-        
-        # Store metrics for logging
-        self._last_gns_metrics = {
-            "gns_mu": gns_mu,
-            "Bsimple_from_mu": Bsimple_from_mu,
-            "gns_ess": ess_global,
-            "gns_consistency_ratio": (Bsimple_from_mu / ess_global) / max(gns_mu, 1e-12),
-            "gns_G2": G2_global,
-            "gns_tr_sigma": tr_sigma_micro,
-        }
-
     # ========================================================================
     # ENTROPY PROBE IMPLEMENTATION (complex, needs refactoring)
     # ========================================================================
