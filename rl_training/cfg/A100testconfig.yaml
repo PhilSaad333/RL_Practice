@@ -85,14 +85,22 @@ entropy_probe:
   sketch_r: 0
   out_dir: entropy_probes
 
-# Gradient Noise Scale probe (ENABLED with debug for testing)
+# Gradient Noise Scale probe (DISABLED for entropy probe testing)
 gns_probe:
-  enabled: true           # Track gradient noise for batch size optimization
+  enabled: false          # Disabled to focus on entropy probe testing
   window_size: 8          # Number of steps to store for variance computation
   ema_alpha: 0.1          # EMA smoothing factor
-  debug: true             # Print debug information for testing
+  debug: false            # Print debug information for testing
+  
+# Entropy Probe (ENABLED for first-order entropy change analysis)
+entropy_probe:
+  enabled: true           # Enable first-order entropy change analysis
+  debug: true             # Print debug information
+  max_sequences: 200      # Memory safety limit for A100 testing
+  store_full_kernel: true # Store complete K_1(t,t') Fisher kernel matrix
+  save_every: 2           # Save detailed data every N steps
   # 
-  # Testing the new GNS probe implementation that stores gradients
-  # across multiple training steps to compute proper variance.
-  # Should fix the gns_tr_sigma = 0 issue we were seeing.
-  # Will compute GNS metrics every 8 steps after window fills up.
+  # Testing the new entropy probe implementation that computes:
+  # δH = -η * (1/(B*G)) * Σ (S(t) - S̄) * K_1(t,t') * A(t') * (1/L_max)
+  # Where K_1(t,t') is the Fisher kernel with Adam conditioning.
+  # This requires per-sequence gradient computation (expensive but accurate).

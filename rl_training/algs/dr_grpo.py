@@ -121,6 +121,17 @@ class DRGRPO(RLAlgorithm):
             debug=gns_config.get("debug", False)
         )
         self._last_gns_metrics: Dict[str, float] = {}  # Store GNS metrics for logging
+        
+        # --- Entropy Probe (First-order entropy change analysis) ---
+        from .entropy_probe import EntropyProbe
+        entropy_config = cfg.get("entropy_probe", {})
+        self.entropy_probe = EntropyProbe(
+            enabled=entropy_config.get("enabled", False),
+            debug=entropy_config.get("debug", False),
+            max_sequences=entropy_config.get("max_sequences", 1000),
+            store_full_kernel=entropy_config.get("store_full_kernel", True)
+        )
+        self._last_entropy_metrics: Dict[str, float] = {}  # Store entropy metrics for logging
 
     # ------------------------------------------------------------------------
     # CORE TRAINING METHODS
@@ -131,6 +142,18 @@ class DRGRPO(RLAlgorithm):
         """Return centred (but *not* normalised) advantage for Dr-GRPO."""
         mean_r = rewards.mean(dim=1, keepdim=True)
         return rewards - mean_r  # (B, G)
+        
+    @torch.no_grad() 
+    def _compute_sequence_log_probs(self, rollouts: RolloutBatch) -> torch.Tensor:
+        """Compute sequence-level log probabilities S(t) = log π(t) for entropy probe."""
+        # Use the precomputed logprobs from rollouts (per-token) and sum over generation
+        B, G, T_gen = rollouts.gen_ids.shape
+        gen_mask = (rollouts.gen_ids != self.pad_id).float()  # (B, G, T_gen)
+        
+        # Sum per-token log probabilities to get sequence log probabilities
+        seq_log_probs = (rollouts.logprobs * gen_mask).sum(dim=2)  # (B, G)
+        
+        return seq_log_probs
 
     def step(
         self,
@@ -202,8 +225,9 @@ class DRGRPO(RLAlgorithm):
         # 5) optional ratio logging
         self._maybe_log_ratios(ratios, gen_mask)
 
-        # 6) optimise (pass rollouts for ESS computation if GNS enabled)
-        self._backward_and_step(loss, sync_grads, rollouts if self.gns_probe.enabled else None)
+        # 6) optimise (pass rollouts for ESS computation if GNS enabled or entropy probe enabled)
+        pass_rollouts = self.gns_probe.enabled or self.entropy_probe.enabled
+        self._backward_and_step(loss, sync_grads, rollouts if pass_rollouts else None)
 
         # 7) metrics
         metrics: Dict[str, float] = {
@@ -219,6 +243,10 @@ class DRGRPO(RLAlgorithm):
         # Add GNS metrics if available
         if self._last_gns_metrics:
             metrics.update(self._last_gns_metrics)
+            
+        # Add entropy probe metrics if available
+        if self._last_entropy_metrics:
+            metrics.update(self._last_entropy_metrics)
 
         # ====================================================================
         # ENTROPY PROBE SECTION (can be refactored out)
@@ -371,6 +399,49 @@ class DRGRPO(RLAlgorithm):
                 if self.gns_probe.should_compute():
                     buffer_size = self.cfg.get("buffer_size", 32)
                     self._last_gns_metrics = self.gns_probe.compute_metrics(buffer_size)
+                    
+            # ================================================================
+            # ENTROPY PROBE: Store per-sequence gradients and compute δH
+            # ================================================================
+            if self.entropy_probe.enabled and rollouts is not None:
+                # Compute advantages and sequence log probabilities
+                advantages = self._compute_advantage(rollouts.reward)  # (B, G)
+                seq_log_probs = self._compute_sequence_log_probs(rollouts)  # (B, G)
+                
+                # Get current learning rate
+                current_lr = self.opt.param_groups[0]['lr']
+                
+                try:
+                    # Store entropy probe data (this computes per-sequence gradients)
+                    self.entropy_probe.store_step_data(
+                        rollouts=rollouts,
+                        advantages=advantages,
+                        log_probs=seq_log_probs,
+                        trainable_params=self._trainable_params(),
+                        optimizer=self.opt,
+                        learning_rate=current_lr,
+                        step_idx=self.actual_opt_step,
+                        policy_model=self.policy,
+                        pad_id=self.pad_id
+                    )
+                    
+                    # Get computed metrics
+                    self._last_entropy_metrics = self.entropy_probe.get_metrics()
+                    
+                    # Save detailed data periodically
+                    entropy_config = self.cfg.get("entropy_probe", {})
+                    save_every = entropy_config.get("save_every", 10)
+                    if self.actual_opt_step % save_every == 0:
+                        save_path = f"/tmp/entropy_probe_step_{self.actual_opt_step}.json"
+                        self.entropy_probe.save_data(save_path)
+                        if self.entropy_probe.debug:
+                            print(f"[EntropyProbe] Saved detailed data to {save_path}")
+                    
+                except Exception as e:
+                    if self.entropy_probe.debug:
+                        print(f"[EntropyProbe] Error in step {self.actual_opt_step}: {e}")
+                    # Clear partial state on error
+                    self.entropy_probe.reset()
             
             clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
             self.opt.step()
