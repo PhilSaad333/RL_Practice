@@ -16,6 +16,12 @@ eval_backbone: qwen2_5_15
 rollout_batch_size: 16
 num_generations: 8
 
+# VLLM settings (default: enabled for better performance)
+# Set use_vllm: false to use standard rollout collection instead
+use_vllm: true
+vllm_reload_every: 5                   # Reload model weights every N steps for online training
+vllm_gpu_memory_utilization: 0.4      # Reserve 40% GPU memory for VLLM, 60% for training
+
 # Recompute logprobs: teacher-forcing forward micro-batch size
 tf_micro_batch: 8
 
@@ -72,8 +78,8 @@ gradient_checkpointing : true
 
 lr_scheduler: "const" # 'const' or 'cosine'
 
-save_every: 1
-total_steps: 2
+save_every: 8
+total_steps: 16
 
 
 entropy_probe:

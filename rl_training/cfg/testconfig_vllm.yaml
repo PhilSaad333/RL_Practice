@@ -1,5 +1,5 @@
-# testconfig_vllm.yaml - Test configuration with VLLM acceleration
-# Same as testconfig.yaml but with VLLM enabled for faster rollout collection
+# testconfig_vllm.yaml - DEPRECATED: VLLM is now default in testconfig.yaml
+# This file is kept for reference. Use testconfig.yaml with use_vllm: false to disable VLLM
 
 # rl_configs/rl_qwen2.yaml
 backbone: Qwen/Qwen2.5-1.5B
