@@ -385,7 +385,7 @@ class RLRunner:
                 },
                 "training_config": dict(self.cfg),
                 "distributed_info": {
-                    "world_size": self.world_size,
+                    "world_size": dist.get_world_size() if dist.is_initialized() else 1,
                     "rank": self.rank,
                     "local_rank": self.local_rank
                 }
