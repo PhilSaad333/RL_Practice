@@ -20,7 +20,7 @@ num_generations: 8
 # Set use_vllm: false to use standard rollout collection instead
 use_vllm: true
 vllm_reload_every: 5                   # Reload model weights every N steps for online training
-vllm_gpu_memory_utilization: 0.3      # Reserve 30% GPU memory for VLLM, 70% for training
+vllm_gpu_memory_utilization: 0.25     # Reserve 25% GPU memory for VLLM, 75% for training
 
 # Recompute logprobs: teacher-forcing forward micro-batch size
 tf_micro_batch: 8

@@ -1,6 +1,6 @@
 # rl_training/runners/collect_rollouts_vllm.py
 from __future__ import annotations
-import re, json, math, time, tempfile, shutil
+import re, json, math, time, tempfile, shutil, gc, os
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Sequence, Optional
@@ -395,8 +395,41 @@ class VLLMRolloutCollector:
     def cleanup(self):
         """Clean up VLLM engine and temporary files."""
         if self.vllm_engine is not None:
-            del self.vllm_engine
-            torch.cuda.empty_cache()
+            try:
+                # Properly shutdown VLLM engine and its worker processes
+                if hasattr(self.vllm_engine, 'llm_engine'):
+                    if hasattr(self.vllm_engine.llm_engine, 'shutdown'):
+                        self.vllm_engine.llm_engine.shutdown()
+                    
+                    # Clean up model runner and workers
+                    if hasattr(self.vllm_engine.llm_engine, 'model_executor'):
+                        executor = self.vllm_engine.llm_engine.model_executor
+                        if hasattr(executor, 'shutdown'):
+                            executor.shutdown()
+                
+                # Delete the engine
+                del self.vllm_engine
+                self.vllm_engine = None
+                
+                # Force aggressive GPU memory cleanup
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+                # Try to trigger garbage collection
+                gc.collect()
+                
+                # Additional CUDA cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+                    torch.cuda.empty_cache()
+                
+                print("[DEBUG] VLLM engine cleaned up successfully")
+                
+            except Exception as e:
+                print(f"[WARNING] Error during VLLM cleanup: {e}")
+                # Still try to free memory
+                self.vllm_engine = None
+                torch.cuda.empty_cache()
         
         if self.temp_model_dir and self.temp_model_dir.exists():
             shutil.rmtree(self.temp_model_dir)
