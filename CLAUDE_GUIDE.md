@@ -22,24 +22,26 @@
 - SSH key location: `~/.ssh/lambda_new`
 - Read the documentation in the `lambda/` folder for complete setup procedures
 
-### 5. Project Structure
+### 5. Project Structure (Updated Aug 2025)
 - **Main algorithm**: `rl_training/algs/dr_grpo.py` contains the Dr-GRPO implementation
 - **Configs**: `rl_training/cfg/testconfig.yaml` for test runs
 - **Evaluations**: `evals/` folder contains evaluation pipeline
-- **Checkpoints**: Stored in S3, synced to `localfs/lora_checkpoints/`
-- **Training runs**: Output to `localfs/rl_runs/`
+- **Checkpoints**: Stored in S3, synced to `localfs/checkpoints/qwen2_5_15_finetuned/`
+- **Training runs**: Output to `localfs/training_runs/` (NEW structure with training_state/)
+- **Eval runs**: Output to `localfs/eval_runs/` (separate from training)
 
 ### 6. Key Features
 - **GNS Probe**: In-loop Gradient Noise Scale tracking in dr_grpo.py
 - **DDP Support**: Multi-GPU training with proper gradient synchronization
 - **ESS Computation**: Effective Sample Size for weighted losses in Dr-GRPO
 
-### 7. Common Commands
+### 7. Common Commands (Updated Aug 2025)
 - **Conda environment**: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate rl`
-- **Single GPU training**: `PYTHONPATH=. python rl_training/runners/rl_runner.py --cfg rl_training/cfg/testconfig.yaml --ckpt /home/ubuntu/localfs/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156`
 - **Multi-GPU training (2x H100)**: `PYTHONPATH=. torchrun --nproc_per_node=2 rl_training/runners/rl_runner.py --cfg rl_training/cfg/testconfig.yaml --ckpt /home/ubuntu/localfs/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156`
+- **Batch evaluation**: `python rl_training/runners/eval_batch.py --training-run run_YYYY-MM-DD_HH-MM-SS --subset-frac 0.02`
+- **Resume training**: `python rl_training/runners/resume_training.py --training-run run_YYYY-MM-DD_HH-MM-SS --from-step latest --additional-steps 10`
+- **S3 backup**: `python rl_training/runners/sync_to_s3.py --action backup --training-run run_YYYY-MM-DD_HH-MM-SS`
 - **Alternative runner**: `rl_training/runners/rl_runner_trl.py` (may need TRL updates - DO NOT USE unless specifically asked)
-- **Evaluation**: Uses the `evals/` pipeline
 - **TensorBoard**: Port forwarding typically on 16007 (user runs PowerShell command)
 
 ### 8. Testing Protocol
