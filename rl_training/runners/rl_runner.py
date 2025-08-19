@@ -15,7 +15,9 @@ from rl_training.algs.dr_grpo import DRGRPO
 from rl_training.algs.base import RolloutBatch
 from rl_training.runners.eval_callback import EvalCallback
 
-RUN_ROOT = pathlib.Path(os.environ.get("RUN_ROOT", "/lambda/nfs/localfs/rl_runs"))
+LOCALFS_ROOT = pathlib.Path(os.environ.get("LOCALFS_ROOT", "/lambda/nfs/localfs"))
+TRAINING_ROOT = LOCALFS_ROOT / "training_runs"
+EVAL_ROOT = LOCALFS_ROOT / "eval_runs"
 
 
 def slice_batch(rb: RolloutBatch, sl: slice) -> RolloutBatch:
@@ -30,7 +32,10 @@ def _unwrap(model):
 
 
 class RLRunner:
-    def __init__(self, cfg_path: str, lora_ckpt: str):
+    def __init__(self, cfg_path: str, lora_ckpt: str, 
+                 resume_optimizer_path: str = None,
+                 resume_scheduler_path: str = None,
+                 resume_info: dict = None):
         # ─── distributed init ────────────────────────────────────────────
         # Changed 8/11: make DDP optional (works in single-GPU Colab)
         if os.environ.get("WORLD_SIZE", "1") != "1":
@@ -47,15 +52,23 @@ class RLRunner:
         # ─── I/O setup ───────────────────────────────────────────────────
         self.cfg = yaml.safe_load(open(cfg_path))
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.dir = RUN_ROOT / f"run_{stamp}"
-        self.dir.mkdir(parents=True, exist_ok=True)
-        # Ensure eval_runs directory also exists
-        (self.dir.parent / "eval_runs").mkdir(parents=True, exist_ok=True)
-        shutil.copy(cfg_path, self.dir / "config.yaml")
+        self.dir = TRAINING_ROOT / f"run_{stamp}"
+        
+        # Create directory structure
+        if self.rank == 0:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            (self.dir / "logs").mkdir(exist_ok=True)
+            (self.dir / "tensorboard").mkdir(exist_ok=True)
+            (self.dir / "training_state").mkdir(exist_ok=True)
+            EVAL_ROOT.mkdir(parents=True, exist_ok=True)
+            shutil.copy(cfg_path, self.dir / "config.yaml")
 
-        self.tb = SummaryWriter(str(self.dir)) if self.rank == 0 else None
+        # Wait for rank 0 to create directories
+        if hasattr(dist, 'is_initialized') and dist.is_initialized():
+            dist.barrier()
+
+        self.tb = SummaryWriter(str(self.dir / "tensorboard")) if self.rank == 0 else None
         self.save_every = self.cfg.get("save_every", 100)
-        self.step_id = 0
 
         # -----GNS----------------------------------------------------------
         self.gns_cfg = self.cfg.get("gns_probe", {})
@@ -100,10 +113,10 @@ class RLRunner:
         self.ref_model = self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")  # Changed 8/11
 
         self.collector = RolloutCollector(self.model, self.tok, self.cfg,
-                                          out_dir=self.dir,
+                                          out_dir=self.dir / "logs",
                                           device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
         self.algo = DRGRPO(self.model, self.cfg, pad_id=self.pad_id,
-                           ratio_log_path=self.dir / "ratios.jsonl")
+                           ratio_log_path=self.dir / "logs" / "ratios.jsonl")
         
         # Calculate grad_accum_steps automatically based on distributed setup
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -117,6 +130,63 @@ class RLRunner:
         
         self.accum = auto_grad_accum_steps
         self.eval_cb = EvalCallback(self.dir, self.cfg)
+        
+        # Store resume information and paths
+        self.resume_info = resume_info
+        self.resume_optimizer_path = resume_optimizer_path
+        self.resume_scheduler_path = resume_scheduler_path
+        
+        # Set starting step based on resume info
+        if resume_info:
+            self.step_id = resume_info["step"]
+            if self.rank == 0:
+                print(f"🔄 Resuming from step {self.step_id}")
+        else:
+            self.step_id = 0
+        
+        # Load optimizer and scheduler states if resuming
+        if resume_optimizer_path and resume_scheduler_path:
+            self._load_training_states()
+        elif resume_optimizer_path or resume_scheduler_path:
+            print("⚠️ Warning: Only one of optimizer/scheduler paths provided, both needed for proper resumption")
+
+    @property
+    def optimizer(self):
+        """Access to the optimizer from the algorithm."""
+        return self.algo.opt
+    
+    @property
+    def scheduler(self):
+        """Access to the scheduler from the algorithm."""
+        return self.algo.lr_sched
+    
+    def _load_training_states(self):
+        """Load optimizer and scheduler states for resumption."""
+        if self.rank == 0:
+            print(f"📥 Loading training states...")
+            print(f"   Optimizer: {self.resume_optimizer_path}")
+            print(f"   Scheduler: {self.resume_scheduler_path}")
+        
+        try:
+            # Load optimizer state
+            optimizer_state = torch.load(self.resume_optimizer_path, map_location=f"cuda:{self.local_rank}")
+            self.optimizer.load_state_dict(optimizer_state)
+            
+            # Load scheduler state if scheduler exists
+            if self.scheduler is not None:
+                scheduler_state = torch.load(self.resume_scheduler_path, map_location=f"cuda:{self.local_rank}")
+                self.scheduler.load_state_dict(scheduler_state)
+            else:
+                if self.rank == 0:
+                    print("⚠️ No scheduler to load (scheduler is None)")
+            
+            if self.rank == 0:
+                print(f"✅ Training states loaded successfully")
+                
+        except Exception as e:
+            if self.rank == 0:
+                print(f"❌ Failed to load training states: {e}")
+            raise
 
     # ─── training loop ────────────────────────────────────────────────────
     def train(self, total_updates: int):
@@ -275,7 +345,7 @@ class RLRunner:
     def _log(self, d):
         if self.rank != 0:
             return
-        with open(self.dir / "train_log.jsonl", "a") as f:
+        with open(self.dir / "logs" / "train_log.jsonl", "a") as f:
             f.write(json.dumps({"step": self.step_id, **d}) + "\n")
         if self.tb:
             for k, v in d.items():
@@ -284,104 +354,57 @@ class RLRunner:
 
     def _save_ckpt(self, final: bool = False):
         tag = f"{self.step_id}" if not final else "final"
-        save_dir = self.dir / f"step_{tag}"
+        save_dir = self.dir / "training_state" / f"step_{tag}"
         if self.rank == 0:
-            _unwrap(self.model).save_pretrained(save_dir)  # Changed 8/11
-            print(f"saved model to {save_dir}")
+            # Save model (LoRA weights)
+            model_dir = save_dir / "model"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            _unwrap(self.model).save_pretrained(model_dir)
+            print(f"saved model to {model_dir}")
             
-            # Run evaluation immediately after saving checkpoint
-            print(f"[DEBUG] Rank {self.rank} running evaluation immediately (step_id={self.step_id})")
-            self._run_eval(save_dir)
+            # Save optimizer state
+            optimizer_path = save_dir / "optimizer.pt"
+            torch.save(self.optimizer.state_dict(), optimizer_path)
+            print(f"saved optimizer state to {optimizer_path}")
+            
+            # Save scheduler state
+            scheduler_path = save_dir / "scheduler.pt"
+            torch.save(self.scheduler.state_dict(), scheduler_path)
+            print(f"saved scheduler state to {scheduler_path}")
+            
+            # Save training info
+            training_info = {
+                "step": self.step_id,
+                "global_step": getattr(self, 'global_step', self.step_id),
+                "epoch": getattr(self, 'epoch', 0),
+                "model_config": {
+                    "backbone": self.cfg.get("backbone"),
+                    "eval_backbone": self.cfg.get("eval_backbone")
+                },
+                "training_config": dict(self.cfg),
+                "distributed_info": {
+                    "world_size": self.world_size,
+                    "rank": self.rank,
+                    "local_rank": self.local_rank
+                }
+            }
+            
+            training_info_path = save_dir / "training_info.json"
+            with open(training_info_path, 'w') as f:
+                json.dump(training_info, f, indent=2)
+            print(f"saved training info to {training_info_path}")
+            
+            # Create/update latest symlink
+            latest_link = self.dir / "training_state" / "step_latest"
+            if latest_link.exists() or latest_link.is_symlink():
+                latest_link.unlink()
+            latest_link.symlink_to(save_dir.name)
+            print(f"updated latest symlink to {save_dir.name}")
+            
+            print(f"[CHECKPOINT] Full training state saved to {save_dir}")
         else:
             print(f"[DEBUG] Rank {self.rank} skipping checkpoint save (rank 0 only)")
 
-    def _run_eval(self, ckpt_dir: pathlib.Path):
-        import subprocess
-        import torch.distributed as dist
-        
-        print(f"[Eval] starting subprocess eval for step {self.step_id} - all ranks syncing...")
-        
-        # Synchronize all ranks before evaluation
-        if hasattr(dist, 'is_initialized') and dist.is_initialized():
-            print(f"[Eval] Rank {self.rank} entering pre-eval barrier...")
-            dist.barrier()
-            print(f"[Eval] Rank {self.rank} passed pre-eval barrier")
-        
-        # Only rank 0 runs the evaluation subprocess
-        if self.rank == 0:
-            print(f"[Eval] Rank 0 starting subprocess evaluation...")
-            
-            # Move training models to CPU to free GPU memory  
-            print(f"[Eval] Moving training model to CPU...")
-            self.model.to("cpu")
-            self.ref_model.to("cpu")
-            torch.cuda.empty_cache(); gc.collect()
-            
-            try:
-                # Build subprocess command with conda activation
-                conda_cmd = (
-                    "source ~/miniconda3/etc/profile.d/conda.sh && "
-                    "conda activate rl && "
-                    "PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 python -m evals.eval_runner "
-                    f"--backbone {self.cfg['eval_backbone']} "
-                    f"--eval-dataset {self.cfg['scheduler']['dataset_name']} "
-                    f"--ckpt-path {str(ckpt_dir.absolute())} "
-                    f"--ckpt-step {str(self.step_id)} "
-                    f"--batch-size {str(self.cfg.get('eval_batch_size', 8))} "
-                    f"--subset-frac {str(self.cfg.get('eval_frac', 1.0))} "
-                    f"--temperature {str(self.cfg.get('eval_temperature', 0.7))} "
-                    f"--top-p 1.0 "
-                    f"--num-return-sequences 8 "
-                    f"--max-new-tokens 256 "
-                    f"--runs-root {str(self.dir.parent / 'eval_runs')}"
-                )
-                
-                print(f"[Eval] Running subprocess with conda activation")
-                print(f"[Eval] Command: {conda_cmd}")
-                print(f"[Eval] Working directory: {str(pathlib.Path.cwd())}")
-                
-                # Run evaluation in bash shell with conda environment
-                result = subprocess.run(
-                    ["bash", "-c", conda_cmd],
-                    cwd=str(pathlib.Path.cwd()),
-                    capture_output=True,
-                    text=True,
-                    timeout=300  # 5 minute timeout (reduced)
-                )
-                
-                print(f"[Eval] Subprocess completed with return code: {result.returncode}")
-                print(f"[Eval] stdout: {result.stdout[-300:] if result.stdout else 'No stdout'}")  # Last 300 chars
-                print(f"[Eval] stderr: {result.stderr[-300:] if result.stderr else 'No stderr'}")  # Last 300 chars
-                
-                if result.returncode == 0:
-                    print(f"[Eval] Subprocess evaluation completed successfully")
-                else:
-                    print(f"[Eval] Subprocess evaluation failed with return code {result.returncode}")
-                    print(f"[Eval] Full stderr: {result.stderr}")
-                    print(f"[Eval] Full stdout: {result.stdout}")
-                    
-            except subprocess.TimeoutExpired:
-                print(f"[Eval] Subprocess evaluation timed out after 5 minutes")
-            except Exception as e:
-                print(f"[Eval] Subprocess evaluation failed: {e}")
-                import traceback
-                traceback.print_exc()
-            finally:
-                # Move models back to GPU
-                torch.cuda.empty_cache(); gc.collect()
-                print(f"[Eval] Moving training model back to GPU...")
-                self.model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
-                self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
-        else:
-            print(f"[Eval] Rank {self.rank} waiting for rank 0 to complete evaluation...")
-        
-        # Synchronize all ranks after evaluation
-        if hasattr(dist, 'is_initialized') and dist.is_initialized():
-            print(f"[Eval] Rank {self.rank} entering post-eval barrier...")
-            dist.barrier()
-            print(f"[Eval] Rank {self.rank} passed post-eval barrier")
-            
-        print(f"[Eval] finished, resuming training.")
 
 
     def _probe_gns(self, rb):
@@ -592,6 +615,10 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--cfg",  required=True, help="Path to YAML config")
     p.add_argument("--ckpt", required=True, help="Path to LoRA adapter checkpoint dir")
+    # Resume training arguments
+    p.add_argument("--resume-optimizer", help="Path to saved optimizer state (.pt file)")
+    p.add_argument("--resume-scheduler", help="Path to saved scheduler state (.pt file)")
+    p.add_argument("--resume-training-info", help="Path to saved training info (.json file)")
     # tolerate torchrun/launch variants; ignored by our code
     p.add_argument("--local-rank", type=int, default=0)
     p.add_argument("--local_rank", type=int, default=0)
@@ -599,6 +626,18 @@ if __name__ == "__main__":
     args, _ = p.parse_known_args()
 
     cfg_dict = yaml.safe_load(open(args.cfg))
-    runner = RLRunner(args.cfg, args.ckpt)
+    
+    # Determine if this is a resume operation
+    resume_info = None
+    if args.resume_training_info:
+        import json
+        with open(args.resume_training_info, 'r') as f:
+            resume_info = json.load(f)
+        print(f"🔄 Resuming training from step {resume_info['step']}")
+    
+    runner = RLRunner(args.cfg, args.ckpt, 
+                      resume_optimizer_path=args.resume_optimizer,
+                      resume_scheduler_path=args.resume_scheduler,
+                      resume_info=resume_info)
     runner.train(total_updates=cfg_dict["total_steps"])
 
