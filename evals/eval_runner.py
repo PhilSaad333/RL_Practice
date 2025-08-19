@@ -63,7 +63,10 @@ def main(backbone: str = "phi2",
         quantized=False,         # Disabled for distributed training compatibility
     )
 
-    step_id = int(ckpt_step) if ckpt_step else int(Path(ckpt_path).name.rsplit("-", 1)[-1])
+    if ckpt_step:
+        step_id = ckpt_step if ckpt_step == "final" else int(ckpt_step)
+    else:
+        step_id = int(Path(ckpt_path).name.rsplit("-", 1)[-1])
 
 
     if subset_frac < 1.0:
@@ -139,7 +142,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-path", type=str, default=None, dest="ckpt_path")
     parser.add_argument("--ckpt-step", type=str, default=None, dest="ckpt_step")
     parser.add_argument("--eval-dataset", type=str, default="gsm8k", dest="eval_dataset")
-    parser.add_argument("--batch-size", type=int, default=2, dest="batch_size")
+    parser.add_argument("--batch-size", type=int, default=8, dest="batch_size")
     parser.add_argument("--subset-frac", type=float, default=1.0, dest="subset_frac")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=1.0, dest="top_p")
