@@ -15,19 +15,19 @@ from pathlib import Path
 
 def run_command(cmd, description=""):
     """Run a shell command and return success status"""
-    print(f"🔄 {description}")
+    print(f"[*] {description}")
     print(f"   Command: {' '.join(cmd)}")
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            print(f"✅ Success")
+            print(f"[+] Success")
             return True
         else:
-            print(f"❌ Failed: {result.stderr}")
+            print(f"[-] Failed: {result.stderr}")
             return False
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"[-] Error: {e}")
         return False
 
 def sync_training_run(ip, run_name, data_dir):
@@ -38,7 +38,9 @@ def sync_training_run(ip, run_name, data_dir):
     # Sync training run
     cmd = [
         "scp", "-r", "-i", "~/.ssh/lambda_new",
-        f"ubuntu@{ip}:/lambda/nfs/localfs/training_runs/{run_name}/",
+        "-o", "StrictHostKeyChecking=no", 
+        "-o", "UserKnownHostsFile=/dev/null",
+        f"ubuntu@{ip}:/home/ubuntu/localfs/training_runs/{run_name}/",
         str(local_path.parent)
     ]
     
@@ -51,7 +53,9 @@ def sync_training_run(ip, run_name, data_dir):
     
     cmd = [
         "scp", "-r", "-i", "~/.ssh/lambda_new", 
-        f"ubuntu@{ip}:/lambda/nfs/localfs/eval_runs/{run_name}_*",
+        "-o", "StrictHostKeyChecking=no", 
+        "-o", "UserKnownHostsFile=/dev/null",
+        f"ubuntu@{ip}:/home/ubuntu/localfs/eval_runs/{run_name}_*",
         str(eval_local_path)
     ]
     
@@ -66,7 +70,9 @@ def sync_metrics_only(ip, data_dir):
     # Sync consolidated metrics
     cmd = [
         "scp", "-i", "~/.ssh/lambda_new",
-        f"ubuntu@{ip}:/lambda/nfs/localfs/eval_runs/*/consolidated_metrics.csv",
+        "-o", "StrictHostKeyChecking=no", 
+        "-o", "UserKnownHostsFile=/dev/null",
+        f"ubuntu@{ip}:/home/ubuntu/localfs/eval_runs/*/consolidated_metrics.csv",
         str(metrics_dir)
     ]
     run_command(cmd, "Syncing consolidated metrics")
@@ -74,20 +80,24 @@ def sync_metrics_only(ip, data_dir):
     # Sync training logs
     cmd = [
         "scp", "-i", "~/.ssh/lambda_new",
-        f"ubuntu@{ip}:/lambda/nfs/localfs/training_runs/*/logs/train_log.jsonl",
+        "-o", "StrictHostKeyChecking=no", 
+        "-o", "UserKnownHostsFile=/dev/null",
+        f"ubuntu@{ip}:/home/ubuntu/localfs/training_runs/*/logs/train_log.jsonl",
         str(metrics_dir)
     ]
     run_command(cmd, "Syncing training logs")
 
 def list_remote_runs(ip):
     """List available runs on Lambda instance"""
-    print(f"📋 Available runs on {ip}:")
+    print(f"[*] Available runs on {ip}:")
     
     # List training runs
     cmd = [
-        "ssh", "-i", "~/.ssh/lambda_new",
+        "ssh", "-i", "~/.ssh/lambda_new", 
+        "-o", "StrictHostKeyChecking=no", 
+        "-o", "UserKnownHostsFile=/dev/null",
         f"ubuntu@{ip}",
-        "ls -la /lambda/nfs/localfs/training_runs/ | grep run_"
+        "ls -la /home/ubuntu/localfs/training_runs/ | grep run_"
     ]
     
     try:
@@ -119,8 +129,8 @@ def main():
     project_dir = script_dir.parent
     data_dir = project_dir / "data"
     
-    print(f"🎯 Syncing data from Lambda instance: {args.ip}")
-    print(f"📁 Local data directory: {data_dir}")
+    print(f"[*] Syncing data from Lambda instance: {args.ip}")
+    print(f"[*] Local data directory: {data_dir}")
     
     # List runs if requested
     if args.list:
@@ -142,22 +152,22 @@ def main():
             if sync_training_run(args.ip, run_name, data_dir):
                 success_count += 1
         
-        print(f"\\n🎉 Synced {success_count}/{len(available_runs)} runs successfully")
+        print(f"\\n[+] Synced {success_count}/{len(available_runs)} runs successfully")
         
     elif args.run:
         # Sync specific run
         if args.run in available_runs:
             sync_training_run(args.ip, args.run, data_dir)
         else:
-            print(f"❌ Run '{args.run}' not found on instance")
+            print(f"[-] Run '{args.run}' not found on instance")
             print(f"   Available runs: {available_runs}")
     
     else:
-        print("❌ Please specify --run, --all, --metrics-only, or --list")
+        print("[-] Please specify --run, --all, --metrics-only, or --list")
         sys.exit(1)
     
-    print(f"\\n📊 Data synced to {data_dir}")
-    print("💡 Use the notebooks/training_analysis.ipynb notebook to analyze the data")
+    print(f"\\n[+] Data synced to {data_dir}")
+    print("[*] Use the notebooks/training_analysis.ipynb notebook to analyze the data")
 
 if __name__ == "__main__":
     main()
