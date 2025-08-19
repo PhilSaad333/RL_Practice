@@ -46,7 +46,7 @@ def main(backbone: str = "phi2",
          ckpt_path: str | None = None,      # full Drive path or None
          ckpt_step: str | None = None,      # 500 / 1000 / 1404 / None
          eval_dataset: str = "gsm8k",
-         batch_size: int = 2,
+         batch_size: int = 32,
          subset_frac: float = 1.0,
          temperature: float = 0.7,
          top_p: float = 1.0,
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-path", type=str, default=None, dest="ckpt_path")
     parser.add_argument("--ckpt-step", type=str, default=None, dest="ckpt_step")
     parser.add_argument("--eval-dataset", type=str, default="gsm8k", dest="eval_dataset")
-    parser.add_argument("--batch-size", type=int, default=8, dest="batch_size")
+    parser.add_argument("--batch-size", type=int, default=32, dest="batch_size")
     parser.add_argument("--subset-frac", type=float, default=1.0, dest="subset_frac")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=1.0, dest="top_p")
