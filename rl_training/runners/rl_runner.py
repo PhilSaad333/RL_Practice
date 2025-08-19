@@ -296,36 +296,19 @@ class RLRunner:
             print(f"[DEBUG] Rank {self.rank} skipping checkpoint save (rank 0 only)")
 
     def _run_eval(self, ckpt_dir: pathlib.Path):
-        # Only run evaluation on rank 0 to avoid distributed issues
-        if self.rank != 0:
-            print(f"[Eval] Skipping evaluation on rank {self.rank} (rank 0 only)")
-            return
-            
-        print(f"[Eval] starting in-process eval for step {self.step_id} …")
+        import subprocess
+        import torch.distributed as dist
         
-        # Switch to in-process evaluation to avoid subprocess issues
-        try:
-            # Import evaluation functions
-            from evals.eval_runner import main as eval_main
-            import os  # Import os here for use in eval_args
-            
-            # Set up evaluation parameters
-            eval_args = {
-                'backbone': self.cfg["eval_backbone"],
-                'ft_dataset': self.cfg["scheduler"]["dataset_name"],
-                'ckpt_path': str(os.path.abspath(ckpt_dir)),
-                'ckpt_step': str(self.step_id),
-                'batch_size': self.cfg.get("eval_batch_size", 8),
-                'subset_frac': self.cfg.get("eval_frac", 1.0),
-                'eval_dataset': self.cfg["scheduler"]["dataset_name"],
-                'temperature': self.cfg.get("eval_temperature", 0.7),
-                'top_p': 1.0,
-                'num_return_sequences': 8,
-                'max_new_tokens': 256,
-                'runs_root': str(self.dir.parent / "eval_runs")
-            }
-            
-            print(f"[Eval] Running in-process evaluation with args: {eval_args}")
+        print(f"[Eval] starting subprocess eval for step {self.step_id} - all ranks syncing...")
+        
+        # Synchronize all ranks before evaluation
+        if hasattr(dist, 'is_initialized') and dist.is_initialized():
+            dist.barrier()
+            print(f"[Eval] Rank {self.rank} passed pre-eval barrier")
+        
+        # Only rank 0 runs the evaluation subprocess
+        if self.rank == 0:
+            print(f"[Eval] Rank 0 starting subprocess evaluation...")
             
             # Move training models to CPU to free GPU memory  
             print(f"[Eval] Moving training model to CPU...")
@@ -333,32 +316,67 @@ class RLRunner:
             self.ref_model.to("cpu")
             torch.cuda.empty_cache(); gc.collect()
             
-            # Force evaluation to use only GPU 0 to avoid tensor size issues
-            original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+            try:
+                # Build subprocess command for evaluation
+                cmd = [
+                    "python", "-m", "evals.eval_runner",
+                    "--backbone", self.cfg["eval_backbone"],
+                    "--eval-dataset", self.cfg["scheduler"]["dataset_name"],
+                    "--ckpt-path", str(ckpt_dir.absolute()),
+                    "--ckpt-step", str(self.step_id),
+                    "--batch-size", str(self.cfg.get("eval_batch_size", 8)),
+                    "--subset-frac", str(self.cfg.get("eval_frac", 1.0)),
+                    "--temperature", str(self.cfg.get("eval_temperature", 0.7)),
+                    "--top-p", "1.0",
+                    "--num-return-sequences", "8",
+                    "--max-new-tokens", "256",
+                    "--runs-root", str(self.dir.parent / "eval_runs")
+                ]
+                
+                print(f"[Eval] Running subprocess: {' '.join(cmd)}")
+                
+                # Run evaluation in clean subprocess (no distributed state)
+                env = os.environ.copy()
+                env['CUDA_VISIBLE_DEVICES'] = '0'  # Force single GPU
+                env['PYTHONPATH'] = '.'
+                
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(pathlib.Path.cwd()),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=600  # 10 minute timeout
+                )
+                
+                if result.returncode == 0:
+                    print(f"[Eval] Subprocess evaluation completed successfully")
+                    print(f"[Eval] stdout: {result.stdout[-200:]}")  # Last 200 chars
+                else:
+                    print(f"[Eval] Subprocess evaluation failed with return code {result.returncode}")
+                    print(f"[Eval] stderr: {result.stderr}")
+                    
+            except subprocess.TimeoutExpired:
+                print(f"[Eval] Subprocess evaluation timed out after 10 minutes")
+            except Exception as e:
+                print(f"[Eval] Subprocess evaluation failed: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Move models back to GPU
+                torch.cuda.empty_cache(); gc.collect()
+                print(f"[Eval] Moving training model back to GPU...")
+                self.model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+                self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        else:
+            print(f"[Eval] Rank {self.rank} waiting for rank 0 to complete evaluation...")
+        
+        # Synchronize all ranks after evaluation
+        if hasattr(dist, 'is_initialized') and dist.is_initialized():
+            dist.barrier()
+            print(f"[Eval] Rank {self.rank} passed post-eval barrier")
             
-            # Run evaluation in-process (single GPU only)
-            eval_main(**eval_args)
-            
-            # Restore original CUDA_VISIBLE_DEVICES
-            if original_cuda_visible is not None:
-                os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible
-            else:
-                os.environ.pop('CUDA_VISIBLE_DEVICES', None)
-            
-            print(f"[Eval] In-process evaluation completed successfully")
-            
-        except Exception as e:
-            print(f"[Eval] In-process evaluation failed: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            # Always move models back to GPU
-            torch.cuda.empty_cache(); gc.collect()
-            print(f"[Eval] Moving training model back to GPU...")
-            self.model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
-            self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
-            print(f"[Eval] finished, resuming training.")
+        print(f"[Eval] finished, resuming training.")
 
 
     def _probe_gns(self, rb):
