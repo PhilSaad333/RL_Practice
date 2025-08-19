@@ -337,6 +337,8 @@ class RLRunner:
                 )
                 
                 print(f"[Eval] Running subprocess with conda activation")
+                print(f"[Eval] Command: {conda_cmd}")
+                print(f"[Eval] Working directory: {str(pathlib.Path.cwd())}")
                 
                 # Run evaluation in bash shell with conda environment
                 result = subprocess.run(
@@ -347,12 +349,16 @@ class RLRunner:
                     timeout=300  # 5 minute timeout (reduced)
                 )
                 
+                print(f"[Eval] Subprocess completed with return code: {result.returncode}")
+                print(f"[Eval] stdout: {result.stdout[-300:] if result.stdout else 'No stdout'}")  # Last 300 chars
+                print(f"[Eval] stderr: {result.stderr[-300:] if result.stderr else 'No stderr'}")  # Last 300 chars
+                
                 if result.returncode == 0:
                     print(f"[Eval] Subprocess evaluation completed successfully")
-                    print(f"[Eval] stdout: {result.stdout[-200:]}")  # Last 200 chars
                 else:
                     print(f"[Eval] Subprocess evaluation failed with return code {result.returncode}")
-                    print(f"[Eval] stderr: {result.stderr}")
+                    print(f"[Eval] Full stderr: {result.stderr}")
+                    print(f"[Eval] Full stdout: {result.stdout}")
                     
             except subprocess.TimeoutExpired:
                 print(f"[Eval] Subprocess evaluation timed out after 5 minutes")
