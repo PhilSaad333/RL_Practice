@@ -134,7 +134,8 @@ class RLRunner:
             # Use standard rollout collector (no VLLM imports)
             self.collector = RolloutCollector(
                 self.model, self.tok, self.cfg,
-                out_dir=self.dir / "logs"
+                out_dir=self.dir / "logs",
+                device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
             )
         # Calculate grad_accum_steps automatically based on distributed setup
         world_size = dist.get_world_size() if dist.is_initialized() else 1
