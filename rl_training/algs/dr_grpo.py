@@ -203,7 +203,7 @@ class DRGRPO(RLAlgorithm):
         self._maybe_log_ratios(ratios, gen_mask)
 
         # 6) optimise (pass rollouts for ESS computation if GNS enabled)
-        self._backward_and_step(loss, sync_grads, rollouts if self._gns_enabled else None)
+        self._backward_and_step(loss, sync_grads, rollouts if self.gns_probe.enabled else None)
 
         # 7) metrics
         metrics: Dict[str, float] = {
@@ -708,34 +708,4 @@ class DRGRPO(RLAlgorithm):
         # clear grads so training step isn't affected
         self.opt.zero_grad(set_to_none=True)
         return total
-
-
-    def _grad_sq_norm_for_effective_batch(self, microbatches, ref_model, *, avoid_ddp_allreduce=True):
-        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: starting with {len(microbatches)} microbatches")
-        self.opt.zero_grad(set_to_none=True)
-
-        ctx = self.policy.no_sync() if avoid_ddp_allreduce and hasattr(self.policy, "no_sync") else nullcontext()
-        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: entering grad computation context")
-        with ctx, torch.enable_grad():
-            scale = 1.0 / max(len(microbatches), 1)      # ← 1/K
-            print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: scale={scale}, starting microbatch loop")
-            for i, mb in enumerate(microbatches):                      # ← K microbatches
-                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: processing microbatch {i+1}/{len(microbatches)}")
-                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: calling _loss_for_batch for mb {i+1}")
-                loss = self._loss_for_batch(mb, ref_model) * scale
-                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: got loss={loss.item():.6f}, calling backward for mb {i+1}")
-                loss.backward()                          # accumulate grads
-                print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: completed backward for mb {i+1}")
-        print(f"[GNS DEBUG] _grad_sq_norm_for_effective_batch: exited grad computation context")
-
-        # sum of squared grads over trainable params
-        total = 0.0
-        for p in self._trainable_params():
-            if p.grad is not None:
-                g = p.grad.detach().double()
-                total += float((g * g).sum().item())
-        self.opt.zero_grad(set_to_none=True)
-        return total
-
-
 

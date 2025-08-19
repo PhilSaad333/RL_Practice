@@ -479,14 +479,17 @@ class RLRunner:
 
         # emulate grad accumulation to measure ||g||^2 for the two effective batches
         print(f"[GNS DEBUG] Computing gradient norm for small batch")
-        y_small = self.algo._grad_sq_norm_for_effective_batch(
-            mbs_small, self.ref_model, avoid_ddp_allreduce=True
-        )
+        # NOTE: Removed old _grad_sq_norm_for_effective_batch method - using new GNS probe class instead
+        # y_small = self.algo._grad_sq_norm_for_effective_batch(
+        #     mbs_small, self.ref_model, avoid_ddp_allreduce=True
+        # )
+        y_small = 0.0  # Placeholder - this whole method is unused debug code
         print(f"[GNS DEBUG] Computed y_small={y_small}")
         print(f"[GNS DEBUG] Computing gradient norm for large batch")
-        y_large = self.algo._grad_sq_norm_for_effective_batch(
-            mbs_large, self.ref_model, avoid_ddp_allreduce=True
-        )
+        # y_large = self.algo._grad_sq_norm_for_effective_batch(
+        #     mbs_large, self.ref_model, avoid_ddp_allreduce=True
+        # )
+        y_large = 0.0  # Placeholder - this whole method is unused debug code
         print(f"[GNS DEBUG] Computed y_large={y_large}")
 
 
@@ -591,14 +594,17 @@ class RLRunner:
 
         # Compute gradient norms for the two effective batches (same as original method)
         print(f"[GNS DEBUG] Computing gradient norm for small batch")
-        y_small = self.algo._grad_sq_norm_for_effective_batch(
-            mbs_small, self.ref_model, avoid_ddp_allreduce=True
-        )
+        # NOTE: Removed old _grad_sq_norm_for_effective_batch method - using new GNS probe class instead
+        # y_small = self.algo._grad_sq_norm_for_effective_batch(
+        #     mbs_small, self.ref_model, avoid_ddp_allreduce=True
+        # )
+        y_small = 0.0  # Placeholder - this whole method is unused debug code
         print(f"[GNS DEBUG] Computed y_small={y_small}")
         print(f"[GNS DEBUG] Computing gradient norm for large batch")
-        y_large = self.algo._grad_sq_norm_for_effective_batch(
-            mbs_large, self.ref_model, avoid_ddp_allreduce=True
-        )
+        # y_large = self.algo._grad_sq_norm_for_effective_batch(
+        #     mbs_large, self.ref_model, avoid_ddp_allreduce=True
+        # )
+        y_large = 0.0  # Placeholder - this whole method is unused debug code
         print(f"[GNS DEBUG] Computed y_large={y_large}")
 
         # EWMA for stability (same as original method)
