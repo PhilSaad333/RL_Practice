@@ -13,7 +13,7 @@ eval_backbone: qwen2_5_15
 # -------------- rollout collector ---------------- #
 
 # ---- rollout collection ----
-rollout_batch_size: 8
+rollout_batch_size: 16
 num_generations: 8
 
 # VLLM settings (default: enabled for better performance)
@@ -30,7 +30,7 @@ save_rollouts_every: 0
 
 
 
-buffer_size       : 16    # REDUCED for A100 (40GB) vs H100 (80GB)
+buffer_size       : 32    # REDUCED for A100 (40GB) vs H100 (80GB)
 microbatch_size   : 2    # Optimized for A100 40GB memory
 # grad_accum_steps automatically computed: buffer_size / (world_size * microbatch_size)
 # For 1 GPU: 16 / (1 * 2) = 8 microbatches
