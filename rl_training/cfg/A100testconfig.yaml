@@ -73,9 +73,9 @@ bf16: true                # Use bfloat16 precision
 gradient_checkpointing: true
 lr_scheduler: "const"     # Constant learning rate
 
-# Checkpoint configuration (GNS testing)
-save_every: 8             # Save every 8 steps to avoid too many checkpoints
-total_steps: 16           # 16 steps for proper GNS variance computation
+# Checkpoint configuration (Entropy probe testing)
+save_every: 1             # Save every step for testing
+total_steps: 2            # Just 2 steps for quick entropy probe testing
 
 # -------------- Diagnostic Probes ---------------- #
 
@@ -98,7 +98,7 @@ entropy_probe:
   debug: true             # Print debug information
   max_sequences: 200      # Memory safety limit for A100 testing
   store_full_kernel: true # Store complete K_1(t,t') Fisher kernel matrix
-  save_every: 2           # Save detailed data every N steps
+  save_every: 1           # Save detailed data every step for testing
   # 
   # Testing the new entropy probe implementation that computes:
   # δH = -η * (1/(B*G)) * Σ (S(t) - S̄) * K_1(t,t') * A(t') * (1/L_max)
