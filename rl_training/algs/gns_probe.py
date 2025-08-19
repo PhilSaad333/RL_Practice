@@ -6,17 +6,27 @@ from typing import Optional, Dict, List, Tuple
 
 class GNSProbe:
     """
-    Gradient Noise Scale (GNS) probe for estimating critical batch size.
+    Gradient Noise-to-Signal Ratio probe for monitoring training stability.
     
-    The GNS measures the ratio of gradient variance to the squared gradient norm,
-    helping determine if batch size is too small (high noise) or larger than needed.
+    This probe measures the ratio of gradient variance to squared gradient norm
+    by averaging over recent training steps. While not the "true" GNS (which would
+    require multiple gradient samples from the same model state), this step-averaged
+    approach provides a useful measure of training stability and batch efficiency.
+    
+    Key assumption: The model changes slowly enough over N steps that step-averaging
+    provides a reasonable estimate of the noise-to-signal ratio.
+    
+    Interpretation:
+    - Ratio << 1: Very stable, batch size may be larger than needed
+    - Ratio ≈ 1: Good balance between noise and signal
+    - Ratio >> 1: High noise, consider increasing batch size
     
     This implementation:
-    - Stores gradient snapshots over a window of training steps
-    - Computes variance across these snapshots
+    - Stores gradient snapshots over a rolling window of training steps
+    - Computes variance across these snapshots (includes sampling + optimization noise)
     - Properly handles Dr-GRPO weighted losses
     - Stores gradients on CPU to save GPU memory
-    - Tracks EMA of GNS metrics for stability
+    - Tracks EMA of metrics for stability
     """
     
     def __init__(
@@ -100,20 +110,22 @@ class GNSProbe:
     
     def compute_metrics(self, effective_batch_size: int) -> Dict[str, float]:
         """
-        Compute GNS metrics from stored gradients.
+        Compute gradient noise-to-signal ratio from stored gradients.
         
         Args:
-            effective_batch_size: Total effective batch size (for critical batch computation)
-                                 Should be buffer_size for Dr-GRPO
+            effective_batch_size: Total effective batch size in PROMPTS (buffer_size for Dr-GRPO).
+                                 Note: This is B (prompts), not B*G (total generations).
         
         Returns:
-            Dictionary with GNS metrics
+            Dictionary with noise-to-signal metrics and derived quantities
         """
         if not self.enabled or len(self.gradient_history) < 2:
             return {
+                "gns_noise_to_signal": 0.0,
                 "gns_mu": 0.0,
                 "gns_tr_sigma": 0.0,
                 "gns_critical_batch": 0.0,
+                "gns_ema_noise_to_signal": self.ema_gns_mu or 0.0,
                 "gns_ema_mu": self.ema_gns_mu or 0.0,
                 "gns_ema_tr_sigma": self.ema_tr_sigma or 0.0,
                 "gns_ema_critical_batch": self.ema_critical_batch or 0.0,
@@ -142,10 +154,17 @@ class GNSProbe:
         # Compute gradient norm squared
         grad_norm_sq = float((mean_grad * mean_grad).sum())
         
-        # Compute GNS metrics
+        # Compute noise-to-signal ratio
         tr_sigma = variance  # This is the trace of the covariance
-        gns_mu = tr_sigma / max(grad_norm_sq, 1e-12)
-        critical_batch = gns_mu * effective_batch_size
+        noise_to_signal = tr_sigma / max(grad_norm_sq, 1e-12)  # The fundamental ratio
+        
+        # Legacy naming for compatibility (gns_mu = noise-to-signal ratio)
+        gns_mu = noise_to_signal
+        
+        # Critical batch interpretation: at what batch size would noise ≈ signal?
+        # If noise_to_signal = 1/B_eff, then critical_batch = 1
+        # Since we measure over steps (not within batch), this is an approximation
+        critical_batch = noise_to_signal * effective_batch_size
         
         # Update EMAs
         if self.ema_gns_mu is None:
@@ -161,14 +180,16 @@ class GNSProbe:
         
         if self.debug and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[GNS] Computed from {len(self.gradient_history)} steps: "
-                  f"mu={gns_mu:.6e}, tr_sigma={tr_sigma:.6e}, "
-                  f"critical_batch={critical_batch:.1f}")
+                  f"noise/signal={noise_to_signal:.6e}, tr_sigma={tr_sigma:.6e}, "
+                  f"critical_batch={critical_batch:.1f} (prompts, not generations)")
         
         return {
-            "gns_mu": gns_mu,
+            "gns_noise_to_signal": noise_to_signal,  # The fundamental metric
+            "gns_mu": gns_mu,  # Legacy name (same as noise_to_signal)
             "gns_tr_sigma": tr_sigma,
             "gns_critical_batch": critical_batch,
-            "gns_ema_mu": self.ema_gns_mu,
+            "gns_ema_noise_to_signal": self.ema_gns_mu,  # EMA of noise/signal
+            "gns_ema_mu": self.ema_gns_mu,  # Legacy name
             "gns_ema_tr_sigma": self.ema_tr_sigma,
             "gns_ema_critical_batch": self.ema_critical_batch,
             "gns_window_size": len(self.gradient_history),
