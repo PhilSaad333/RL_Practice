@@ -56,6 +56,7 @@ class DRGRPO(RLAlgorithm):
         *,
         pad_id: int | None = None,
         ratio_log_path: str | pathlib.Path | None = None,
+        grad_accum_steps: int | None = None,
     ):
         super().__init__(policy, cfg)
         self.cfg = cfg
@@ -84,7 +85,7 @@ class DRGRPO(RLAlgorithm):
                 self.lr_sched = None
 
         self.pad_id = pad_id if pad_id is not None else getattr(policy.config, "pad_token_id", 0)
-        self.accum_steps: int = cfg["grad_accum_steps"]
+        self.accum_steps: int = grad_accum_steps if grad_accum_steps is not None else cfg.get("grad_accum_steps", 1)
         self._accum_ctr: int = 0
         self.actual_opt_step: int = 0
         self.device = None

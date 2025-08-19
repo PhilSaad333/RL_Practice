@@ -115,9 +115,6 @@ class RLRunner:
         self.collector = RolloutCollector(self.model, self.tok, self.cfg,
                                           out_dir=self.dir / "logs",
                                           device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
-        self.algo = DRGRPO(self.model, self.cfg, pad_id=self.pad_id,
-                           ratio_log_path=self.dir / "logs" / "ratios.jsonl")
-        
         # Calculate grad_accum_steps automatically based on distributed setup
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.buffer_size = self.cfg["buffer_size"]
@@ -128,6 +125,10 @@ class RLRunner:
             print(f"[AUTO CONFIG] buffer_size={self.buffer_size}, world_size={world_size}, microbatch_size={microbatch_size}")
             config_grad_accum = self.cfg.get('grad_accum_steps', 'not specified')
             print(f"[AUTO CONFIG] Calculated grad_accum_steps={auto_grad_accum_steps} (config had {config_grad_accum})")
+        
+        self.algo = DRGRPO(self.model, self.cfg, pad_id=self.pad_id,
+                           ratio_log_path=self.dir / "logs" / "ratios.jsonl",
+                           grad_accum_steps=auto_grad_accum_steps)
         
         self.accum = auto_grad_accum_steps
         self.eval_cb = EvalCallback(self.dir, self.cfg)
