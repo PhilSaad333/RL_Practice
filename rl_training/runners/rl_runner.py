@@ -11,7 +11,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel, prepare_model_for_kbit_training
 
 from rl_training.runners.collect_rollouts import RolloutCollector
-from rl_training.runners.collect_rollouts_vllm import create_rollout_collector
 from rl_training.algs.dr_grpo import DRGRPO
 from rl_training.algs.base import RolloutBatch
 from rl_training.runners.eval_callback import EvalCallback
@@ -115,19 +114,28 @@ class RLRunner:
 
         # Create rollout collector (VLLM or standard)
         use_vllm = self.cfg.get("use_vllm", False)
-        vllm_kwargs = {
-            "vllm_reload_every": self.cfg.get("vllm_reload_every", 10),
-            "vllm_tensor_parallel": self.cfg.get("vllm_tensor_parallel", 1),
-            "vllm_gpu_memory_utilization": self.cfg.get("vllm_gpu_memory_utilization", 0.4),
-            "device": f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
-        }
         
-        self.collector = create_rollout_collector(
-            self.model, self.tok, self.cfg,
-            out_dir=self.dir / "logs",
-            use_vllm=use_vllm,
-            **vllm_kwargs
-        )
+        if use_vllm:
+            # Import VLLM components only when needed to avoid CUDA initialization
+            from rl_training.runners.collect_rollouts_vllm import create_rollout_collector
+            vllm_kwargs = {
+                "vllm_reload_every": self.cfg.get("vllm_reload_every", 10),
+                "vllm_tensor_parallel": self.cfg.get("vllm_tensor_parallel", 1),
+                "vllm_gpu_memory_utilization": self.cfg.get("vllm_gpu_memory_utilization", 0.4),
+                "device": f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
+            }
+            self.collector = create_rollout_collector(
+                self.model, self.tok, self.cfg,
+                out_dir=self.dir / "logs",
+                use_vllm=True,
+                **vllm_kwargs
+            )
+        else:
+            # Use standard rollout collector (no VLLM imports)
+            self.collector = RolloutCollector(
+                self.model, self.tok, self.cfg,
+                out_dir=self.dir / "logs"
+            )
         # Calculate grad_accum_steps automatically based on distributed setup
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.buffer_size = self.cfg["buffer_size"]
