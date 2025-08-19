@@ -17,3 +17,7 @@ __pycache__/
 
 # raw datasets live here – never commit them
 datasets/raw/
+
+# Data downloaded from Lambda instances
+data/
+!data/README.md
