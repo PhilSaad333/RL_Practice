@@ -93,7 +93,7 @@ class GNSProbe:
         self.steps_accumulated += 1
         self.total_steps_seen += 1
         
-        if self.debug and dist.get_rank() == 0:
+        if self.debug and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[GNS] Stored gradient {self.steps_accumulated}/{self.window_size}, "
                   f"||g||^2 = {float((grad_vector * grad_vector).sum()):.6e}, "
                   f"weight = {dr_grpo_weight:.4f}")
@@ -159,7 +159,7 @@ class GNSProbe:
             self.ema_tr_sigma = (1 - self.ema_alpha) * self.ema_tr_sigma + self.ema_alpha * tr_sigma
             self.ema_critical_batch = (1 - self.ema_alpha) * self.ema_critical_batch + self.ema_alpha * critical_batch
         
-        if self.debug and dist.get_rank() == 0:
+        if self.debug and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[GNS] Computed from {len(self.gradient_history)} steps: "
                   f"mu={gns_mu:.6e}, tr_sigma={tr_sigma:.6e}, "
                   f"critical_batch={critical_batch:.1f}")
