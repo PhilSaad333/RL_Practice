@@ -27,9 +27,9 @@ save_rollouts_every: 0    # 0 = never save
 # -------------- Training Configuration (Single A100 Optimized) ---------------- #
 
 # Buffer and batch sizes (optimized for single A100 40GB)
-buffer_size: 16           # Reduced from 32 to avoid OOM
+buffer_size: 32           # Increased for better GNS data collection
 microbatch_size: 2        # Keep at 2
-# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 16 / (1 * 2) = 8
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 32 / (1 * 2) = 16
 
 # PPO configuration
 ppo_epochs: 1             # Single epoch per buffer
@@ -73,9 +73,9 @@ bf16: true                # Use bfloat16 precision
 gradient_checkpointing: true
 lr_scheduler: "const"     # Constant learning rate
 
-# Checkpoint configuration (testing)
-save_every: 1             # Save every step for debugging
-total_steps: 2            # 2 steps for quick testing
+# Checkpoint configuration (GNS testing)
+save_every: 8             # Save every 8 steps to avoid too many checkpoints
+total_steps: 16           # 16 steps for proper GNS variance computation
 
 # -------------- Diagnostic Probes ---------------- #
 
@@ -95,3 +95,4 @@ gns_probe:
   # Testing the new GNS probe implementation that stores gradients
   # across multiple training steps to compute proper variance.
   # Should fix the gns_tr_sigma = 0 issue we were seeing.
+  # Will compute GNS metrics every 8 steps after window fills up.
