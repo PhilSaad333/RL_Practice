@@ -215,4 +215,7 @@ if __name__ == "__main__":
         print_profile_info()
         sys.exit(0)
     
-    main(**vars(args))
+    # Remove list_profiles from args before passing to main
+    args_dict = vars(args)
+    args_dict.pop('list_profiles', None)
+    main(**args_dict)
