@@ -96,7 +96,10 @@ def main(backbone: str = "phi2",
     )
 
     if ckpt_step:
-        step_id = ckpt_step if ckpt_step == "final" else int(ckpt_step)
+        if ckpt_step in ["final", "base"]:
+            step_id = ckpt_step
+        else:
+            step_id = int(ckpt_step)
     else:
         step_id = int(Path(ckpt_path).name.rsplit("-", 1)[-1])
 
