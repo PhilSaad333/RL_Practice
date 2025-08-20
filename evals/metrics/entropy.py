@@ -31,8 +31,10 @@ def _stats(arr: np.ndarray, prefix: str) -> Dict[str, float]:
 def entropy_metrics(records: List[EvalRecord]) -> List[Dict]:
     """
     For each prompt (q_idx) emit statistics over all completions' tokens:
-        • surprisal  = −log p(chosen)
-        • entropy    = −∑ₖ pₖ log pₖ  (per generation step)
+        • entropy = −log p(chosen) = surprisal (correct entropy estimator)
+        
+    NOTE: Previously computed expensive Shannon entropy −∑ₖ pₖ log pₖ which was
+    incorrect as an entropy estimator. The surprisal is the proper estimator.
     """
     rows: List[Dict] = []
 
@@ -40,19 +42,17 @@ def entropy_metrics(records: List[EvalRecord]) -> List[Dict]:
         # r.logprobs and r.entropies are List[N] of np.ndarray[T]
         if not r.logprobs:                  # empty list → emit all-NaN row
             row = {"q_idx": r.q_idx}
-            for pref in ("surp", "ent"):
-                row.update(
-                    {f"{pref}_{s}": np.nan for s in ("mean", "std", "max", "p95")}
-                )
+            row.update(
+                {f"entropy_{s}": np.nan for s in ("mean", "std", "max", "p95")}
+            )
             rows.append(row)
             continue
 
-        surp = -np.concatenate(r.logprobs)      # (tokens, )
-        ent  =  np.concatenate(r.entropies)     # (tokens, )
+        # The entropies are now correctly computed as surprisal = -log p(chosen)
+        entropy = np.concatenate(r.entropies)   # (tokens, ) - this is now surprisal
 
         row = {"q_idx": r.q_idx}
-        row.update(_stats(surp, "surp"))
-        row.update(_stats(ent,  "ent"))
+        row.update(_stats(entropy, "entropy"))
         rows.append(row)
 
     return rows

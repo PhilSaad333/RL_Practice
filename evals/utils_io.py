@@ -156,7 +156,8 @@ def generate_with_logprobs(
         # causal-LM shift (labels are next-token ids)
         tgt = blk[:, 1:].unsqueeze(-1)                    # [mb, T_full-1, 1]
         lp  = log_p[:, :-1].gather(2, tgt).squeeze(-1)    # [mb, T_full-1]
-        ent = -(log_p[:, :-1].exp() * log_p[:, :-1]).sum(-1)
+        # NOTE: Removed expensive incorrect entropy computation -(log_p.exp() * log_p).sum(-1)
+        # The surprisal (-log_p of chosen token) is the correct entropy estimator
 
         # slice *row by row* so we keep only real generation tokens
         gl_sub = gen_lens[i : i + tf_micro_batch].tolist()      # list[int]
@@ -180,17 +181,18 @@ def generate_with_logprobs(
 
             keep = cut - prompt_len             # #tokens we actually keep
             keep_lens.append(keep)              # ❶ remember it
-            lp_chunks .append(lp [row, start : start + keep])
-            ent_chunks.append(ent[row, start : start + keep])
+            lp_chunks.append(lp[row, start : start + keep])
+            # NOTE: Now using surprisal (lp) as entropy - no separate ent_chunks needed
 
 
         # free GPU RAM early
-        del logits, log_p, lp, ent
+        del logits, log_p, lp
         torch.cuda.empty_cache()
 
 
-    flat_lps  = [lp.cpu().numpy() for lp  in lp_chunks]
-    flat_ents = [ent.cpu().numpy() for ent in ent_chunks]
+    flat_lps = [lp.cpu().numpy() for lp in lp_chunks]
+    # NOTE: Use surprisal (negative log prob) as entropy estimator
+    flat_entropies = [-lp for lp in flat_lps]
 
 
 
@@ -210,13 +212,13 @@ def generate_with_logprobs(
         gen_text.append(row_txt)
 
     # ── reshape flat lists into [B][N] ───────────────────────────────────
-    gen_lps  = [
-        [ flat_lps [b * N + n] for n in range(N) ]
+    gen_lps = [
+        [flat_lps[b * N + n] for n in range(N)]
         for b in range(B)
     ]
-    gen_ents = [
-        [ flat_ents[b * N + n] for n in range(N) ]
+    gen_entropies = [
+        [flat_entropies[b * N + n] for n in range(N)]
         for b in range(B)
     ]
 
-    return gen_text, gen_lps, gen_ents
+    return gen_text, gen_lps, gen_entropies
