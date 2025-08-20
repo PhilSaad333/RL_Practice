@@ -159,19 +159,19 @@ def binary_search_batch_size(
     best_size = min_size
     
     # Quick check if even min_size works
-    if not test_func(min_size, **test_kwargs):
+    if not test_func(min_size):
         logger.error(f"Even minimum batch size {min_size} doesn't fit in memory!")
         return 1
     
     # Quick check if max_size works (save time if we have lots of memory)
-    if test_func(max_size, **test_kwargs):
+    if test_func(max_size):
         return max_size
     
     # Binary search between min and max
     while low <= high:
         mid = (low + high) // 2
         
-        if test_func(mid, **test_kwargs):
+        if test_func(mid):
             best_size = mid
             low = mid + 1  # Try larger
         else:
@@ -219,14 +219,11 @@ def auto_detect_batch_sizes(
     # 1. Find optimal rollout batch size (generation phase)
     logger.info("Testing generation batch sizes...")
     rollout_batch_size = binary_search_batch_size(
-        test_batch_size_generation,
+        lambda batch_size: test_batch_size_generation(
+            model, tokenizer, batch_size, max_tokens, num_sequences, prompt_length
+        ),
         min_size=1,
         max_size=64,  # Conservative max for generation
-        model=model,
-        tokenizer=tokenizer,
-        max_tokens=max_tokens,
-        num_sequences=num_sequences,
-        test_prompt_length=prompt_length
     )
     
     # 2. Find optimal teacher forcing batch size
@@ -237,12 +234,11 @@ def auto_detect_batch_sizes(
     # Start search from rollout_batch_size * num_sequences as baseline
     tf_baseline = rollout_batch_size * num_sequences
     tf_micro_batch = binary_search_batch_size(
-        test_batch_size_teacher_forcing,
+        lambda batch_size: test_batch_size_teacher_forcing(
+            model, tokenizer, batch_size, total_sequence_length
+        ),
         min_size=max(1, tf_baseline // 4),  # Start conservative
         max_size=min(128, tf_baseline * 2),  # Don't go too high
-        model=model,
-        tokenizer=tokenizer,
-        sequence_length=total_sequence_length
     )
     
     # Apply safety factor
