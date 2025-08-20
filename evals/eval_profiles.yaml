@@ -1,0 +1,85 @@
+# evals/eval_profiles.yaml
+# Configuration profiles for different evaluation scenarios
+
+profiles:
+  # Quick testing with small dataset and conservative batch sizes
+  quick_test:
+    subset_frac: 0.02
+    batch_size: "conservative"
+    temperature: 0.7
+    top_p: 1.0
+    num_return_sequences: 8
+    max_new_tokens: 200
+    description: "Fast testing with 2% of dataset, safe batch sizes"
+  
+  # Full evaluation with auto-optimized batch sizes
+  full_evaluation:
+    subset_frac: 1.0
+    batch_size: "auto"
+    temperature: 0.7
+    top_p: 1.0
+    num_return_sequences: 8
+    max_new_tokens: 200
+    description: "Complete evaluation with full dataset, optimized for speed"
+  
+  # Memory-constrained environments (smaller GPUs)
+  memory_optimized:
+    subset_frac: 1.0
+    batch_size: "conservative"
+    temperature: 0.7
+    top_p: 1.0
+    num_return_sequences: 8
+    max_new_tokens: 200
+    description: "Full evaluation with conservative memory usage"
+  
+  # Push GPU limits for maximum throughput
+  high_throughput:
+    subset_frac: 1.0
+    batch_size: "aggressive"
+    temperature: 0.7
+    top_p: 1.0
+    num_return_sequences: 8
+    max_new_tokens: 200
+    description: "Maximum GPU utilization, may cause OOM on smaller GPUs"
+  
+  # Debugging with tiny dataset and small batches
+  debug:
+    subset_frac: 0.001
+    batch_size: 2
+    temperature: 0.7
+    top_p: 1.0
+    num_return_sequences: 4
+    max_new_tokens: 100
+    description: "Minimal evaluation for debugging"
+  
+  # Longer generation evaluation
+  long_generation:
+    subset_frac: 0.1
+    batch_size: "auto"
+    temperature: 0.7
+    top_p: 1.0
+    num_return_sequences: 8
+    max_new_tokens: 512
+    description: "Test longer generation capabilities"
+
+# Default profile to use if none specified
+default_profile: "full_evaluation"
+
+# Lambda-specific optimizations
+lambda_optimizations:
+  # H100 80GB instances
+  h100_80gb:
+    recommended_profiles: ["high_throughput", "full_evaluation"]
+    max_batch_size_hint: 64
+    memory_gb: 80
+  
+  # A100 40GB instances  
+  a100_40gb:
+    recommended_profiles: ["full_evaluation", "memory_optimized"]
+    max_batch_size_hint: 32
+    memory_gb: 40
+  
+  # Multi-GPU setups
+  multi_gpu:
+    note: "Auto-batch sizing handles multi-GPU automatically"
+    recommended_profiles: ["high_throughput"]

@@ -176,14 +176,57 @@ def main():
     parser.add_argument("--steps", help="Comma-separated list of steps to evaluate (e.g., 1,5,10). If not specified, evaluates all steps.")
     parser.add_argument("--eval-dataset", default="gsm8k_r1_template", help="Evaluation dataset")
     parser.add_argument("--backbone", help="Model backbone (auto-detected from training config if not specified)")
-    parser.add_argument("--batch-size", type=int, default=8, help="Evaluation batch size")
+    def parse_batch_size(value):
+        if value.lower() in ["auto", "conservative", "aggressive"]:
+            return value.lower()
+        try:
+            return int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"batch_size must be an integer or 'auto'/'conservative'/'aggressive', got: {value}")
+    
+    parser.add_argument("--batch-size", type=parse_batch_size, default="auto", 
+                        help="Batch size: integer or 'auto'/'conservative'/'aggressive' for auto-detection")
     parser.add_argument("--subset-frac", type=float, default=0.01, help="Fraction of eval dataset to use")
     parser.add_argument("--temperature", type=float, default=0.7, help="Generation temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Top-p sampling")
     parser.add_argument("--num-return-sequences", type=int, default=8, help="Number of sequences per prompt")
     parser.add_argument("--max-new-tokens", type=int, default=256, help="Max tokens to generate")
+    parser.add_argument("--profile", type=str, help="Evaluation profile name (e.g., 'quick_test', 'full_evaluation')")
+    parser.add_argument("--list-profiles", action="store_true", help="List available evaluation profiles and exit")
     
     args = parser.parse_args()
+    
+    if args.list_profiles:
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
+        from evals.profile_loader import print_profile_info
+        print_profile_info()
+        return
+    
+    # Apply profile if specified
+    if args.profile:
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
+        from evals.profile_loader import get_profile, list_profiles
+        
+        try:
+            profile_config = get_profile(args.profile)
+            print(f"📋 Applying evaluation profile: {args.profile}")
+            print(f"   Description: {profile_config.get('_description', 'No description')}")
+            
+            # Apply profile settings to args
+            for key, value in profile_config.items():
+                if key.startswith('_'):  # Skip metadata
+                    continue
+                if hasattr(args, key):
+                    setattr(args, key, value)
+                    print(f"   {key} = {value}")
+            
+        except ValueError as e:
+            print(f"❌ Profile error: {e}")
+            available_profiles = list(list_profiles().keys())
+            print(f"   Available profiles: {', '.join(available_profiles)}")
+            return
     
     # Find training run
     training_run_dir = find_training_run(args.training_run)

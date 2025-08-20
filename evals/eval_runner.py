@@ -38,6 +38,8 @@ from tqdm.auto import tqdm
 
 from evals.utils_io import load_everything, generate_with_logprobs
 from evals.metrics.tag_format import tag_format_metrics
+from evals.auto_batch import get_recommended_batch_sizes
+from evals.profile_loader import get_profile, list_profiles
 
 
 
@@ -46,15 +48,45 @@ def main(backbone: str = "phi2",
          ckpt_path: str | None = None,      # full Drive path or None
          ckpt_step: str | None = None,      # 500 / 1000 / 1404 / None
          eval_dataset: str = "gsm8k",
-         batch_size: int = 32,
+         batch_size: int | str = "auto",    # int or "auto"/"conservative"/"aggressive"
          subset_frac: float = 1.0,
          temperature: float = 0.7,
          top_p: float = 1.0,
          num_return_sequences: int = 8,
          max_new_tokens: int = 256,
          runs_root: str = os.environ.get("EVAL_RUNS_ROOT", "eval_runs"),
+         profile: str | None = None,        # evaluation profile name
          ):
 
+    # Apply profile if specified
+    if profile:
+        try:
+            profile_config = get_profile(profile)
+            print(f"📋 Applying evaluation profile: {profile}")
+            print(f"   Description: {profile_config.get('_description', 'No description')}")
+            
+            # Apply profile settings (only if not explicitly overridden)
+            # This is a simple implementation - could be more sophisticated
+            if batch_size == "auto":  # Only apply if using default
+                batch_size = profile_config.get('batch_size', batch_size)
+            if subset_frac == 1.0:
+                subset_frac = profile_config.get('subset_frac', subset_frac)
+            if temperature == 0.7:
+                temperature = profile_config.get('temperature', temperature)
+            if top_p == 1.0:
+                top_p = profile_config.get('top_p', top_p)
+            if num_return_sequences == 8:
+                num_return_sequences = profile_config.get('num_return_sequences', num_return_sequences)
+            if max_new_tokens == 256:
+                max_new_tokens = profile_config.get('max_new_tokens', max_new_tokens)
+                
+            print(f"   Applied: batch_size={batch_size}, subset_frac={subset_frac}")
+            
+        except ValueError as e:
+            print(f"❌ Profile error: {e}")
+            available_profiles = list(list_profiles().keys())
+            print(f"   Available profiles: {', '.join(available_profiles)}")
+            return
 
     model, tok, prompts, golds, stopper = load_everything(
         backbone, 
@@ -68,6 +100,20 @@ def main(backbone: str = "phi2",
     else:
         step_id = int(Path(ckpt_path).name.rsplit("-", 1)[-1])
 
+    # Auto-detect batch size if requested
+    if isinstance(batch_size, str):
+        print(f"Auto-detecting batch size (mode: {batch_size})...")
+        rollout_batch_size, tf_micro_batch = get_recommended_batch_sizes(
+            model, tok, 
+            max_tokens=max_new_tokens,
+            num_sequences=num_return_sequences,
+            prompt_length=100,  # Estimate typical prompt length
+            mode=batch_size
+        )
+        batch_size = rollout_batch_size
+        print(f"Using auto-detected batch_size={batch_size}, tf_micro_batch={tf_micro_batch}")
+    else:
+        tf_micro_batch = batch_size  # Use same for both if manually specified
 
     if subset_frac < 1.0:
         keep = int(len(prompts) * subset_frac)
@@ -95,7 +141,8 @@ def main(backbone: str = "phi2",
 
         batch_prompts = prompts[start : start + batch_size]
         gens, lps, ents = generate_with_logprobs(
-            model, tok, batch_prompts, cfg, stopper
+            model, tok, batch_prompts, cfg, stopper,
+            tf_micro_batch=tf_micro_batch
         )                               # gens: List[List[str]] length = batch_size
         for i, prompt in enumerate(batch_prompts):
             recs.append(EvalRecord(
@@ -142,13 +189,30 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-path", type=str, default=None, dest="ckpt_path")
     parser.add_argument("--ckpt-step", type=str, default=None, dest="ckpt_step")
     parser.add_argument("--eval-dataset", type=str, default="gsm8k", dest="eval_dataset")
-    parser.add_argument("--batch-size", type=int, default=32, dest="batch_size")
+    def parse_batch_size(value):
+        if value.lower() in ["auto", "conservative", "aggressive"]:
+            return value.lower()
+        try:
+            return int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"batch_size must be an integer or 'auto'/'conservative'/'aggressive', got: {value}")
+    
+    parser.add_argument("--batch-size", type=parse_batch_size, default="auto", dest="batch_size",
+                        help="Batch size: integer or 'auto'/'conservative'/'aggressive' for auto-detection")
     parser.add_argument("--subset-frac", type=float, default=1.0, dest="subset_frac")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=1.0, dest="top_p")
     parser.add_argument("--num-return-sequences", type=int, default=8, dest="num_return_sequences")
     parser.add_argument("--max-new-tokens", type=int, default=256, dest="max_new_tokens")
     parser.add_argument("--runs-root", type=str, default=os.environ.get("EVAL_RUNS_ROOT", "eval_runs"), dest="runs_root")
+    parser.add_argument("--profile", type=str, help="Evaluation profile name (e.g., 'quick_test', 'full_evaluation')")
+    parser.add_argument("--list-profiles", action="store_true", help="List available evaluation profiles and exit")
     
     args = parser.parse_args()
+    
+    if args.list_profiles:
+        from evals.profile_loader import print_profile_info
+        print_profile_info()
+        return
+    
     main(**vars(args))
