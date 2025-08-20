@@ -291,8 +291,8 @@ class DRGRPO(RLAlgorithm):
         self._maybe_log_ratios(ratios, gen_mask)
 
         # 6) optimise (pass rollouts for ESS computation if GNS enabled or entropy probe enabled)
-        pass_rollouts = self.gns_probe.enabled or self.entropy_probe.enabled
-        self._backward_and_step(loss, sync_grads, rollouts if pass_rollouts else None)
+        pass_rollouts = self.gns_probe.enabled or self.entropy_probe.enabled or self.simple_entropy_probe.enabled
+        self._backward_and_step(loss, sync_grads, rollouts if pass_rollouts else None, call_entropy_probe)
 
         # 7) metrics
         metrics: Dict[str, float] = {
@@ -433,7 +433,7 @@ class DRGRPO(RLAlgorithm):
         return float((kl_tok.sum() / (gen_mask.sum() + 1e-8)).item())
 
     # -- optimisation ----------------------------------------------------------
-    def _backward_and_step(self, loss: torch.Tensor, sync_grads: bool, rollouts: RolloutBatch | None = None) -> None:
+    def _backward_and_step(self, loss: torch.Tensor, sync_grads: bool, rollouts: RolloutBatch | None = None, call_entropy_probe: bool = False) -> None:
         """Handle backward, gradient clipping, optimiser & scheduler."""
         maybe = (self.policy.no_sync if (hasattr(self.policy, "no_sync") and not sync_grads) else nullcontext)
         with maybe():
