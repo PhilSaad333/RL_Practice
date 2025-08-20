@@ -1,0 +1,105 @@
+# h100_single_qwen2_5_1_5b_optimized.yaml
+# PRODUCTION CONFIG: Optimized batch sizes for single H100 80GB + Qwen2.5-1.5B
+# Memory utilization: ~75% (tested and verified Aug 2025)
+# 
+# Optimizations from baseline:
+# - rollout_batch_size: 24 → 36 (+50%)
+# - tf_micro_batch: 16 → 24 (+50%) 
+# - microbatch_size: 4 → 6 (+50%)
+# 
+# Use this config for single H100 80GB instances with Qwen2.5-1.5B model
+
+# Model configuration 
+backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
+
+# -------------- Rollout Collection (Optimized for H100 80GB) ---------------- #
+
+# Batch sizes for generation (optimized)
+rollout_batch_size: 36        # Optimized for H100 memory capacity
+num_generations: 8            # Keep at 8 for good diversity
+
+# VLLM disabled due to dependency conflicts
+use_vllm: false
+vllm_reload_every: 5
+vllm_gpu_memory_utilization: 0.35
+
+# Teacher-forcing configuration (optimized)
+tf_micro_batch: 24            # Optimized for H100 memory capacity
+
+# Data saving
+save_rollouts_every: 0        # 0 = never save (saves disk space)
+
+# -------------- Training Configuration (Optimized for H100 80GB) ---------------- #
+
+# Buffer and batch sizes (optimized)
+buffer_size: 64               # Good balance for statistics and memory
+microbatch_size: 6            # Optimized for H100 memory capacity
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 64 / (1 * 6) = 10.67 → 11
+
+# PPO configuration
+ppo_epochs: 1                 # Single epoch per buffer
+max_new_tokens: 100           # Reasonable generation length
+temperature: 0.7              # Sampling temperature
+
+# Evaluation configuration
+eval_frac: 0.02               # Small fraction for regular evaluation
+eval_batch_size: 64           # Standard evaluation batch size
+eval_temperature: 0.7
+
+# Reward configuration
+reward_var_thresh: 0.01
+reject_all_zero: true
+reject_all_max: true
+
+reward_fns:
+  - tag_pref                  # Primary reward function
+
+# Scheduler configuration
+scheduler:
+  name: mix_passrate
+  dataset_name: gsm8k_r1_template
+  split: "train"
+  ema_alpha: 0.01
+  boundaries: [0.2, 0.8]
+  sample_weights: [1, 1, 1]
+
+# ------------------ GRPO Trainer Configuration ---------------- #
+
+# Learning rate and optimization
+lr: 1.0e-6                    # Learning rate
+clip_eps: 0.2                 # PPO clipping epsilon
+clip_+: 0.2                   # Asymmetric clipping
+cfg["kl_beta"]: 0.0           # KL penalty (0 = compute for logging only)
+ent_coef: 0.0                 # Entropy coefficient
+grad_clip: 1.0                # Gradient clipping norm
+
+# Training settings
+bf16: true                    # Use bfloat16 precision
+gradient_checkpointing: true
+lr_scheduler: "const"         # Constant learning rate
+
+# Checkpoint configuration
+save_every: 10                # Save every 10 steps (adjust as needed)
+total_steps: 100              # Adjust based on training requirements
+
+# -------------- Diagnostic Probes (Configurable) ---------------- #
+
+# Gradient Noise Scale probe (optional - enable for GNS analysis)
+gns_probe:
+  enabled: false              # Enable if GNS analysis needed
+  window_size: 16             # Window for GNS computation
+  ema_alpha: 0.1              # EMA smoothing factor
+  debug: false                # Set true for debug output
+
+# Simple Entropy Probe (optional - enable for entropy monitoring)
+simple_entropy_probe:
+  enabled: false              # Enable if entropy monitoring needed
+  debug: false                # Set true for debug output
+  preconditioning_mode: "previous_step"
+  log_every: 5                # Log frequency
+
+# Complex Entropy Probe (disabled - use separate analysis framework)
+entropy_probe:
+  enabled: false              # Keep disabled for production
+  debug: false
