@@ -81,13 +81,13 @@ lr_scheduler: "const"         # Constant learning rate
 
 # Checkpoint configuration
 save_every: 10                # Save every 10 steps (adjust as needed)
-total_steps: 100              # Adjust based on training requirements
+total_steps: 64               # 64 steps for comprehensive GNS testing
 
 # -------------- Diagnostic Probes (Configurable) ---------------- #
 
 # Gradient Noise Scale probe (optional - enable for GNS analysis)
 gns_probe:
-  enabled: false              # Enable if GNS analysis needed
+  enabled: true               # Enable for GNS data collection
   window_size: 16             # Window for GNS computation
   ema_alpha: 0.1              # EMA smoothing factor
   debug: false                # Set true for debug output
