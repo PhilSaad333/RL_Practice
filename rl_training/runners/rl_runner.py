@@ -311,7 +311,8 @@ class RLRunner:
                 print(f"[DEBUG] Rank {self.rank} microbatch {micro_cnt+1}: sync_grads={sync} (step_id will be {self.step_id + (1 if sync else 0)})")
                 mb = rb.get_batch(idx, device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
                 print(f"[DEBUG] Rank {self.rank} calling algo.step for microbatch {micro_cnt+1}")
-                stats = self.algo.step(mb, self.ref_model, sync_grads=sync)
+                # Skip entropy probe during microbatch processing
+                stats = self.algo.step(mb, self.ref_model, sync_grads=sync, call_entropy_probe=False)
                 print(f"[DEBUG] Rank {self.rank} completed algo.step for microbatch {micro_cnt+1}")
                 for k, v in stats.items():
                     stats_sum[k] += v
@@ -320,6 +321,13 @@ class RLRunner:
                 if sync:
                     self.step_id += 1
                     print(f"[DEBUG] Rank {self.rank} incremented step_id to {self.step_id}")
+                    
+                    # Call entropy probe on full buffer after optimization step
+                    if hasattr(self.algo, 'entropy_probe') and self.algo.entropy_probe.enabled:
+                        print(f"[DEBUG] Rank {self.rank} calling entropy probe on full buffer")
+                        full_buffer_batch = rb.get_all_as_batch(device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+                        self.algo.call_entropy_probe_on_buffer(full_buffer_batch)
+                        print(f"[DEBUG] Rank {self.rank} completed entropy probe on full buffer")
                 del mb, stats
                 torch.cuda.empty_cache()
             print(f"[DEBUG] Rank {self.rank} completed PPO epoch {epoch+1}/{K}")

@@ -122,7 +122,18 @@ class DRGRPO(RLAlgorithm):
         )
         self._last_gns_metrics: Dict[str, float] = {}  # Store GNS metrics for logging
         
-        # --- Entropy Probe (First-order entropy change analysis) ---
+        # --- Entropy Probes ---
+        # Simple entropy probe (lightweight, for regular training)
+        from .simple_entropy_probe import SimpleEntropyProbe
+        simple_entropy_config = cfg.get("simple_entropy_probe", {})
+        self.simple_entropy_probe = SimpleEntropyProbe(
+            enabled=simple_entropy_config.get("enabled", False),
+            debug=simple_entropy_config.get("debug", False),
+            preconditioning_mode=simple_entropy_config.get("preconditioning_mode", "previous_step"),
+            log_every=simple_entropy_config.get("log_every", 1)
+        )
+        
+        # Complex entropy probe (expensive, for detailed analysis)
         from .entropy_probe import EntropyProbe
         entropy_config = cfg.get("entropy_probe", {})
         self.entropy_probe = EntropyProbe(
@@ -131,6 +142,7 @@ class DRGRPO(RLAlgorithm):
             max_sequences=entropy_config.get("max_sequences", 1000),
             store_full_kernel=entropy_config.get("store_full_kernel", True)
         )
+        
         self._last_entropy_metrics: Dict[str, float] = {}  # Store entropy metrics for logging
 
     # ------------------------------------------------------------------------
@@ -154,6 +166,55 @@ class DRGRPO(RLAlgorithm):
         seq_log_probs = (rollouts.logprobs * gen_mask).sum(dim=2)  # (B, G)
         
         return seq_log_probs
+        
+    def call_entropy_probe_on_buffer(self, rollouts: RolloutBatch) -> None:
+        """
+        Call entropy probe on full buffer of rollouts (called externally by training runner).
+        
+        Args:
+            rollouts: Full buffer rollouts (B=buffer_size, G=num_generations)
+        """
+        if not self.entropy_probe.enabled or rollouts is None:
+            return
+            
+        # Compute advantages and sequence log probabilities for full buffer
+        advantages = self._compute_advantage(rollouts.reward)  # (B, G)
+        seq_log_probs = self._compute_sequence_log_probs(rollouts)  # (B, G)
+        
+        # Get current learning rate
+        current_lr = self.opt.param_groups[0]['lr']
+        
+        try:
+            # Store entropy probe data (this computes per-sequence gradients)
+            self.entropy_probe.store_step_data(
+                rollouts=rollouts,
+                advantages=advantages,
+                log_probs=seq_log_probs,
+                trainable_params=self._trainable_params(),
+                optimizer=self.opt,
+                learning_rate=current_lr,
+                step_idx=self.actual_opt_step,
+                policy_model=self.policy,
+                pad_id=self.pad_id
+            )
+            
+            # Get computed metrics
+            self._last_entropy_metrics = self.entropy_probe.get_metrics()
+            
+            # Save detailed data periodically
+            entropy_config = self.cfg.get("entropy_probe", {})
+            save_every = entropy_config.get("save_every", 10)
+            if self.actual_opt_step % save_every == 0:
+                save_path = f"/tmp/entropy_probe_step_{self.actual_opt_step}.json"
+                self.entropy_probe.save_data(save_path)
+                if self.entropy_probe.debug:
+                    print(f"[EntropyProbe] Saved detailed data to {save_path}")
+            
+        except Exception as e:
+            if self.entropy_probe.debug:
+                print(f"[EntropyProbe] Error in buffer step {self.actual_opt_step}: {e}")
+            # Clear partial state on error
+            self.entropy_probe.reset()
 
     def step(
         self,
@@ -161,9 +222,13 @@ class DRGRPO(RLAlgorithm):
         ref_model,
         *,
         sync_grads: bool = True,
+        call_entropy_probe: bool = True,
     ) -> Dict[str, float]:
         """
         One optimisation step (or gradient-accumulation micro-step).
+        
+        Args:
+            call_entropy_probe: If False, skip entropy probe to allow buffer-level accumulation
         """
         # Debug distributed training hanging
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -401,9 +466,39 @@ class DRGRPO(RLAlgorithm):
                     self._last_gns_metrics = self.gns_probe.compute_metrics(buffer_size)
                     
             # ================================================================
-            # ENTROPY PROBE: Store per-sequence gradients and compute δH
+            # SIMPLE ENTROPY PROBE: Fast δH prediction during regular training
             # ================================================================
-            if self.entropy_probe.enabled and rollouts is not None:
+            if self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe:
+                # Compute advantages and sequence log probabilities
+                advantages = self._compute_advantage(rollouts.reward)  # (B, G)
+                seq_log_probs = self._compute_sequence_log_probs(rollouts)  # (B, G)
+                
+                # Get current learning rate
+                current_lr = self.opt.param_groups[0]['lr']
+                
+                try:
+                    # Predict entropy change using simple δH formula
+                    simple_entropy_metrics = self.simple_entropy_probe.compute_delta_h_prediction(
+                        rollouts=rollouts,
+                        advantages=advantages,
+                        log_probs=seq_log_probs,
+                        trainable_params=self._trainable_params(),
+                        optimizer=self.opt,
+                        learning_rate=current_lr,
+                        pad_id=self.pad_id
+                    )
+                    
+                    # Merge simple entropy metrics into main metrics
+                    self._last_entropy_metrics.update(simple_entropy_metrics)
+                    
+                except Exception as e:
+                    if self.simple_entropy_probe.debug:
+                        print(f"[SimpleEntropyProbe] Error in step {self.actual_opt_step}: {e}")
+                    
+            # ================================================================
+            # COMPLEX ENTROPY PROBE: Store per-sequence gradients and compute δH
+            # ================================================================
+            if self.entropy_probe.enabled and rollouts is not None and call_entropy_probe:
                 # Compute advantages and sequence log probabilities
                 advantages = self._compute_advantage(rollouts.reward)  # (B, G)
                 seq_log_probs = self._compute_sequence_log_probs(rollouts)  # (B, G)

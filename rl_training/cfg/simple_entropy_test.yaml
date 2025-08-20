@@ -1,0 +1,99 @@
+# simple_entropy_test.yaml - Test configuration for simple entropy probe
+# Based on A100testconfig.yaml with simple entropy probe enabled
+
+# Model configuration
+backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
+
+# -------------- Rollout Collection (Single A100 Optimized) ---------------- #
+
+# Batch sizes for generation (reduced for A100 40GB)
+rollout_batch_size: 12    # Halved from 24 for single A100
+num_generations: 8        # Keep at 8
+
+# VLLM disabled due to dependency conflicts
+use_vllm: false
+vllm_reload_every: 5
+vllm_gpu_memory_utilization: 0.25
+
+# Teacher-forcing configuration (reduced for memory)
+tf_micro_batch: 8         # Keep at 8 for now
+
+# Data saving
+save_rollouts_every: 0    # 0 = never save
+
+# -------------- Training Configuration (Single A100 Optimized) ---------------- #
+
+# Buffer and batch sizes (optimized for single A100 40GB)
+buffer_size: 32           # Increased for better GNS data collection
+microbatch_size: 2        # Keep at 2
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 32 / (1 * 2) = 16
+
+# PPO configuration
+ppo_epochs: 1             # Single epoch per buffer
+max_new_tokens: 100       # Reduced from 150 to save memory
+temperature: 0.7          # Sampling temperature
+
+# Evaluation configuration
+eval_frac: 0.01           # Small fraction for testing
+eval_batch_size: 64       # Keep evaluation batch size
+eval_temperature: 0.7
+
+# Reward configuration
+reward_var_thresh: 0.01
+reject_all_zero: true
+reject_all_max: true
+
+reward_fns:
+  - tag_pref              # Primary reward function
+
+# Scheduler configuration
+scheduler:
+  name: mix_passrate
+  dataset_name: gsm8k_r1_template
+  split: "train"
+  ema_alpha: 0.01
+  boundaries: [0.2, 0.8]
+  sample_weights: [1, 1, 1]
+
+# ------------------ GRPO Trainer Configuration ---------------- #
+
+# Learning rate and optimization
+lr: 1.0e-6                # Learning rate
+clip_eps: 0.2             # PPO clipping epsilon
+clip_+: 0.2               # Asymmetric clipping
+cfg["kl_beta"]: 0.0       # KL penalty (0 = compute for logging only)
+ent_coef: 0.0             # Entropy coefficient
+grad_clip: 1.0            # Gradient clipping norm
+
+# Training settings
+bf16: true                # Use bfloat16 precision
+gradient_checkpointing: true
+lr_scheduler: "const"     # Constant learning rate
+
+# Checkpoint configuration
+save_every: 1             # Save every step for testing
+total_steps: 10           # 10 steps for simple entropy probe testing
+
+# -------------- Diagnostic Probes ---------------- #
+
+# Simple Entropy Probe (ENABLED for lightweight monitoring)
+simple_entropy_probe:
+  enabled: true           # Enable lightweight entropy change prediction
+  debug: true             # Print debug information
+  preconditioning_mode: "previous_step"  # "none" or "previous_step"
+  log_every: 1            # Log every step
+
+# Complex Entropy Probe (DISABLED for this test)
+entropy_probe:
+  enabled: false          # Disable expensive Fisher kernel computation
+  debug: false
+  max_sequences: 200
+  store_full_kernel: false
+
+# Gradient Noise Scale probe (DISABLED for this test)
+gns_probe:
+  enabled: false          # Disabled to focus on simple entropy testing
+  window_size: 8
+  ema_alpha: 0.1
+  debug: false
