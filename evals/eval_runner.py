@@ -213,6 +213,6 @@ if __name__ == "__main__":
     if args.list_profiles:
         from evals.profile_loader import print_profile_info
         print_profile_info()
-        return
+        sys.exit(0)
     
     main(**vars(args))
