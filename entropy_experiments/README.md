@@ -30,6 +30,25 @@ PYTHONPATH=.. python entropy_runner.py \
 
 This enables studying how training updates affect logprobs of **any sequence**, not just training sequences.
 
+### Critical Sampling Requirements
+
+**⚠️ IMPORTANT: The two rollout buffers must have different sampling criteria:**
+
+**Training Buffer (t')**: 
+- **Filtered sampling** (current behavior)
+- Reject sequences with all-correct or all-incorrect answers (zero advantages)
+- Apply difficulty-based sampling weights from scheduler
+- Only sequences that provide gradient signal
+
+**Evaluation Buffer (t)**:
+- **Unfiltered representative sampling** 
+- **NO rejection** based on correctness
+- **NO difficulty-based sampling bias**
+- Pure random sampling from dataset
+- Represents the true data distribution
+
+**Rationale**: The Fisher kernel K(t,t') measures how gradient updates from filtered training sequences t' affect the log-probabilities of arbitrary evaluation sequences t. Using the same filtered sampling for both would bias the analysis and not reflect how training affects the broader data distribution.
+
 ## File Structure
 
 - `entropy_runner.py` - Main specialized runner for detailed analysis

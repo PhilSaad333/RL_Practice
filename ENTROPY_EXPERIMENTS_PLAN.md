@@ -17,10 +17,24 @@ In our theoretical derivation:
 **Current approach**: E_t[...] estimated using same training samples t_i'
 **Better approach**: E_t[...] estimated using **separate samples t**, then compute cross-terms K₁(t,t_i')
 
-**Scientific value**: Study how training batch t_i' affects logprobs of **any sequence t**, including:
+**⚠️ CRITICAL: Different sampling criteria for the two buffers:**
+
+**Training Buffer (t_i')**: 
+- Current filtered behavior: reject sequences with zero advantages
+- Apply scheduler difficulty weighting
+- Only samples that provide gradient signal
+
+**Evaluation Buffer (t)**:
+- **UNFILTERED** random sampling from dataset
+- NO rejection based on correctness 
+- NO difficulty-based sampling bias
+- Represents true data distribution
+
+**Scientific value**: Study how filtered training batch t_i' affects logprobs of **any sequence t**, including:
 - Same-prompt vs different-prompt interactions
 - Training batch vs held-out sequences
 - Fisher kernel structure across diverse sequence types
+- Effect of training on the broader data distribution (not just "learnable" sequences)
 
 ## Implementation Architecture
 
