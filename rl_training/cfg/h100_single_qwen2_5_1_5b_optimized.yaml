@@ -39,7 +39,7 @@ microbatch_size: 6            # Optimized for H100 memory capacity
 
 # PPO configuration
 ppo_epochs: 1                 # Single epoch per buffer
-max_new_tokens: 100           # Reasonable generation length
+max_new_tokens: 200           # Increased to avoid truncation (tag_correct 70%→95%)
 temperature: 0.7              # Sampling temperature
 
 # Evaluation configuration
