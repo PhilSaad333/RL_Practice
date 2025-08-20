@@ -58,3 +58,30 @@ This affects **all resumed training runs** and could explain training instabilit
 2. Resume from intermediate step
 3. Verify KL divergence computed against **original fine-tuned model**, not resume step model
 4. Compare KL trajectories: continuous vs resumed training should match
+
+---
+
+## 📚 Updated Training Documentation
+
+### ⚠️ CRITICAL: The `--ckpt` Argument
+
+When running training, the `--ckpt` argument is **essential for correct KL computation**:
+
+```bash
+# Single GPU training
+PYTHONPATH=. python rl_training/runners/rl_runner.py \
+  --cfg rl_training/cfg/h100_single_qwen2_5_1_5b_optimized.yaml \
+  --ckpt /path/to/original/fine-tuned/checkpoint
+
+# Multi-GPU training
+PYTHONPATH=. torchrun --nproc_per_node=2 rl_training/runners/rl_runner.py \
+  --cfg rl_training/cfg/h100_dual_test.yaml \
+  --ckpt /path/to/original/fine-tuned/checkpoint
+```
+
+**Key Points:**
+- This checkpoint becomes the **reference model** for KL divergence computation
+- KL penalty is ALWAYS computed against this original checkpoint (not current training state)
+- **Never change this path** when resuming training - always use the same original checkpoint
+- Essential for training stability and reproducibility across training sessions
+- The fix ensures this reference model is loaded fresh from the original checkpoint, not copied from current model state
