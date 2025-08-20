@@ -15,8 +15,8 @@ eval_backbone: qwen2_5_15
 
 # -------------- Rollout Collection (Optimized for H100 80GB) ---------------- #
 
-# Batch sizes for generation (optimized)
-rollout_batch_size: 36        # Optimized for H100 memory capacity
+# Batch sizes for generation (reduced for max_new_tokens=200)
+rollout_batch_size: 24        # Reduced from 36 (33% reduction for longer sequences)
 num_generations: 8            # Keep at 8 for good diversity
 
 # VLLM disabled due to dependency conflicts
@@ -24,18 +24,18 @@ use_vllm: false
 vllm_reload_every: 5
 vllm_gpu_memory_utilization: 0.35
 
-# Teacher-forcing configuration (optimized)
-tf_micro_batch: 24            # Optimized for H100 memory capacity
+# Teacher-forcing configuration (reduced for max_new_tokens=200)
+tf_micro_batch: 16            # Reduced from 24 (33% reduction, power of 2)
 
 # Data saving
 save_rollouts_every: 0        # 0 = never save (saves disk space)
 
 # -------------- Training Configuration (Optimized for H100 80GB) ---------------- #
 
-# Buffer and batch sizes (optimized)
+# Buffer and batch sizes (reduced for max_new_tokens=200)
 buffer_size: 64               # Good balance for statistics and memory
-microbatch_size: 6            # Optimized for H100 memory capacity
-# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 64 / (1 * 6) = 10.67 → 11
+microbatch_size: 4            # Reduced from 6 (33% reduction, power of 2)
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 64 / (1 * 4) = 16
 
 # PPO configuration
 ppo_epochs: 1                 # Single epoch per buffer
