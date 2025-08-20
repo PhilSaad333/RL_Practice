@@ -36,6 +36,8 @@ class RLRunner:
                  resume_optimizer_path: str = None,
                  resume_scheduler_path: str = None,
                  resume_info: dict = None):
+        # Store original checkpoint path for reference model (KL computation)
+        self.original_lora_ckpt = lora_ckpt
         # ─── distributed init ────────────────────────────────────────────
         # Changed 8/11: make DDP optional (works in single-GPU Colab)
         if os.environ.get("WORLD_SIZE", "1") != "1":
@@ -108,9 +110,9 @@ class RLRunner:
         self.pad_id = self.tok.pad_token_id
         self.tok.padding_side = "left"
 
-        # Changed 8/11: build ref model robustly for single or multi-GPU
-        self.ref_model = copy.deepcopy(_unwrap(self.model)).eval().requires_grad_(False)  # Changed 8/11
-        self.ref_model = self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")  # Changed 8/11
+        # Create reference model from original checkpoint (not current model state)
+        self.ref_model = self._create_reference_model()
+        self.ref_model = self.ref_model.to(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
 
         # Create rollout collector (VLLM or standard)
         use_vllm = self.cfg.get("use_vllm", False)
@@ -658,6 +660,35 @@ class RLRunner:
         
         torch.cuda.empty_cache()
         print(f"[DEBUG] Rank {self.rank}: Cleanup completed")
+
+    def _create_reference_model(self):
+        """Create reference model from original checkpoint for consistent KL computation.
+        
+        This ensures KL divergence is always computed against the original fine-tuned 
+        checkpoint, not the current model state (important for training resume).
+        """
+        print(f"[DEBUG] Creating reference model from original checkpoint: {self.original_lora_ckpt}")
+        
+        # Load the same base model setup
+        bnb = BitsAndBytesConfig(load_in_4bit=True,
+                                 bnb_4bit_quant_type="nf4",
+                                 bnb_4bit_use_double_quant=True,
+                                 bnb_4bit_compute_dtype=torch.bfloat16)
+        base = AutoModelForCausalLM.from_pretrained(self.cfg["backbone"],
+                                                    torch_dtype=torch.bfloat16,
+                                                    quantization_config=bnb)
+        base = prepare_model_for_kbit_training(base)
+        base.gradient_checkpointing_enable()
+        base.config.use_cache = False
+
+        # Load the original LoRA checkpoint (not current model state)
+        ref_model = PeftModel.from_pretrained(base, self.original_lora_ckpt, is_trainable=False)
+        
+        # Reference model should be in eval mode and require no gradients
+        ref_model = ref_model.eval().requires_grad_(False)
+        
+        print(f"[DEBUG] Reference model created successfully from {self.original_lora_ckpt}")
+        return ref_model
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
