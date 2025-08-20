@@ -137,10 +137,17 @@ class SimpleEntropyProbe:
         B, G = log_probs.shape
         device = log_probs.device
         
-        # Compute mean log probability for baseline
-        mean_log_prob = log_probs.mean()
+        # Compute mean log probability for baseline (distributed)
+        local_mean = log_probs.mean()
+        if dist.is_initialized():
+            # Average across all GPUs for global baseline
+            global_mean = local_mean.clone()
+            dist.all_reduce(global_mean, op=dist.ReduceOp.AVG)
+            mean_log_prob = global_mean
+        else:
+            mean_log_prob = local_mean
         
-        # Centered log probabilities: S(t) - S̄
+        # Centered log probabilities: S(t) - S̄_global
         centered_log_probs = log_probs - mean_log_prob  # (B, G)
         
         # We need to compute: E[(S-S̄) ∂_α S] = E[(S-S̄) ∂_α log π(t)]
@@ -158,17 +165,33 @@ class SimpleEntropyProbe:
         # Backward pass to get gradients
         weighted_log_prob_sum.backward(retain_graph=True)
         
-        # Collect gradients and normalize by batch size
+        # Collect gradients and normalize by global batch size
         entropy_grad_chunks = []
+        
+        # Get global batch size for proper normalization
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            global_batch_size = B * G * world_size
+        else:
+            global_batch_size = B * G
+            
         for param in trainable_params:
             if param.grad is not None:
-                # Entropy gradient: ∂_α H = -E[(S-S̄) ∂_α S] = -(1/N) Σ (S-S̄) ∂_α S
-                entropy_grad = -param.grad.detach().flatten() / (B * G)
+                # Entropy gradient: ∂_α H = -E[(S-S̄) ∂_α S] = -(1/N_global) Σ (S-S̄) ∂_α S
+                entropy_grad = -param.grad.detach().flatten() / global_batch_size
                 entropy_grad_chunks.append(entropy_grad)
             else:
                 entropy_grad_chunks.append(torch.zeros(param.numel(), device=device))
         
-        return torch.cat(entropy_grad_chunks)
+        local_entropy_grad = torch.cat(entropy_grad_chunks)
+        
+        # Sum gradients across GPUs (they're already normalized by global batch size)
+        if dist.is_initialized():
+            global_entropy_grad = local_entropy_grad.clone()
+            dist.all_reduce(global_entropy_grad, op=dist.ReduceOp.SUM)
+            return global_entropy_grad
+        else:
+            return local_entropy_grad
     
     def _extract_parameter_updates(
         self,

@@ -1,0 +1,97 @@
+# h100_dual_test.yaml - 2×H100 test config with 2x batch size and learning rate
+# Testing distributed training efficiency before scaling to 8×GPU
+
+# Model configuration 
+backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
+
+# -------------- Rollout Collection (2×H100 Distributed) ---------------- #
+
+# Batch sizes (2x increase for dual GPU)
+rollout_batch_size: 24        # Keep same per-GPU (total: 48)
+num_generations: 8            # Keep at 8
+
+# VLLM disabled due to dependency conflicts
+use_vllm: false
+vllm_reload_every: 5
+vllm_gpu_memory_utilization: 0.35
+
+# Teacher-forcing configuration
+tf_micro_batch: 16            # Keep same per-GPU
+
+# Data saving
+save_rollouts_every: 0        # 0 = never save
+
+# -------------- Training Configuration (2×H100 Distributed) ---------------- #
+
+# Buffer and batch sizes (2x for dual GPU)
+buffer_size: 128              # 2x increase (64 → 128)
+microbatch_size: 4            # Keep same per-GPU
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 128 / (2 * 4) = 16
+
+# PPO configuration
+ppo_epochs: 1                 # Single epoch per buffer
+max_new_tokens: 200           # Keep same (no truncation)
+temperature: 0.7              # Sampling temperature
+
+# Evaluation configuration
+eval_frac: 0.02               # Small fraction for testing
+eval_batch_size: 64           # Keep per-GPU
+eval_temperature: 0.7
+
+# Reward configuration
+reward_var_thresh: 0.01
+reject_all_zero: true
+reject_all_max: true
+
+reward_fns:
+  - tag_pref                  # Primary reward function
+
+# Scheduler configuration
+scheduler:
+  name: mix_passrate
+  dataset_name: gsm8k_r1_template
+  split: "train"
+  ema_alpha: 0.01
+  boundaries: [0.2, 0.8]
+  sample_weights: [1, 1, 1]
+
+# ------------------ GRPO Trainer Configuration ---------------- #
+
+# Learning rate and optimization (2x scaling for 2x effective batch)
+lr: 2.0e-6                    # 2x increase (1e-6 → 2e-6)
+clip_eps: 0.2                 # PPO clipping epsilon
+clip_+: 0.2                   # Asymmetric clipping
+cfg["kl_beta"]: 0.0           # KL penalty (0 = compute for logging only)
+ent_coef: 0.0                 # Entropy coefficient
+grad_clip: 1.0                # Gradient clipping norm
+
+# Training settings
+bf16: true                    # Use bfloat16 precision
+gradient_checkpointing: true
+lr_scheduler: "const"         # Constant learning rate
+
+# Checkpoint configuration
+save_every: 5                 # Save every 5 steps for testing
+total_steps: 20               # 20 steps for dual GPU testing
+
+# -------------- Diagnostic Probes (Distributed Testing) ---------------- #
+
+# Gradient Noise Scale probe (test distributed collection)
+gns_probe:
+  enabled: true               # Enable for distributed GNS testing
+  window_size: 8              # Smaller window for testing
+  ema_alpha: 0.1              # EMA smoothing factor
+  debug: true                 # Debug distributed collection
+
+# Simple Entropy Probe (NEEDS DISTRIBUTED FIX)
+simple_entropy_probe:
+  enabled: true               # Enable for distributed testing
+  debug: true                 # Debug distributed entropy computation
+  preconditioning_mode: "previous_step"
+  log_every: 1                # Log every step for testing
+
+# Complex Entropy Probe (disabled)
+entropy_probe:
+  enabled: false              # Keep disabled
+  debug: false
