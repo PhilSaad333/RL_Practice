@@ -124,6 +124,7 @@ class SimpleEntropyProbe:
         # Process gradients: ∂_α H = -E[(S-S̄) ∂_α S] = -(1/N_global) Σ (S-S̄) ∂_α S
         entropy_grad_chunks = []
         non_zero_grads = 0
+        none_grads = 0
         for param, grad in zip(trainable_params, entropy_grads):
             if grad is not None:
                 entropy_grad = -grad.detach().flatten() / global_batch_size
@@ -131,18 +132,21 @@ class SimpleEntropyProbe:
                 if torch.any(grad != 0):
                     non_zero_grads += 1
             else:
+                none_grads += 1
                 entropy_grad_chunks.append(torch.zeros(param.numel(), device=device))
         
         result = torch.cat(entropy_grad_chunks)
         
         if self.debug:
             print(f"[SimpleEntropyProbe] Microbatch entropy computation:")
-            print(f"  Entropy loss: {entropy_loss.item():.6f}")
+            print(f"  Entropy loss: {entropy_loss.item():.6f}, device: {entropy_loss.device}")
             print(f"  Token logp shape: {token_log_probs.shape}, device: {token_log_probs.device}")
             print(f"  Seq logp grad_fn: {seq_log_probs.grad_fn}")
             print(f"  Trainable params: {len(trainable_params)}")
             print(f"  First param device: {trainable_params[0].device if trainable_params else 'None'}")
+            print(f"  Param requires_grad: {trainable_params[0].requires_grad if trainable_params else 'None'}")
             print(f"  Non-zero gradients: {non_zero_grads}/{len(trainable_params)}")
+            print(f"  None gradients: {none_grads}/{len(trainable_params)}")
             print(f"  Result norm: {torch.norm(result).item():.6f}")
         
         return result
