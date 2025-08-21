@@ -314,8 +314,8 @@ class RLRunner:
                 print(f"[DEBUG] Rank {self.rank} microbatch {micro_cnt+1}: sync_grads={sync} (step_id will be {self.step_id + (1 if sync else 0)})")
                 mb = rb.get_batch(idx, device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
                 print(f"[DEBUG] Rank {self.rank} calling algo.step for microbatch {micro_cnt+1}")
-                # Skip entropy probe during microbatch processing
-                stats = self.algo.step(mb, self.ref_model, sync_grads=sync, call_entropy_probe=False)
+                # Only call entropy probe on the final microbatch (when sync_grads=True)
+                stats = self.algo.step(mb, self.ref_model, sync_grads=sync, call_entropy_probe=sync)
                 print(f"[DEBUG] Rank {self.rank} completed algo.step for microbatch {micro_cnt+1}")
                 for k, v in stats.items():
                     stats_sum[k] += v

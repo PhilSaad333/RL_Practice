@@ -473,9 +473,7 @@ class DRGRPO(RLAlgorithm):
             # ================================================================
             # SIMPLE ENTROPY PROBE: Fast δH prediction during regular training
             # ================================================================
-            print(f"[DEBUG] Simple entropy probe check: enabled={self.simple_entropy_probe.enabled}, rollouts={rollouts is not None}, call_entropy_probe={call_entropy_probe}")
             if self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe:
-                print(f"[DEBUG] Running simple entropy probe computation...")
                 # Compute advantages and sequence log probabilities
                 advantages = self._compute_advantage(rollouts.reward)  # (B, G)
                 seq_log_probs = self._compute_sequence_log_probs(rollouts)  # (B, G)
