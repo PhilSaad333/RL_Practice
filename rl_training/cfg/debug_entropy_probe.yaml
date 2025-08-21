@@ -5,16 +5,16 @@
 backbone: Qwen/Qwen2.5-1.5B
 eval_backbone: qwen2_5_15
 
-# Rollout Collection (larger for better entropy signal)
-rollout_batch_size: 16       # Increased for better signal (was 4)
+# Rollout Collection (smaller for faster debugging)
+rollout_batch_size: 8        # Reduced for faster testing (was 16)
 num_generations: 8           # Keep at 8 for diversity
 use_vllm: false
-tf_micro_batch: 16           # Increased (was 4)
+tf_micro_batch: 8            # Reduced for faster testing (was 16)
 save_rollouts_every: 0
 
-# Training Configuration (larger for better signal)
-buffer_size: 64              # Increased for better signal (was 16)
-microbatch_size: 4           # Increased (was 2)
+# Training Configuration (smaller for faster debugging)
+buffer_size: 32              # Reduced for faster testing (was 64)
+microbatch_size: 4           # Keep same (was 4)
 ppo_epochs: 1
 max_new_tokens: 50           # Short for quick test
 temperature: 0.7
@@ -51,7 +51,7 @@ lr_scheduler: "const"
 
 # Checkpoint configuration
 save_every: 1
-total_steps: 2                # 2 steps for better debugging
+total_steps: 1                # 1 step for faster debugging
 
 # Diagnostic Probes
 gns_probe:
