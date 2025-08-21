@@ -258,13 +258,14 @@ class RLRunner:
                     # Convert RolloutBuffer to RolloutBatch for entropy probe
                     entropy_batch = entropy_rb.to_batch(device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
                     
-                    # Compute ∇H using entropy buffer
+                    # Compute ∇H using entropy buffer with gradient accumulation
                     entropy_grads = self.algo.simple_entropy_probe.compute_entropy_gradients_only(
                         entropy_rollouts=entropy_batch,
                         trainable_params=ddp_trainable_params,
                         policy_model=self.model,
                         cfg=self.cfg,
-                        step_number=self.step_id + 1
+                        step_number=self.step_id + 1,
+                        microbatch_size=B  # Use same microbatch size as training
                     )
                     
                     print(f"[DEBUG] Rank {self.rank} computed entropy gradients, norm: {torch.norm(entropy_grads).item():.6f}")

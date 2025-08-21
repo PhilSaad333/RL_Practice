@@ -55,55 +55,93 @@ class SimpleEntropyProbe:
         trainable_params: List[torch.nn.Parameter],
         policy_model: torch.nn.Module,
         cfg: dict,
-        step_number: int
+        step_number: int,
+        microbatch_size: int = 4
     ) -> torch.Tensor:
         """
         Compute only entropy gradients ∇H from independent entropy rollouts.
+        Uses gradient accumulation with same microbatch size as training.
         Used in dual-buffer approach to avoid Fisher kernel correlation bias.
+        
+        Args:
+            microbatch_size: Size of microbatches for gradient accumulation
         
         Returns:
             torch.Tensor: Flattened entropy gradients ∇H
         """
         device = next(policy_model.parameters()).device
+        B, G, T_g = entropy_rollouts.gen_ids.shape
         
-        # Build sequences from rollouts
-        seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences_from_rollouts(
-            entropy_rollouts, cfg, device
-        )
+        # Initialize accumulated gradients
+        accumulated_grads = None
+        total_samples = 0
         
-        # Teacher forcing pass through policy model
-        policy_model.eval()
-        with torch.no_grad():
+        # Clear gradients
+        for param in trainable_params:
+            if param.grad is not None:
+                param.grad.zero_()
+        
+        # Process in microbatches like training
+        for batch_start in range(0, B, microbatch_size):
+            batch_end = min(batch_start + microbatch_size, B)
+            mb_B = batch_end - batch_start
+            
+            # Extract microbatch
+            mb_rollouts_data = type(entropy_rollouts)(
+                prompt_ids=entropy_rollouts.prompt_ids[batch_start:batch_end],
+                gen_ids=entropy_rollouts.gen_ids[batch_start:batch_end],
+                reward=entropy_rollouts.reward[batch_start:batch_end],
+                logprobs=entropy_rollouts.logprobs[batch_start:batch_end],
+                tag_correct=entropy_rollouts.tag_correct[batch_start:batch_end],
+                think_len=entropy_rollouts.think_len[batch_start:batch_end]
+            )
+            
+            # Build sequences for microbatch
+            seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences_from_rollouts(
+                mb_rollouts_data, cfg, device
+            )
+            
+            # Forward pass through policy model (in training mode for gradients)
+            policy_model.train()
             outputs = policy_model(input_ids=seq_flat, attention_mask=attn_mask)
             logits = outputs.logits[:, :-1, :]  # Remove last position
-        
-        # Compute log probabilities
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        target_log_probs = torch.gather(log_probs, dim=-1, index=targets_tok.unsqueeze(-1)).squeeze(-1)
-        
-        # Apply generation mask to sum only over generated tokens
-        B, G, T_g = entropy_rollouts.gen_ids.shape
-        gen_mask_flat = gen_mask.reshape(B * G, T_g)
-        masked_log_probs = target_log_probs * gen_mask_flat
-        sequence_log_probs = masked_log_probs.sum(dim=-1)  # (B*G,) - sum per sequence
-        
-        # Reshape back to (B, G) for entropy gradient computation
-        sequence_log_probs = sequence_log_probs.reshape(B, G)
-        
-        # Switch back to training mode for gradient computation
-        policy_model.train()
-        
-        # Compute entropy gradients using existing method
-        pad_id = cfg.get("pad_token_id", 0)
-        entropy_grads = self._compute_entropy_gradients(
-            entropy_rollouts, sequence_log_probs, trainable_params, pad_id
-        )
+            
+            # Compute log probabilities
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            target_log_probs = torch.gather(log_probs, dim=-1, index=targets_tok.unsqueeze(-1)).squeeze(-1)
+            
+            # Apply generation mask to sum only over generated tokens
+            gen_mask_flat = gen_mask.reshape(mb_B * G, T_g)
+            masked_log_probs = target_log_probs * gen_mask_flat
+            sequence_log_probs = masked_log_probs.sum(dim=-1)  # (mb_B*G,) - sum per sequence
+            
+            # Reshape back to (mb_B, G) for entropy gradient computation
+            sequence_log_probs = sequence_log_probs.reshape(mb_B, G)
+            
+            # Compute entropy gradients for this microbatch
+            pad_id = cfg.get("pad_token_id", 0)
+            mb_entropy_grads = self._compute_entropy_gradients(
+                mb_rollouts_data, sequence_log_probs, trainable_params, pad_id
+            )
+            
+            # Accumulate gradients (weighted by microbatch size)
+            weight = mb_B / B  # Weight by proportion of total batch
+            if accumulated_grads is None:
+                accumulated_grads = mb_entropy_grads * weight
+            else:
+                accumulated_grads += mb_entropy_grads * weight
+            
+            total_samples += mb_B
+            
+            if self.debug:
+                mb_grad_norm = torch.norm(mb_entropy_grads).item()
+                print(f"[ENTROPY] Step {step_number}, microbatch {batch_start//microbatch_size + 1}: grad norm = {mb_grad_norm:.6f}")
         
         if self.debug:
-            grad_norm = torch.norm(entropy_grads).item()
-            print(f"[ENTROPY] Step {step_number}: entropy gradient norm = {grad_norm:.6f}")
+            total_grad_norm = torch.norm(accumulated_grads).item()
+            print(f"[ENTROPY] Step {step_number}: total accumulated gradient norm = {total_grad_norm:.6f}")
         
-        return entropy_grads
+        return accumulated_grads
 
     def compute_entropy_dual_buffer(
         self,
