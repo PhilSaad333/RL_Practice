@@ -547,9 +547,11 @@ class DRGRPO(RLAlgorithm):
                     current_lr = self.opt.param_groups[0]['lr']
                     
                     # Complete delta H calculation with accumulated gradients + current Adam states
+                    # Use DDP-wrapped parameters (consistent with gradient computation)
+                    ddp_trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
                     entropy_metrics = self.simple_entropy_probe.complete_delta_h_calculation(
                         accumulated_entropy_grads=self._entropy_grad_accumulator,
-                        trainable_params=self._trainable_params(),
+                        trainable_params=ddp_trainable_params,
                         optimizer=self.opt,
                         learning_rate=current_lr
                     )
@@ -634,8 +636,10 @@ class DRGRPO(RLAlgorithm):
             advantages = self._compute_advantage(rollouts.reward)  # (B, G)
             
             # Compute entropy gradients for this microbatch using autograd.grad()
+            # Use DDP-wrapped model parameters since new_logp was computed through DDP model
+            ddp_trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
             entropy_grads = self.simple_entropy_probe.compute_entropy_gradients_microbatch(
-                new_logp, gen_mask, advantages, self._trainable_params(), self.pad_id
+                new_logp, gen_mask, advantages, ddp_trainable_params, self.pad_id
             )
             
             # Accumulate across microbatches (same pattern as training gradients)
