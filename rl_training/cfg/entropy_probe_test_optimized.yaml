@@ -1,0 +1,94 @@
+# entropy_probe_test_optimized.yaml
+# Optimized config for testing sequential entropy probe with stable Adam states
+# Based on h100_dual_qwen2_5_1_5b_optimized.yaml but configured for entropy probe testing
+
+# Model configuration 
+backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
+
+# -------------- Rollout Collection (Optimized for H100 80GB) ---------------- #
+
+# Batch sizes for generation (proven optimal for max_new_tokens=200)
+rollout_batch_size: 24        # Keep same per GPU (24 per GPU = 48 total)
+num_generations: 8            # Keep at 8 for good diversity
+
+# VLLM disabled due to dependency conflicts
+use_vllm: false
+vllm_reload_every: 5
+vllm_gpu_memory_utilization: 0.35
+
+# Teacher-forcing configuration (proven optimal)
+tf_micro_batch: 16            # Keep same per GPU (16 per GPU = 32 total)
+
+# Data saving
+save_rollouts_every: 0        # 0 = never save (saves disk space)
+
+# -------------- Training Configuration (Optimized for dual H100 80GB) ---------------- #
+
+# Buffer and batch sizes (doubled for 2x GPU)
+buffer_size: 128              # Doubled from 64 for 2x GPU setup
+microbatch_size: 4            # Keep same per GPU for memory efficiency
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 128 / (2 * 4) = 16
+
+# PPO configuration
+ppo_epochs: 1                 # Single epoch per buffer
+max_new_tokens: 200           # Proven optimal (tag_correct 70%→95%)
+temperature: 0.7              # Sampling temperature
+
+# Evaluation configuration
+eval_frac: 0.02               # Small fraction for regular evaluation
+eval_batch_size: 64           # Standard evaluation batch size
+eval_temperature: 0.7
+
+# Reward configuration
+reward_var_thresh: 0.01
+reject_all_zero: true
+reject_all_max: true
+
+reward_fns:
+  - tag_pref                  # Primary reward function
+
+# Scheduler configuration
+scheduler:
+  name: mix_passrate
+  dataset_name: gsm8k_r1_template
+  split: "train"
+  ema_alpha: 0.01
+  boundaries: [0.2, 0.8]
+  sample_weights: [1, 1, 1]
+
+# ------------------ GRPO Trainer Configuration ---------------- #
+
+# Learning rate and optimization
+lr: 1.0e-6                    # Learning rate
+clip_eps: 0.2                 # PPO clipping epsilon
+clip_+: 0.2                   # Asymmetric clipping
+cfg["kl_beta"]: 0.0           # KL penalty (0 = compute for logging only)
+ent_coef: 0.0                 # Entropy coefficient
+grad_clip: 1.0                # Gradient clipping norm
+
+# Training settings
+bf16: true                    # Use bfloat16 precision
+gradient_checkpointing: true
+lr_scheduler: "const"         # Constant learning rate
+
+# Checkpoint configuration
+save_every: 2                 # Save every 2 steps
+total_steps: 10               # 10 steps to test entropy probe with stable Adam states
+
+# -------------- Diagnostic Probes (Entropy Probe Testing) ---------------- #
+
+# Gradient Noise Scale probe (disabled for entropy probe focus)
+gns_probe:
+  enabled: false
+
+# Simple Entropy Probe (ENABLED for testing with debug output)
+simple_entropy_probe:
+  enabled: true               # Enable for entropy probe testing
+  debug: true                 # Enable debug output to monitor values
+  preconditioning_mode: "previous_step"
+  log_every: 1                # Log every step
+
+# Complex Entropy Probe (disabled)
+entropy_probe:
+  enabled: false
