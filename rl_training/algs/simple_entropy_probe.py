@@ -99,7 +99,15 @@ class SimpleEntropyProbe:
         # This gives us ∂/∂α [sum((S-S̄) * S)] = sum((S-S̄) * ∂S/∂α) = the entropy gradient we want
         entropy_loss = torch.sum(centered_log_probs * seq_log_probs)
         
-        # Use torch.autograd.grad() instead of .backward() to avoid interfering with .grad
+        # Note: We don't clear gradients here as that would interfere with training
+        
+        # FINAL TEST: Just compare autograd.grad() vs what we know about the parameters
+        if self.debug:
+            print(f"[SimpleEntropyProbe] Final diagnostic check...")
+            print(f"  First few param shapes: {[p.shape for p in trainable_params[:3]]}")
+            print(f"  First param in computation graph: {trainable_params[0] in seq_log_probs.grad_fn.next_functions[0][0].variable if hasattr(seq_log_probs.grad_fn.next_functions[0][0], 'variable') else 'Unknown'}")
+        
+        # Now try autograd.grad (original approach)
         try:
             entropy_grads = torch.autograd.grad(
                 outputs=entropy_loss,
