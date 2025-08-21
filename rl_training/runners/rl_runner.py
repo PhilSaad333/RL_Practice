@@ -151,7 +151,8 @@ class RLRunner:
             print(f"[AUTO CONFIG] Calculated grad_accum_steps={auto_grad_accum_steps} (config had {config_grad_accum})")
         
         self.algo = DRGRPO(self.model, self.cfg, pad_id=self.pad_id,
-                           ratio_log_path=self.dir / "logs" / "ratios.jsonl",
+                           # ratio_log_path=self.dir / "logs" / "ratios.jsonl",  # Disabled for production
+                           ratio_log_path=None,
                            grad_accum_steps=auto_grad_accum_steps)
         
         self.accum = auto_grad_accum_steps

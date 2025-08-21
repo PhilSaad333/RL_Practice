@@ -1,0 +1,41 @@
+# Lambda Cloud evaluation configuration
+# Copy this to ~/.lambda_eval_config.yaml and customize
+
+# Remote Lambda instance settings
+remote_workspace: "/home/ubuntu/RL_Practice"
+remote_localfs: "/home/ubuntu/localfs" 
+ssh_user: "ubuntu"
+conda_env: "rl"
+
+# Evaluation settings
+default_timeout: 3600  # 1 hour timeout for evaluations
+sync_results: true     # Auto-sync results when job completes
+cleanup_remote: false  # Keep results on Lambda (recommended)
+
+# File sync settings
+rsync_options:
+  - "--archive"
+  - "--verbose" 
+  - "--compress"
+  - "--progress"
+  - "--partial"
+
+# Lambda instance profiles (optional - for future auto-scaling)
+instance_profiles:
+  h100_80gb:
+    gpu_type: "H100"
+    memory_gb: 80
+    recommended_profiles: ["high_throughput", "full_evaluation"]
+    max_concurrent_evals: 1
+  
+  a100_40gb:
+    gpu_type: "A100" 
+    memory_gb: 40
+    recommended_profiles: ["full_evaluation", "memory_optimized"]
+    max_concurrent_evals: 1
+
+# Notification settings (future feature)
+notifications:
+  enabled: false
+  email: null
+  slack_webhook: null

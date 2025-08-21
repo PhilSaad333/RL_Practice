@@ -84,8 +84,6 @@ class RolloutCollector:
         self.cfg        = cfg
 
         self.rank = dist.get_rank() if dist.is_initialized() else 0
-        trace_name = f"rollouts_rank{self.rank}.jsonl"
-        self._trace_file = Path(out_dir) / trace_name
 
         # Device handling
         if device is None:
@@ -118,8 +116,15 @@ class RolloutCollector:
 
         # persistence
         self.out_dir     = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        self._trace_file = self.out_dir / "rollouts.jsonl"
+        # Only rank 0 should create directories in distributed mode
+        if not (hasattr(dist, 'is_initialized') and dist.is_initialized()) or dist.get_rank() == 0:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+        # Use per-rank rollout files to avoid conflicts in distributed mode
+        if hasattr(dist, 'is_initialized') and dist.is_initialized():
+            trace_name = f"rollouts_rank{self.rank}.jsonl"
+        else:
+            trace_name = "rollouts.jsonl"
+        self._trace_file = self.out_dir / trace_name
 
         # Removed old entropy modes; always compute sampled entropy cheaply  # Changed 8/11
         self.tf_micro_batch: int = max(1, int(cfg.get("tf_micro_batch", 8)))  # still used to slice scores  # Changed 8/11
