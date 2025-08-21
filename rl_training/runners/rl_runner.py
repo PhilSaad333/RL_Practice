@@ -237,12 +237,56 @@ class RLRunner:
                 mem_before = torch.cuda.memory_allocated() / 1024**3
                 print(f"[MEMORY] Rank {self.rank} GPU memory before collection: {mem_before:.2f}GB")
             
-            rb = self.collector.collect_batch(batch_prompts=per_rank)
+            # ═══ DUAL-BUFFER ENTROPY PROBE COLLECTION ═══
+            entropy_grads = None
+            if self.algo.simple_entropy_probe.enabled and self.step_id > 0:  # Skip first step
+                print(f"[DEBUG] Rank {self.rank} collecting ENTROPY buffer (step {self.step_id + 1})")
+                
+                # 1. Collect entropy buffer (half size)
+                entropy_per_rank = per_rank // 2
+                entropy_rb = self.collector.collect_batch(batch_prompts=entropy_per_rank)
+                
+                if torch.cuda.is_available():
+                    mem_after_entropy = torch.cuda.memory_allocated() / 1024**3
+                    print(f"[MEMORY] Rank {self.rank} GPU memory after entropy collection: {mem_after_entropy:.2f}GB")
+                
+                # 2. Compute entropy gradients and cleanup immediately
+                try:
+                    current_lr = self.algo.opt.param_groups[0]['lr']
+                    ddp_trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                    
+                    # Compute ∇H using entropy buffer
+                    entropy_grads = self.algo.simple_entropy_probe.compute_entropy_gradients_only(
+                        entropy_rollouts=entropy_rb,
+                        trainable_params=ddp_trainable_params,
+                        policy_model=self.model,
+                        cfg=self.cfg,
+                        step_number=self.step_id + 1
+                    )
+                    
+                    print(f"[DEBUG] Rank {self.rank} computed entropy gradients, norm: {torch.norm(entropy_grads).item():.6f}")
+                    
+                except Exception as e:
+                    print(f"[ENTROPY] Error computing entropy gradients: {e}")
+                    entropy_grads = None
+                
+                # 3. Immediate cleanup of entropy buffer
+                del entropy_rb
+                torch.cuda.empty_cache()
+                
+                if torch.cuda.is_available():
+                    mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
+                    print(f"[MEMORY] Rank {self.rank} GPU memory after entropy cleanup: {mem_after_cleanup:.2f}GB")
+            
+            # 4. Collect training buffer (remaining half or full if no entropy probe)
+            training_per_rank = per_rank // 2 if (self.algo.simple_entropy_probe.enabled and self.step_id > 0) else per_rank
+            print(f"[DEBUG] Rank {self.rank} collecting TRAINING buffer")
+            rb = self.collector.collect_batch(batch_prompts=training_per_rank)
             
             # Memory monitoring after collection
             if torch.cuda.is_available():
                 mem_after_collect = torch.cuda.memory_allocated() / 1024**3
-                print(f"[MEMORY] Rank {self.rank} GPU memory after collection: {mem_after_collect:.2f}GB")
+                print(f"[MEMORY] Rank {self.rank} GPU memory after training collection: {mem_after_collect:.2f}GB")
             
             # Add barrier after collection to ensure both ranks finish before training
             if self.ddp:
@@ -253,7 +297,7 @@ class RLRunner:
             print(f"[DEBUG] Rank {self.rank} about to start training on buffer")
             
             # each rank trains on its shard; DDP averages grads for you
-            self._train_one_buffer(rb, K, ga_steps, B)
+            self._train_one_buffer(rb, K, ga_steps, B, entropy_grads)
             
             # ═══ SYNCHRONIZED PROBE PROCESSING (Option 2: Buffer Data Preservation) ═══
             # Rank 0 determines if GNS probe needs processing and broadcasts to all ranks
@@ -302,7 +346,7 @@ class RLRunner:
                 self._save_ckpt()
         self._save_ckpt(final=True)
 
-    def _train_one_buffer(self, rb, K, ga_steps, B):
+    def _train_one_buffer(self, rb, K, ga_steps, B, entropy_grads=None):
         print(f"[DEBUG] Rank {self.rank} entered _train_one_buffer with {len(rb)} prompts, K={K}, ga_steps={ga_steps}, B={B}")
         stats_sum, total_mb_cnt = defaultdict(float), 0
         for epoch in range(K):
@@ -315,7 +359,7 @@ class RLRunner:
                 mb = rb.get_batch(idx, device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
                 print(f"[DEBUG] Rank {self.rank} calling algo.step for microbatch {micro_cnt+1}")
                 # Only call entropy probe on the final microbatch (when sync_grads=True)
-                stats = self.algo.step(mb, self.ref_model, sync_grads=sync, call_entropy_probe=sync)
+                stats = self.algo.step(mb, self.ref_model, sync_grads=sync, call_entropy_probe=sync, entropy_grads=entropy_grads if sync else None)
                 print(f"[DEBUG] Rank {self.rank} completed algo.step for microbatch {micro_cnt+1}")
                 for k, v in stats.items():
                     stats_sum[k] += v

@@ -49,28 +49,88 @@ class SimpleEntropyProbe:
         self.delta_h_history = []
         self.entropy_history = []
         
-    def compute_entropy_sequential(
+    def compute_entropy_gradients_only(
         self,
-        token_log_probs: torch.Tensor,  # (B, G, T_g) token-level log probabilities with gradients
-        gen_mask: torch.Tensor,         # (B, G, T_g) generation mask
+        entropy_rollouts: Any,
+        trainable_params: List[torch.nn.Parameter],
+        policy_model: torch.nn.Module,
+        cfg: dict,
+        step_number: int
+    ) -> torch.Tensor:
+        """
+        Compute only entropy gradients ∇H from independent entropy rollouts.
+        Used in dual-buffer approach to avoid Fisher kernel correlation bias.
+        
+        Returns:
+            torch.Tensor: Flattened entropy gradients ∇H
+        """
+        device = next(policy_model.parameters()).device
+        
+        # Build sequences from rollouts
+        seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences_from_rollouts(
+            entropy_rollouts, cfg, device
+        )
+        
+        # Teacher forcing pass through policy model
+        policy_model.eval()
+        with torch.no_grad():
+            outputs = policy_model(input_ids=seq_flat, attention_mask=attn_mask)
+            logits = outputs.logits[:, :-1, :]  # Remove last position
+        
+        # Compute log probabilities
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        target_log_probs = torch.gather(log_probs, dim=-1, index=targets_tok.unsqueeze(-1)).squeeze(-1)
+        
+        # Apply generation mask to sum only over generated tokens
+        B, G, T_g = entropy_rollouts.gen_ids.shape
+        gen_mask_flat = gen_mask.reshape(B * G, T_g)
+        masked_log_probs = target_log_probs * gen_mask_flat
+        sequence_log_probs = masked_log_probs.sum(dim=-1)  # (B*G,) - sum per sequence
+        
+        # Reshape back to (B, G) for entropy gradient computation
+        sequence_log_probs = sequence_log_probs.reshape(B, G)
+        
+        # Switch back to training mode for gradient computation
+        policy_model.train()
+        
+        # Compute entropy gradients using existing method
+        pad_id = cfg.get("pad_token_id", 0)
+        entropy_grads = self._compute_entropy_gradients(
+            entropy_rollouts, sequence_log_probs, trainable_params, pad_id
+        )
+        
+        if self.debug:
+            grad_norm = torch.norm(entropy_grads).item()
+            print(f"[ENTROPY] Step {step_number}: entropy gradient norm = {grad_norm:.6f}")
+        
+        return entropy_grads
+
+    def compute_entropy_dual_buffer(
+        self,
+        entropy_rollouts: Any,          # Independent rollouts for entropy gradient estimation
+        training_rollouts: Any,         # Independent rollouts for training (to compute δθ)
         trainable_params: List[torch.nn.Parameter],
         optimizer: torch.optim.Optimizer,
         learning_rate: float,
-        step_number: int
+        step_number: int,
+        policy_model: torch.nn.Module,
+        cfg: dict
     ) -> Dict[str, float]:
         """
-        Sequential entropy probe: run separate forward/backward pass using previous Adam states.
+        Dual-buffer entropy probe: Use independent rollout buffers for unbiased δH estimation.
         
-        This approach avoids the mysterious torch.autograd.grad() failure by using the exact
-        same .backward() mechanism as training, but in a separate pass.
+        This approach eliminates bias from using the same samples for both ∇H estimation
+        and δθ computation by using two independent rollout buffers.
         
         Args:
-            token_log_probs: Token-level log probabilities with gradients (B, G, T_g)
-            gen_mask: Generation mask (B, G, T_g)
+            entropy_rollouts: Independent rollouts for computing ∇H = E[(S-S̄) ∇S]
+            training_rollouts: Independent rollouts for training/computing δθ
             trainable_params: Trainable parameters
             optimizer: Adam optimizer with previous step's states
             learning_rate: Current learning rate
             step_number: Current step number (skip if step 1)
+            policy_model: Policy model for forward passes
+            cfg: Configuration dict for model settings
             
         Returns:
             Dictionary with entropy change prediction and diagnostic metrics
@@ -96,66 +156,107 @@ class SimpleEntropyProbe:
             print(f"[SimpleEntropyProbe] Sequential entropy computation (step {step_number}):")
         
         try:
-            # 1. Clear any existing gradients
+            # STEP 1: Compute ∇H using ENTROPY BUFFER (independent samples)
             optimizer.zero_grad()
             
-            # 2. Compute sequence log probabilities from token-level (same as optimizer path)
-            seq_log_probs = (token_log_probs * gen_mask).sum(dim=-1)  # (B, G) with gradients
+            # Forward pass on entropy buffer
+            entropy_seq_flat, entropy_attn_mask, entropy_targets_tok, entropy_gen_mask = self._build_sequences_from_rollouts(
+                entropy_rollouts, cfg, policy_model.device
+            )
+            B_ent, G_ent, T_g_ent = entropy_rollouts.gen_ids.shape
             
-            # 3. Compute mean log probability for baseline (distributed)
-            local_mean = seq_log_probs.mean()
+            # Forward pass for entropy computation
+            with torch.cuda.amp.autocast(enabled=cfg.get("bf16", True), dtype=torch.bfloat16):
+                entropy_logits = policy_model(entropy_seq_flat, attention_mask=entropy_attn_mask).logits
+            entropy_logits = entropy_logits / cfg.get("temperature", 1.0)
+            entropy_logp_all = torch.nn.functional.log_softmax(entropy_logits.float(), dim=-1)
+            entropy_new_logp = entropy_logp_all[:, :-1].gather(-1, entropy_targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g_ent:]
+            entropy_new_logp = torch.nan_to_num(entropy_new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+            entropy_new_logp = entropy_new_logp.view(B_ent, G_ent, T_g_ent)
+            
+            # Compute sequence log probabilities for entropy buffer
+            entropy_seq_log_probs = (entropy_new_logp * entropy_gen_mask).sum(dim=-1)  # (B, G) with gradients
+            
+            # Compute mean log probability for baseline (distributed)
+            local_mean = entropy_seq_log_probs.mean()
             if dist.is_initialized():
-                # Average across all GPUs for global baseline
                 global_mean = local_mean.clone()
                 dist.all_reduce(global_mean, op=dist.ReduceOp.AVG)
                 mean_log_prob = global_mean
             else:
                 mean_log_prob = local_mean
             
-            # 4. Centered log probabilities: S(t) - S̄_global (detached to remove unwanted gradients)
-            centered_log_probs = (seq_log_probs - mean_log_prob).detach()  # (B, G)
+            # Centered log probabilities: S(t) - S̄_global (detached to remove unwanted gradients)
+            centered_log_probs = (entropy_seq_log_probs - mean_log_prob).detach()  # (B, G)
             
-            # 5. Create entropy loss: sum((S-S̄) * S) where only S has gradients
-            entropy_loss = torch.sum(centered_log_probs * seq_log_probs)
+            # Create entropy loss: sum((S-S̄) * S) where only S has gradients
+            entropy_loss = torch.sum(centered_log_probs * entropy_seq_log_probs)
             
-            # 6. Compute entropy gradients using .backward() (we know this works!)
+            # Compute entropy gradients using .backward()
             entropy_loss.backward()
             
-            # 7. Extract and process entropy gradients
+            # Extract entropy gradients ∇H
             entropy_grad_chunks = []
-            param_update_chunks = []
-            
-            # Get global batch size for proper normalization
             if dist.is_initialized():
                 world_size = dist.get_world_size()
-                global_batch_size = B * G * world_size
+                global_batch_size_ent = B_ent * G_ent * world_size
             else:
-                global_batch_size = B * G
+                global_batch_size_ent = B_ent * G_ent
             
-            non_zero_grads = 0
-            none_grads = 0
-            
+            entropy_non_zero_grads = 0
             for param in trainable_params:
                 if param.grad is not None:
                     # Entropy gradient: ∂_α H = -E[(S-S̄) ∂_α S] = -(1/N_global) Σ (S-S̄) ∂_α S
-                    entropy_grad = -param.grad.detach().flatten() / global_batch_size
+                    entropy_grad = -param.grad.detach().flatten() / global_batch_size_ent
                     entropy_grad_chunks.append(entropy_grad)
-                    
-                    # Parameter update from previous step (use current learning rate)
-                    param_update = -learning_rate * param.grad.detach().flatten()
-                    param_update_chunks.append(param_update)
-                    
                     if torch.any(param.grad != 0):
-                        non_zero_grads += 1
+                        entropy_non_zero_grads += 1
                 else:
-                    none_grads += 1
-                    entropy_grad_chunks.append(torch.zeros(param.numel(), device=device))
-                    param_update_chunks.append(torch.zeros(param.numel(), device=device))
+                    entropy_grad_chunks.append(torch.zeros(param.numel(), device=policy_model.device))
             
             entropy_grads = torch.cat(entropy_grad_chunks)
+            
+            # STEP 2: Compute δθ using TRAINING BUFFER (independent samples)  
+            optimizer.zero_grad()
+            
+            # Forward pass on training buffer
+            train_seq_flat, train_attn_mask, train_targets_tok, train_gen_mask = self._build_sequences_from_rollouts(
+                training_rollouts, cfg, policy_model.device
+            )
+            B_train, G_train, T_g_train = training_rollouts.gen_ids.shape
+            
+            # Forward pass for training computation
+            with torch.cuda.amp.autocast(enabled=cfg.get("bf16", True), dtype=torch.bfloat16):
+                train_logits = policy_model(train_seq_flat, attention_mask=train_attn_mask).logits
+            train_logits = train_logits / cfg.get("temperature", 1.0)
+            train_logp_all = torch.nn.functional.log_softmax(train_logits.float(), dim=-1)
+            train_new_logp = train_logp_all[:, :-1].gather(-1, train_targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g_train:]
+            train_new_logp = torch.nan_to_num(train_new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+            train_new_logp = train_new_logp.view(B_train, G_train, T_g_train)
+            
+            # Compute a dummy training loss (we just need gradients for δθ estimation)
+            train_seq_log_probs = (train_new_logp * train_gen_mask).sum(dim=-1)  # (B, G)
+            train_loss = -train_seq_log_probs.mean()  # Simple loss for gradient computation
+            
+            # Compute training gradients
+            train_loss.backward()
+            
+            # Extract parameter updates δθ
+            param_update_chunks = []
+            train_non_zero_grads = 0
+            for param in trainable_params:
+                if param.grad is not None:
+                    # Parameter update from current gradients (use current learning rate)
+                    param_update = -learning_rate * param.grad.detach().flatten()
+                    param_update_chunks.append(param_update)
+                    if torch.any(param.grad != 0):
+                        train_non_zero_grads += 1
+                else:
+                    param_update_chunks.append(torch.zeros(param.numel(), device=policy_model.device))
+            
             param_updates = torch.cat(param_update_chunks)
             
-            # 8. Apply Adam preconditioning using PREVIOUS step's states
+            # STEP 3: Apply Adam preconditioning using PREVIOUS step's states
             conditioned_updates = self._apply_adam_preconditioning_sequential(
                 param_updates, optimizer, trainable_params
             )
@@ -182,12 +283,15 @@ class SimpleEntropyProbe:
             self.step_counter += 1
             
             if self.debug:
+                print(f"  Entropy buffer size: ({B_ent}, {G_ent}, {T_g_ent})")
+                print(f"  Training buffer size: ({B_train}, {G_train}, {T_g_train})")
                 print(f"  Entropy loss: {entropy_loss.item():.6f}")
-                print(f"  Non-zero gradients: {non_zero_grads}/{len(trainable_params)}")
-                print(f"  None gradients: {none_grads}/{len(trainable_params)}")
+                print(f"  Training loss: {train_loss.item():.6f}")
+                print(f"  Entropy non-zero gradients: {entropy_non_zero_grads}/{len(trainable_params)}")
+                print(f"  Training non-zero gradients: {train_non_zero_grads}/{len(trainable_params)}")
                 print(f"  Entropy grad norm: {torch.norm(entropy_grads).item():.6f}")
                 print(f"  Param update norm: {torch.norm(conditioned_updates).item():.6f}")
-                print(f"  Predicted δH: {delta_h:.6f}")
+                print(f"  Predicted δH (dual-buffer): {delta_h:.6f}")
             
             return {
                 "simple_entropy_delta_h_predicted": delta_h,
@@ -241,6 +345,166 @@ class SimpleEntropyProbe:
             return param_updates * conditioning_factors
         
         return param_updates
+    
+    def _build_sequences_from_rollouts(self, rollouts: Any, cfg: dict, device: torch.device):
+        """Build sequences from rollouts (same logic as dr_grpo._build_sequences)."""
+        import torch
+        
+        # Extract pad_id from cfg or use default
+        pad_id = cfg.get("pad_token_id", 0)
+        
+        B, G, T_g = rollouts.gen_ids.shape
+        prompt_rep = rollouts.prompt_ids.unsqueeze(1).expand(-1, G, -1)
+        seq_ids = torch.cat((prompt_rep, rollouts.gen_ids), dim=-1)  # (B, G, T_total)
+
+        seq_flat = seq_ids.reshape(B * G, -1)
+        attn_mask = (seq_flat != pad_id).long()
+        targets_tok = seq_flat[:, 1:]  # teacher forcing targets
+        gen_mask = (rollouts.gen_ids != pad_id).float()  # (B, G, T_g)
+        
+        return seq_flat, attn_mask, targets_tok, gen_mask
+    
+    def compute_entropy_sequential(
+        self,
+        token_log_probs: torch.Tensor,  # (B, G, T_g) token-level log probabilities with gradients
+        gen_mask: torch.Tensor,         # (B, G, T_g) generation mask
+        trainable_params: List[torch.nn.Parameter],
+        optimizer: torch.optim.Optimizer,
+        learning_rate: float,
+        step_number: int
+    ) -> Dict[str, float]:
+        """
+        Original sequential entropy probe (fallback method).
+        """
+        if not self.enabled:
+            return {}
+            
+        # Skip first step (no previous Adam states)
+        if step_number <= 1:
+            if self.debug:
+                print(f"[SimpleEntropyProbe] Skipping first step (no previous Adam states)")
+            return {
+                "simple_entropy_delta_h_predicted": 0.0,
+                "simple_entropy_grad_norm": 0.0,
+                "simple_entropy_param_norm": 0.0,
+                "simple_entropy_step_count": self.step_counter,
+            }
+            
+        B, G, T_g = token_log_probs.shape
+        device = token_log_probs.device
+        
+        if self.debug:
+            print(f"[SimpleEntropyProbe] Sequential entropy computation (step {step_number}):")
+        
+        try:
+            # Clear any existing gradients
+            optimizer.zero_grad()
+            
+            # Compute sequence log probabilities from token-level (same as optimizer path)
+            seq_log_probs = (token_log_probs * gen_mask).sum(dim=-1)  # (B, G) with gradients
+            
+            # Compute mean log probability for baseline (distributed)
+            local_mean = seq_log_probs.mean()
+            if dist.is_initialized():
+                # Average across all GPUs for global baseline
+                global_mean = local_mean.clone()
+                dist.all_reduce(global_mean, op=dist.ReduceOp.AVG)
+                mean_log_prob = global_mean
+            else:
+                mean_log_prob = local_mean
+            
+            # Centered log probabilities: S(t) - S̄_global (detached to remove unwanted gradients)
+            centered_log_probs = (seq_log_probs - mean_log_prob).detach()  # (B, G)
+            
+            # Create entropy loss: sum((S-S̄) * S) where only S has gradients
+            entropy_loss = torch.sum(centered_log_probs * seq_log_probs)
+            
+            # Compute entropy gradients using .backward() (we know this works!)
+            entropy_loss.backward()
+            
+            # Extract and process entropy gradients
+            entropy_grad_chunks = []
+            param_update_chunks = []
+            
+            # Get global batch size for proper normalization
+            if dist.is_initialized():
+                world_size = dist.get_world_size()
+                global_batch_size = B * G * world_size
+            else:
+                global_batch_size = B * G
+            
+            non_zero_grads = 0
+            none_grads = 0
+            
+            for param in trainable_params:
+                if param.grad is not None:
+                    # Entropy gradient: ∂_α H = -E[(S-S̄) ∂_α S] = -(1/N_global) Σ (S-S̄) ∂_α S
+                    entropy_grad = -param.grad.detach().flatten() / global_batch_size
+                    entropy_grad_chunks.append(entropy_grad)
+                    
+                    # Parameter update from previous step (use current learning rate)
+                    param_update = -learning_rate * param.grad.detach().flatten()
+                    param_update_chunks.append(param_update)
+                    
+                    if torch.any(param.grad != 0):
+                        non_zero_grads += 1
+                else:
+                    none_grads += 1
+                    entropy_grad_chunks.append(torch.zeros(param.numel(), device=device))
+                    param_update_chunks.append(torch.zeros(param.numel(), device=device))
+            
+            entropy_grads = torch.cat(entropy_grad_chunks)
+            param_updates = torch.cat(param_update_chunks)
+            
+            # Apply Adam preconditioning using PREVIOUS step's states
+            conditioned_updates = self._apply_adam_preconditioning_sequential(
+                param_updates, optimizer, trainable_params
+            )
+            
+            # Compute δH = Σ_α (∂_α H) × (δθ_α) × P_α
+            delta_h = torch.sum(entropy_grads * conditioned_updates).item()
+            
+            # All-reduce delta_h across ranks (same as training metrics)
+            if dist.is_initialized():
+                delta_h_tensor = torch.tensor(delta_h, device=device)
+                dist.all_reduce(delta_h_tensor, op=dist.ReduceOp.AVG)
+                delta_h = delta_h_tensor.item()
+            
+            # Store metrics
+            self.last_delta_h = delta_h
+            self.last_entropy_gradient_norm = torch.norm(entropy_grads).item()
+            self.last_param_update_norm = torch.norm(conditioned_updates).item()
+            
+            # Update history
+            self.delta_h_history.append(delta_h)
+            if len(self.delta_h_history) > 100:  # Keep last 100 steps
+                self.delta_h_history.pop(0)
+                
+            self.step_counter += 1
+            
+            if self.debug:
+                print(f"  Entropy loss: {entropy_loss.item():.6f}")
+                print(f"  Non-zero gradients: {non_zero_grads}/{len(trainable_params)}")
+                print(f"  None gradients: {none_grads}/{len(trainable_params)}")
+                print(f"  Entropy grad norm: {torch.norm(entropy_grads).item():.6f}")
+                print(f"  Param update norm: {torch.norm(conditioned_updates).item():.6f}")
+                print(f"  Predicted δH: {delta_h:.6f}")
+            
+            return {
+                "simple_entropy_delta_h_predicted": delta_h,
+                "simple_entropy_grad_norm": self.last_entropy_gradient_norm,
+                "simple_entropy_param_norm": self.last_param_update_norm,
+                "simple_entropy_step_count": self.step_counter,
+            }
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[SimpleEntropyProbe] Error in sequential computation: {e}")
+            return {}
+        
+        finally:
+            # Always clear gradients after entropy probe to not interfere with training
+            optimizer.zero_grad()
     
     def complete_delta_h_calculation(
         self,

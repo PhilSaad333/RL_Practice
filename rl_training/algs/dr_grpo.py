@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import pathlib
 from contextlib import nullcontext
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 
 import numpy as np                        # Added 8/11
 import torch
@@ -228,6 +228,7 @@ class DRGRPO(RLAlgorithm):
         *,
         sync_grads: bool = True,
         call_entropy_probe: bool = True,
+        entropy_grads: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         """
         One optimisation step (or gradient-accumulation micro-step).
@@ -303,7 +304,7 @@ class DRGRPO(RLAlgorithm):
 
         # 6) optimise (pass rollouts for ESS computation if GNS enabled or entropy probe enabled)
         pass_rollouts = self.gns_probe.enabled or self.entropy_probe.enabled or self.simple_entropy_probe.enabled
-        self._backward_and_step(loss, sync_grads, rollouts if pass_rollouts else None, call_entropy_probe)
+        self._backward_and_step(loss, sync_grads, rollouts if pass_rollouts else None, call_entropy_probe, entropy_grads)
 
         # 7) metrics
         metrics: Dict[str, float] = {
@@ -448,7 +449,7 @@ class DRGRPO(RLAlgorithm):
         return float((kl_tok.sum() / (gen_mask.sum() + 1e-8)).item())
 
     # -- optimisation ----------------------------------------------------------
-    def _backward_and_step(self, loss: torch.Tensor, sync_grads: bool, rollouts: RolloutBatch | None = None, call_entropy_probe: bool = False) -> None:
+    def _backward_and_step(self, loss: torch.Tensor, sync_grads: bool, rollouts: RolloutBatch | None = None, call_entropy_probe: bool = False, entropy_grads: Optional[torch.Tensor] = None) -> None:
         """Handle backward, gradient clipping, optimiser & scheduler."""
         maybe = (self.policy.no_sync if (hasattr(self.policy, "no_sync") and not sync_grads) else nullcontext)
         with maybe():
@@ -481,14 +482,41 @@ class DRGRPO(RLAlgorithm):
                     self._last_gns_metrics = self.gns_probe.compute_metrics(buffer_size)
                     
             # ================================================================
-            # SIMPLE ENTROPY PROBE: Sequential δH prediction before training step
+            # SIMPLE ENTROPY PROBE: Dual-buffer δH prediction using pre-computed gradients
             # ================================================================
-            if self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe:
-                # Get current learning rate
+            if self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe and entropy_grads is not None:
+                # Use pre-computed entropy gradients from dual-buffer approach
+                current_lr = self.opt.param_groups[0]['lr']
+                ddp_trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
+                
+                try:
+                    # Use training rollouts to compute δθ and combine with pre-computed ∇H
+                    entropy_metrics = self.simple_entropy_probe.complete_delta_h_calculation(
+                        entropy_grads=entropy_grads,
+                        training_rollouts=rollouts,
+                        trainable_params=ddp_trainable_params,
+                        optimizer=self.opt,
+                        learning_rate=current_lr,
+                        step_number=self.actual_opt_step + 1,
+                        policy_model=self.policy,
+                        cfg=self.cfg
+                    )
+                    
+                    self._last_simple_entropy_metrics = entropy_metrics
+                    
+                    if self.simple_entropy_probe.debug:
+                        grad_norm = torch.norm(entropy_grads).item()
+                        print(f"[ENTROPY] Step {self.actual_opt_step + 1}: Using dual-buffer approach, ∇H norm = {grad_norm:.6f}")
+                    
+                except Exception as e:
+                    if self.simple_entropy_probe.debug:
+                        print(f"[SimpleEntropyProbe] Error in dual-buffer computation: {e}")
+                    self._last_simple_entropy_metrics = {}
+                    
+            elif self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe and entropy_grads is None:
+                # Fallback to sequential approach if no pre-computed gradients available
                 current_lr = self.opt.param_groups[0]['lr']
                 
-                # Run sequential entropy probe BEFORE training gradients
-                # This uses a separate forward pass and previous Adam states
                 try:
                     # Re-compute new_logp for entropy probe (extra forward pass)
                     seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
@@ -503,7 +531,7 @@ class DRGRPO(RLAlgorithm):
                     new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
                     new_logp = new_logp.view(B, G, T_g)
                     
-                    # Run sequential entropy computation
+                    # Run sequential entropy computation (fallback approach)
                     ddp_trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
                     entropy_metrics = self.simple_entropy_probe.compute_entropy_sequential(
                         token_log_probs=new_logp,
