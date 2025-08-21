@@ -312,6 +312,11 @@ class DRGRPO(RLAlgorithm):
         # Add entropy probe metrics if available
         if self._last_entropy_metrics:
             metrics.update(self._last_entropy_metrics)
+            
+        # Add simple entropy probe metrics if available
+        if self.simple_entropy_probe.enabled:
+            simple_metrics = self.simple_entropy_probe.get_metrics()
+            metrics.update(simple_metrics)
 
         # ====================================================================
         # ENTROPY PROBE SECTION (can be refactored out)
