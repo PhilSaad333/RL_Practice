@@ -51,7 +51,7 @@ lr_scheduler: "const"
 
 # Checkpoint configuration
 save_every: 1
-total_steps: 1                # 1 step for faster debugging
+total_steps: 2                # 2 steps to test sequential entropy probe
 
 # Diagnostic Probes
 gns_probe:
