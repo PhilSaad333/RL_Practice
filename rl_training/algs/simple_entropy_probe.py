@@ -100,7 +100,8 @@ class SimpleEntropyProbe:
                 inputs=trainable_params,
                 retain_graph=True,
                 create_graph=False,
-                only_inputs=True
+                only_inputs=True,
+                allow_unused=True  # Some LoRA parameters may not be used in this computation
             )
         except RuntimeError as e:
             if self.debug:
