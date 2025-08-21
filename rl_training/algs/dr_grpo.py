@@ -146,8 +146,7 @@ class DRGRPO(RLAlgorithm):
         self._last_entropy_metrics: Dict[str, float] = {}  # Store entropy metrics for logging
         self._last_simple_entropy_metrics: Dict[str, float] = {}  # Store simple entropy metrics for logging
         
-        # Simple entropy probe accumulation
-        self._entropy_grad_accumulator = None  # Accumulate entropy gradients across microbatches
+        # Simple entropy probe (sequential approach)
         self._last_sync_grads = True  # Track previous sync_grads to detect new training step start
 
     # ------------------------------------------------------------------------
@@ -293,14 +292,8 @@ class DRGRPO(RLAlgorithm):
         else:
             kl_mean = self._kl_metric_only(seq_flat, attn_mask, targets_tok, new_logp, ref_model, gen_mask, T_g)
 
-        # 4.5) Simple entropy probe gradient accumulation (per microbatch)
-        if self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe:
-            # Reset accumulator if starting new training step (previous was final microbatch, this is first)
-            if self._last_sync_grads and not sync_grads:
-                self._entropy_grad_accumulator = None
-            
-            # Accumulate entropy gradients for this microbatch (use token-level new_logp)
-            self._accumulate_entropy_gradients(rollouts, new_logp, gen_mask)
+        # 4.5) Simple entropy probe (sequential approach before training step)
+        # Note: This is now handled in _backward_and_step() method to run before training
         
         # Track sync_grads state for next call
         self._last_sync_grads = sync_grads
@@ -488,9 +481,45 @@ class DRGRPO(RLAlgorithm):
                     self._last_gns_metrics = self.gns_probe.compute_metrics(buffer_size)
                     
             # ================================================================
-            # SIMPLE ENTROPY PROBE: Fast δH prediction during regular training
+            # SIMPLE ENTROPY PROBE: Sequential δH prediction before training step
             # ================================================================
-            # Simple entropy probe will be called from step() method where new_logp is available
+            if self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe:
+                # Get current learning rate
+                current_lr = self.opt.param_groups[0]['lr']
+                
+                # Run sequential entropy probe BEFORE training gradients
+                # This uses a separate forward pass and previous Adam states
+                try:
+                    # Re-compute new_logp for entropy probe (extra forward pass)
+                    seq_flat, attn_mask, targets_tok, gen_mask = self._build_sequences(rollouts)
+                    B, G, T_g = rollouts.gen_ids.shape
+                    
+                    # Forward pass for entropy probe (same as training)
+                    with torch.cuda.amp.autocast(enabled=self.cfg.get("bf16", True), dtype=torch.bfloat16):
+                        logits = self.policy(seq_flat, attention_mask=attn_mask).logits
+                    logits = logits / self.cfg.get("temperature", 1.0)
+                    logp_all = F.log_softmax(logits.float(), dim=-1)
+                    new_logp = logp_all[:, :-1].gather(-1, targets_tok.unsqueeze(-1)).squeeze(-1)[:, -T_g:]
+                    new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+                    new_logp = new_logp.view(B, G, T_g)
+                    
+                    # Run sequential entropy computation
+                    ddp_trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
+                    entropy_metrics = self.simple_entropy_probe.compute_entropy_sequential(
+                        token_log_probs=new_logp,
+                        gen_mask=gen_mask,
+                        trainable_params=ddp_trainable_params,
+                        optimizer=self.opt,
+                        learning_rate=current_lr,
+                        step_number=self.actual_opt_step + 1  # +1 because we haven't incremented yet
+                    )
+                    
+                    self._last_simple_entropy_metrics = entropy_metrics
+                    
+                except Exception as e:
+                    if self.simple_entropy_probe.debug:
+                        print(f"[SimpleEntropyProbe] Error in sequential computation: {e}")
+                    self._last_simple_entropy_metrics = {}
                     
             # ================================================================
             # COMPLEX ENTROPY PROBE: Store per-sequence gradients and compute δH
@@ -540,28 +569,7 @@ class DRGRPO(RLAlgorithm):
             if self.lr_sched is not None:
                 self.lr_sched.step()
             
-            # Complete simple entropy probe calculation (after optimizer step, with current Adam states)
-            if self.simple_entropy_probe.enabled and self._entropy_grad_accumulator is not None:
-                try:
-                    # Get current learning rate
-                    current_lr = self.opt.param_groups[0]['lr']
-                    
-                    # Complete delta H calculation with accumulated gradients + current Adam states
-                    # Use DDP-wrapped parameters (consistent with gradient computation)
-                    ddp_trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
-                    entropy_metrics = self.simple_entropy_probe.complete_delta_h_calculation(
-                        accumulated_entropy_grads=self._entropy_grad_accumulator,
-                        trainable_params=ddp_trainable_params,
-                        optimizer=self.opt,
-                        learning_rate=current_lr
-                    )
-                    
-                    self._last_simple_entropy_metrics = entropy_metrics
-                    
-                except Exception as e:
-                    if self.simple_entropy_probe.debug:
-                        print(f"[SimpleEntropyProbe] Error completing calculation: {e}")
-                    self._last_simple_entropy_metrics = {}
+            # Note: Simple entropy probe now runs sequentially before training step, no post-processing needed
             
             self.opt.zero_grad(set_to_none=True)
             self.actual_opt_step += 1
