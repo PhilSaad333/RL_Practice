@@ -8,8 +8,8 @@ eval_backbone: qwen2_5_15
 
 # -------------- Rollout Collection (Optimized for H100 80GB) ---------------- #
 
-# Batch sizes for generation (optimized for memory efficiency)
-rollout_batch_size: 20        # Reduced to 20 per GPU for better memory usage (40 total)
+# Batch sizes for generation (aggressive memory optimization)
+rollout_batch_size: 12        # Reduced to 12 per GPU for minimal memory usage (24 total)
 num_generations: 8            # Keep at 8 for good diversity
 
 # VLLM disabled due to dependency conflicts
@@ -25,10 +25,10 @@ save_rollouts_every: 0        # 0 = never save (saves disk space)
 
 # -------------- Training Configuration (Optimized for dual H100 80GB) ---------------- #
 
-# Buffer and batch sizes (optimized for memory efficiency)
-buffer_size: 100              # Reduced from 128 for better memory usage
+# Buffer and batch sizes (aggressive memory optimization)
+buffer_size: 64               # Reduced to 64 for minimal memory usage
 microbatch_size: 4            # Keep same per GPU for memory efficiency
-# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 100 / (2 * 4) = 12.5 → 12
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 64 / (2 * 4) = 8
 
 # PPO configuration
 ppo_epochs: 1                 # Single epoch per buffer
