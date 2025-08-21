@@ -51,19 +51,21 @@ class SimpleEntropyProbe:
         
     def compute_entropy_gradients_microbatch(
         self,
-        seq_log_probs: torch.Tensor,  # (B, G) sequence-level log probabilities with gradients
-        advantages: torch.Tensor,     # (B, G) advantages
+        token_log_probs: torch.Tensor,  # (B, G, T_g) token-level log probabilities with gradients
+        gen_mask: torch.Tensor,         # (B, G, T_g) generation mask
+        advantages: torch.Tensor,       # (B, G) advantages
         trainable_params: List[torch.nn.Parameter],
         pad_id: int = 0
     ) -> torch.Tensor:
         """
         Compute entropy gradients for a single microbatch using torch.autograd.grad().
         
-        This replaces the old _compute_entropy_gradients method and uses autograd.grad()
-        to avoid interfering with training gradients accumulated in .grad.
+        This works directly with token-level log probabilities to match the exact 
+        computation path used by the optimizer, ensuring gradient flow to LoRA parameters.
         
         Args:
-            seq_log_probs: Sequence log probabilities with gradients (B, G)
+            token_log_probs: Token-level log probabilities with gradients (B, G, T_g)
+            gen_mask: Generation mask (B, G, T_g)
             advantages: Advantages for this microbatch (B, G)  
             trainable_params: Trainable parameters
             pad_id: Padding token ID
@@ -72,10 +74,13 @@ class SimpleEntropyProbe:
             Flattened entropy gradients for this microbatch
         """
         if not self.enabled:
-            return torch.zeros(sum(p.numel() for p in trainable_params), device=seq_log_probs.device)
+            return torch.zeros(sum(p.numel() for p in trainable_params), device=token_log_probs.device)
             
-        B, G = seq_log_probs.shape
-        device = seq_log_probs.device
+        B, G, T_g = token_log_probs.shape
+        device = token_log_probs.device
+        
+        # Compute sequence log probabilities from token-level (same as optimizer path)
+        seq_log_probs = (token_log_probs * gen_mask).sum(dim=-1)  # (B, G) with gradients
         
         # Compute mean log probability for baseline (distributed)
         local_mean = seq_log_probs.mean()
@@ -90,13 +95,14 @@ class SimpleEntropyProbe:
         # Centered log probabilities: S(t) - S̄_global
         centered_log_probs = seq_log_probs - mean_log_prob  # (B, G)
         
-        # Compute weighted sum for backprop: Σ_t (S(t) - S̄) S(t)
-        weighted_log_prob_sum = torch.sum(centered_log_probs * seq_log_probs)
+        # Create an entropy-based "loss" that follows the same pattern as PPO loss
+        # This ensures we use the same computation path that the optimizer uses
+        entropy_loss = torch.sum(centered_log_probs * seq_log_probs)
         
         # Use torch.autograd.grad() instead of .backward() to avoid interfering with .grad
         try:
             entropy_grads = torch.autograd.grad(
-                outputs=weighted_log_prob_sum,
+                outputs=entropy_loss,
                 inputs=trainable_params,
                 retain_graph=True,
                 create_graph=False,
@@ -131,7 +137,7 @@ class SimpleEntropyProbe:
         
         if self.debug:
             print(f"[SimpleEntropyProbe] Microbatch entropy computation:")
-            print(f"  Weighted log prob sum: {weighted_log_prob_sum.item():.6f}")
+            print(f"  Entropy loss: {entropy_loss.item():.6f}")
             print(f"  Non-zero gradients: {non_zero_grads}/{len(trainable_params)}")
             print(f"  Result norm: {torch.norm(result).item():.6f}")
         

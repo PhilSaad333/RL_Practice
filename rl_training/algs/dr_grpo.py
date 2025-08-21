@@ -299,7 +299,7 @@ class DRGRPO(RLAlgorithm):
             if self._last_sync_grads and not sync_grads:
                 self._entropy_grad_accumulator = None
             
-            # Accumulate entropy gradients for this microbatch
+            # Accumulate entropy gradients for this microbatch (use token-level new_logp)
             self._accumulate_entropy_gradients(rollouts, new_logp, gen_mask)
         
         # Track sync_grads state for next call
@@ -630,15 +630,12 @@ class DRGRPO(RLAlgorithm):
             gen_mask: Generation mask (B, G, T_g)
         """
         try:
-            # Compute sequence log probabilities from token-level new_logp
-            seq_log_probs = (new_logp * gen_mask).sum(dim=-1)  # (B, G) with gradients
-            
             # Compute advantages for this microbatch
             advantages = self._compute_advantage(rollouts.reward)  # (B, G)
             
             # Compute entropy gradients for this microbatch using autograd.grad()
             entropy_grads = self.simple_entropy_probe.compute_entropy_gradients_microbatch(
-                seq_log_probs, advantages, self._trainable_params(), self.pad_id
+                new_logp, gen_mask, advantages, self._trainable_params(), self.pad_id
             )
             
             # Accumulate across microbatches (same pattern as training gradients)
