@@ -117,14 +117,25 @@ class SimpleEntropyProbe:
             
         # Process gradients: ∂_α H = -E[(S-S̄) ∂_α S] = -(1/N_global) Σ (S-S̄) ∂_α S
         entropy_grad_chunks = []
+        non_zero_grads = 0
         for param, grad in zip(trainable_params, entropy_grads):
             if grad is not None:
                 entropy_grad = -grad.detach().flatten() / global_batch_size
                 entropy_grad_chunks.append(entropy_grad)
+                if torch.any(grad != 0):
+                    non_zero_grads += 1
             else:
                 entropy_grad_chunks.append(torch.zeros(param.numel(), device=device))
         
-        return torch.cat(entropy_grad_chunks)
+        result = torch.cat(entropy_grad_chunks)
+        
+        if self.debug:
+            print(f"[SimpleEntropyProbe] Microbatch entropy computation:")
+            print(f"  Weighted log prob sum: {weighted_log_prob_sum.item():.6f}")
+            print(f"  Non-zero gradients: {non_zero_grads}/{len(trainable_params)}")
+            print(f"  Result norm: {torch.norm(result).item():.6f}")
+        
+        return result
     
     def complete_delta_h_calculation(
         self,
@@ -161,6 +172,13 @@ class SimpleEntropyProbe:
             
             # Compute δH = Σ_α (∂_α H) × (δθ_α) × P_α
             delta_h = torch.sum(accumulated_entropy_grads * conditioned_updates).item()
+            
+            if self.debug:
+                print(f"[SimpleEntropyProbe] Final calculation:")
+                print(f"  Accumulated entropy grad norm: {torch.norm(accumulated_entropy_grads).item():.6f}")
+                print(f"  Param updates norm: {torch.norm(param_updates).item():.6f}")
+                print(f"  Conditioned updates norm: {torch.norm(conditioned_updates).item():.6f}")
+                print(f"  Delta H: {delta_h:.6f}")
             
             # Store metrics
             self.last_delta_h = delta_h
