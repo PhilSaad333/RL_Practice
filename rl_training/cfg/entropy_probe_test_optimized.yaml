@@ -9,7 +9,7 @@ eval_backbone: qwen2_5_15
 # -------------- Rollout Collection (Optimized for H100 80GB) ---------------- #
 
 # Batch sizes for generation (proven optimal for max_new_tokens=200)
-rollout_batch_size: 24        # Keep same per GPU (24 per GPU = 48 total)
+rollout_batch_size: 22        # Reduced from 24 to 22 per GPU for memory efficiency (44 total)
 num_generations: 8            # Keep at 8 for good diversity
 
 # VLLM disabled due to dependency conflicts

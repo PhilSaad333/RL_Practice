@@ -255,9 +255,12 @@ class RLRunner:
                     current_lr = self.algo.opt.param_groups[0]['lr']
                     ddp_trainable_params = [p for p in self.model.parameters() if p.requires_grad]
                     
+                    # Convert RolloutBuffer to RolloutBatch for entropy probe
+                    entropy_batch = entropy_rb.to_batch(device=f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+                    
                     # Compute ∇H using entropy buffer
                     entropy_grads = self.algo.simple_entropy_probe.compute_entropy_gradients_only(
-                        entropy_rollouts=entropy_rb,
+                        entropy_rollouts=entropy_batch,
                         trainable_params=ddp_trainable_params,
                         policy_model=self.model,
                         cfg=self.cfg,
