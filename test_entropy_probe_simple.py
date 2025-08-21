@@ -73,10 +73,10 @@ def test_entropy_probe_computation():
     
     # Test different entropy loss formulations
     
-    # Test 1: Our current formulation
-    print("\nTest 1: Current entropy probe formulation")
+    # Test 1: Our current formulation (with detached centering)
+    print("\nTest 1: Current entropy probe formulation (detached)")
     mean_log_prob = seq_log_probs.mean()
-    centered_log_probs = seq_log_probs - mean_log_prob
+    centered_log_probs = (seq_log_probs - mean_log_prob).detach()
     entropy_loss1 = torch.sum(centered_log_probs * seq_log_probs)
     
     print(f"  Centered log probs: {centered_log_probs}")
