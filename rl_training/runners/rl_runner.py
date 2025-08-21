@@ -265,7 +265,7 @@ class RLRunner:
                         policy_model=self.model,
                         cfg=self.cfg,
                         step_number=self.step_id + 1,
-                        microbatch_size=B  # Use same microbatch size as training
+                        microbatch_size=self.cfg["microbatch_size"]  # Use same microbatch size as training (4)
                     )
                     
                     print(f"[DEBUG] Rank {self.rank} computed entropy gradients, norm: {torch.norm(entropy_grads).item():.6f}")
