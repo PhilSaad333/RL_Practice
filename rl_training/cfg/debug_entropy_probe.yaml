@@ -1,0 +1,69 @@
+# debug_entropy_probe.yaml - Minimal config for entropy probe debugging
+# Based on h100_dual_qwen2_5_1_5b_optimized.yaml but with 1 step only
+
+# Model configuration 
+backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
+
+# Rollout Collection (minimal for quick test)
+rollout_batch_size: 4        # Small batch for quick test
+num_generations: 4           # Small for quick test
+use_vllm: false
+tf_micro_batch: 4            # Small for quick test
+save_rollouts_every: 0
+
+# Training Configuration (minimal)
+buffer_size: 16              # Small buffer for quick test  
+microbatch_size: 2           # Small for quick test
+ppo_epochs: 1
+max_new_tokens: 50           # Short for quick test
+temperature: 0.7
+eval_frac: 0.02
+eval_batch_size: 16
+eval_temperature: 0.7
+
+# Reward configuration
+reward_var_thresh: 0.01
+reject_all_zero: true
+reject_all_max: true
+reward_fns:
+  - tag_pref
+
+# Scheduler configuration
+scheduler:
+  name: mix_passrate
+  dataset_name: gsm8k_r1_template
+  split: "train"
+  ema_alpha: 0.01
+  boundaries: [0.2, 0.8]
+  sample_weights: [1, 1, 1]
+
+# GRPO Trainer Configuration
+lr: 1.0e-6
+clip_eps: 0.2
+clip_+: 0.2
+cfg["kl_beta"]: 0.0
+ent_coef: 0.0
+grad_clip: 1.0
+bf16: true
+gradient_checkpointing: true
+lr_scheduler: "const"
+
+# Checkpoint configuration
+save_every: 1
+total_steps: 1                # Just 1 step for debugging
+
+# Diagnostic Probes
+gns_probe:
+  enabled: false
+
+# Simple Entropy Probe (ENABLED with debug for testing)
+simple_entropy_probe:
+  enabled: true               # Enable for debugging
+  debug: true                 # Enable debug output
+  preconditioning_mode: "previous_step"
+  log_every: 1
+
+# Complex Entropy Probe (disabled)
+entropy_probe:
+  enabled: false
