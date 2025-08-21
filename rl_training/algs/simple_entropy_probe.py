@@ -49,6 +49,149 @@ class SimpleEntropyProbe:
         self.delta_h_history = []
         self.entropy_history = []
         
+    def compute_entropy_gradients_microbatch(
+        self,
+        seq_log_probs: torch.Tensor,  # (B, G) sequence-level log probabilities with gradients
+        advantages: torch.Tensor,     # (B, G) advantages
+        trainable_params: List[torch.nn.Parameter],
+        pad_id: int = 0
+    ) -> torch.Tensor:
+        """
+        Compute entropy gradients for a single microbatch using torch.autograd.grad().
+        
+        This replaces the old _compute_entropy_gradients method and uses autograd.grad()
+        to avoid interfering with training gradients accumulated in .grad.
+        
+        Args:
+            seq_log_probs: Sequence log probabilities with gradients (B, G)
+            advantages: Advantages for this microbatch (B, G)  
+            trainable_params: Trainable parameters
+            pad_id: Padding token ID
+            
+        Returns:
+            Flattened entropy gradients for this microbatch
+        """
+        if not self.enabled:
+            return torch.zeros(sum(p.numel() for p in trainable_params), device=seq_log_probs.device)
+            
+        B, G = seq_log_probs.shape
+        device = seq_log_probs.device
+        
+        # Compute mean log probability for baseline (distributed)
+        local_mean = seq_log_probs.mean()
+        if dist.is_initialized():
+            # Average across all GPUs for global baseline
+            global_mean = local_mean.clone()
+            dist.all_reduce(global_mean, op=dist.ReduceOp.AVG)
+            mean_log_prob = global_mean
+        else:
+            mean_log_prob = local_mean
+        
+        # Centered log probabilities: S(t) - S̄_global
+        centered_log_probs = seq_log_probs - mean_log_prob  # (B, G)
+        
+        # Compute weighted sum for backprop: Σ_t (S(t) - S̄) S(t)
+        weighted_log_prob_sum = torch.sum(centered_log_probs * seq_log_probs)
+        
+        # Use torch.autograd.grad() instead of .backward() to avoid interfering with .grad
+        try:
+            entropy_grads = torch.autograd.grad(
+                outputs=weighted_log_prob_sum,
+                inputs=trainable_params,
+                retain_graph=True,
+                create_graph=False,
+                only_inputs=True
+            )
+        except RuntimeError as e:
+            if self.debug:
+                print(f"[SimpleEntropyProbe] autograd.grad failed: {e}")
+            return torch.zeros(sum(p.numel() for p in trainable_params), device=device)
+        
+        # Get global batch size for proper normalization
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            global_batch_size = B * G * world_size
+        else:
+            global_batch_size = B * G
+            
+        # Process gradients: ∂_α H = -E[(S-S̄) ∂_α S] = -(1/N_global) Σ (S-S̄) ∂_α S
+        entropy_grad_chunks = []
+        for param, grad in zip(trainable_params, entropy_grads):
+            if grad is not None:
+                entropy_grad = -grad.detach().flatten() / global_batch_size
+                entropy_grad_chunks.append(entropy_grad)
+            else:
+                entropy_grad_chunks.append(torch.zeros(param.numel(), device=device))
+        
+        return torch.cat(entropy_grad_chunks)
+    
+    def complete_delta_h_calculation(
+        self,
+        accumulated_entropy_grads: torch.Tensor,  # Accumulated entropy gradients across microbatches
+        trainable_params: List[torch.nn.Parameter],
+        optimizer: torch.optim.Optimizer,
+        learning_rate: float
+    ) -> Dict[str, float]:
+        """
+        Complete the delta H calculation using accumulated entropy gradients and current Adam states.
+        
+        Args:
+            accumulated_entropy_grads: Entropy gradients accumulated across all microbatches
+            trainable_params: Trainable parameters
+            optimizer: Current optimizer with up-to-date Adam states
+            learning_rate: Current learning rate
+            
+        Returns:
+            Dictionary with entropy change prediction and diagnostic metrics
+        """
+        if not self.enabled:
+            return {}
+            
+        try:
+            # All-reduce accumulated entropy gradients across ranks (like training gradients)
+            if dist.is_initialized():
+                dist.all_reduce(accumulated_entropy_grads, op=dist.ReduceOp.SUM)
+            
+            # Extract parameter updates: δθ_α (what optimizer just applied)
+            param_updates = self._extract_parameter_updates(trainable_params, learning_rate)
+            
+            # Apply Adam preconditioning: P_α (using current Adam states)
+            conditioned_updates = self._apply_preconditioning(param_updates, optimizer, trainable_params)
+            
+            # Compute δH = Σ_α (∂_α H) × (δθ_α) × P_α
+            delta_h = torch.sum(accumulated_entropy_grads * conditioned_updates).item()
+            
+            # Store metrics
+            self.last_delta_h = delta_h
+            self.last_entropy_gradient_norm = torch.norm(accumulated_entropy_grads).item()
+            self.last_param_update_norm = torch.norm(conditioned_updates).item()
+            
+            # Update history
+            self.delta_h_history.append(delta_h)
+            if len(self.delta_h_history) > 100:  # Keep last 100 steps
+                self.delta_h_history.pop(0)
+                
+            self.step_counter += 1
+            
+            # Debug output
+            if self.debug and (self.step_counter % self.log_every == 0):
+                print(f"[SimpleEntropyProbe] Step {self.step_counter}:")
+                print(f"  Predicted δH: {delta_h:.6f}")
+                print(f"  Entropy grad norm: {self.last_entropy_gradient_norm:.6f}")
+                print(f"  Param update norm: {self.last_param_update_norm:.6f}")
+            
+            return {
+                "simple_entropy_delta_h_predicted": delta_h,
+                "simple_entropy_grad_norm": self.last_entropy_gradient_norm,
+                "simple_entropy_param_norm": self.last_param_update_norm,
+                "simple_entropy_step_count": self.step_counter,
+            }
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[SimpleEntropyProbe] Error in delta H calculation: {e}")
+            return {}
+
     def compute_delta_h_prediction(
         self,
         rollouts: Any,  # RolloutBatch

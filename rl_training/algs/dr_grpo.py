@@ -144,6 +144,11 @@ class DRGRPO(RLAlgorithm):
         )
         
         self._last_entropy_metrics: Dict[str, float] = {}  # Store entropy metrics for logging
+        self._last_simple_entropy_metrics: Dict[str, float] = {}  # Store simple entropy metrics for logging
+        
+        # Simple entropy probe accumulation
+        self._entropy_grad_accumulator = None  # Accumulate entropy gradients across microbatches
+        self._last_sync_grads = True  # Track previous sync_grads to detect new training step start
 
     # ------------------------------------------------------------------------
     # CORE TRAINING METHODS
@@ -166,6 +171,7 @@ class DRGRPO(RLAlgorithm):
         seq_log_probs = (rollouts.logprobs * gen_mask).sum(dim=2)  # (B, G)
         
         return seq_log_probs
+    
         
     def call_entropy_probe_on_buffer(self, rollouts: RolloutBatch) -> None:
         """
@@ -287,6 +293,18 @@ class DRGRPO(RLAlgorithm):
         else:
             kl_mean = self._kl_metric_only(seq_flat, attn_mask, targets_tok, new_logp, ref_model, gen_mask, T_g)
 
+        # 4.5) Simple entropy probe gradient accumulation (per microbatch)
+        if self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe:
+            # Reset accumulator if starting new training step (previous was final microbatch, this is first)
+            if self._last_sync_grads and not sync_grads:
+                self._entropy_grad_accumulator = None
+            
+            # Accumulate entropy gradients for this microbatch
+            self._accumulate_entropy_gradients(rollouts, new_logp, gen_mask)
+        
+        # Track sync_grads state for next call
+        self._last_sync_grads = sync_grads
+
         # 5) optional ratio logging
         self._maybe_log_ratios(ratios, gen_mask)
 
@@ -314,9 +332,8 @@ class DRGRPO(RLAlgorithm):
             metrics.update(self._last_entropy_metrics)
             
         # Add simple entropy probe metrics if available
-        if self.simple_entropy_probe.enabled:
-            simple_metrics = self.simple_entropy_probe.get_metrics()
-            metrics.update(simple_metrics)
+        if self._last_simple_entropy_metrics:
+            metrics.update(self._last_simple_entropy_metrics)
 
         # ====================================================================
         # ENTROPY PROBE SECTION (can be refactored out)
@@ -473,32 +490,7 @@ class DRGRPO(RLAlgorithm):
             # ================================================================
             # SIMPLE ENTROPY PROBE: Fast δH prediction during regular training
             # ================================================================
-            if self.simple_entropy_probe.enabled and rollouts is not None and call_entropy_probe:
-                # Compute advantages and sequence log probabilities
-                advantages = self._compute_advantage(rollouts.reward)  # (B, G)
-                seq_log_probs = self._compute_sequence_log_probs(rollouts)  # (B, G)
-                
-                # Get current learning rate
-                current_lr = self.opt.param_groups[0]['lr']
-                
-                try:
-                    # Predict entropy change using simple δH formula
-                    simple_entropy_metrics = self.simple_entropy_probe.compute_delta_h_prediction(
-                        rollouts=rollouts,
-                        advantages=advantages,
-                        log_probs=seq_log_probs,
-                        trainable_params=self._trainable_params(),
-                        optimizer=self.opt,
-                        learning_rate=current_lr,
-                        pad_id=self.pad_id
-                    )
-                    
-                    # Merge simple entropy metrics into main metrics
-                    self._last_entropy_metrics.update(simple_entropy_metrics)
-                    
-                except Exception as e:
-                    if self.simple_entropy_probe.debug:
-                        print(f"[SimpleEntropyProbe] Error in step {self.actual_opt_step}: {e}")
+            # Simple entropy probe will be called from step() method where new_logp is available
                     
             # ================================================================
             # COMPLEX ENTROPY PROBE: Store per-sequence gradients and compute δH
@@ -547,6 +539,28 @@ class DRGRPO(RLAlgorithm):
             self.opt.step()
             if self.lr_sched is not None:
                 self.lr_sched.step()
+            
+            # Complete simple entropy probe calculation (after optimizer step, with current Adam states)
+            if self.simple_entropy_probe.enabled and self._entropy_grad_accumulator is not None:
+                try:
+                    # Get current learning rate
+                    current_lr = self.opt.param_groups[0]['lr']
+                    
+                    # Complete delta H calculation with accumulated gradients + current Adam states
+                    entropy_metrics = self.simple_entropy_probe.complete_delta_h_calculation(
+                        accumulated_entropy_grads=self._entropy_grad_accumulator,
+                        trainable_params=self._trainable_params(),
+                        optimizer=self.opt,
+                        learning_rate=current_lr
+                    )
+                    
+                    self._last_simple_entropy_metrics = entropy_metrics
+                    
+                except Exception as e:
+                    if self.simple_entropy_probe.debug:
+                        print(f"[SimpleEntropyProbe] Error completing calculation: {e}")
+                    self._last_simple_entropy_metrics = {}
+            
             self.opt.zero_grad(set_to_none=True)
             self.actual_opt_step += 1
 
@@ -605,6 +619,39 @@ class DRGRPO(RLAlgorithm):
         # Use unwrapped model to get parameters without DDP wrapper
         unwrapped_policy = _unwrap(self.policy)
         return [p for p in unwrapped_policy.parameters() if isinstance(p, torch.nn.Parameter) and p.requires_grad]
+    
+    def _accumulate_entropy_gradients(self, rollouts: RolloutBatch, new_logp: torch.Tensor, gen_mask: torch.Tensor) -> None:
+        """
+        Accumulate entropy gradients for current microbatch (parallel to training gradient accumulation).
+        
+        Args:
+            rollouts: Current microbatch rollouts
+            new_logp: Token-level log probabilities with gradients (B, G, T_g)
+            gen_mask: Generation mask (B, G, T_g)
+        """
+        try:
+            # Compute sequence log probabilities from token-level new_logp
+            seq_log_probs = (new_logp * gen_mask).sum(dim=-1)  # (B, G) with gradients
+            
+            # Compute advantages for this microbatch
+            advantages = self._compute_advantage(rollouts.reward)  # (B, G)
+            
+            # Compute entropy gradients for this microbatch using autograd.grad()
+            entropy_grads = self.simple_entropy_probe.compute_entropy_gradients_microbatch(
+                seq_log_probs, advantages, self._trainable_params(), self.pad_id
+            )
+            
+            # Accumulate across microbatches (same pattern as training gradients)
+            if self._entropy_grad_accumulator is None:
+                self._entropy_grad_accumulator = entropy_grads
+            else:
+                self._entropy_grad_accumulator += entropy_grads
+                
+        except Exception as e:
+            if self.simple_entropy_probe.debug:
+                print(f"[SimpleEntropyProbe] Error accumulating gradients: {e}")
+            # Don't break training if entropy probe fails
+            pass
     
     # ========================================================================
     # ENTROPY PROBE IMPLEMENTATION (complex, needs refactoring)
