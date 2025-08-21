@@ -92,11 +92,11 @@ class SimpleEntropyProbe:
         else:
             mean_log_prob = local_mean
         
-        # Centered log probabilities: S(t) - S̄_global
-        centered_log_probs = seq_log_probs - mean_log_prob  # (B, G)
+        # Centered log probabilities: S(t) - S̄_global (detached to remove unwanted gradients)
+        centered_log_probs = (seq_log_probs - mean_log_prob).detach()  # (B, G)
         
-        # Create an entropy-based "loss" that follows the same pattern as PPO loss
-        # This ensures we use the same computation path that the optimizer uses
+        # Create entropy loss: sum((S-S̄) * S) where only S has gradients
+        # This gives us ∂/∂α [sum((S-S̄) * S)] = sum((S-S̄) * ∂S/∂α) = the entropy gradient we want
         entropy_loss = torch.sum(centered_log_probs * seq_log_probs)
         
         # Use torch.autograd.grad() instead of .backward() to avoid interfering with .grad
@@ -138,6 +138,10 @@ class SimpleEntropyProbe:
         if self.debug:
             print(f"[SimpleEntropyProbe] Microbatch entropy computation:")
             print(f"  Entropy loss: {entropy_loss.item():.6f}")
+            print(f"  Token logp shape: {token_log_probs.shape}, device: {token_log_probs.device}")
+            print(f"  Seq logp grad_fn: {seq_log_probs.grad_fn}")
+            print(f"  Trainable params: {len(trainable_params)}")
+            print(f"  First param device: {trainable_params[0].device if trainable_params else 'None'}")
             print(f"  Non-zero gradients: {non_zero_grads}/{len(trainable_params)}")
             print(f"  Result norm: {torch.norm(result).item():.6f}")
         
