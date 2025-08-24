@@ -1,0 +1,103 @@
+# h100_dual_gns_64step_2xlr.yaml
+# EXPERIMENTAL CONFIG: 64-step run with DOUBLE learning rate (2.0e-6) for comparison
+# Based on successful buffer_size 256 run from 2025-08-22
+# 
+# Key differences from base config:
+# - lr: 2.0e-6 (doubled from 1.0e-6)
+# - Same buffer_size: 256 (proven optimal)
+# - Same GNS probe settings for comparison
+
+# Model configuration 
+backbone: Qwen/Qwen2.5-1.5B
+eval_backbone: qwen2_5_15
+
+# -------------- Rollout Collection (Proven Optimal for 2x H100) ---------------- #
+
+# Batch sizes for generation (tested and proven optimal)
+rollout_batch_size: 20        # 24 per GPU = 48 total (optimal memory utilization)
+num_generations: 8            # Keep at 8 for good diversity
+
+# VLLM disabled due to dependency conflicts
+use_vllm: false
+vllm_reload_every: 5
+vllm_gpu_memory_utilization: 0.35
+
+# Teacher-forcing configuration (tested and proven optimal)
+tf_micro_batch: 16            # 16 per GPU = 32 total (proven optimal)
+
+# Data saving
+save_rollouts_every: 0        # 0 = never save (saves disk space)
+
+# -------------- Training Configuration (Proven Optimal for 2x H100) ---------------- #
+
+# Buffer and batch sizes (tested and confirmed optimal)
+buffer_size: 256              # Proven optimal for 2x GPU setup
+microbatch_size: 4            # 4 per GPU for optimal memory efficiency
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 256 / (2 * 4) = 32
+
+# PPO configuration
+ppo_epochs: 1                 # Single epoch per buffer
+max_new_tokens: 200           # Proven optimal (tag_correct 70%→95%)
+temperature: 0.7              # Sampling temperature
+
+# Evaluation configuration
+eval_frac: 0.02               # Small fraction for regular evaluation
+eval_batch_size: 64           # Standard evaluation batch size
+eval_temperature: 0.7
+
+# Reward configuration
+reward_var_thresh: 0.01
+reject_all_zero: true
+reject_all_max: true
+
+reward_fns:
+  - tag_pref                  # Primary reward function
+
+# Scheduler configuration
+scheduler:
+  name: mix_passrate
+  dataset_name: gsm8k_r1_template
+  split: "train"
+  ema_alpha: 0.01
+  boundaries: [0.2, 0.8]
+  sample_weights: [1, 1, 1]
+
+# ------------------ GRPO Trainer Configuration ---------------- #
+
+# Learning rate and optimization (EXPERIMENTAL: DOUBLED LEARNING RATE)
+lr: 2.0e-6                    # Learning rate (DOUBLED from 1.0e-6)
+clip_eps: 0.2                 # PPO clipping epsilon
+clip_+: 0.2                   # Asymmetric clipping
+cfg["kl_beta"]: 0.0           # KL penalty (0 = compute for logging only)
+ent_coef: 0.0                 # Entropy coefficient
+grad_clip: 1.0                # Gradient clipping norm
+
+# Training settings
+bf16: true                    # Use bfloat16 precision
+gradient_checkpointing: true
+lr_scheduler: "const"         # Constant learning rate
+
+# Checkpoint configuration
+save_every: 10                # Save every 10 steps for GNS analysis
+total_steps: 64               # 64 steps for comprehensive GNS data collection
+
+# -------------- Diagnostic Probes (GNS Focus) ---------------- #
+
+# Gradient Noise Scale probe (ENABLED for comprehensive analysis)
+gns_probe:
+  enabled: true               # Enable for comprehensive GNS data collection
+  window_size: 16             # Window for GNS computation
+  ema_alpha: 0.1              # EMA smoothing factor
+  debug: false                # Set true for debug output
+
+# Simple Entropy Probe (DISABLED - focus on GNS)
+simple_entropy_probe:
+  enabled: false              # Disable for GNS-focused run
+  debug: false                # Set true for debug output
+  preconditioning_mode: "previous_step"
+  log_every: 5                # Log frequency
+
+# Complex Entropy Probe (disabled - use separate analysis framework)
+entropy_probe:
+  enabled: false              # Keep disabled for production
+  debug: false
