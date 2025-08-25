@@ -79,7 +79,7 @@ gradient_checkpointing: true
 lr_scheduler: "const"         # Constant learning rate
 
 # Checkpoint configuration
-save_every: 1                 # Save every step for testing
+save_every: 10                 # Save every step for testing
 total_steps: 2                # 2 steps for initial testing
 
 # -------------- Diagnostic Probes (Configurable) ---------------- #

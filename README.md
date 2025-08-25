@@ -31,54 +31,24 @@ Probably it would be good to have a more quantitative understanding of the Fishe
 
 
 ### Key Components
-```
-rl_training/
-├── algs/dr_grpo.py           # Main RL algorithm with entropy probes
-├── runners/                  # Training orchestration
-│   ├── rl_runner.py         # Main training loop
-│   ├── eval_batch.py        # Batch evaluation of checkpoints
-│   └── resume_training.py   # Resume from any checkpoint
-└── utils/                   # Gradient noise scale, Fisher kernels, etc.
 
-evals/                       # Evaluation pipeline
-└── metrics/                 # Custom metrics for entropy analysis
-```
+rl_training - Some training code so we can do online measurements during training, or save checkpoints and do offline measurements on them. Online experiments will be put in this folder, including measuring the gradient noise scale during training, and measuring the predicted entropy step change.
+
+evals - What it sounds like.
+
+entropy_experiments - At least for now this is where have our offline experiments, where we load checkpoints and do some tests on them. Currently implemented is the a measurement of the predicted value of $\delta\mathcal{H}$ and the true value. As part of that we also measure an estimator of the variance of the estimator of $\delta\mathcal{H}$ so we can get a sense of what batch sizes we need to make a good comparison (also to get myself more familiar with the methods used to do this sort of thing). Next we will add some measurments of the Fisher Kernel itself.
 
 
 ### Models & Datasets
 - **Models**: Qwen2.5-1.5B (LoRA fine-tuned)
 - **Dataset**: GSM8K mathematical reasoning with R1 template format
-- **Training Results**: In early runs (single A100 on colab) it took several hours to do ~50 steps, but that was enough for a ~10% pass@1 gain on evals. But this was so slow I decided I needed to switch to multi-gpu
+- **Training Results**: Pass@1 improvement from about 52% to 65@ over 64 steps, approximately linear growth in pass rate over this range of training with no signs of slowing down yet, but I stopped at 64 since that gave me enough checkpoints to do some experiments with (for now), and the training is getting expensive. Batch size was chosen based on measuring the gradient noise scale (not quite, but something close to it which was more convenient to measure), and learning rate chosen by starting at a value I saw used for a similar model and task, then increased by 2 when the gradient noise to signal ratio seemed low enough for it to be safe. It would be nice to do a more thorough search for optimal choices but I'm not made of money and it's not like I'm aiming to do an extended training run.
 - **Environment**: Lambda Cloud GPU instances (e.g 2x H100 80GB)
 
 ### Current Investigations
-1. **Linear Order Entropy Changes**: Testing whether δH₁ ≈ actual entropy changes
-2. **Fisher Kernel Structure**: Measuring K₁(t,t') between sequences
+1. **Linear Order Entropy Changes**: Testing whether $\delta \mathcal{H} \approx$ actual entropy changes
+2. **Fisher Kernel Structure**: Measuring $K_1(t,t')$ between sequences
 3. **Sequence Correlations**: Beyond Cui et al.'s token-level analysis
 
 
-
-### File Organization
-```
-/lambda/nfs/localfs/
-├── training_runs/              # Complete training sessions
-│   └── run_YYYY-MM-DD_HH-MM-SS/
-│       ├── training_state/     # Full checkpoints (model + optimizer)
-│       ├── logs/              # Training metrics, rollouts, ratios
-│       └── tensorboard/       # TensorBoard events
-└── eval_runs/                 # Evaluation results
-    └── *_gsm8k_r1_template/
-        ├── consolidated_metrics.csv
-        └── step_*/            # Per-checkpoint results
-```
-
-
-## Documentation
-
-A lot of the documentation was written for claude code's usage. I started using claude code after switching from using colab's gpus to the lambda cloud. I found it pretty annoying to interact with the lambda cloud, especially having to set up every time, but now claude can run anything I'd like pretty seamlessly. Thanks Claude! 
-
-- [`NEW_TRAINING_WORKFLOW.md`](NEW_TRAINING_WORKFLOW.md) - Complete workflow documentation
-- [`CLAUDE_GUIDE.md`](CLAUDE_GUIDE.md) - Project context and commands
-- [`lambda/LAMBDA_SETUP_GUIDE.md`](lambda/LAMBDA_SETUP_GUIDE.md) - Infrastructure setup
-- [`docs/RL_studies (1).pdf`](docs/RL_studies%20(1).pdf) - Theoretical foundations
 
