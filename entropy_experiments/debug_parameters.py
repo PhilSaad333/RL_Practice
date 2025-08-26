@@ -133,9 +133,16 @@ def main():
     checkpoint_path = config['checkpoint']['checkpoint_path']
     print(f"Checkpoint path: {checkpoint_path}")
     
-    # Initialize the probe (this loads the model)
+    # Initialize the probe and load the checkpoint
     print("Initializing OfflineEntropyProbe...")
     probe = OfflineEntropyProbe(config)
+    
+    print("Loading checkpoint...")
+    probe.load_checkpoint(checkpoint_path)
+    
+    if probe.model is None:
+        print("❌ ERROR: Model failed to load!")
+        return
     
     # Analyze the loaded model
     results = analyze_model_parameters(probe.model, checkpoint_path)
