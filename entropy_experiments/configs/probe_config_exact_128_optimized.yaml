@@ -14,10 +14,11 @@ probe_config:
   mode: "exact"                 # Use exact per-prompt U-statistic (not blocks)
   # Note: M parameter not needed for exact mode
 
-# Memory and performance - OPTIMIZED for 40GB A100 (not 80GB)
-# Current usage: 27% of 40GB = ~11GB used, 29GB free
+# Memory and performance - OPTIMIZED for 40GB A100
+# Match training constraints: G=8 requires microbatch_size=2 on single 40GB A100
 memory_config:
-  microbatch_size: 6            # INCREASED from 2 (conservative for 40GB A100)
+  microbatch_size: 2            # Match training: single 40GB A100 with G=8 sequences
+  importance_microbatch_size: 2 # Same constraint applies to importance sampling
   amp: true                     # Use automatic mixed precision
   dtype: "bfloat16"             # Match training configuration
 

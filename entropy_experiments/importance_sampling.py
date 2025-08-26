@@ -187,7 +187,7 @@ class ImportanceSampler:
                                       prompt_lens: List[int], 
                                       attention_masks: torch.Tensor) -> torch.Tensor:
         """
-        Compute sequence log probabilities for given tokenized sequences.
+        Compute sequence log probabilities for given tokenized sequences with microbatching.
         
         Args:
             sequences: [B, G, max_len] tokenized sequences
@@ -200,44 +200,58 @@ class ImportanceSampler:
         B, G, max_len = sequences.shape
         all_logprobs = []
         
-        # Process in batches for memory efficiency
+        # Use importance-specific microbatch size to avoid OOM during importance sampling
+        importance_microbatch_size = self.config.get('memory_config', {}).get('importance_microbatch_size', 2)
+        self.logger.debug(f"Using importance_microbatch_size={importance_microbatch_size} for memory efficiency")
+        
         for b in range(B):
             batch_seqs = sequences[b]  # [G, max_len]
             prompt_len = prompt_lens[b]
             batch_masks = attention_masks[b]  # [G, max_len]
             
-            # Teacher forcing pass with gradients enabled
-            was_training = self.model.training
-            self.model.train()
+            # Microbatch the G sequences for this prompt to avoid OOM
+            prompt_logprobs = []
+            for g_start in range(0, G, importance_microbatch_size):
+                g_end = min(g_start + importance_microbatch_size, G)
+                micro_seqs = batch_seqs[g_start:g_end]  # [micro_size, max_len]
+                micro_masks = batch_masks[g_start:g_end]  # [micro_size, max_len]
+                
+                # Teacher forcing pass with gradients enabled
+                was_training = self.model.training
+                self.model.train()
+                
+                try:
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                        logits = self.model(micro_seqs).logits  # [micro_size, max_len, vocab_size]
+                    
+                    # Convert to log probabilities
+                    log_probs = F.log_softmax(logits, dim=-1)  # [micro_size, max_len, vocab_size]
+                    
+                    # Extract log probs of actual tokens (causal shift)
+                    target_ids = micro_seqs[:, 1:].unsqueeze(-1)  # [micro_size, max_len-1, 1]
+                    token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)  # [micro_size, max_len-1]
+                    
+                    # Sum over generation tokens only (excluding prompt)
+                    gen_start = prompt_len - 1  # -1 for causal shift
+                    gen_token_log_probs = token_log_probs[:, gen_start:]  # [micro_size, gen_len]
+                    
+                    # Create mask for real generation tokens
+                    gen_mask = micro_masks[:, prompt_len:].float()  # [micro_size, gen_len]
+                    if gen_mask.shape[1] > gen_token_log_probs.shape[1]:
+                        gen_mask = gen_mask[:, :gen_token_log_probs.shape[1]]
+                    elif gen_mask.shape[1] < gen_token_log_probs.shape[1]:
+                        gen_token_log_probs = gen_token_log_probs[:, :gen_mask.shape[1]]
+                    
+                    # Compute sequence log probabilities
+                    seq_log_probs = (gen_token_log_probs * gen_mask).sum(dim=1)  # [micro_size]
+                    prompt_logprobs.append(seq_log_probs)
+                    
+                finally:
+                    self.model.train(was_training)
             
-            try:
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                    logits = self.model(batch_seqs).logits  # [G, max_len, vocab_size]
-                
-                # Convert to log probabilities
-                log_probs = F.log_softmax(logits, dim=-1)  # [G, max_len, vocab_size]
-                
-                # Extract log probs of actual tokens (causal shift)
-                target_ids = batch_seqs[:, 1:].unsqueeze(-1)  # [G, max_len-1, 1]
-                token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)  # [G, max_len-1]
-                
-                # Sum over generation tokens only (excluding prompt)
-                gen_start = prompt_len - 1  # -1 for causal shift
-                gen_token_log_probs = token_log_probs[:, gen_start:]  # [G, gen_len]
-                
-                # Create mask for real generation tokens
-                gen_mask = batch_masks[:, prompt_len:].float()  # [G, gen_len]
-                if gen_mask.shape[1] > gen_token_log_probs.shape[1]:
-                    gen_mask = gen_mask[:, :gen_token_log_probs.shape[1]]
-                elif gen_mask.shape[1] < gen_token_log_probs.shape[1]:
-                    gen_token_log_probs = gen_token_log_probs[:, :gen_mask.shape[1]]
-                
-                # Compute sequence log probabilities
-                seq_log_probs = (gen_token_log_probs * gen_mask).sum(dim=1)  # [G]
-                all_logprobs.append(seq_log_probs)
-                
-            finally:
-                self.model.train(was_training)
+            # Concatenate microbatched results for this prompt
+            all_seq_logprobs = torch.cat(prompt_logprobs, dim=0)  # [G]
+            all_logprobs.append(all_seq_logprobs)
         
         return torch.stack(all_logprobs, dim=0)  # [B, G]
         
