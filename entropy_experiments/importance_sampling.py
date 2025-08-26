@@ -216,13 +216,14 @@ class ImportanceSampler:
                 micro_seqs = batch_seqs[g_start:g_end]  # [micro_size, max_len]
                 micro_masks = batch_masks[g_start:g_end]  # [micro_size, max_len]
                 
-                # Teacher forcing pass with gradients enabled
+                # Teacher forcing pass for log probability computation (no gradients needed)
                 was_training = self.model.training
-                self.model.train()
+                self.model.eval()  # Use eval mode for inference
                 
                 try:
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                        logits = self.model(micro_seqs).logits  # [micro_size, max_len, vocab_size]
+                    with torch.no_grad():  # CRITICAL: No gradients needed - saves ~50% memory
+                        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                            logits = self.model(micro_seqs).logits  # [micro_size, max_len, vocab_size]
                     
                     # Convert to log probabilities
                     log_probs = F.log_softmax(logits, dim=-1)  # [micro_size, max_len, vocab_size]

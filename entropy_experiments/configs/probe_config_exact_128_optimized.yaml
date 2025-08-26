@@ -18,7 +18,7 @@ probe_config:
 # Match training constraints: G=8 requires microbatch_size=2 on single 40GB A100
 memory_config:
   microbatch_size: 2            # Match training: single 40GB A100 with G=8 sequences
-  importance_microbatch_size: 2 # Same constraint applies to importance sampling
+  importance_microbatch_size: 1 # Reduce for importance sampling OOM (more conservative)
   amp: true                     # Use automatic mixed precision
   dtype: "bfloat16"             # Match training configuration
 
