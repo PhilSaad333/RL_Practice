@@ -1,11 +1,11 @@
 """
 Adam Preconditioner
 
-Extracts and applies Adam optimizer's second moment preconditioning P^{1/2}.
+Extracts and applies Adam optimizer's second moment preconditioning P.
 Based on Section V of offline_entropy_probe_strategy.txt.
 
 The Adam preconditioner transforms gradients according to:
-    P^{1/2} g = (v^{1/2} + ε)^{-1} ⊙ g
+    P g = (v^{1/2} + ε)^{-1} ⊙ g
 
 where v is the second moment estimate from Adam's optimizer state.
 """
@@ -20,7 +20,7 @@ class AdamPreconditioner:
     """
     Extracts second moment estimates from Adam optimizer and applies preconditioning.
     
-    This implements the P^{1/2} transformation to match the optimizer's geometry,
+    This implements the P transformation to match the optimizer's geometry,
     ensuring that our entropy probe predictions align with actual training dynamics.
     """
     
@@ -45,10 +45,7 @@ class AdamPreconditioner:
         
     def _extract_second_moments(self) -> None:
         """
-        Extract second moment estimates v from Adam optimizer state.
-        
-        CRITICAL FIX (P3): Extract for ALL parameters, not gated on p.grad existence.
-        Use parameter object ID for mapping to avoid ordering issues.
+        Extract second moment estimates v from Adam optimizer state.       
         """
         self._v_states = {}
         self._param_to_group = {}  # Map param id to (group_idx, beta2, eps, step)
@@ -85,10 +82,8 @@ class AdamPreconditioner:
         
     def apply_preconditioner(self, gradient: torch.Tensor, param: torch.nn.Parameter) -> torch.Tensor:
         """
-        Apply Adam preconditioning: P^{1/2} g = (v_hat^{1/2} + ε)^{-1} ⊙ g
-        
-        CRITICAL FIX (P3): Use parameter object directly, apply bias correction.
-        
+        Apply Adam preconditioning: P g = (v_hat^{1/2} + ε)^{-1} ⊙ g
+                
         Args:
             gradient: Gradient tensor to precondition
             param: The parameter object this gradient belongs to

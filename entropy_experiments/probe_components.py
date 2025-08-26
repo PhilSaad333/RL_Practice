@@ -223,7 +223,7 @@ class ProbeComponents:
         
         Args:
             batch_data: Sampled batch from sample_batch()
-            adam_preconditioner: Component for applying P^{1/2}
+            adam_preconditioner: Component for applying P
             u_statistics: Component for U-statistic computation
             distributed_helpers: Component for distributed coordination
             
@@ -387,17 +387,21 @@ class ProbeComponents:
             S_b = S[b]  # [G] sequence log-probs for this prompt
             
             # Compute leave-one-out means
-            loo_means = torch.zeros_like(S_b)
-            for g in range(G):
-                if G > 1:
-                    mask = torch.ones(G, dtype=torch.bool, device=self.device)
-                    mask[g] = False
-                    loo_means[g] = S_b[mask].mean()
-                else:
-                    loo_means[g] = S_b[g]  # If G=1, use itself
-            
+            # Do with torch no grad
+            with torch.no_grad():
+                loo_means = torch.zeros_like(S_b)
+                for g in range(G):
+                    if G > 1:
+                        mask = torch.ones(G, dtype=torch.bool, device=self.device)
+                        mask[g] = False
+                        loo_means[g] = S_b[mask].mean()
+                    else:
+                        loo_means[g] = S_b[g]  # If G=1, use itself
+                
             # L_X for this prompt: mean_g((S - S_loo) * S)
-            prompt_loss = ((S_b - loo_means) * S_b).mean()
+            # The factor (S-S_loo) is detached
+            coeff = (S_b - loo_means).detach()
+            prompt_loss = (coeff * S_b).mean()
             total_loss = total_loss + prompt_loss  # Keep as tensor
             total_count += 1
             
@@ -442,11 +446,8 @@ class ProbeComponents:
                                distributed_helpers: Optional['DistributedHelpers']) -> Dict[str, Any]:
         """
         Compute δH₁ using exact per-prompt U-statistic with microbatched processing.
-        
-        NEW MEMORY-EFFICIENT IMPLEMENTATION:
-        - Uses microbatched gradient computation to bound VRAM by microbatch size
-        - Never materializes computation graph spanning all prompts
-        - Computes U_cross = (B/(B-1)) * bars_dot - (1/(B(B-1))) * diag_sum
+            - Uses microbatched gradient computation to bound VRAM by microbatch size
+            - Computes U_cross = (B/(B-1)) * bars_dot - (1/(B(B-1))) * diag_sum
         """
         start_time = time.time()
         self.logger.info("Computing δH₁ using microbatched exact per-prompt method")
@@ -485,8 +486,7 @@ class ProbeComponents:
             # 1c. Apply preconditioner and accumulate into ΣX
             for param in params:
                 if param.grad is not None:
-                    preconditioned_grad = adam_preconditioner.apply_preconditioner(param.grad, param)
-                    X_sum[id(param)].add_(preconditioned_grad)
+                    X_sum[id(param)].add_(param.grad)
             
             # Free activations immediately
             self.model.zero_grad()
@@ -533,47 +533,29 @@ class ProbeComponents:
         r_values = []
         
         for unit, unit_idx in self._iter_prompts_as_units(batch_data):
-            # Get X_u gradients
+            # X forward
             self.model.zero_grad()
-            S_u = self._teacher_force_logprobs(unit)
-            L_X_u = self._build_probe_loss_X_from_S(S_u)
-            L_X_u.backward()
-            
-            # Get Y_u gradients
-            y_grads_u = torch.autograd.grad(
-                self._build_probe_loss_Y_from_S(S_u), 
-                params, 
-                allow_unused=True
-            )
-            
-            # Compute required dot products
-            dot_Xu_Yu = 0.0      # X̃_u · Ỹ_u 
-            dot_Xu_SumY = 0.0    # X̃_u · ΣY
-            dot_Yu_SumX = 0.0    # Ỹ_u · ΣX
-            
+            S_uX = self._teacher_force_logprobs(unit)
+            L_X_u = self._build_probe_loss_X_from_S(S_uX)
+            L_X_u.backward()                                   # frees graph
+
+            # Y forward (fresh)
+            S_uY = self._teacher_force_logprobs(unit)
+            L_Y_u = self._build_probe_loss_Y_from_S(S_uY)
+            y_grads_u = torch.autograd.grad(L_Y_u, params, allow_unused=True)
+
+            dot_Xu_Yu = dot_Xu_SumY = dot_Yu_SumX = 0.0
             for param, y_grad in zip(params, y_grads_u):
-                param_id = id(param)
-                
-                # Get preconditioned X_u
-                X_u_grad = param.grad
-                if X_u_grad is not None:
-                    X_u_preconditioned = adam_preconditioner.apply_preconditioner(X_u_grad, param)
-                else:
+                pid = id(param)
+                X_u = param.grad
+                if X_u is None:
                     continue
-                    
-                # Get preconditioned Y_u  
-                if y_grad is not None:
-                    Y_u_preconditioned = adam_preconditioner.apply_preconditioner(y_grad, param)
-                else:
+                Y_u = adam_preconditioner.apply_preconditioner(y_grad, param) if y_grad is not None else None
+                if Y_u is None:
                     continue
-                
-                # Compute dot products
-                dot_Xu_Yu += (X_u_preconditioned * Y_u_preconditioned).sum().item()
-                
-                if param_id in Y_sum:
-                    dot_Xu_SumY += (X_u_preconditioned * Y_sum[param_id]).sum().item()
-                if param_id in X_sum:
-                    dot_Yu_SumX += (Y_u_preconditioned * X_sum[param_id]).sum().item()
+                dot_Xu_Yu   += (X_u * Y_u).sum().item()
+                dot_Xu_SumY += (X_u * Y_sum[pid]).sum().item()
+                dot_Yu_SumX += (Y_u * X_sum[pid]).sum().item()
             
             # Update diagonal sum
             diag_sum += dot_Xu_Yu
@@ -683,8 +665,7 @@ class ProbeComponents:
             # Apply preconditioner and accumulate into ΣX_blocks
             for param in params:
                 if param.grad is not None:
-                    preconditioned_grad = adam_preconditioner.apply_preconditioner(param.grad, param)
-                    X_sum_blocks[id(param)].add_(preconditioned_grad)
+                    X_sum_blocks[id(param)].add_(param.grad)
             
             # Free activations immediately
             self.model.zero_grad()
@@ -721,75 +702,59 @@ class ProbeComponents:
             if param_id in X_sum_blocks and param_id in Y_sum_blocks:
                 bars_dot_blocks += (X_sum_blocks[param_id] * Y_sum_blocks[param_id]).sum().item()
         bars_dot_blocks /= (M * M)
-        
+             
+
         # =========================================================================
         # PHASE 3: DIAGONAL LOOP - Compute Σ diag_blocks and row-means r_b
         # =========================================================================
         self.logger.debug("Phase 3: Diagonal loop - computing block diagonal terms and row means")
-        
+
         diag_sum_blocks = 0.0
         r_values_blocks = []
-        
+
         for microbatch in self._iter_prompt_microbatches(batch_data, microbatch_size):
-            # Get X_b gradients for this block
+            # X_b forward/backward
             self.model.zero_grad()
-            S_b = self._teacher_force_logprobs(microbatch)
-            L_X_b = self._build_probe_loss_X_from_S(S_b)
+            S_bX = self._teacher_force_logprobs(microbatch)
+            L_X_b = self._build_probe_loss_X_from_S(S_bX)
             L_X_b.backward()
-            
-            # Get Y_b gradients for this block
-            y_grads_b = torch.autograd.grad(
-                self._build_probe_loss_Y_from_S(S_b), 
-                params, 
-                allow_unused=True
-            )
-            
-            # Compute required dot products for this block
-            dot_Xb_Yb = 0.0      # X̃_b · Ỹ_b
-            dot_Xb_SumY = 0.0    # X̃_b · ΣY_blocks  
-            dot_Yb_SumX = 0.0    # Ỹ_b · ΣX_blocks
-            
+
+            # Y_b forward/grad (fresh graph)
+            S_bY = self._teacher_force_logprobs(microbatch)
+            L_Y_b = self._build_probe_loss_Y_from_S(S_bY)
+            y_grads_b = torch.autograd.grad(L_Y_b, params, allow_unused=True)
+
+            dot_Xb_Yb = 0.0
+            dot_Xb_SumY = 0.0
+            dot_Yb_SumX = 0.0
+
             for param, y_grad in zip(params, y_grads_b):
-                param_id = id(param)
-                
-                # Get preconditioned X_b
-                X_b_grad = param.grad
-                if X_b_grad is not None:
-                    X_b_preconditioned = adam_preconditioner.apply_preconditioner(X_b_grad, param)
-                else:
+                pid = id(param)
+                X_b = param.grad
+                if X_b is None:
                     continue
-                    
-                # Get preconditioned Y_b
-                if y_grad is not None:
-                    Y_b_preconditioned = adam_preconditioner.apply_preconditioner(y_grad, param)
-                else:
+                Y_b = adam_preconditioner.apply_preconditioner(y_grad, param) if y_grad is not None else None
+                if Y_b is None:
                     continue
-                
-                # Compute dot products
-                dot_Xb_Yb += (X_b_preconditioned * Y_b_preconditioned).sum().item()
-                
-                if param_id in Y_sum_blocks:
-                    dot_Xb_SumY += (X_b_preconditioned * Y_sum_blocks[param_id]).sum().item()
-                if param_id in X_sum_blocks:
-                    dot_Yb_SumX += (Y_b_preconditioned * X_sum_blocks[param_id]).sum().item()
-            
-            # Update diagonal sum
+
+                dot_Xb_Yb   += (X_b * Y_b).sum().item()
+                dot_Xb_SumY += (X_b * Y_sum_blocks[pid]).sum().item()
+                dot_Yb_SumX += (Y_b * X_sum_blocks[pid]).sum().item()
+
+            # accumulate diagonal
             diag_sum_blocks += dot_Xb_Yb
-            
-            # Compute row mean for this block: r_b = 0.5 * [X̃_b·Ȳ_{-b} + Ỹ_b·X̄_{-b}]
-            # where Ȳ_{-b} = (ΣY_blocks - Ỹ_b)/(M-1) and X̄_{-b} = (ΣX_blocks - X̃_b)/(M-1)
+
+            # r_b = 0.5 [X_b · Ȳ_{−b} + Y_b · X̄_{−b}]
             if M > 1:
                 XdotYbar_minus = (dot_Xb_SumY - dot_Xb_Yb) / (M - 1)
                 YdotXbar_minus = (dot_Yb_SumX - dot_Xb_Yb) / (M - 1)
                 r_b = 0.5 * (XdotYbar_minus + YdotXbar_minus)
             else:
                 r_b = 0.0
-                
+
             r_values_blocks.append(r_b)
-            
-            # Free activations
             self.model.zero_grad()
-        
+
         # Apply distributed reduction if needed
         if distributed_helpers:
             bars_dot_blocks, diag_sum_blocks = distributed_helpers.reduce_scalars(
@@ -834,70 +799,6 @@ class ProbeComponents:
             **variance_results
         }
         
-    def _compute_prompt_contribution(self, prompt_idx: int,
-                                   logprobs: torch.Tensor, advantages: torch.Tensor,
-                                   max_lengths: List[int], 
-                                   adam_preconditioner: 'AdamPreconditioner') -> float:
-        """
-        Compute (X̃_n · Ỹ_n) for a single prompt using autograd.
-        
-        This implements the core "scalar probe loss" strategy to avoid
-        storing parameter-sized vectors.
-        """
-        n = prompt_idx
-        
-        # Extract data for this prompt
-        S_n = logprobs[n, :]  # [G] 
-        A_n = advantages[n, :]  # [G]
-        L_max_n = max_lengths[n]
-        
-        # Compute leave-one-out baselines
-        S_n_loo = torch.zeros_like(S_n)
-        for g in range(len(S_n)):
-            mask = torch.ones_like(S_n, dtype=torch.bool)
-            mask[g] = False
-            S_n_loo[g] = S_n[mask].mean()
-            
-        # Build scalar probe losses
-        # L_X^(n) = (1/G) * Σ_g (S_{n,g} - S̄_{n,-g}) * S_{n,g}
-        L_X_n = ((S_n - S_n_loo) * S_n).mean()
-        
-        # L_Y^(n) = (1/(L_max * G)) * Σ_g A_{n,g} * S_{n,g}  
-        L_Y_n = (A_n * S_n).mean() / L_max_n
-        
-        # Use autograd.grad to extract gradients
-        # First backward: L_X -> param.grad (with retain_graph=True)
-        self.model.zero_grad()
-        L_X_n.backward(retain_graph=True)
-        
-        # Apply preconditioner to get X̃_n
-        x_tilde_params = []
-        for param in self.model.parameters():
-            if param.grad is not None:
-                x_tilde_param = adam_preconditioner.apply_preconditioner(param.grad)
-                x_tilde_params.append(x_tilde_param)
-            else:
-                x_tilde_params.append(None)
-                
-        # Second gradient extraction: L_Y (without affecting param.grad)
-        y_grads = torch.autograd.grad(
-            L_Y_n, self.model.parameters(), 
-            retain_graph=False, allow_unused=True
-        )
-        
-        # Apply preconditioner to get Ỹ_n and compute dot product
-        dot_product = 0.0
-        for x_tilde, y_grad in zip(x_tilde_params, y_grads):
-            if x_tilde is not None and y_grad is not None:
-                y_tilde = adam_preconditioner.apply_preconditioner(y_grad)
-                dot_product += (x_tilde * y_tilde).sum().item()
-                
-        return dot_product
-        
-    # REMOVED: _build_total_probe_loss
-    # This method created massive computation graphs spanning all prompts, which is exactly
-    # what the microbatched approach avoids. Replaced by _build_probe_loss_X_from_S and 
-    # _build_probe_loss_Y_from_S which work on microbatch-sized chunks.
         
     def _build_prompt_probe_loss(self, sequences: torch.Tensor, prompt_len: int,
                                 advantages: torch.Tensor, max_length: int, 
@@ -964,16 +865,18 @@ class ProbeComponents:
         if loss_type == "X":
             # L_X = mean_g((S_{n,g} - loo_mean(S_{n,·})) * S_{n,g})
             # Compute leave-one-out means for each response
-            loo_means = torch.zeros_like(seq_log_probs)
-            for g in range(G):
-                if G > 1:
-                    mask = torch.ones(G, dtype=torch.bool, device=self.device)
-                    mask[g] = False  
-                    loo_means[g] = seq_log_probs[mask].mean()
-                else:
-                    loo_means[g] = seq_log_probs[g]  # If G=1, use itself
-                    
-            probe_loss = ((seq_log_probs - loo_means) * seq_log_probs).mean()
+            with torch.no_grad():
+                loo_means = torch.zeros_like(seq_log_probs)
+                for g in range(G):
+                    if G > 1:
+                        mask = torch.ones(G, dtype=torch.bool, device=self.device)
+                        mask[g] = False  
+                        loo_means[g] = seq_log_probs[mask].mean()
+                    else:
+                        loo_means[g] = seq_log_probs[g]  # If G=1, use itself
+            
+            coeff = (seq_log_probs - loo_means).detach()
+            probe_loss = (coeff * seq_log_probs).mean()
             
         elif loss_type == "Y":
             # L_Y = mean_g((A_{n,g} / L_max) * S_{n,g})
@@ -1097,52 +1000,6 @@ class ProbeComponents:
             self.logger.warning(f"Error computing rewards for prompt_id {prompt_id}: {e}, using zero rewards")
             return torch.zeros(len(responses), device=self.device)
         
-    def _compute_block_pair_contribution(self, b_start: int, b_end: int, c_start: int, c_end: int,
-                                        logprobs: torch.Tensor, advantages: torch.Tensor,
-                                        max_lengths: List[int],
-                                        adam_preconditioner: 'AdamPreconditioner') -> float:
-        """
-        Compute contribution from block pair (b, c) where b ≠ c.
-        
-        This implements the "recompute X then Y" strategy from Section VII.B.
-        """
-        # Build L_X for block b
-        L_X_b = self._build_block_probe_loss(
-            b_start, b_end, logprobs, advantages, max_lengths, loss_type="X"
-        )
-        
-        # Build L_Y for block c  
-        L_Y_c = self._build_block_probe_loss(
-            c_start, c_end, logprobs, advantages, max_lengths, loss_type="Y"
-        )
-        
-        # Backward L_X_b to get X̃_b in param.grad
-        self.model.zero_grad()
-        L_X_b.backward()
-        
-        # Apply preconditioner to param.grad
-        x_tilde_params = []
-        for param in self.model.parameters():
-            if param.grad is not None:
-                x_tilde_param = adam_preconditioner.apply_preconditioner(param.grad)
-                x_tilde_params.append(x_tilde_param)
-            else:
-                x_tilde_params.append(None)
-                
-        # Get gradients of L_Y_c without affecting param.grad
-        y_grads = torch.autograd.grad(
-            L_Y_c, self.model.parameters(),
-            retain_graph=False, allow_unused=True
-        )
-        
-        # Apply preconditioner and compute dot product
-        dot_product = 0.0
-        for x_tilde, y_grad in zip(x_tilde_params, y_grads):
-            if x_tilde is not None and y_grad is not None:
-                y_tilde = adam_preconditioner.apply_preconditioner(y_grad)
-                dot_product += (x_tilde * y_tilde).sum().item()
-                
-        return dot_product
         
     def _compute_block_diagonal_contribution(self, block_start: int, block_end: int,
                                            logprobs: torch.Tensor, advantages: torch.Tensor, 
@@ -1180,14 +1037,16 @@ class ProbeComponents:
             
             if loss_type == "X":
                 # Compute leave-one-out baseline
-                S_n_loo = torch.zeros_like(S_n)
-                for g in range(G):
-                    mask = torch.ones_like(S_n, dtype=torch.bool)
-                    mask[g] = False
-                    S_n_loo[g] = S_n[mask].mean()
+                with torch.no_grad():
+                    S_n_loo = torch.zeros_like(S_n)
+                    for g in range(G):
+                        mask = torch.ones_like(S_n, dtype=torch.bool)
+                        mask[g] = False
+                        S_n_loo[g] = S_n[mask].mean()
                     
                 # L_X contribution: (S_{n,g} - S̄_{n,-g}) * S_{n,g}
-                loss_n = ((S_n - S_n_loo) * S_n).sum()
+                coeff = (S_n - S_n_loo).detach()
+                loss_n = (coeff * S_n).sum()
                 weight_n = G
                 
             elif loss_type == "Y":
