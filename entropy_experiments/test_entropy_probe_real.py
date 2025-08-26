@@ -72,11 +72,11 @@ def create_real_checkpoint_config():
             'reduce_dtype': 'float32'
         },
         
-        # Real checkpoint paths
+        # Real checkpoint paths (using S3 checkpoint with proper optimizer states)
         'checkpoint': {
-            'checkpoint_path': '/home/ubuntu/localfs/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156',
-            'optimizer_path': '',  # Will try to find automatically
-            'model_config_path': 'Qwen/Qwen2.5-1.5B'  # Base model
+            'checkpoint_path': '/home/ubuntu/localfs/checkpoints/qwen2_05_finetuned/checkpoint-156',
+            'optimizer_path': '/home/ubuntu/localfs/checkpoints/qwen2_05_finetuned/checkpoint-156/optimizer.pt',  # Real Adam states from S3
+            'model_config_path': 'Qwen/Qwen2-0.5B'  # Base model for 0.5B checkpoint
         },
         
         # Generation settings (shorter for testing)
