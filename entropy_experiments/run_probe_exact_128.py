@@ -67,8 +67,7 @@ def main():
     
     try:
         results = probe.run_offline_analysis(
-            config['checkpoint']['checkpoint_path'],
-            optimizer_path=config['checkpoint']['optimizer_path']
+            config['checkpoint']['checkpoint_path']
         )
         
         # Print results summary
