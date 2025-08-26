@@ -3,7 +3,7 @@
 
 # Core sampling parameters - large batch for variance estimation
 batch_config:
-  B: 64                         # LARGE: For meaningful variance estimates of δH₁ 
+  B: 32                         # BALANCED: Large enough for variance estimates, within A100 limits 
   G: 8                          # Keep at target value
   rollout_batch_size: 32        # INCREASED: More efficient for B=64 (32×8=256 sequences per call)
   dataset_name: "gsm8k_r1_template"  # Dataset to sample prompts from
