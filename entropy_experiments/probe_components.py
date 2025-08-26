@@ -507,10 +507,10 @@ class ProbeComponents:
         # =========================================================================
         self.logger.debug("Phase 1: X-pass - accumulating ΣX via microbatches")
         
-        # Allocate ΣX buffer (param-sized, same dtype/device as params)
+        # ✅ CPU ACCUMULATORS: Allocate ΣX buffer on CPU to save GPU memory
         X_sum = {}
         for param in params:
-            X_sum[id(param)] = torch.zeros_like(param, memory_format=torch.preserve_format)
+            X_sum[id(param)] = torch.zeros_like(param, device='cpu', dtype=torch.float32)
             
         # Accumulate X gradients over microbatches
         for microbatch in self._iter_prompt_microbatches(batch_data, microbatch_size):
@@ -522,10 +522,12 @@ class ProbeComponents:
             self.model.zero_grad()
             L_X_mb.backward()
             
-            # 1c. Apply preconditioner and accumulate into ΣX
+            # 1c. Apply preconditioner and accumulate into ΣX (CPU)
             for param in params:
                 if param.grad is not None:
-                    X_sum[id(param)].add_(param.grad)
+                    # Move gradient to CPU in float32 for accumulation
+                    grad_cpu = param.grad.detach().to('cpu', dtype=torch.float32)
+                    X_sum[id(param)].add_(grad_cpu)
             
             # Free activations immediately
             self.model.zero_grad()
@@ -535,10 +537,10 @@ class ProbeComponents:
         # =========================================================================
         self.logger.debug("Phase 2: Y-pass - accumulating ΣY via microbatches")
         
-        # Allocate ΣY buffer  
+        # ✅ CPU ACCUMULATORS: Allocate ΣY buffer on CPU to save GPU memory  
         Y_sum = {}
         for param in params:
-            Y_sum[id(param)] = torch.zeros_like(param, memory_format=torch.preserve_format)
+            Y_sum[id(param)] = torch.zeros_like(param, device='cpu', dtype=torch.float32)
             
         # Accumulate Y gradients over microbatches
         for microbatch in self._iter_prompt_microbatches(batch_data, microbatch_size):
@@ -549,11 +551,13 @@ class ProbeComponents:
             # Get Y gradients via autograd.grad
             y_grads = torch.autograd.grad(L_Y_mb, params, allow_unused=True)
             
-            # Apply preconditioner and accumulate into ΣY
+            # Apply preconditioner and accumulate into ΣY (CPU)
             for param, y_grad in zip(params, y_grads):
                 if y_grad is not None:
                     preconditioned_grad = adam_preconditioner.apply_preconditioner(y_grad, param)
-                    Y_sum[id(param)].add_(preconditioned_grad)
+                    # Move gradient to CPU in float32 for accumulation
+                    grad_cpu = preconditioned_grad.detach().to('cpu', dtype=torch.float32)
+                    Y_sum[id(param)].add_(grad_cpu)
         
         # Compute bars_dot = (ΣX · ΣY) / B²
         bars_dot = 0.0
