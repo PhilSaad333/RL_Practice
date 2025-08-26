@@ -118,8 +118,11 @@ class OfflineEntropyProbe:
             optimizer_state = torch.load(optimizer_path, map_location='cpu')
         else:
             # Try to load optimizer from a companion file or embedded in checkpoint
+            # For LoRA adapters, optimizer is typically in parent directory
+            parent_dir = os.path.dirname(checkpoint_path)
             possible_optimizer_paths = [
-                checkpoint_path + "/optimizer.pt",
+                os.path.join(parent_dir, "optimizer.pt"),  # Most common: ../optimizer.pt
+                checkpoint_path + "/optimizer.pt",         # Inside model dir (unlikely)
                 checkpoint_path.replace('.pt', '_optimizer.pt'),
                 checkpoint_path.replace('.pth', '_optimizer.pth'),
             ]
