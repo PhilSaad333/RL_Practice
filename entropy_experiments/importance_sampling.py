@@ -312,9 +312,47 @@ class ImportanceSampler:
                 # Compare to dr_grpo.py: they pass attention_mask, we might be missing it
                 self.logger.info(f"🔍 DEBUGGING: micro_masks.shape = {micro_masks.shape}")
                 
+                # SAVE GENERATED RESPONSES: Let's inspect what the model actually generated
+                try:
+                    # Try to get tokenizer from different possible locations
+                    tokenizer = None
+                    if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                        tokenizer = self.tokenizer
+                    elif hasattr(self.model, 'tokenizer'):
+                        tokenizer = self.model.tokenizer
+                    else:
+                        # Load tokenizer directly
+                        from transformers import AutoTokenizer
+                        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B")
+                    
+                    if tokenizer is not None:
+                        # Decode the sequence to see what was generated
+                        decoded_seq = tokenizer.decode(micro_seqs[0], skip_special_tokens=False)
+                        self.logger.info(f"🔍 GENERATED SEQUENCE: {decoded_seq[:200]}...")  # First 200 chars
+                        
+                        # Show the generation part only (after prompt)
+                        prompt_len = prompt_lens[b]
+                        if prompt_len < len(micro_seqs[0]):
+                            generated_tokens = micro_seqs[0][prompt_len:]
+                            decoded_gen = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+                            self.logger.info(f"🔍 GENERATED PART ONLY: {decoded_gen[:100]}...")  # First 100 chars
+                    else:
+                        self.logger.info(f"🔍 TOKENS (no tokenizer available): {micro_seqs[0][:50].tolist()}...")  # First 50 tokens
+                        
+                except Exception as e:
+                    self.logger.info(f"🔍 TOKENS (tokenizer error {e}): {micro_seqs[0][:50].tolist()}...")  # First 50 tokens
+                
+                # TEST: Try without gradients first to see if that's the issue
+                with torch.no_grad():
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                        # Try the same approach as dr_grpo.py with attention_mask
+                        logits = self.model(micro_seqs, attention_mask=micro_masks).logits  # [micro_size, max_len, vocab_size]
+                        self.logger.info(f"🔍 SUCCESS: Forward pass without gradients worked! logits.shape = {logits.shape}")
+                        
+                # Now try WITH gradients to confirm the issue
+                self.logger.info(f"🔍 TESTING: Now trying WITH gradients...")
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                    # Try the same approach as dr_grpo.py with attention_mask
-                    logits = self.model(micro_seqs, attention_mask=micro_masks).logits  # [micro_size, max_len, vocab_size]
+                    logits_with_grads = self.model(micro_seqs, attention_mask=micro_masks).logits
                 
                 if hasattr(torch.cuda, 'memory_allocated'):
                     mem_after = torch.cuda.memory_allocated() / 1024**3  # GB
