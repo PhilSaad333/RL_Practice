@@ -271,36 +271,47 @@ class ImportanceSampler:
         total_tokens = 0
         
         # Simple training objective: maximize log-likelihood of generated tokens
+        # IMPORTANT: Use microbatching to avoid OOM during gradient computation
+        importance_microbatch_size = self.config.get('memory_config', {}).get('importance_microbatch_size', 2)
+        
         for b in range(B):
             batch_seqs = sequences[b]  # [G, max_len]
             prompt_len = prompt_lens[b]
             batch_masks = attention_masks[b]  # [G, max_len]
             
-            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                logits = self.model(batch_seqs).logits  # [G, max_len, vocab_size]
-            
-            # Compute cross-entropy loss on generation tokens only
-            for g in range(G):
-                seq = batch_seqs[g]  # [max_len]
-                seq_logits = logits[g]  # [max_len, vocab_size]
-                seq_mask = batch_masks[g]  # [max_len]
+            # Microbatch the G sequences to avoid OOM during gradient computation
+            for g_start in range(0, G, importance_microbatch_size):
+                g_end = min(g_start + importance_microbatch_size, G)
+                micro_seqs = batch_seqs[g_start:g_end]  # [micro_size, max_len]
+                micro_masks = batch_masks[g_start:g_end]  # [micro_size, max_len]
                 
-                # Focus on generation tokens
-                gen_targets = seq[prompt_len:]  # [gen_len]
-                gen_logits = seq_logits[prompt_len-1:-1]  # [gen_len, vocab_size] (causal shift)
-                gen_mask = seq_mask[prompt_len:].float()  # [gen_len]
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                    logits = self.model(micro_seqs).logits  # [micro_size, max_len, vocab_size]
                 
-                if gen_targets.shape[0] > 0 and gen_logits.shape[0] > 0:
-                    min_len = min(gen_targets.shape[0], gen_logits.shape[0])
-                    gen_targets = gen_targets[:min_len]
-                    gen_logits = gen_logits[:min_len]
-                    gen_mask = gen_mask[:min_len]
+                # Compute cross-entropy loss on generation tokens only
+                for micro_g in range(logits.shape[0]):
+                    g = g_start + micro_g  # Global sequence index
+                    seq = micro_seqs[micro_g]  # [max_len]
+                    seq_logits = logits[micro_g]  # [max_len, vocab_size]
+                    seq_mask = micro_masks[micro_g]  # [max_len]
                     
-                    # Compute loss
-                    losses = F.cross_entropy(gen_logits, gen_targets, reduction='none')
-                    masked_loss = (losses * gen_mask).sum()
-                    total_loss += masked_loss
-                    total_tokens += gen_mask.sum()
+                    # Focus on generation tokens
+                    gen_targets = seq[prompt_len:]  # [gen_len]
+                    gen_logits = seq_logits[prompt_len-1:-1]  # [gen_len, vocab_size] (causal shift)
+                    gen_mask = seq_mask[prompt_len:].float()  # [gen_len]
+                    
+                    if gen_targets.shape[0] > 0 and gen_logits.shape[0] > 0:
+                        min_len = min(gen_targets.shape[0], gen_logits.shape[0])
+                        gen_targets = gen_targets[:min_len]
+                        gen_logits = gen_logits[:min_len]
+                        gen_mask = gen_mask[:min_len]
+                        
+                        # Compute loss
+                        losses = F.cross_entropy(gen_logits, gen_targets, reduction='none')
+                        masked_loss = (losses * gen_mask).sum()
+                        
+                        total_loss += masked_loss
+                        total_tokens += gen_mask.sum()
         
         return total_loss / total_tokens if total_tokens > 0 else torch.tensor(0.0, device=self.device)
         
