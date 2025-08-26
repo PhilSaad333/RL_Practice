@@ -12,10 +12,14 @@ import torch
 import yaml
 import logging
 import sys
+import warnings
 from pathlib import Path
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent))
+
+# Suppress the extremely verbose Qwen2 caching warning
+warnings.filterwarnings("ignore", message=".*Caching is incompatible with gradient checkpointing.*")
 
 from entropy_experiments import OfflineEntropyProbe
 
