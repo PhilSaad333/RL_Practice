@@ -1,0 +1,98 @@
+Fix Plan: torch.autograd.grad returns None for Y-loss
+
+Context
+- Observed: autograd.grad(L_Y_mb, params, allow_unused=True) returns all None → ΔH₁≈0.
+- X-pass works via backward() → param.grad populated. Y-pass differs only in using autograd.grad.
+- Environment: LoRA over 4-bit base (bnb), AMP bf16, gradient checkpointing enabled, left-padding teacher forcing.
+
+Likely causes (in practice)
+- Operational mismatch: autograd.grad with allow_unused=True can quietly mask a broken link or yield None due to subtle graph/PEFT wrapping, even when backward() would populate grads.
+- Masking/length corner cases: empty generation region yields zero gradient — but you report 65% pass rate; still log avg generated length to rule this out.
+- Rare graph detachment: accidental no_grad somewhere; verify S.requires_grad.
+
+Plan A (recommended): Use backward() for Y-pass like X-pass
+Rationale
+- Symmetry with X-pass, proven to populate grads correctly in your setup.
+- Keeps per-micro peak memory bounded; accumulation into Y_sum remains explicit.
+
+Changes (conceptual, precise placement)
+File: entropy_experiments/probe_components.py
+Function: _compute_delta_h1_exact (and _compute_delta_h1_blocks similarly)
+
+1) Replace autograd.grad in Y-pass microbatch loop with backward() and read param.grad
+--- PATCH SKETCH START ---
+# Y-pass allocate
+Y_sum = {id(p): torch.zeros_like(p, memory_format=torch.preserve_format) for p in params}
+
+for microbatch in self._iter_prompt_microbatches(batch_data, microbatch_size):
+    # Fresh forward with grad
+    S_dict = self._teacher_force_logprobs(microbatch)
+    L_Y_mb = self._build_probe_loss_Y_from_S(S_dict)
+
+    # Isolate microbatch grads
+    self.model.zero_grad(set_to_none=True)
+    L_Y_mb.backward()
+
+    # Accumulate preconditioned grads
+    for p in params:
+        if p.grad is not None:
+            Y_sum[id(p)].add_(adam_preconditioner.apply_preconditioner(p.grad, p))
+
+    self.model.zero_grad(set_to_none=True)
+--- PATCH SKETCH END ---
+
+2) Diagonal phase: capture X_u via backward, then Y_u via a separate backward
+--- PATCH SKETCH START ---
+for unit, unit_idx in self._iter_prompts_as_units(batch_data):
+    # X_u
+    self.model.zero_grad(set_to_none=True)
+    S_uX = self._teacher_force_logprobs(unit)
+    L_X_u = self._build_probe_loss_X_from_S(S_uX)
+    L_X_u.backward()
+    X_u_dict = {id(p): (p.grad.detach().clone() if p.grad is not None else None) for p in params}
+
+    # Y_u
+    self.model.zero_grad(set_to_none=True)
+    S_uY = self._teacher_force_logprobs(unit)
+    L_Y_u = self._build_probe_loss_Y_from_S(S_uY)
+    L_Y_u.backward()
+
+    dot_Xu_Yu = dot_Xu_SumY = dot_Yu_SumX = 0.0
+    for p in params:
+        pid = id(p)
+        Xu = X_u_dict[pid]
+        Yu = p.grad
+        if Xu is None or Yu is None:
+            continue
+        Yu = adam_preconditioner.apply_preconditioner(Yu, p)
+        dot_Xu_Yu   += (Xu * Yu).sum().item()
+        dot_Xu_SumY += (Xu * Y_sum[pid]).sum().item()
+        dot_Yu_SumX += (Yu * X_sum[pid]).sum().item()
+
+    self.model.zero_grad(set_to_none=True)
+--- PATCH SKETCH END ---
+
+Notes
+- This fully removes autograd.grad from the probe path, aligning behavior with X-pass. Peak memory remains bounded per microbatch.
+- Use set_to_none=True for faster frees; accumulate on CPU as per earlier OOM proposals if VRAM is tight.
+
+Plan B (if you must keep autograd.grad): Harden and debug
+1) Remove allow_unused=True temporarily to surface the exact failure (raise).
+2) Assert S.requires_grad is True; log S.dtype, device, and a small backward(S.sum()) to verify grads populate.
+3) Ensure params list is fresh and matches model.parameters() objects at the time of call (no wrapper swaps mid-function).
+4) Log non-None counts in X vs Y to confirm the discrepancy is isolated to autograd.grad.
+
+Grad accumulation considerations
+- We isolate per-micro grads via zero_grad() before each backward; we then explicitly add into X_sum/Y_sum and zero again. This is equivalent to “manual accumulation” but keeps parameter .grad representing only the last microbatch.
+- No interaction with optimizer here; this is a pure probe gradient flow.
+
+Validation
+- After changes, log for one microbatch:
+  - [Y-pass] non-none grads: expect >0 and similar coverage to X.
+  - Norms: ||X_sum|| and ||Y_sum|| should be nonzero; sample dot-product for first few params should be nonzero.
+- deltaH1 should no longer print exactly zero (unless truly tiny); confirm with high-precision logging.
+
+Risk/compat
+- Backward() twice per unit (diag) is safe as we build two fresh graphs; we do not reuse a freed graph.
+- With gradient checkpointing enabled, ensure inputs are on the correct device; we already run teacher forcing per microbatch on GPU.
+

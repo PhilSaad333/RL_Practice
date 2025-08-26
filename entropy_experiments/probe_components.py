@@ -559,6 +559,7 @@ class ProbeComponents:
             Y_sum[id(param)] = torch.zeros_like(param, device='cpu', dtype=torch.float32)
             
         # Accumulate Y gradients over microbatches
+        first_microbatch = True
         for microbatch in self._iter_prompt_microbatches(batch_data, microbatch_size):
             # Fresh forward with grad
             S_dict = self._teacher_force_logprobs(microbatch)
@@ -567,18 +568,26 @@ class ProbeComponents:
             # 🔍 DEBUG: Check L_Y_mb gradient requirements
             self.logger.info(f"🔍 [L_Y] requires_grad={L_Y_mb.requires_grad}, grad_fn={L_Y_mb.grad_fn}")
             
-            # 🔍 DEBUG: Test if backward() works instead of autograd.grad
-            # Clear any existing gradients first
-            for param in params:
-                if param.grad is not None:
-                    param.grad = None
-                    
-            # Try backward() to see if gradients flow
-            L_Y_mb.backward(retain_graph=True)
-            
-            # Check how many params have gradients after backward
-            backward_grad_count = sum(1 for param in params if param.grad is not None)
-            self.logger.info(f"🔍 [BACKWARD-TEST] {backward_grad_count}/{len(params)} params have gradients after backward()")
+            # 🔍 DIAGNOSTIC TEST: Test backward() vs autograd.grad() on first microbatch only
+            if first_microbatch:
+                # Clear any existing gradients first
+                for param in params:
+                    if param.grad is not None:
+                        param.grad = None
+                        
+                # Try backward() to see if gradients flow
+                L_Y_mb.backward(retain_graph=True)
+                
+                # Check how many params have gradients after backward
+                backward_grad_count = sum(1 for param in params if param.grad is not None)
+                self.logger.info(f"🔍 [DIAGNOSTIC] backward() test: {backward_grad_count}/{len(params)} params have gradients")
+                
+                # Clear gradients again for autograd.grad test
+                for param in params:
+                    if param.grad is not None:
+                        param.grad = None
+                        
+                first_microbatch = False
             
             # Get Y gradients via autograd.grad
             y_grads = torch.autograd.grad(L_Y_mb, params, allow_unused=True)
