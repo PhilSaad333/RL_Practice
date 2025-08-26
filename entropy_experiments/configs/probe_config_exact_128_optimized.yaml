@@ -44,9 +44,9 @@ checkpoint:
   optimizer_path: "/home/ubuntu/localfs/rl_training_runs/training_state/step_latest/optimizer.pt"
   model_config_path: "Qwen/Qwen2.5-1.5B"
 
-# Generation settings - reasonable for testing
+# Generation settings - increased for better coverage
 generation:
-  max_new_tokens: 100           # Moderate length for efficiency
+  max_new_tokens: 200           # Increased for better response coverage
   temperature: 0.7              # Match training temperature
   top_p: 1.0                   # Full distribution
   do_sample: true              # Enable sampling
