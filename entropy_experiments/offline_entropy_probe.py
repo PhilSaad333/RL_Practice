@@ -175,9 +175,21 @@ class OfflineEntropyProbe:
         
         This follows the same pattern as rl_runner.py for loading LoRA models.
         """
-        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+        from transformers import AutoModelForCausalLM
         from peft import PeftModel, prepare_model_for_kbit_training
         import os
+        
+        # Handle BitsAndBytesConfig import (version compatibility)
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError:
+            try:
+                from bitsandbytes import BitsAndBytesConfig
+            except ImportError:
+                # Fallback: define a dummy class
+                class BitsAndBytesConfig:
+                    def __init__(self, **kwargs):
+                        pass
         
         self.logger.info("Initializing model from checkpoint...")
         
