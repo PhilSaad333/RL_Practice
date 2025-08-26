@@ -48,7 +48,7 @@ class ProbeComponents:
         
         # Mode configuration
         self.mode = config['probe_config']['mode']  # "exact" or "blocks"
-        self.M = config['probe_config']['M']  # number of blocks if mode="blocks"
+        self.M = config['probe_config'].get('M', None)  # number of blocks if mode="blocks"
         
         self.logger.info(f"ProbeComponents initialized: mode={self.mode}, B={self.B}, G={self.G}")
         
