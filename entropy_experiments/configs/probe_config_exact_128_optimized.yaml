@@ -18,6 +18,7 @@ probe_config:
 memory_config:
   microbatch_size: 1            # REDUCED: Conservative for OOM mitigation (was 2)
   importance_microbatch_size: 1 # Already conservative
+  teacher_force_microbatch_size: 2  # NEW: G-microbatching for gradient computations
   amp: true                     # Use automatic mixed precision
   dtype: "bfloat16"             # Match training configuration
 

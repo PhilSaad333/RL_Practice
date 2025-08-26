@@ -936,7 +936,7 @@ class ProbeComponents:
         
     def _compute_sequence_logprobs(self, sequences: torch.Tensor, prompt_len: int) -> torch.Tensor:
         """
-        Compute sequence log probabilities via teacher forcing.
+        Compute sequence log probabilities via teacher forcing with G-microbatching.
         
         Args:
             sequences: [G, total_len] generated sequences 
@@ -947,21 +947,41 @@ class ProbeComponents:
         """
         G, total_len = sequences.shape
         
-        # Teacher forcing forward pass
-        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-            logits = self.model(sequences).logits  # [G, total_len, vocab_size]
-            
-        # Apply temperature if configured
-        temp = self.config['generation'].get('temperature', 1.0)
-        if temp != 1.0:
-            logits = logits / temp
-            
-        # Convert to log probabilities
-        log_probs = F.log_softmax(logits, dim=-1)  # [G, total_len, vocab_size]
+        # ✅ G-MICROBATCHING: Process sequences in smaller chunks to reduce memory
+        teacher_force_microbatch_size = self.config.get('memory_config', {}).get('teacher_force_microbatch_size', 2)
+        self.logger.debug(f"Using teacher_force_microbatch_size={teacher_force_microbatch_size} for gradient computation")
         
-        # Extract log probs of actual tokens (causal shift)
-        target_ids = sequences[:, 1:].unsqueeze(-1)  # [G, total_len-1, 1]
-        token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)  # [G, total_len-1]
+        all_token_log_probs = []
+        
+        # Process G sequences in microbatches
+        for g_start in range(0, G, teacher_force_microbatch_size):
+            g_end = min(g_start + teacher_force_microbatch_size, G)
+            micro_sequences = sequences[g_start:g_end]  # [g_micro, total_len]
+            
+            # Teacher forcing forward pass on microbatch
+            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                logits = self.model(micro_sequences).logits  # [g_micro, total_len, vocab_size]
+                
+            # Apply temperature if configured
+            temp = self.config['generation'].get('temperature', 1.0)
+            if temp != 1.0:
+                logits = logits / temp
+                
+            # Convert to log probabilities in float32 for numerical stability
+            log_probs = F.log_softmax(logits.float(), dim=-1)  # [g_micro, total_len, vocab_size]
+            
+            # Extract log probs of actual tokens (causal shift)
+            target_ids = micro_sequences[:, 1:].unsqueeze(-1)  # [g_micro, total_len-1, 1]
+            token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)  # [g_micro, total_len-1]
+            
+            all_token_log_probs.append(token_log_probs)
+            
+            # Free intermediate tensors to reduce memory pressure
+            del logits, log_probs, target_ids, token_log_probs
+            torch.cuda.empty_cache()
+        
+        # Concatenate all microbatch results
+        token_log_probs = torch.cat(all_token_log_probs, dim=0)  # [G, total_len-1]
         
         # Sum over generation tokens only (excluding prompt)
         gen_start = prompt_len - 1  # -1 for causal shift
