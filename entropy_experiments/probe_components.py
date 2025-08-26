@@ -529,8 +529,9 @@ class ProbeComponents:
                     grad_cpu = param.grad.detach().to('cpu', dtype=torch.float32)
                     X_sum[id(param)].add_(grad_cpu)
             
-            # Free activations immediately
-            self.model.zero_grad()
+            # ✅ Enhanced memory cleanup
+            self.model.zero_grad(set_to_none=True)  # More aggressive cleanup
+            torch.cuda.empty_cache()
         
         # =========================================================================
         # PHASE 2: Y-PASS - Accumulate ΣY via microbatches (Option A)
@@ -558,6 +559,9 @@ class ProbeComponents:
                     # Move gradient to CPU in float32 for accumulation
                     grad_cpu = preconditioned_grad.detach().to('cpu', dtype=torch.float32)
                     Y_sum[id(param)].add_(grad_cpu)
+        
+        # ✅ Enhanced memory cleanup after Y-pass
+        torch.cuda.empty_cache()
         
         # Compute bars_dot = (ΣX · ΣY) / B²
         bars_dot = 0.0
@@ -614,8 +618,10 @@ class ProbeComponents:
                 
             r_values.append(r_u)
             
-            # Free activations
-            self.model.zero_grad()
+            # ✅ Enhanced memory cleanup in diagonal loop
+            self.model.zero_grad(set_to_none=True)
+            if b % 2 == 0:  # Cleanup every 2 prompts to balance performance vs memory
+                torch.cuda.empty_cache()
         
         # Apply distributed reduction if needed
         if distributed_helpers:
