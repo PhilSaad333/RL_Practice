@@ -460,8 +460,9 @@ class ProbeComponents:
         microbatch_size = self.config.get('memory_config', {}).get('microbatch_size', 4)
         self.logger.info(f"Using microbatch_size={microbatch_size} for memory efficiency")
         
-        # Get model parameters for gradient accumulation
-        params = list(self.model.parameters())
+        # Get model parameters that require gradients (LoRA parameters only)
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        self.logger.info(f"Using {len(params)} trainable parameters for gradient computation")
         
         # =========================================================================
         # PHASE 1: X-PASS - Accumulate ΣX via microbatches
@@ -639,8 +640,9 @@ class ProbeComponents:
         M = (B + microbatch_size - 1) // microbatch_size  # Ceiling division
         self.logger.info(f"Using {M} blocks (microbatches) with max_size={microbatch_size}")
         
-        # Get model parameters for gradient accumulation
-        params = list(self.model.parameters())
+        # Get model parameters that require gradients (LoRA parameters only)
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        self.logger.info(f"Using {len(params)} trainable parameters for gradient computation")
         
         # =========================================================================
         # PHASE 1: X-PASS - Accumulate ΣX_blocks via microbatches  
