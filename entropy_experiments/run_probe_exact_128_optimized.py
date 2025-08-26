@@ -46,7 +46,7 @@ def main():
     logger = setup_logging()
     logger.info("🚀 Starting OPTIMIZED entropy probe measurement")
     logger.info("OPTIMIZATIONS:")
-    logger.info("  - Batched rollout generation (32 prompts × 8 responses = 256 sequences per call)")
+    logger.info("  - Batched rollout generation (16 prompts × 8 responses = 128 sequences per call)")
     logger.info("  - Increased microbatch_size=2 for 40GB A100")
     logger.info("  - Target: >70% GPU memory utilization")
     
@@ -70,7 +70,7 @@ def main():
     logger.info(f"  Sequences per generation call: {config['batch_config']['rollout_batch_size'] * config['batch_config']['G']}")
     logger.info(f"  Generation calls: {config['batch_config']['B'] // config['batch_config']['rollout_batch_size']}")
     logger.info(f"  Microbatch size: {config['memory_config']['microbatch_size']}")
-    logger.info(f"  Expected speedup: ~{128 // config['batch_config']['rollout_batch_size']}x faster rollout generation")
+    logger.info(f"  Expected speedup: ~{config['batch_config']['B'] // config['batch_config']['rollout_batch_size']}x faster rollout generation (vs sequential)")
     
     # Create and run entropy probe
     logger.info("Initializing OfflineEntropyProbe...")

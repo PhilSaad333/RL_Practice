@@ -3,9 +3,9 @@
 
 # Core sampling parameters - optimized for parallelization
 batch_config:
-  B: 128                         # Number of prompts per batch
+  B: 32                          # Number of prompts per batch (reduced for fast testing)
   G: 8                          # Number of responses per prompt
-  rollout_batch_size: 32        # NEW: Process 32 prompts simultaneously (32*8=256 sequences per generation call)
+  rollout_batch_size: 16        # NEW: Process 16 prompts simultaneously (16*8=128 sequences per generation call) - balanced for memory
   dataset_name: "gsm8k_r1_template"  # Dataset to sample prompts from
   split: "train"                # Dataset split to use
 
