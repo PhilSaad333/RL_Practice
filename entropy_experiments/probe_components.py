@@ -486,7 +486,8 @@ class ProbeComponents:
         
         # Get model parameters that require gradients (LoRA parameters only)
         params = [p for p in self.model.parameters() if p.requires_grad]
-        self.logger.info(f"Using {len(params)} trainable parameters for gradient computation")
+        total_trainable_params = sum(p.numel() for p in params)
+        self.logger.info(f"Using {total_trainable_params:,} trainable parameters ({len(params)} tensors) for gradient computation")
         
         # =========================================================================
         # PHASE 1: X-PASS - Accumulate ΣX via microbatches
@@ -666,7 +667,8 @@ class ProbeComponents:
         
         # Get model parameters that require gradients (LoRA parameters only)
         params = [p for p in self.model.parameters() if p.requires_grad]
-        self.logger.info(f"Using {len(params)} trainable parameters for gradient computation")
+        total_trainable_params = sum(p.numel() for p in params)
+        self.logger.info(f"Using {total_trainable_params:,} trainable parameters ({len(params)} tensors) for gradient computation")
         
         # =========================================================================
         # PHASE 1: X-PASS - Accumulate ΣX_blocks via microbatches  
