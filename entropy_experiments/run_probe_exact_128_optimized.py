@@ -18,8 +18,16 @@ from pathlib import Path
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-# Suppress the extremely verbose Qwen2 caching warning
+# Suppress the extremely verbose Qwen2 caching warnings
 warnings.filterwarnings("ignore", message=".*Caching is incompatible with gradient checkpointing.*")
+
+# Also suppress transformers logging warnings
+import transformers
+transformers.logging.set_verbosity_error()
+
+# Set logging level to reduce model output
+import os
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 from entropy_experiments import OfflineEntropyProbe
 
@@ -38,8 +46,8 @@ def main():
     logger = setup_logging()
     logger.info("🚀 Starting OPTIMIZED entropy probe measurement")
     logger.info("OPTIMIZATIONS:")
-    logger.info("  - Batched rollout generation (16 prompts × 8 responses = 128 sequences per call)")
-    logger.info("  - Increased microbatch_size=6 for 40GB A100")
+    logger.info("  - Batched rollout generation (32 prompts × 8 responses = 256 sequences per call)")
+    logger.info("  - Increased microbatch_size=2 for 40GB A100")
     logger.info("  - Target: >70% GPU memory utilization")
     
     # Set deterministic behavior
