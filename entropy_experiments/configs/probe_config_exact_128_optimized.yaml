@@ -1,0 +1,68 @@
+# Offline Entropy Probe Configuration - Optimized for 40GB A100
+# Exact Mode with B=128, optimized batch sizes for maximum GPU utilization
+
+# Core sampling parameters - optimized for parallelization
+batch_config:
+  B: 128                         # Number of prompts per batch
+  G: 8                          # Number of responses per prompt
+  rollout_batch_size: 16        # NEW: Process 16 prompts simultaneously (16*8=128 sequences per generation call)
+  dataset_name: "gsm8k_r1_template"  # Dataset to sample prompts from
+  split: "train"                # Dataset split to use
+
+# Probe computation mode - using exact for full accuracy
+probe_config:
+  mode: "exact"                 # Use exact per-prompt U-statistic (not blocks)
+  # Note: M parameter not needed for exact mode
+
+# Memory and performance - OPTIMIZED for 40GB A100 (not 80GB)
+# Current usage: 27% of 40GB = ~11GB used, 29GB free
+memory_config:
+  microbatch_size: 6            # INCREASED from 2 (conservative for 40GB A100)
+  amp: true                     # Use automatic mixed precision
+  dtype: "bfloat16"             # Match training configuration
+
+# Variance estimation - compute both methods
+stats_config:
+  compute_plugin_se: true       # Plug-in standard error estimate
+  compute_jackknife_se: true    # Jackknife standard error estimate
+
+# Importance sampling for actual ΔH measurement
+importance_sampling:
+  use_snis: true                # Self-normalized importance sampling
+  use_psis: false               # Skip PSIS for now (simpler)
+  ess_threshold: 0.5            # Effective sample size threshold
+  resample_on_low_ess: false    # Don't resample for testing
+
+# Distributed settings - single GPU setup
+distributed:
+  find_unused_parameters: true  # Required for DDP compatibility
+  reduce_dtype: "float32"       # Standard precision for reductions
+
+# Real checkpoint paths - using extracted RL training checkpoint
+checkpoint:
+  checkpoint_path: "/home/ubuntu/localfs/rl_training_runs/training_state/step_latest/model"
+  optimizer_path: "/home/ubuntu/localfs/rl_training_runs/training_state/step_latest/optimizer.pt"
+  model_config_path: "Qwen/Qwen2.5-1.5B"
+
+# Generation settings - reasonable for testing
+generation:
+  max_new_tokens: 100           # Moderate length for efficiency
+  temperature: 0.7              # Match training temperature
+  top_p: 1.0                   # Full distribution
+  do_sample: true              # Enable sampling
+  pad_token_id: null           # Auto-detect from tokenizer
+
+# Output and logging
+output:
+  save_results: true           # Save detailed results
+  results_path: "entropy_probe_exact_128_optimized_results.json"
+  log_level: "INFO"            # Standard logging
+  save_samples: false          # Don't save samples (saves space)
+
+# Advanced options - for production measurement
+advanced:
+  cross_fitting: false         # Use all G responses for both X and Y
+  force_recompute: true        # Don't use cached computations
+  validation_mode: false       # Skip extra validation checks for speed
+  profile_memory: true         # Monitor memory usage
+  profile_timing: true         # Profile timing components

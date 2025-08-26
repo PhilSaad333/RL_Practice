@@ -119,60 +119,84 @@ class ProbeComponents:
             self._tokenizer.pad_token = self._tokenizer.eos_token
             
         # Generate responses and collect sequences for later teacher forcing
+        # OPTIMIZED: Use batched rollout generation instead of sequential prompts
         all_sequences = []
         all_prompt_lens = []
         all_advantages = []
         max_lengths = []
         all_attention_masks = []
         
-        for b, prompt in enumerate(prompts):
-            # Generate G responses for this prompt
+        # Rollout batch size for parallel generation (optimized for 40GB A100)
+        # With 27% usage = ~11GB used, we have 29GB free for larger batches
+        rollout_batch_size = self.config.get('batch_config', {}).get('rollout_batch_size', 8)
+        self.logger.info(f"Using rollout_batch_size={rollout_batch_size} for batched generation")
+        
+        # Process prompts in batches for parallel generation
+        for batch_start in range(0, len(prompts), rollout_batch_size):
+            batch_end = min(batch_start + rollout_batch_size, len(prompts))
+            batch_prompts = prompts[batch_start:batch_end]
+            batch_examples = sampled_examples[batch_start:batch_end] 
+            batch_prompt_ids = prompt_ids[batch_start:batch_end]
+            
+            self.logger.debug(f"Generating responses for prompts {batch_start}-{batch_end-1} ({len(batch_prompts)} prompts)")
+            
             with torch.inference_mode():
-                # Tokenize prompt
-                prompt_enc = self._tokenizer([prompt], padding=True, return_tensors="pt").to(self.device)
-                prompt_len = prompt_enc.input_ids.shape[1]
+                # Tokenize all prompts in batch with padding
+                batch_prompt_enc = self._tokenizer(batch_prompts, padding=True, return_tensors="pt").to(self.device)
+                batch_prompt_lens = (batch_prompt_enc.attention_mask).sum(dim=1).tolist()  # Get actual prompt lengths
                 
-                # Generate
+                # Generate G responses for each prompt simultaneously
+                # This generates len(batch_prompts) * G sequences in one call
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                     gen_out = self.model.generate(
-                        **prompt_enc,
+                        **batch_prompt_enc,
                         generation_config=gen_cfg,
                         logits_processor=self._get_stop_processor(),
                         return_dict_in_generate=True
                     )
                     
-                # Extract sequences 
-                sequences = gen_out.sequences  # [G, total_len]
+                # Extract sequences: [batch_size * G, total_len]
+                all_gen_sequences = gen_out.sequences  
                 
-                # Decode generated text for advantage computation
-                responses = []
-                for g in range(G):
-                    gen_ids = sequences[g, prompt_len:]
-                    # Trim at stop tag if present
-                    gen_ids = self._trim_at_stop_tag(gen_ids)
-                    response_text = self._tokenizer.decode(gen_ids, skip_special_tokens=True)
-                    responses.append(response_text)
+                # Reshape to [batch_size, G, total_len]
+                batch_size = len(batch_prompts)
+                total_len = all_gen_sequences.shape[1]
+                sequences_reshaped = all_gen_sequences.view(batch_size, G, total_len)
                 
-                # Store sequences and metadata for probe passes
-                all_sequences.append(sequences)  # [G, total_len]
-                all_prompt_lens.append(prompt_len)
-                
-                # Create attention masks
-                attention_mask = (sequences != self._tokenizer.pad_token_id).long()
-                all_attention_masks.append(attention_mask)
-                
-                # Compute real rewards using the same reward function as training
-                prompt_id = prompt_ids[b]  # Get the dataset index for this prompt
-                rewards = self._compute_rewards(prompt_id, responses, sampled_examples[b])
-                
-                # Compute advantages following DRGRPO: A = R - mean(R) per prompt
-                advantages = rewards - rewards.mean()  # Center advantages (GRPO style)
-                all_advantages.append(advantages)
-                
-                # Track max response length for probe loss normalization
-                response_lengths = [len(self._tokenizer.encode(resp, add_special_tokens=False)) for resp in responses]
-                max_len = max(response_lengths) if response_lengths else 200
-                max_lengths.append(max_len)
+                # Process each prompt in the batch
+                for local_b, (prompt, example, prompt_id, prompt_len) in enumerate(zip(
+                    batch_prompts, batch_examples, batch_prompt_ids, batch_prompt_lens
+                )):
+                    sequences = sequences_reshaped[local_b]  # [G, total_len]
+                    
+                    # Decode generated text for advantage computation
+                    responses = []
+                    for g in range(G):
+                        gen_ids = sequences[g, prompt_len:]
+                        # Trim at stop tag if present
+                        gen_ids = self._trim_at_stop_tag(gen_ids)
+                        response_text = self._tokenizer.decode(gen_ids, skip_special_tokens=True)
+                        responses.append(response_text)
+                    
+                    # Store sequences and metadata for probe passes
+                    all_sequences.append(sequences)  # [G, total_len]
+                    all_prompt_lens.append(prompt_len)
+                    
+                    # Create attention masks
+                    attention_mask = (sequences != self._tokenizer.pad_token_id).long()
+                    all_attention_masks.append(attention_mask)
+                    
+                    # Compute real rewards using the same reward function as training
+                    rewards = self._compute_rewards(prompt_id, responses, example)
+                    
+                    # Compute advantages following DRGRPO: A = R - mean(R) per prompt
+                    advantages = rewards - rewards.mean()  # Center advantages (GRPO style)
+                    all_advantages.append(advantages)
+                    
+                    # Track max response length for probe loss normalization
+                    response_lengths = [len(self._tokenizer.encode(resp, add_special_tokens=False)) for resp in responses]
+                    max_len = max(response_lengths) if response_lengths else 200
+                    max_lengths.append(max_len)
         
         # Pad sequences to same length and stack
         max_seq_len = max(seq.shape[1] for seq in all_sequences)
