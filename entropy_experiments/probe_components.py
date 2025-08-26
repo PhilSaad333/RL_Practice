@@ -251,7 +251,8 @@ class ProbeComponents:
     def compute_delta_h1(self, batch_data: Dict[str, Any], 
                         adam_preconditioner: 'AdamPreconditioner',
                         u_statistics: 'UStatisticsCalculator', 
-                        distributed_helpers: Optional['DistributedHelpers'] = None) -> Dict[str, Any]:
+                        distributed_helpers: Optional['DistributedHelpers'] = None,
+                        optimizer: Optional[torch.optim.Optimizer] = None) -> Dict[str, Any]:
         """
         Compute first-order entropy change prediction δH₁.
         
@@ -528,10 +529,20 @@ class ProbeComponents:
                     # Move gradient to CPU in float32 for accumulation
                     grad_cpu = param.grad.detach().to('cpu', dtype=torch.float32)
                     X_sum[id(param)].add_(grad_cpu)
+        
+        # 🔍 X-PASS GRADIENT FLOW DEBUG (before clearing)
+        non_none_x = sum(1 for p in params if p.grad is not None)
+        if non_none_x > 0:
+            x_grad_norms = [p.grad.norm().item() for p in params if p.grad is not None]
+            x_grad_mean = sum(x_grad_norms) / len(x_grad_norms)
+            x_grad_max = max(x_grad_norms)
+            self.logger.info(f"🔍 [X-PASS] Gradients: {non_none_x}/{len(params)} params, mean_norm={x_grad_mean:.2e}, max_norm={x_grad_max:.2e}")
+        else:
+            self.logger.warning(f"🔍 [X-PASS] WARNING: No gradients found! {non_none_x}/{len(params)}")
             
-            # ✅ Enhanced memory cleanup
-            self.model.zero_grad(set_to_none=True)  # More aggressive cleanup
-            torch.cuda.empty_cache()
+        # ✅ Enhanced memory cleanup
+        self.model.zero_grad(set_to_none=True)  # More aggressive cleanup
+        torch.cuda.empty_cache()
         
         # =========================================================================
         # PHASE 2: Y-PASS - Accumulate ΣY via microbatches (Option A)
@@ -560,15 +571,37 @@ class ProbeComponents:
                     grad_cpu = preconditioned_grad.detach().to('cpu', dtype=torch.float32)
                     Y_sum[id(param)].add_(grad_cpu)
         
+        # 🔍 Y-PASS GRADIENT FLOW DEBUG  
+        y_non_none = sum(1 for g in y_grads if g is not None)
+        if y_non_none > 0:
+            y_grad_norms = [g.norm().item() for g in y_grads if g is not None]
+            y_grad_mean = sum(y_grad_norms) / len(y_grad_norms)
+            y_grad_max = max(y_grad_norms)
+            self.logger.info(f"🔍 [Y-PASS] Gradients: {y_non_none}/{len(params)} params, mean_norm={y_grad_mean:.2e}, max_norm={y_grad_max:.2e}")
+        else:
+            self.logger.warning(f"🔍 [Y-PASS] WARNING: No gradients found! {y_non_none}/{len(params)}")
+        
         # ✅ Enhanced memory cleanup after Y-pass
         torch.cuda.empty_cache()
+        
+        # 🔍 X_SUM/Y_SUM MAGNITUDE DEBUG
+        x_sum_norms = [X_sum[id(p)].norm().item() for p in params if id(p) in X_sum]
+        y_sum_norms = [Y_sum[id(p)].norm().item() for p in params if id(p) in Y_sum]
+        if x_sum_norms and y_sum_norms:
+            x_sum_mean = sum(x_sum_norms) / len(x_sum_norms)
+            y_sum_mean = sum(y_sum_norms) / len(y_sum_norms)
+            x_sum_max = max(x_sum_norms)
+            y_sum_max = max(y_sum_norms)
+            self.logger.info(f"🔍 [SUMS] X_sum mean_norm={x_sum_mean:.2e}, max_norm={x_sum_max:.2e}")
+            self.logger.info(f"🔍 [SUMS] Y_sum mean_norm={y_sum_mean:.2e}, max_norm={y_sum_max:.2e}")
         
         # Compute bars_dot = (ΣX · ΣY) / B²
         bars_dot = 0.0
         for param in params:
             param_id = id(param)
             if param_id in X_sum and param_id in Y_sum:
-                bars_dot += (X_sum[param_id] * Y_sum[param_id]).sum().item()
+                dot_product = (X_sum[param_id] * Y_sum[param_id]).sum().item()
+                bars_dot += dot_product
         bars_dot /= (B * B)
         
         # =========================================================================
@@ -639,8 +672,15 @@ class ProbeComponents:
         else:
             U_cross = 0.0
             
-        learning_rate = self._get_learning_rate()
+        learning_rate = self._get_learning_rate(optimizer)
         delta_h1 = -learning_rate * U_cross
+        
+        # 🔍 HIGH-PRECISION DEBUG LOGGING
+        self.logger.info(f"🔍 [ASSEMBLY] U_cross={U_cross:.10f}")
+        self.logger.info(f"🔍 [ASSEMBLY] learning_rate={learning_rate:.2e}")
+        self.logger.info(f"🔍 [ASSEMBLY] delta_h1={delta_h1:.10f}")
+        self.logger.info(f"🔍 [ASSEMBLY] bars_dot={bars_dot:.10f}")
+        self.logger.info(f"🔍 [ASSEMBLY] diag_sum={diag_sum:.10f}")
         
         # Compute variance estimates from r_values
         variance_results = u_statistics.compute_variance_estimates(
@@ -1134,11 +1174,18 @@ class ProbeComponents:
         # Return normalized scalar loss
         return total_loss / total_weight if total_weight > 0 else torch.tensor(0.0, device=self.device)
         
-    def _get_learning_rate(self) -> float:
+    def _get_learning_rate(self, optimizer: Optional[torch.optim.Optimizer] = None) -> float:
         """Extract learning rate from optimizer for δH₁ computation."""
-        # This is a simplified version - you may need to adapt based on your optimizer
-        if hasattr(self.model, 'optimizer'):
-            return self.model.optimizer.param_groups[0]['lr']
+        if optimizer is not None:
+            lr = optimizer.param_groups[0]['lr']
+            self.logger.info(f"🔍 [LR] Extracted learning rate from optimizer: {lr:.2e}")
+            return lr
+        elif hasattr(self.model, 'optimizer'):
+            lr = self.model.optimizer.param_groups[0]['lr']
+            self.logger.info(f"🔍 [LR] Extracted learning rate from model.optimizer: {lr:.2e}")
+            return lr
         else:
             # Use from config as fallback
-            return self.config.get('learning_rate', 1e-6)  # Default fallback
+            lr = self.config.get('learning_rate', 1e-6)  # Default fallback
+            self.logger.warning(f"🔍 [LR] Using fallback learning rate: {lr:.2e} (may be incorrect!)")
+            return lr

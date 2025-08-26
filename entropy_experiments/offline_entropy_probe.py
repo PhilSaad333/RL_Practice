@@ -412,7 +412,8 @@ class OfflineEntropyProbe:
             batch_data=batch_data,
             adam_preconditioner=self.adam_preconditioner,
             u_statistics=self.u_statistics,
-            distributed_helpers=self.distributed_helpers
+            distributed_helpers=self.distributed_helpers,
+            optimizer=self.optimizer  # 🔍 Pass optimizer for correct learning rate extraction
         )
         
     def _compute_actual_entropy_change(self, batch_data: Dict[str, Any]) -> Dict[str, Any]:

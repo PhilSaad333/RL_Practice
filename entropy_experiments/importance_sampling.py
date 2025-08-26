@@ -78,6 +78,12 @@ class ImportanceSampler:
         # Step 3: Compute importance weights
         log_weights = logprobs_updated - logprobs_original  # [B, G]
         
+        # 🔍 IMPORTANCE SAMPLING DEBUG  
+        self.logger.info(f"🔍 [IS] logprobs_original: mean={logprobs_original.mean().item():.3f}, min={logprobs_original.min().item():.3f}, max={logprobs_original.max().item():.3f}")
+        self.logger.info(f"🔍 [IS] logprobs_updated: mean={logprobs_updated.mean().item():.3f}, min={logprobs_updated.min().item():.3f}, max={logprobs_updated.max().item():.3f}")
+        self.logger.info(f"🔍 [IS] log_weights: mean={log_weights.mean().item():.3f}, min={log_weights.min().item():.3f}, max={log_weights.max().item():.3f}")
+        self.logger.info(f"🔍 [IS] Expected: logprobs should be NEGATIVE (log probabilities), updated should be LARGER (better model)")
+        
         # Step 3: Apply importance sampling
         if self.use_snis:
             snis_results = self._compute_snis_entropy(logprobs_updated, log_weights)
@@ -93,6 +99,20 @@ class ImportanceSampler:
         # Step 5: Compute entropy change
         updated_entropy = entropy_results['entropy_estimate']
         delta_h = updated_entropy - original_entropy
+        
+        # 🔍 ENTROPY CHANGE DEBUG
+        self.logger.info(f"🔍 [ENTROPY] original_entropy={original_entropy:.3f}")
+        self.logger.info(f"🔍 [ENTROPY] updated_entropy={updated_entropy:.3f}")  
+        self.logger.info(f"🔍 [ENTROPY] delta_h={delta_h:.3f}")
+        self.logger.info(f"🔍 [ENTROPY] Expected: Entropy should DECREASE (negative delta_h) during training")
+        
+        # 🔍 MAGNITUDE CHECK
+        seq_length_est = sequences.shape[2] - torch.tensor(prompt_lens).float().mean()
+        expected_entropy_magnitude = seq_length_est * 0.25  # ~0.25 per token
+        self.logger.info(f"🔍 [MAGNITUDE] Avg sequence length ≈ {seq_length_est:.1f}, expected total entropy ≈ {expected_entropy_magnitude:.1f}")
+        self.logger.info(f"🔍 [MAGNITUDE] Observed entropy magnitudes: orig={abs(original_entropy):.1f}, updated={abs(updated_entropy):.1f}")
+        if abs(delta_h) > expected_entropy_magnitude:
+            self.logger.warning(f"🔍 [MAGNITUDE] WARNING: |delta_h|={abs(delta_h):.1f} >> expected magnitude {expected_entropy_magnitude:.1f}")
         
         # Step 6: Apply PSIS if requested
         psis_results = {}

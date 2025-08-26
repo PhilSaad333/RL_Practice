@@ -1,0 +1,60 @@
+Entropy Measurement Notes: Definition, Masking, and Units
+
+What is computed today
+- Quantity: Sequence-level entropy in nats, not per-token.
+  - For a sequence x (prompt p plus generated y), we compute S(x) = sum_{t in generated tokens} log p(token_t | prefix).
+  - Entropy estimate is −E[S(x)] under a target distribution (original or updated), not divided by token count.
+  - True delta H (SNIS): H(p₁) − H(p₀) where H(p) ≈ −E_{x∼p₁}[log p₁(x)] using self-normalized IS with samples from p₀.
+
+Token inclusion rules in code
+- Prompt tokens: Excluded.
+  - Indexing uses gen_start = prompt_len − 1 and masks from prompt_len onward.
+- Padding tokens: Excluded.
+  - gen_mask = (ids != pad_id) after prompt; padded positions are 0-weighted.
+- EOS token: Included as a real token.
+  - We trim after a custom stop tag in sampling but do not remove EOS in entropy; EOS contributes one token of log-prob.
+- After EOS: Ignored.
+  - Everything after EOS is padding and thus masked out.
+
+Where this happens (paths)
+- ProbeComponents._compute_sequence_logprobs (used for delta H₁):
+  - Sums token log-probs from prompt_len onward; returns S ∈ R[G].
+- ImportanceSampler._compute_logprobs_for_sequences (used for true delta H):
+  - Same masking scheme, summed over generated tokens; returns [B, G] sums.
+- ImportanceSampler._compute_original_entropy / SNIS entropy:
+  - Original: −mean over sequences of summed log-probs (sequence-level).
+  - Updated (SNIS): −(Σ_i w_i S_i) / (Σ_i w_i) where w_i = exp(log p₁(x_i) − log p₀(x_i)).
+
+Implications: length bias
+- Because S is a sum, longer sequences contribute larger magnitudes to entropy and IS weights, even if per-token cross-entropy matches.
+- This is expected with sequence-level entropy. If you want the per-token view, normalize by token count.
+
+Reconciling magnitudes (why values like ~150 can appear)
+- Units: nats (PyTorch cross-entropy/log-softmax uses natural logs). To convert to bits, divide by ln 2 ≈ 0.6931.
+- Sequence-level scaling: If average generated length ≈ L and per-token cross-entropy ≈ h (nats), then expected S ≈ −L·h and H ≈ L·h. E.g., L=100, h≈1 nat → H≈100.
+- SNIS step size: If the optimizer step is not normalized by total tokens (or weights are extremely peaked), delta H can be inflated. Ensure the IS training step normalizes grads by total generated tokens.
+
+Sanity checks to run
+- Report averages at IS time:
+  - Avg generation length: mean over sequences of (# non-pad tokens after prompt).
+  - Original per-token NLL: −Σ S_i / Σ lengths_i (nats/token).
+  - Updated per-token NLL (SNIS-weighted): −(Σ w_i S_i) / (Σ w_i lengths_i).
+  - Convert to bits/token for comparison: divide by ln 2.
+- Expect these to be near your prior 0.2–0.3 bits/token (≈0.14–0.21 nats/token) on similar data/models; GSM8K may be higher.
+
+Answering the two key questions
+1) Pad/EOS handling: Pad tokens are excluded; EOS is included as a normal token; everything after EOS is padding and excluded.
+2) Prompt token contributions: Excluded in both delta H₁ and true delta H. We start at prompt_len (left-padded, so this is the common generation start column) and only sum generated tokens.
+
+If you want per-token entropy instead
+- Define per-token entropy for updated model:
+  H_tok(p₁) ≈ − (Σ_i w_i S_i) / (Σ_i w_i L_i), where S_i is sum of log-probs over generated tokens for sequence i, L_i is the generated length, w_i = exp(log p₁(x_i) − log p₀(x_i)).
+- Original per-token entropy:
+  H_tok(p₀) ≈ − (Σ_i S_i) / (Σ_i L_i).
+- Delta per-token: ΔH_tok = H_tok(p₁) − H_tok(p₀).
+- Optionally exclude EOS: subtract EOS position from both S_i and L_i if present.
+
+Notes for future alignment
+- delta H₁ currently uses the sequence-summed S; if you compare delta H₁ to a per-token true ΔH, consider a length-normalized variant of S in the probe losses.
+- Heavy-tailed IS weights can make sequence-level estimates unstable. PSIS or weight clipping can stabilize SNIS if ESS is low.
+

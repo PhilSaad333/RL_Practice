@@ -1,0 +1,85 @@
+Debug Plan: Predicted ΔH₁ Showing As Zero
+
+Symptom
+- Log line prints δH (predicted): -0.000000, suggesting ΔH₁≈0. With a checkpoint achieving ~65% GSM8K pass rate, “all-zero advantages” is unlikely to be the root cause.
+
+Most likely causes (given high pass rate)
+1) Formatting/scale effects:
+   - U_cross is nonzero but small; learning_rate used is tiny (fallback 1e-6), so deltaH1 = −lr·U_cross rounds to 0 at 6 decimals.
+   - Action: print U_cross and deltaH1 with high precision and log lr explicitly to confirm magnitude.
+2) Vanishing Y gradients due to graph/masking issues:
+   - S inadvertently computed under no_grad, or generation mask length is 0 due to prompt_len/left-padding mismatch; yields zero-length region and no gradient.
+   - Action: assert S.requires_grad is True; log average generated length and ensure attention_mask aligns with left padding.
+3) Grads not flowing through trainables (coverage issue):
+   - y_grads are None for many params due to allow_unused=True or adapters not engaged in the path used by teacher forcing.
+   - Action: count non-None grads after X backward and in Y-pass (autograd.grad) and log coverage.
+4) Preconditioner extreme scaling:
+   - Large v_hat from Adam state can shrink Y_sum norms substantially post-preconditioning, making bars_dot small.
+   - Action: log ||X_sum||, ||Y_sum||, and sample per-parameter dot products to confirm non-zero magnitudes.
+5) Rare zero-advantage prompts (unlikely here):
+   - With ~65% pass rate, per-prompt A_b usually has variance; keep as a sanity check only, not a primary suspicion.
+
+Instrumentation to add (minimal, guarded by a flag)
+File: entropy_experiments/probe_components.py in _compute_delta_h1_exact (and blocks)
+Insert logs right after X and Y accumulations and in diag loop:
+- Trainable params and grad coverage:
+  - total_params = len(params)
+  - non_none_x = sum(1 for p in params if p.grad is not None) after X backward
+  - y_non_none = count of non-None in y_grads
+- Norms and magnitudes:
+  - x_norm = sqrt(Σ ||X_sum[p]||²), y_norm likewise
+  - Sample dot (first 3 params) to see nonzero products
+- Advantage statistics per prompt:
+  - For each microbatch, log: fraction of prompts where A_b std > 0; histogram buckets of std(A_b)
+- S requires_grad check:
+  - Assert S.requires_grad for at least one sequence per microbatch
+
+File: entropy_experiments/probe_components.py (in assembly stage)
+- Log U_cross pre-LR and deltaH1 separately with high precision: U_cross (%.10f), lr (%.2e), deltaH1 (%.10f).
+
+Targeted assertions (development only)
+1) Replace L_Y with a proxy loss for a single microbatch (temporary):
+   - Use L_Y_mb = S.mean() for that microbatch; Y gradients must be nonzero (confirms path and coverage irrespective of rewards).
+2) Coverage assertion:
+   - After Y-pass autograd.grad, assert y_non_none > 0; if 0, investigate parameter filtering and teacher-forcing path.
+
+Precision and logging fixes
+- Print more decimals: log U_cross with `%.10f` and deltaH1 with scientific notation to rule out rounding-to-zero.
+- Log average non-pad generated length; investigate any 0-length generations.
+
+Reward signal notes
+- Given ~65% pass rate, A_b should usually have variance; treat reward shaping as optional, not required to resolve zero ΔH₁.
+
+Minimal diffs (sketches for Claude Code)
+1) Add grad coverage and norms after X-pass:
+--- SKETCH START ---
+non_none_x = 0
+for param in params:
+    if param.grad is not None:
+        non_none_x += 1
+self.logger.info(f"[X-pass] non-none grads: {non_none_x}/{len(params)}")
+--- SKETCH END ---
+
+2) Log Y-pass coverage and norms:
+--- SKETCH START ---
+y_non_none = sum(g is not None for g in y_grads)
+self.logger.info(f"[Y-pass] non-none grads: {y_non_none}/{len(params)}")
+--- SKETCH END ---
+
+3) Advantage stats per microbatch:
+--- SKETCH START ---
+A_mb = microbatch['advantages']  # [mb, G]
+stds = A_mb.std(dim=1)
+frac_nonzero = (stds > 0).float().mean().item()
+self.logger.info(f"[A] prompts with nonzero std: {frac_nonzero:.2f}")
+--- SKETCH END ---
+
+4) Report U_cross pre-LR and deltaH1 with precision:
+--- SKETCH START ---
+self.logger.info(f"U_cross={U_cross:.10f}, lr={learning_rate:.2e}, deltaH1={delta_h1:.10f}")
+--- SKETCH END ---
+
+Acceptance criteria
+- If A often zero per prompt: see [A] frac_nonzero ≪ 1.0. ΔH₁≈0 is expected; fix is reward shaping or larger G.
+- If grad coverage ≈0: bug in graph construction; S.requires_grad false or wrong device/mask; must be fixed.
+- If U_cross ~ 1e−9 and deltaH1 prints as 0: increase print precision and/or scale learning rate extraction.
