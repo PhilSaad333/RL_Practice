@@ -1,11 +1,11 @@
 # Offline Entropy Probe Configuration - Optimized for 40GB A100
 # Exact Mode with B=128, optimized batch sizes for maximum GPU utilization
 
-# Core sampling parameters - scaling back up with structural fixes
+# Core sampling parameters - large batch for variance estimation
 batch_config:
-  B: 16                         # INCREASED: Test scaling with structural fixes (was 8)
-  G: 8                          # RESTORED: Back to original target (was 4)  
-  rollout_batch_size: 16        # RESTORED: Back to original (was 8)
+  B: 64                         # LARGE: For meaningful variance estimates of δH₁ 
+  G: 8                          # Keep at target value
+  rollout_batch_size: 32        # INCREASED: More efficient for B=64 (32×8=256 sequences per call)
   dataset_name: "gsm8k_r1_template"  # Dataset to sample prompts from
   split: "train"                # Dataset split to use
 
