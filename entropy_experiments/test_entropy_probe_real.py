@@ -114,7 +114,10 @@ def test_real_checkpoint_loading(config, logger):
     try:
         # Create probe and load checkpoint
         probe = OfflineEntropyProbe(config)
-        probe.load_checkpoint(config['checkpoint']['checkpoint_path'])
+        probe.load_checkpoint(
+            config['checkpoint']['checkpoint_path'],
+            config['checkpoint']['optimizer_path']
+        )
         
         # Verify model is loaded
         if probe.model is None:
