@@ -1,11 +1,11 @@
 # Offline Entropy Probe Configuration - Optimized for 40GB A100
 # Exact Mode with B=128, optimized batch sizes for maximum GPU utilization
 
-# Core sampling parameters - conservative for OOM mitigation
+# Core sampling parameters - scaling back up with structural fixes
 batch_config:
-  B: 8                          # REDUCED: Conservative for OOM mitigation (was 32)
-  G: 4                          # REDUCED: Conservative for OOM mitigation (was 8)  
-  rollout_batch_size: 8         # REDUCED: Match B (was 16)
+  B: 16                         # INCREASED: Test scaling with structural fixes (was 8)
+  G: 8                          # RESTORED: Back to original target (was 4)  
+  rollout_batch_size: 16        # RESTORED: Back to original (was 8)
   dataset_name: "gsm8k_r1_template"  # Dataset to sample prompts from
   split: "train"                # Dataset split to use
 
@@ -47,7 +47,7 @@ checkpoint:
 
 # Generation settings - increased for better coverage
 generation:
-  max_new_tokens: 64            # REDUCED: Conservative for OOM mitigation (was 100)
+  max_new_tokens: 200           # RESTORED: Back to original target (was 64)
   temperature: 0.7              # Match training temperature
   top_p: 1.0                   # Full distribution
   do_sample: true              # Enable sampling
