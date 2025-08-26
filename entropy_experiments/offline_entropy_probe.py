@@ -358,7 +358,9 @@ class OfflineEntropyProbe:
             in offline_entropy_probe_strategy.txt section "Appendix: Minimal interfaces"
         """
         if not self.checkpoint_loaded:
-            self.load_checkpoint(checkpoint_path)
+            # Get optimizer path from config if available
+            optimizer_path = self.config['checkpoint'].get('optimizer_path')
+            self.load_checkpoint(checkpoint_path, optimizer_path)
             
         start_time = time.time()
         
