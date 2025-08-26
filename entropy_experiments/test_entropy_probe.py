@@ -109,57 +109,46 @@ def create_minimal_test_config():
 
 def create_mock_model():
     """
-    Create a minimal mock model for testing.
-    
-    CRITICAL FIX (P5): Use small model that can run quickly on CPU/GPU.
+    Create a minimal, offline-safe causal LM + trivial tokenizer.
     """
-    from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-    
-    # Use a genuinely small model for fast testing
-    try:
-        # Try GPT-2 small first (124M parameters)
-        model_name = "gpt2"
-        print(f"Loading small model {model_name} for testing...")
-        
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float32,  # Use float32 for CPU compatibility
-            device_map="auto" if torch.cuda.is_available() else "cpu"
-        )
-        
-        # Setup tokenizer
-        tokenizer.padding_side = "left" 
-        tokenizer.pad_token = tokenizer.eos_token
-        
-        return model, tokenizer
-        
-    except Exception as e:
-        print(f"Failed to load GPT-2: {e}")
-        print("Creating tiny custom model for testing...")
-        
-        # Create a minimal transformer model from scratch
-        from transformers import GPT2Config, GPT2LMHeadModel
-        
-        config = GPT2Config(
-            vocab_size=1000,    # Very small vocab
-            n_positions=128,    # Short sequences
-            n_embd=64,         # Tiny embedding dimension
-            n_layer=2,         # Just 2 layers
-            n_head=2,          # 2 attention heads
-            n_inner=128,       # Small feedforward
-        )
-        
-        model = GPT2LMHeadModel(config)
-        
-        # Create minimal tokenizer 
-        from transformers import GPT2Tokenizer
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        tokenizer.padding_side = "left"
-        tokenizer.pad_token = tokenizer.eos_token
-        
-        print("Created tiny custom model for testing")
-        return model, tokenizer
+    import torch
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    config = GPT2Config(
+        vocab_size=1000,
+        n_positions=128,
+        n_embd=64,
+        n_layer=2,
+        n_head=2,
+        n_inner=128,
+    )
+    model = GPT2LMHeadModel(config)
+
+    # Minimal whitespace tokenizer stub
+    class WhiteSpaceTok:
+        pad_token_id = 0
+        eos_token_id = 1
+        padding_side = "left"
+        def __call__(self, texts, return_tensors=None, padding=True, truncation=True, max_length=128):
+            import torch
+            if isinstance(texts, str):
+                texts = [texts]
+            ids = []
+            for t in texts:
+                toks = t.strip().split()
+                vec = [min(len(tok), 998)+1 for tok in toks]  # dumb mapping 1..999
+                vec = ([self.pad_token_id] * max(0, max_length - len(vec))) + vec[-max_length:]
+                ids.append(vec)
+            input_ids = torch.tensor(ids, dtype=torch.long)
+            attention_mask = (input_ids != self.pad_token_id).long()
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+        def decode(self, ids):
+            return " ".join(["x"] * sum(int(i != self.pad_token_id) for i in ids))
+
+    tokenizer = WhiteSpaceTok()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    return model, tokenizer
 
 
 def create_mock_optimizer(model):
@@ -223,7 +212,7 @@ def test_batch_sampling(config, model_components, logger):
         )
         
         # Validate batch structure
-        required_keys = ['prompts', 'responses', 'logprobs', 'advantages', 'max_lengths']
+        required_keys = ['prompts', 'responses', 'sequences', 'attention_masks', 'advantages', 'max_lengths', 'prompt_lens']
         for key in required_keys:
             if key not in batch_data:
                 raise ValueError(f"Missing key in batch_data: {key}")
