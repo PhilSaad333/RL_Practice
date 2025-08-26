@@ -74,7 +74,7 @@ def create_real_checkpoint_config():
         
         # Real checkpoint paths (using actual RL training run with proper optimizer states)
         'checkpoint': {
-            'checkpoint_path': '/home/ubuntu/localfs/rl_training_runs/training_state/step_latest',
+            'checkpoint_path': '/home/ubuntu/localfs/rl_training_runs/training_state/step_latest/model',  # LoRA adapter path
             'optimizer_path': '/home/ubuntu/localfs/rl_training_runs/training_state/step_latest/optimizer.pt',  # Real Adam states from RL training
             'model_config_path': 'Qwen/Qwen2.5-1.5B'  # Base model for real RL checkpoint
         },
