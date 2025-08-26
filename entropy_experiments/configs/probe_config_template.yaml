@@ -11,12 +11,12 @@ batch_config:
 # Probe computation mode
 probe_config:
   mode: "blocks"                 # "exact" for per-prompt, "blocks" for memory-efficient
-  M: 8                          # Number of blocks (if mode="blocks") 
+  M: 16                          # Number of blocks (if mode="blocks") 
   pairs_per_block: "all"        # "all" for complete U-statistic, or integer for incomplete
   
 # Memory and performance
 memory_config:
-  microbatch_size: 4            # Prompts per microbatch (memory constraint)
+  microbatch_size: 2            # Prompts per microbatch (memory constraint) (2 on A100, 4 on H100)
   amp: true                     # Use automatic mixed precision (match training)
   dtype: "bfloat16"             # AMP dtype, should match training
   
