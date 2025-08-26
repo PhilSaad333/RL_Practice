@@ -175,21 +175,9 @@ class OfflineEntropyProbe:
         
         This follows the same pattern as rl_runner.py for loading LoRA models.
         """
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
         from peft import PeftModel, prepare_model_for_kbit_training
         import os
-        
-        # Handle BitsAndBytesConfig import (version compatibility)
-        try:
-            from transformers import BitsAndBytesConfig
-        except ImportError:
-            try:
-                from bitsandbytes import BitsAndBytesConfig
-            except ImportError:
-                # Fallback: define a dummy class
-                class BitsAndBytesConfig:
-                    def __init__(self, **kwargs):
-                        pass
         
         self.logger.info("Initializing model from checkpoint...")
         
@@ -213,26 +201,24 @@ class OfflineEntropyProbe:
         # Get backbone from config or infer from LoRA adapter
         backbone = self.config['checkpoint'].get('model_config_path', 'Qwen/Qwen2.5-1.5B')
         
-        # Setup quantization config (same as rl_runner.py)
+        # Setup quantization config (exact copy from rl_runner.py)
         bnb = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_quant_type="nf4", 
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16
         )
         
-        # Load base model
+        # Load base model (exact copy from rl_runner.py pattern)
         base = AutoModelForCausalLM.from_pretrained(
             backbone,
             torch_dtype=torch.bfloat16,
-            quantization_config=bnb,
-            trust_remote_code=True
+            quantization_config=bnb
         )
-        base = prepare_model_for_kbit_training(base)
+        base = prepare_model_for_kbit_training(base)  # PEFT/QLoRA prep
         base.gradient_checkpointing_enable()
         base.config.use_cache = False
         
-        # Load LoRA adapter
+        # Load LoRA adapter (exact copy from rl_runner.py pattern)
         model = PeftModel.from_pretrained(base, lora_path, is_trainable=True)
         model.enable_input_require_grads()
         
