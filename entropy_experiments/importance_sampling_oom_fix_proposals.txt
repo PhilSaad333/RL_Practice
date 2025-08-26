@@ -1,0 +1,156 @@
+Importance Sampling OOM Fix Proposals (Targeted for Claude Code)
+
+Context
+- Environment: A100 40GB, probe runs with run_probe_exact.py and config probe_config_exact_128_optimized.yaml.
+- Symptom: CUDA OOM when increasing B to 64 during importance sampling stage (after deltaH1 computation).
+- Root cause: _build_training_loss currently accumulates a single computation graph across all B×G microbatches before backward(), causing the autograd graph to grow linearly with the number of microbatches. This is much tighter than ordinary optimization where gradient accumulation calls backward per microbatch to free graphs.
+
+Primary Fix (Gradient accumulation with per-micro backward)
+Objective: Bound peak memory by doing forward+backward on microbatches, accumulating grads, and never holding the full graph in memory.
+
+Files and functions
+- entropy_experiments/importance_sampling.py:_compute_updated_logprobs
+- entropy_experiments/importance_sampling.py:_build_training_loss (replace with streaming backward helper)
+
+Implementation steps
+1) Replace loss aggregation with per-micro backward
+   - Introduce a new helper that performs microbatched forward+backward and accumulates grads without returning a loss tensor:
+
+   --- PATCH START ---
+   File: entropy_experiments/importance_sampling.py
+   @@
+   class ImportanceSampler:
+       ...
+       def _accumulate_grads_for_importance(self, batch_data: Dict[str, Any]) -> int:
+           """Compute grads for a training step in microbatches and accumulate them.
+           Returns the total number of generation tokens used for scaling."""
+           sequences = batch_data['sequences']
+           prompt_lens = batch_data['prompt_lens']
+           attention_masks = batch_data['attention_masks']
+
+           B, G, max_len = sequences.shape
+           importance_microbatch_size = self.config.get('memory_config', {}).get('importance_microbatch_size', 1)
+           total_tokens = 0
+
+           for b in range(B):
+               batch_seqs = sequences[b]
+               prompt_len = prompt_lens[b]
+               batch_masks = attention_masks[b]
+
+               for g_start in range(0, G, importance_microbatch_size):
+                   g_end = min(g_start + importance_microbatch_size, G)
+                   micro_seqs = batch_seqs[g_start:g_end].to(self.device, non_blocking=True)
+                   micro_masks = batch_masks[g_start:g_end].to(self.device, non_blocking=True)
+
+                   self.model.train()
+                   with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                       logits = self.model(micro_seqs, attention_mask=micro_masks).logits
+
+                   # Per-token loss on generation region only
+                   gen_targets = micro_seqs[:, prompt_len:]
+                   gen_logits  = logits[:, prompt_len-1:-1]
+                   gen_mask    = micro_masks[:, prompt_len:].float()
+
+                   if gen_targets.shape[1] and gen_logits.shape[1]:
+                       min_len = min(gen_targets.shape[1], gen_logits.shape[1])
+                       gen_targets = gen_targets[:, :min_len]
+                       gen_logits  = gen_logits[:, :min_len]
+                       gen_mask    = gen_mask[:, :min_len]
+
+                       # Cross-entropy with no reduction, then mask and sum
+                       per_tok = torch.nn.functional.cross_entropy(
+                           gen_logits.reshape(-1, gen_logits.size(-1)),
+                           gen_targets.reshape(-1),
+                           reduction='none'
+                       ).view(gen_logits.size(0), -1)
+
+                       masked_loss = (per_tok * gen_mask).sum()
+                       tokens = gen_mask.sum()
+                       total_tokens += int(tokens.item())
+
+                       # Backward now to free graph; scale by 1 (we will normalize grads later)
+                       if tokens > 0:
+                           masked_loss.backward()
+
+                   # free refs
+                   del logits, micro_seqs, micro_masks
+
+           return total_tokens
+
+   @@
+   def _compute_updated_logprobs(self, batch_data: Dict[str, Any], optimizer: torch.optim.Optimizer) -> torch.Tensor:
+       ...
+       # STEP 2: Take a training step on same batch using streaming backward
+       # Snapshot parameters to CPU for safe restore
+       cpu_snapshots = [p.detach().to('cpu').clone() for p in self.model.parameters()]
+       optimizer.zero_grad(set_to_none=True)
+       total_tokens = self._accumulate_grads_for_importance(batch_data)
+       
+       # Normalize grads by total_tokens to match mean loss semantics
+       with torch.no_grad():
+           scale = 1.0 / max(total_tokens, 1)
+           for p in self.model.parameters():
+               if p.grad is not None:
+                   p.grad.mul_(scale)
+       optimizer.step()
+
+       # STEP 3: Recompute updated log-probs on SAME sequences
+       updated_logprobs = self._compute_logprobs_for_sequences(
+           batch_data['sequences'], batch_data['prompt_lens'], batch_data['attention_masks']
+       )
+
+       # Restore original params
+       with torch.no_grad():
+           for p, snap in zip(self.model.parameters(), cpu_snapshots):
+               p.data.copy_(snap.to(p.device))
+       optimizer.zero_grad(set_to_none=True)
+
+       return updated_logprobs
+   --- PATCH END ---
+
+Notes
+- Backward per microbatch frees the graph immediately, bounding peak memory to one microbatch forward+backward. This mirrors typical training gradient accumulation.
+- Normalizing grads by total generation tokens preserves equivalence to mean-loss backward.
+- CPU snapshots ensure a correct restore for AdamW (don’t attempt param.data -= lr*grad, which is incorrect for AdamW).
+
+Secondary Fixes (optional but recommended)
+2) Use fused CE for original logprobs to avoid log_softmax materialization
+   - In _compute_logprobs_for_sequences, replace log_softmax+gather with negative cross_entropy(reduction='none') against next-token targets, masked and summed. Even under no_grad, this reduces peak intermediate memory.
+   - Also pass attention_mask to the model forward to skip padded compute.
+
+   --- PATCH SKETCH ---
+   File: entropy_experiments/importance_sampling.py:_compute_logprobs_for_sequences
+   - logits = self.model(micro_seqs).logits
+   + logits = self.model(micro_seqs, attention_mask=micro_masks).logits
+   - log_probs = F.log_softmax(logits, dim=-1)
+   - token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)
+   + per_tok_ce = F.cross_entropy(
+       logits[:, :-1, :].reshape(-1, logits.size(-1)),
+       micro_seqs[:, 1:].reshape(-1), reduction='none'
+     ).view(logits.size(0), -1)
+   + token_log_probs = -per_tok_ce
+   --- END SKETCH ---
+
+3) Ensure device moves are explicit and non_blocking
+   - When consuming CPU-stored sequences/masks, move slices with `.to(self.device, non_blocking=True)` in both IS and probe paths to reduce copies and jitter.
+
+4) Tighten importance microbatch size for B=64
+   - Keep `memory_config.importance_microbatch_size: 1` while testing B=64; with the primary fix, this should be stable.
+
+Validation checklist
+1) Run with B=64, G=8, max_new_tokens=100, importance_microbatch_size=1.
+2) Enable memory profiling at the start/end of the IS step:
+   - Insert (temporarily): `torch.cuda.reset_peak_memory_stats()` before IS, and log `torch.cuda.max_memory_allocated()/1e9` after.
+3) Confirm no monotonic growth across microbatches; peak should stabilize below device limit.
+4) Numerics: Compare deltaH_snis against the previous implementation at B=8–16; expect close agreement within tolerance.
+
+Why IS looks tighter than “ordinary optimization”
+- Without per-micro backward, a single autograd graph spans all B×G sequences — ordinary training typically calls backward each accumulation step, freeing graphs immediately.
+- IS performs extra passes: original logprobs (inference), training pass (with grads), updated logprobs (inference). That’s 2× inference + 1× training on the same batch, increasing peak usage.
+- Teacher-forced LM loss materializes logits of shape [micro, L, V]; cross-entropy via fused kernels avoids an extra log_softmax allocation but logits dominate. Chunking G with per-micro backward keeps this peak bounded.
+
+Acceptance criteria
+- B=64 completes on A100-40GB without CUDA OOM using the changes above.
+- Peak VRAM bounded and repeatable across runs; stable during IS loop.
+- deltaH_snis and ESS consistent on smaller B with the previous code path.
+

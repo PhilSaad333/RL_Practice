@@ -154,30 +154,43 @@ class ImportanceSampler:
         # STEP 1: Compute original log-probs S before step
         original_logprobs = self._compute_logprobs_for_sequences(sequences, prompt_lens, attention_masks)
         
-        # STEP 2: Create a training loss on the same batch to take a real optimizer step
-        # Use a simple training objective: maximize log-likelihood of responses
-        training_loss = self._build_training_loss(batch_data)
+        # STEP 2: Take training step using streaming backward (avoids massive computation graph)
+        # Snapshot parameters to CPU for proper restore after AdamW step  
+        cpu_snapshots = []
+        for param in self.model.parameters():
+            if param.requires_grad:
+                cpu_snapshots.append(param.detach().to('cpu').clone())
         
-        self.logger.debug("Taking optimizer step for importance sampling")
+        self.logger.debug("Taking optimizer step for importance sampling with streaming backward")
         
-        # STEP 3: Take optimizer step (this modifies model parameters θ → θ⁺)
-        optimizer.zero_grad()
-        training_loss.backward()
+        # STEP 3: Accumulate gradients using streaming backward (no memory buildup)
+        optimizer.zero_grad(set_to_none=True)
+        total_tokens = self._accumulate_grads_for_importance(batch_data)
+        
+        # Scale gradients by 1/total_tokens to match mean loss semantics
+        if total_tokens > 0:
+            scale = 1.0 / total_tokens
+            with torch.no_grad():
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param.grad.mul_(scale)
+        
+        # Take optimizer step (θ → θ⁺)
         optimizer.step()
         
         # STEP 4: Recompute log-probs S⁺ on SAME sequences under updated model θ⁺
         updated_logprobs = self._compute_logprobs_for_sequences(sequences, prompt_lens, attention_masks)
         
-        # STEP 5: Restore original parameters (undo the step)
-        # This is critical - we don't want to permanently modify the model
-        optimizer.zero_grad()
+        # STEP 5: Restore original parameters from CPU snapshots  
+        # This properly handles AdamW's complex parameter updates
         with torch.no_grad():
-            # Undo the step: θ = θ⁺ - η * ∇L  
+            param_idx = 0
             for param in self.model.parameters():
-                if param.grad is not None:
-                    # Get the step that was taken
-                    lr = optimizer.param_groups[0]['lr']
-                    param.data.sub_(param.grad * lr)  # Undo: subtract what was added
+                if param.requires_grad:
+                    param.data.copy_(cpu_snapshots[param_idx].to(param.device))
+                    param_idx += 1
+        
+        optimizer.zero_grad(set_to_none=True)
                     
         self.logger.debug("Restored original model parameters after importance sampling step")
         
@@ -256,23 +269,32 @@ class ImportanceSampler:
         
         return torch.stack(all_logprobs, dim=0)  # [B, G]
         
-    def _build_training_loss(self, batch_data: Dict[str, Any]) -> torch.Tensor:
+    def _accumulate_grads_for_importance(self, batch_data: Dict[str, Any]) -> int:
         """
-        Build a training loss on the batch for taking an optimizer step.
+        Accumulate gradients for importance sampling using streaming backward.
         
-        This uses a simple negative log-likelihood objective.
+        This replaces _build_training_loss to avoid building massive computation graphs.
+        Each microbatch calls backward() immediately to free memory.
+        
+        Returns:
+            total_tokens: Number of generation tokens for gradient scaling
         """
         sequences = batch_data['sequences']  # [B, G, max_len]
         prompt_lens = batch_data['prompt_lens']  # [B]
         attention_masks = batch_data['attention_masks']  # [B, G, max_len]
         
         B, G, max_len = sequences.shape
-        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         total_tokens = 0
         
-        # Simple training objective: maximize log-likelihood of generated tokens
-        # IMPORTANT: Use microbatching to avoid OOM during gradient computation
-        importance_microbatch_size = self.config.get('memory_config', {}).get('importance_microbatch_size', 2)
+        # Use microbatching to process sequences in small chunks
+        importance_microbatch_size = self.config.get('memory_config', {}).get('importance_microbatch_size', 1)
+        
+        # Ensure model is in training mode for gradients  
+        self.model.train()
+        
+        # Enable gradient checkpointing for memory efficiency
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
         
         for b in range(B):
             batch_seqs = sequences[b]  # [G, max_len]
@@ -282,71 +304,15 @@ class ImportanceSampler:
             # Microbatch the G sequences to avoid OOM during gradient computation
             for g_start in range(0, G, importance_microbatch_size):
                 g_end = min(g_start + importance_microbatch_size, G)
-                micro_seqs = batch_seqs[g_start:g_end]  # [micro_size, max_len]
-                micro_masks = batch_masks[g_start:g_end]  # [micro_size, max_len]
+                micro_seqs = batch_seqs[g_start:g_end].to(self.device)  # [micro_size, max_len]
+                micro_masks = batch_masks[g_start:g_end].to(self.device)  # [micro_size, max_len]
                 
-                # Clear GPU cache before gradient computation
-                torch.cuda.empty_cache()
-                
-                # Memory monitoring and shape debugging
-                if hasattr(torch.cuda, 'memory_allocated'):
-                    mem_before = torch.cuda.memory_allocated() / 1024**3  # GB
-                    self.logger.info(f"Memory before gradient computation: {mem_before:.2f} GB")
-                
-                # Critical debugging: log actual shapes and compare to dr_grpo.py approach  
-                self.logger.info(f"🔍 DEBUGGING: micro_seqs.shape = {micro_seqs.shape}")
-                self.logger.info(f"🔍 DEBUGGING: importance_microbatch_size = {importance_microbatch_size}")
-                self.logger.info(f"🔍 DEBUGGING: Expected logits shape: {micro_seqs.shape} -> [{micro_seqs.shape[0]}, {micro_seqs.shape[1]}, ~151643]")
-                expected_mb = (micro_seqs.shape[0] * micro_seqs.shape[1] * 151643 * 2) / (1024**2)  # bfloat16 = 2 bytes
-                self.logger.info(f"🔍 DEBUGGING: Expected logits memory: ~{expected_mb:.1f} MB")
-                self.logger.info(f"🔍 DEBUGGING: micro_seqs device: {micro_seqs.device}, dtype: {micro_seqs.dtype}")
-                self.logger.info(f"🔍 DEBUGGING: Model type: {type(self.model)}")
-                self.logger.info(f"🔍 DEBUGGING: Model training mode: {self.model.training}")
-                
-                # Check if we should unwrap model like dr_grpo.py does
-                if hasattr(self.model, 'module'):
-                    self.logger.info(f"🔍 DEBUGGING: Model has .module attribute (DDP wrapped)")
-                else:
-                    self.logger.info(f"🔍 DEBUGGING: Model is not DDP wrapped")
-                
-                # Compare to dr_grpo.py: they pass attention_mask, we might be missing it
-                self.logger.info(f"🔍 DEBUGGING: micro_masks.shape = {micro_masks.shape}")
-                
-                # SAVE GENERATED RESPONSES: Let's inspect what the model actually generated
-                try:
-                    # Try to get tokenizer from different possible locations
-                    tokenizer = None
-                    if hasattr(self, 'tokenizer') and self.tokenizer is not None:
-                        tokenizer = self.tokenizer
-                    elif hasattr(self.model, 'tokenizer'):
-                        tokenizer = self.model.tokenizer
-                    else:
-                        # Load tokenizer directly
-                        from transformers import AutoTokenizer
-                        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B")
-                    
-                    # Sample generation logging removed for performance
-                    pass
-                        
-                except Exception as e:
-                    pass  # Skip generation logging for performance
-                
-                # ✅ Use gradient checkpointing to reduce memory during forward pass
-                if hasattr(self.model, 'gradient_checkpointing_enable'):
-                    self.model.gradient_checkpointing_enable()
-                
-                # Ensure model is in training mode for gradients
-                self.model.train()
-                
+                # Forward pass with gradients
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                     logits = self.model(micro_seqs, attention_mask=micro_masks).logits
                 
-                # Convert to float32 BEFORE loss computation to maintain gradients (like dr_grpo.py)
+                # Convert to float32 for numerical stability (like dr_grpo.py)
                 logits = logits.float()
-                
-                if hasattr(torch.cuda, 'memory_allocated'):
-                    mem_after = torch.cuda.memory_allocated() / 1024**3  # GB
-                    self.logger.info(f"Memory after forward pass: {mem_after:.2f} GB (+{mem_after-mem_before:.2f} GB)")
                 
                 # Compute cross-entropy loss on generation tokens only
                 for micro_g in range(logits.shape[0]):
@@ -370,10 +336,19 @@ class ImportanceSampler:
                         losses = F.cross_entropy(gen_logits, gen_targets, reduction='none')
                         masked_loss = (losses * gen_mask).sum()
                         
-                        total_loss = total_loss + masked_loss  # Non-in-place to preserve gradients
-                        total_tokens += gen_mask.sum()
+                        # Count tokens for final scaling
+                        tokens_in_seq = gen_mask.sum()
+                        total_tokens += int(tokens_in_seq.item())
+                        
+                        # 🔥 CRITICAL: Call backward() IMMEDIATELY to free computation graph
+                        if tokens_in_seq > 0:
+                            masked_loss.backward()
+                
+                # Free memory immediately after each microbatch
+                del logits, micro_seqs, micro_masks
+                torch.cuda.empty_cache()
         
-        return total_loss / total_tokens if total_tokens > 0 else torch.tensor(0.0, device=self.device)
+        return total_tokens
         
     def _compute_snis_entropy(self, logprobs: torch.Tensor, log_weights: torch.Tensor) -> Dict[str, Any]:
         """
