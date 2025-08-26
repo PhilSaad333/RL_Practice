@@ -285,8 +285,20 @@ class ImportanceSampler:
                 micro_seqs = batch_seqs[g_start:g_end]  # [micro_size, max_len]
                 micro_masks = batch_masks[g_start:g_end]  # [micro_size, max_len]
                 
+                # Clear GPU cache before gradient computation
+                torch.cuda.empty_cache()
+                
+                # Memory monitoring
+                if hasattr(torch.cuda, 'memory_allocated'):
+                    mem_before = torch.cuda.memory_allocated() / 1024**3  # GB
+                    self.logger.info(f"Memory before gradient computation: {mem_before:.2f} GB")
+                
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                     logits = self.model(micro_seqs).logits  # [micro_size, max_len, vocab_size]
+                
+                if hasattr(torch.cuda, 'memory_allocated'):
+                    mem_after = torch.cuda.memory_allocated() / 1024**3  # GB
+                    self.logger.info(f"Memory after forward pass: {mem_after:.2f} GB (+{mem_after-mem_before:.2f} GB)")
                 
                 # Compute cross-entropy loss on generation tokens only
                 for micro_g in range(logits.shape[0]):
