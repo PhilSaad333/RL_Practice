@@ -272,7 +272,7 @@ class ProbeComponents:
         
         if self.mode == "exact":
             return self._compute_delta_h1_exact(
-                batch_data, adam_preconditioner, u_statistics, distributed_helpers
+                batch_data, adam_preconditioner, u_statistics, distributed_helpers, optimizer
             )
         elif self.mode == "blocks":
             return self._compute_delta_h1_blocks(
@@ -481,7 +481,8 @@ class ProbeComponents:
     def _compute_delta_h1_exact(self, batch_data: Dict[str, Any],
                                adam_preconditioner: 'AdamPreconditioner', 
                                u_statistics: 'UStatisticsCalculator',
-                               distributed_helpers: Optional['DistributedHelpers']) -> Dict[str, Any]:
+                               distributed_helpers: Optional['DistributedHelpers'],
+                               optimizer: Optional[torch.optim.Optimizer] = None) -> Dict[str, Any]:
         """
         Compute δH₁ using exact per-prompt U-statistic with microbatched processing.
             - Uses microbatched gradient computation to bound VRAM by microbatch size
