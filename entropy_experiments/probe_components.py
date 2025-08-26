@@ -567,6 +567,19 @@ class ProbeComponents:
             # 🔍 DEBUG: Check L_Y_mb gradient requirements
             self.logger.info(f"🔍 [L_Y] requires_grad={L_Y_mb.requires_grad}, grad_fn={L_Y_mb.grad_fn}")
             
+            # 🔍 DEBUG: Test if backward() works instead of autograd.grad
+            # Clear any existing gradients first
+            for param in params:
+                if param.grad is not None:
+                    param.grad = None
+                    
+            # Try backward() to see if gradients flow
+            L_Y_mb.backward(retain_graph=True)
+            
+            # Check how many params have gradients after backward
+            backward_grad_count = sum(1 for param in params if param.grad is not None)
+            self.logger.info(f"🔍 [BACKWARD-TEST] {backward_grad_count}/{len(params)} params have gradients after backward()")
+            
             # Get Y gradients via autograd.grad
             y_grads = torch.autograd.grad(L_Y_mb, params, allow_unused=True)
             
