@@ -620,7 +620,7 @@ class ProbeComponents:
             
             # ✅ Enhanced memory cleanup in diagonal loop
             self.model.zero_grad(set_to_none=True)
-            if b % 2 == 0:  # Cleanup every 2 prompts to balance performance vs memory
+            if unit_idx % 2 == 0:  # Cleanup every 2 prompts to balance performance vs memory
                 torch.cuda.empty_cache()
         
         # Apply distributed reduction if needed
