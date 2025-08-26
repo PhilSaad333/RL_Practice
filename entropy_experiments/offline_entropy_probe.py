@@ -198,6 +198,10 @@ class OfflineEntropyProbe:
             
     def _load_lora_model(self, lora_path: str) -> torch.nn.Module:
         """Load LoRA model following rl_runner.py pattern."""
+        # Import here to match rl_runner.py pattern
+        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+        from peft import PeftModel, prepare_model_for_kbit_training
+        
         # Get backbone from config or infer from LoRA adapter
         backbone = self.config['checkpoint'].get('model_config_path', 'Qwen/Qwen2.5-1.5B')
         
