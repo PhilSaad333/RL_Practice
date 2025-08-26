@@ -288,13 +288,33 @@ class ImportanceSampler:
                 # Clear GPU cache before gradient computation
                 torch.cuda.empty_cache()
                 
-                # Memory monitoring
+                # Memory monitoring and shape debugging
                 if hasattr(torch.cuda, 'memory_allocated'):
                     mem_before = torch.cuda.memory_allocated() / 1024**3  # GB
                     self.logger.info(f"Memory before gradient computation: {mem_before:.2f} GB")
                 
+                # Critical debugging: log actual shapes and compare to dr_grpo.py approach  
+                self.logger.info(f"🔍 DEBUGGING: micro_seqs.shape = {micro_seqs.shape}")
+                self.logger.info(f"🔍 DEBUGGING: importance_microbatch_size = {importance_microbatch_size}")
+                self.logger.info(f"🔍 DEBUGGING: Expected logits shape: {micro_seqs.shape} -> [{micro_seqs.shape[0]}, {micro_seqs.shape[1]}, ~151643]")
+                expected_mb = (micro_seqs.shape[0] * micro_seqs.shape[1] * 151643 * 2) / (1024**2)  # bfloat16 = 2 bytes
+                self.logger.info(f"🔍 DEBUGGING: Expected logits memory: ~{expected_mb:.1f} MB")
+                self.logger.info(f"🔍 DEBUGGING: micro_seqs device: {micro_seqs.device}, dtype: {micro_seqs.dtype}")
+                self.logger.info(f"🔍 DEBUGGING: Model type: {type(self.model)}")
+                self.logger.info(f"🔍 DEBUGGING: Model training mode: {self.model.training}")
+                
+                # Check if we should unwrap model like dr_grpo.py does
+                if hasattr(self.model, 'module'):
+                    self.logger.info(f"🔍 DEBUGGING: Model has .module attribute (DDP wrapped)")
+                else:
+                    self.logger.info(f"🔍 DEBUGGING: Model is not DDP wrapped")
+                
+                # Compare to dr_grpo.py: they pass attention_mask, we might be missing it
+                self.logger.info(f"🔍 DEBUGGING: micro_masks.shape = {micro_masks.shape}")
+                
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                    logits = self.model(micro_seqs).logits  # [micro_size, max_len, vocab_size]
+                    # Try the same approach as dr_grpo.py with attention_mask
+                    logits = self.model(micro_seqs, attention_mask=micro_masks).logits  # [micro_size, max_len, vocab_size]
                 
                 if hasattr(torch.cuda, 'memory_allocated'):
                     mem_after = torch.cuda.memory_allocated() / 1024**3  # GB
