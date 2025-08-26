@@ -370,7 +370,7 @@ class ImportanceSampler:
                         losses = F.cross_entropy(gen_logits, gen_targets, reduction='none')
                         masked_loss = (losses * gen_mask).sum()
                         
-                        total_loss += masked_loss
+                        total_loss = total_loss + masked_loss  # Non-in-place to preserve gradients
                         total_tokens += gen_mask.sum()
         
         return total_loss / total_tokens if total_tokens > 0 else torch.tensor(0.0, device=self.device)
