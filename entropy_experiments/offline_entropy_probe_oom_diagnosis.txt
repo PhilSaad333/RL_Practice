@@ -1,0 +1,72 @@
+Offline Entropy Probe OOM Diagnosis and Runbook
+
+Summary
+- Symptom: CUDA OOM during offline entropy probe, often mid-way through X/Y passes or during importance sampling training step.
+- Scope: `entropy_experiments/offline_entropy_probe.py` orchestrator with heavy compute in `probe_components.py` and `importance_sampling.py`.
+- Root causes (most likely): peak activations from teacher-forced forwards over G sequences, per-param accumulators on GPU, and using full-model grads instead of LoRA-only.
+
+Where memory spikes
+- `ProbeComponents._teacher_force_logprobs` → `_compute_sequence_logprobs`:
+  - Computes logits for shape `[G, total_len, vocab_size]` with gradients; this dominates VRAM per microbatch.
+  - Currently processes all G responses at once (no G-microbatch for gradient path).
+  - Uses `log_softmax(...).gather(...)`, temporarily materializing a `[G,L,V]` tensor (large) in the autograd graph.
+- `ProbeComponents._compute_delta_h1_exact/_blocks`:
+  - Allocates param-sized buffers `X_sum` and `Y_sum` on the model device. If non-LoRA model is used, this explodes VRAM.
+- `ImportanceSampler._build_training_loss` (the “updated model” pass):
+  - Performs training forward with gradients over G sequences, microbatched by `importance_microbatch_size`, but still produces `[micro_G, L, V]` logits per step.
+  - Uses gradients then calls `optimizer.step()` and tries to “undo” step in-place using `param.grad * lr` which is not the Adam update; aside from correctness, it leaves grads around until explicitly cleared.
+- `ProbeComponents.sample_batch`:
+  - Stores all sequences and masks as tensors; if left on GPU, they add up, though token tensors are small vs logits.
+
+Likely scenarios that trigger OOM
+- Full-model grads: Loading a full model checkpoint path causes all base params to require grad; buffers `X_sum`/`Y_sum` and gradient graphs then exceed VRAM quickly.
+- No G-microbatch on gradient path: With G=8, L≈200–600, V≈151k, the `[G,L,V]` logits are large. Doing all G at once for S builds a large graph even with small prompt microbatch size.
+- LoRA base unintentionally trainable: If base isn’t fully frozen, parameter count grows beyond LoRA scale.
+- Importance sampling step: Even with `no_grad()` in the readback pass, the training-loss forward (with grad) per G chunk can hit peaks.
+
+Quick mitigations (no code changes; config/runbook)
+- Reduce workload
+  - Set `batch_config.B` smaller (e.g., 16 → 8) and/or `generation.max_new_tokens` (e.g., 200 → 64/100).
+  - Lower `memory_config.microbatch_size` to 1–2 and set `memory_config.importance_microbatch_size` to 1.
+  - Temporarily drop `probe_config.mode: blocks` with small M, or use `exact` with small B to validate stability.
+- Ensure LoRA-only grads
+  - Use a LoRA adapter path (directory containing `adapter_model.safetensors`) so only adapter params are trainable.
+  - If using a full checkpoint path, expect OOM unless freezing base (see proposals doc for code change).
+- Runtime switches
+  - Environment: `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8`.
+  - Disable any stray `pin_memory` in DataLoaders (not used here by default).
+  - Keep AMP on bfloat16; avoid casting to float32 inadvertently.
+  - Move generated sequences to CPU during sampling to reduce steady-state VRAM (proposal below details minimal diff).
+
+Memory expectations (rules of thumb)
+- Logits tensor memory per forward ≈ `G * L * V * bytes_per_dtype`.
+  - Example: `G=8`, `L=512`, `V=151,643`, `bfloat16=2 bytes` → ~1.2 GB for the logits alone, plus activations. With gradients, plan ~2–3× peak.
+  - Peak per microbatch ≈ logits + autograd buffers for attention/MLP layers; scaling ~linearly in G and L.
+
+Validate with instrumentation (temporary; safe to add under a debug flag)
+- Before loops: `torch.cuda.reset_peak_memory_stats()`.
+- After each microbatch: log `torch.cuda.max_memory_allocated()/1e9` and `torch.cuda.memory_reserved()/1e9`.
+- Ensure peaks stabilize when reducing `G` microbatch and `microbatch_size`.
+
+Most effective structural fixes (require code changes; see proposals doc)
+1) G-microbatch for gradient path
+   - Add `teacher_force_microbatch_size` (default 1–2) and chunk the `[G, L]` sequences inside `_compute_sequence_logprobs` for gradient-enabled passes.
+   - This lowers the peak `[G,L,V]` logits to `[g_mb,L,V]` during X/Y passes.
+2) Keep accumulators on CPU
+   - Allocate `X_sum`/`Y_sum` on CPU in `float32`; add `param.grad.detach().to('cpu', dtype=torch.float32)` during accumulation and only compute dot-products on CPU.
+   - This removes two param-sized GPU buffers from the peak.
+3) Enforce LoRA-only gradients / fail fast
+   - After model load, compute `sum(p.numel() for p in model.parameters() if p.requires_grad)`; if above a safe threshold (e.g., >50M), either freeze base or raise with guidance.
+4) Importance step safety
+   - Snapshot parameter data to CPU and restore from CPU after step; or use stateless functional update to avoid keeping a full GPU clone.
+   - Always `optimizer.zero_grad(set_to_none=True)` after restore to free gradient storage.
+
+Acceptance criteria
+- No CUDA OOM across typical configs on a 40 GB GPU with `B∈{16,32}`, `G∈{4,8}`, `max_new_tokens≤100`.
+- Peak allocated VRAM stable across microbatches; no monotonic growth.
+- Results (deltaH1, SNIS deltaH) within numerical tolerance compared to current pipeline on smaller B/G.
+
+Next steps
+- See `entropy_experiments/offline_entropy_probe_oom_patch_proposals.txt` for minimal diffs to implement the above.
+- If you prefer config-only mitigation, start by: `B=8`, `G=4`, `microbatch_size=1`, `importance_microbatch_size=1`, `max_new_tokens=64`, verify, then scale up knobs.
+

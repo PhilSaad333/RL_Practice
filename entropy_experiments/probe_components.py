@@ -141,9 +141,16 @@ class ProbeComponents:
             self.logger.debug(f"Generating responses for prompts {batch_start}-{batch_end-1} ({len(batch_prompts)} prompts)")
             
             with torch.inference_mode():
-                # Tokenize all prompts in batch with padding
+                # ✅ FIX: Use LEFT padding like dr_grpo.py to avoid generating from pad tokens
+                original_padding_side = self._tokenizer.padding_side
+                self._tokenizer.padding_side = "left"
+                
+                # Tokenize all prompts in batch with LEFT padding
                 batch_prompt_enc = self._tokenizer(batch_prompts, padding=True, return_tensors="pt").to(self.device)
                 batch_prompt_lens = (batch_prompt_enc.attention_mask).sum(dim=1).tolist()  # Get actual prompt lengths
+                
+                # Restore original padding side
+                self._tokenizer.padding_side = original_padding_side
                 
                 # Generate G responses for each prompt simultaneously
                 # This generates len(batch_prompts) * G sequences in one call
@@ -163,7 +170,11 @@ class ProbeComponents:
                 total_len = all_gen_sequences.shape[1]
                 sequences_reshaped = all_gen_sequences.view(batch_size, G, total_len)
                 
-                # Process each prompt in the batch
+                # With LEFT padding, find where generation actually starts
+                # All sequences have same shape [G, total_len], generation starts at same position
+                max_prompt_len = max(batch_prompt_lens)
+                
+                # Process each prompt in the batch  
                 for local_b, (prompt, example, prompt_id, prompt_len) in enumerate(zip(
                     batch_prompts, batch_examples, batch_prompt_ids, batch_prompt_lens
                 )):
@@ -172,7 +183,8 @@ class ProbeComponents:
                     # Decode generated text for advantage computation
                     responses = []
                     for g in range(G):
-                        gen_ids = sequences[g, prompt_len:]
+                        # ✅ FIX: With LEFT padding, generation starts at max_prompt_len for ALL sequences
+                        gen_ids = sequences[g, max_prompt_len:]
                         # Trim at stop tag if present
                         gen_ids = self._trim_at_stop_tag(gen_ids)
                         response_text = self._tokenizer.decode(gen_ids, skip_special_tokens=True)
@@ -180,7 +192,8 @@ class ProbeComponents:
                     
                     # Store sequences and metadata for probe passes
                     all_sequences.append(sequences)  # [G, total_len]
-                    all_prompt_lens.append(prompt_len)
+                    # ✅ FIX: Store max_prompt_len (where generation starts) not actual prompt_len
+                    all_prompt_lens.append(max_prompt_len)
                     
                     # Create attention masks
                     attention_mask = (sequences != self._tokenizer.pad_token_id).long()

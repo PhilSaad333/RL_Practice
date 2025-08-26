@@ -225,8 +225,8 @@ class ImportanceSampler:
                         with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                             logits = self.model(micro_seqs).logits  # [micro_size, max_len, vocab_size]
                     
-                    # Convert to log probabilities
-                    log_probs = F.log_softmax(logits, dim=-1)  # [micro_size, max_len, vocab_size]
+                    # Convert to log probabilities in float32 for stability (like dr_grpo.py)
+                    log_probs = F.log_softmax(logits.float(), dim=-1)  # [micro_size, max_len, vocab_size]
                     
                     # Extract log probs of actual tokens (causal shift)
                     target_ids = micro_seqs[:, 1:].unsqueeze(-1)  # [micro_size, max_len-1, 1]
@@ -267,7 +267,7 @@ class ImportanceSampler:
         attention_masks = batch_data['attention_masks']  # [B, G, max_len]
         
         B, G, max_len = sequences.shape
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         total_tokens = 0
         
         # Simple training objective: maximize log-likelihood of generated tokens
@@ -325,34 +325,24 @@ class ImportanceSampler:
                         from transformers import AutoTokenizer
                         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B")
                     
-                    if tokenizer is not None:
-                        # Decode the sequence to see what was generated
-                        decoded_seq = tokenizer.decode(micro_seqs[0], skip_special_tokens=False)
-                        self.logger.info(f"🔍 GENERATED SEQUENCE: {decoded_seq[:200]}...")  # First 200 chars
-                        
-                        # Show the generation part only (after prompt)
-                        prompt_len = prompt_lens[b]
-                        if prompt_len < len(micro_seqs[0]):
-                            generated_tokens = micro_seqs[0][prompt_len:]
-                            decoded_gen = tokenizer.decode(generated_tokens, skip_special_tokens=False)
-                            self.logger.info(f"🔍 GENERATED PART ONLY: {decoded_gen[:100]}...")  # First 100 chars
-                    else:
-                        self.logger.info(f"🔍 TOKENS (no tokenizer available): {micro_seqs[0][:50].tolist()}...")  # First 50 tokens
+                    # Sample generation logging removed for performance
+                    pass
                         
                 except Exception as e:
-                    self.logger.info(f"🔍 TOKENS (tokenizer error {e}): {micro_seqs[0][:50].tolist()}...")  # First 50 tokens
+                    pass  # Skip generation logging for performance
                 
-                # TEST: Try without gradients first to see if that's the issue
-                with torch.no_grad():
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                        # Try the same approach as dr_grpo.py with attention_mask
-                        logits = self.model(micro_seqs, attention_mask=micro_masks).logits  # [micro_size, max_len, vocab_size]
-                        self.logger.info(f"🔍 SUCCESS: Forward pass without gradients worked! logits.shape = {logits.shape}")
-                        
-                # Now try WITH gradients to confirm the issue
-                self.logger.info(f"🔍 TESTING: Now trying WITH gradients...")
+                # ✅ Use gradient checkpointing to reduce memory during forward pass
+                if hasattr(self.model, 'gradient_checkpointing_enable'):
+                    self.model.gradient_checkpointing_enable()
+                
+                # Ensure model is in training mode for gradients
+                self.model.train()
+                
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                    logits_with_grads = self.model(micro_seqs, attention_mask=micro_masks).logits
+                    logits = self.model(micro_seqs, attention_mask=micro_masks).logits
+                
+                # Convert to float32 BEFORE loss computation to maintain gradients (like dr_grpo.py)
+                logits = logits.float()
                 
                 if hasattr(torch.cuda, 'memory_allocated'):
                     mem_after = torch.cuda.memory_allocated() / 1024**3  # GB
@@ -376,7 +366,7 @@ class ImportanceSampler:
                         gen_logits = gen_logits[:min_len]
                         gen_mask = gen_mask[:min_len]
                         
-                        # Compute loss
+                        # Compute loss (logits already in float32 for numerical stability)
                         losses = F.cross_entropy(gen_logits, gen_targets, reduction='none')
                         masked_loss = (losses * gen_mask).sum()
                         

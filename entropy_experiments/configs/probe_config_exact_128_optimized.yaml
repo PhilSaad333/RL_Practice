@@ -1,11 +1,11 @@
 # Offline Entropy Probe Configuration - Optimized for 40GB A100
 # Exact Mode with B=128, optimized batch sizes for maximum GPU utilization
 
-# Core sampling parameters - optimized for parallelization
+# Core sampling parameters - conservative for OOM mitigation
 batch_config:
-  B: 32                          # Number of prompts per batch (reduced for fast testing)
-  G: 8                          # Number of responses per prompt
-  rollout_batch_size: 16        # NEW: Process 16 prompts simultaneously (16*8=128 sequences per generation call) - balanced for memory
+  B: 8                          # REDUCED: Conservative for OOM mitigation (was 32)
+  G: 4                          # REDUCED: Conservative for OOM mitigation (was 8)  
+  rollout_batch_size: 8         # REDUCED: Match B (was 16)
   dataset_name: "gsm8k_r1_template"  # Dataset to sample prompts from
   split: "train"                # Dataset split to use
 
@@ -14,11 +14,10 @@ probe_config:
   mode: "exact"                 # Use exact per-prompt U-statistic (not blocks)
   # Note: M parameter not needed for exact mode
 
-# Memory and performance - OPTIMIZED for 40GB A100
-# Match training constraints: G=8 requires microbatch_size=2 on single 40GB A100
+# Memory and performance - CONSERVATIVE for OOM mitigation  
 memory_config:
-  microbatch_size: 2            # Match training: single 40GB A100 with G=8 sequences
-  importance_microbatch_size: 1 # Reduce for importance sampling OOM (more conservative)
+  microbatch_size: 1            # REDUCED: Conservative for OOM mitigation (was 2)
+  importance_microbatch_size: 1 # Already conservative
   amp: true                     # Use automatic mixed precision
   dtype: "bfloat16"             # Match training configuration
 
@@ -47,7 +46,7 @@ checkpoint:
 
 # Generation settings - increased for better coverage
 generation:
-  max_new_tokens: 200           # Increased for better response coverage
+  max_new_tokens: 64            # REDUCED: Conservative for OOM mitigation (was 100)
   temperature: 0.7              # Match training temperature
   top_p: 1.0                   # Full distribution
   do_sample: true              # Enable sampling
