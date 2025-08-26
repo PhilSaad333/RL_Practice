@@ -395,6 +395,9 @@ class ProbeComponents:
             # Restore training state
             self.model.train(was_training)
         
+        # 🔍 DEBUG: Check S tensor gradient requirements
+        self.logger.info(f"🔍 [S-TENSOR] S.requires_grad={S.requires_grad}, S.grad_fn={S.grad_fn}")
+        
         return {
             'S': S,  # [batch_size, G] with requires_grad=True
             'sequences': sequences,
@@ -560,6 +563,9 @@ class ProbeComponents:
             # Fresh forward with grad
             S_dict = self._teacher_force_logprobs(microbatch)
             L_Y_mb = self._build_probe_loss_Y_from_S(S_dict)
+            
+            # 🔍 DEBUG: Check L_Y_mb gradient requirements
+            self.logger.info(f"🔍 [L_Y] requires_grad={L_Y_mb.requires_grad}, grad_fn={L_Y_mb.grad_fn}")
             
             # Get Y gradients via autograd.grad
             y_grads = torch.autograd.grad(L_Y_mb, params, allow_unused=True)
