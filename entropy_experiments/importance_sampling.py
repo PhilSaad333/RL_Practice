@@ -844,14 +844,22 @@ class ImportanceSampler:
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                     logits = self.model(seq.unsqueeze(0)).logits  # [1, max_len, vocab_size]
                 
-                # Compute NLL loss for generation tokens
-                targets = seq[1:prompt_len].unsqueeze(0)  # [1, gen_len] 
-                logits_gen = logits[0, prompt_len-1:prompt_len-1+len(targets)]  # [gen_len, vocab_size]
+                # Compute NLL loss for generation tokens only
+                gen_tokens = seq[prompt_len:]  # Generation tokens [gen_len]
+                gen_mask = mask[prompt_len:]  # Mask for generation tokens [gen_len]
                 
-                if len(targets) > 0:
-                    loss = F.cross_entropy(logits_gen, targets[0], reduction='sum')
+                # Only compute loss on actual generation tokens (not padding)
+                valid_gen_tokens = gen_tokens[gen_mask.bool()]
+                
+                if len(valid_gen_tokens) > 0:
+                    # Logits that predict generation tokens
+                    logits_for_gen = logits[0, prompt_len-1:prompt_len-1+len(gen_tokens)]  # [gen_len, vocab_size]
+                    # Only use logits corresponding to valid tokens
+                    valid_logits = logits_for_gen[gen_mask.bool()]  # [valid_len, vocab_size]
+                    
+                    loss = F.cross_entropy(valid_logits, valid_gen_tokens, reduction='sum')
                     total_loss += loss
-                    total_tokens += len(targets)
+                    total_tokens += len(valid_gen_tokens)
         
         # Return mean loss for this microbatch and token count
         return total_loss / max(total_tokens, 1), total_tokens
