@@ -1,11 +1,11 @@
 # Test config for new conditional variance estimator
 # B_U = 128 (64 per GPU), B_E varied from 64 to 512
 
-# Core sampling parameters
+# Core sampling parameters - UPDATED: Much larger batch size for testing
 batch_config:
-  B: 512                             # Set to max B_E as fallback
-  B_E: 128                           # Will vary this from 64→512
-  B_U: 128                           # Fixed at 128 (64 per GPU)
+  B: 2048                            # Large batch size for testing
+  B_E: 2048                          # Large evaluation batch 
+  B_U: 128                           # Keep update batch fixed
   G: 8                               # Generations per prompt
   rollout_batch_size: 64             # For generation efficiency
   dataset_name: "gsm8k_r1_template" 
@@ -66,8 +66,8 @@ memory_config:
   amp: true                          # Use mixed precision
   dtype: "bfloat16"                  # H100 optimized
 
-# Learning rate
-learning_rate: 2e-6                  # Match the checkpoint's lr
+# Learning rate - UPDATED: Much larger for testing δH₁ scaling
+learning_rate: 2e-4                  # 100x larger than before
 
 # Use our step_40 checkpoint with optimizer states
 checkpoint:
