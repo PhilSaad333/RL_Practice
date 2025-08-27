@@ -658,7 +658,7 @@ def load_config_template(config_path: str) -> Dict:
             },
             'distributed': {'find_unused_parameters': False, 'reduce_dtype': 'float32', 'barriers': False},
             'importance': {'enabled': False},
-            'importance_sampling': {'use_snis': True, 'use_psis': False, 'ess_threshold': 0.5},
+            'importance_sampling': {'use_snis': True, 'use_psis': False, 'ess_threshold': 0.5, 'resample_on_low_ess': False},
             'stats_config': {'compute_plugin_se': True, 'compute_jackknife_se': False},
             'memory_config': {'microbatch_size': 2, 'teacher_force_microbatch_size': 2, 'amp': True, 'dtype': 'bfloat16'},
             'learning_rate': 2e-6,

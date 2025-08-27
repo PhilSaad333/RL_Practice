@@ -333,11 +333,16 @@ class OfflineEntropyProbe:
             logger=self.logger
         )
         
-        self.importance_sampler = ImportanceSampler(
-            model=self.model,
-            config=self.config,
-            logger=self.logger
-        )
+        # Only initialize ImportanceSampler if importance sampling is enabled
+        if self.config['importance']['enabled']:
+            self.importance_sampler = ImportanceSampler(
+                model=self.model,
+                config=self.config,
+                logger=self.logger
+            )
+        else:
+            self.importance_sampler = None
+            self.logger.info("ImportanceSampler disabled (importance.enabled: false)")
         
         self.u_statistics = UStatisticsCalculator(
             config=self.config,
@@ -424,6 +429,9 @@ class OfflineEntropyProbe:
         
     def _compute_actual_entropy_change(self, batch_data: Dict[str, Any]) -> Dict[str, Any]:
         """Compute actual entropy change via importance sampling."""
+        if self.importance_sampler is None:
+            self.logger.warning("Importance sampling disabled - cannot compute actual entropy change")
+            return {"error": "ImportanceSampler not initialized (importance sampling disabled)"}
         return self.importance_sampler.compute_entropy_change(batch_data, self.optimizer)
     
     def run_mixed_probe(self, checkpoint_path: str = None) -> Dict[str, Any]:
