@@ -324,12 +324,70 @@ class DistributedHelpers:
 
 
 # ========================================================================
-# STAGE 2: Simple standalone functions for mixed E/U batch probe
+# STAGE 2/3: Simple standalone functions for mixed E/U batch probe
 # ========================================================================
 
 def is_distributed() -> bool:
     """Check if we're running under distributed training."""
     return dist.is_available() and dist.is_initialized()
+
+
+def get_dist_info() -> Tuple[bool, int, int]:
+    """
+    Get distributed training information.
+    
+    Returns:
+        Tuple of (is_distributed, rank, world_size)
+    """
+    if not is_distributed():
+        return False, 0, 1
+    
+    return True, dist.get_rank(), dist.get_world_size()
+
+
+def broadcast_int_list(root_rank: int, indices: Optional[List[int]] = None) -> List[int]:
+    """
+    Broadcast a list of integers from root rank to all other ranks.
+    
+    Args:
+        root_rank: Rank to broadcast from
+        indices: List of integers to broadcast (only needed on root rank)
+        
+    Returns:
+        Broadcasted list of integers (available on all ranks)
+    """
+    if not is_distributed():
+        return indices if indices is not None else []
+    
+    rank = dist.get_rank()
+    device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+    
+    if rank == root_rank:
+        if indices is None:
+            indices = []
+        
+        # First broadcast the length
+        length = torch.tensor(len(indices), dtype=torch.int64, device=device)
+        dist.broadcast(length, src=root_rank)
+        
+        if len(indices) > 0:
+            # Then broadcast the data
+            data_tensor = torch.tensor(indices, dtype=torch.int64, device=device)
+            dist.broadcast(data_tensor, src=root_rank)
+        
+        return indices
+    else:
+        # Receive length first
+        length = torch.tensor(0, dtype=torch.int64, device=device)
+        dist.broadcast(length, src=root_rank)
+        
+        if length.item() > 0:
+            # Then receive data
+            data_tensor = torch.zeros(length.item(), dtype=torch.int64, device=device)
+            dist.broadcast(data_tensor, src=root_rank)
+            return data_tensor.tolist()
+        else:
+            return []
 
 
 def all_reduce_scalar_(tensor_scalar: Union[float, torch.Tensor]) -> float:
@@ -362,6 +420,30 @@ def all_reduce_scalar_(tensor_scalar: Union[float, torch.Tensor]) -> float:
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     
     return tensor.item()
+
+
+def all_reduce_scalar_sum(x: torch.Tensor) -> float:
+    """
+    All-reduce a scalar tensor using SUM operation.
+    
+    Args:
+        x: Scalar (0D) tensor on CPU or CUDA
+        
+    Returns:
+        Reduced scalar value as float
+    """
+    if not is_distributed():
+        return x.item()
+    
+    # Ensure tensor is on the right device for communication
+    device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+    if x.device != device:
+        x = x.to(device)
+    
+    # All-reduce sum
+    dist.all_reduce(x, op=dist.ReduceOp.SUM)
+    
+    return x.item()
 
 
 def count_global(n_local: int) -> int:

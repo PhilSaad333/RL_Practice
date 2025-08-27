@@ -24,6 +24,7 @@ import logging
 import time
 import math
 import os
+import random
 from typing import Dict, List, Tuple, Optional, Any, Union
 from pathlib import Path
 import yaml
@@ -33,6 +34,7 @@ from .probe_components import ProbeComponents
 from .adam_preconditioner import AdamPreconditioner  
 from .importance_sampling import ImportanceSampler
 from .u_statistics import UStatisticsCalculator
+from . import distributed_helpers
 from .distributed_helpers import DistributedHelpers
 
 
@@ -474,12 +476,79 @@ class OfflineEntropyProbe:
             
             self.logger.info(f"Mixed probe config: B_E={B_E}, B_U={B_U}, mb_size={mb_size_prompts}, weighting={weighting_mode}")
             
-            # Phase 0: Sample two batches
+            # Stage 3: Deterministic E/U index selection for multi-GPU consistency
+            is_dist, rank, world_size = distributed_helpers.get_dist_info()
+            self.logger.info(f"Distributed info: dist={is_dist}, rank={rank}/{world_size}")
+            
+            # Load dataset to get size
+            from rlp_datasets import DATASET_REGISTRY
+            dataset = DATASET_REGISTRY[self.config['batch_config']['dataset_name']]
+            ds_examples = dataset(self.config['batch_config']['split'])
+            dataset_size = len(ds_examples)
+            
+            # Get master seed for deterministic sampling
+            master_seed = self.config.get('probe_rework', {}).get('master_seed', 42)
+            
+            if is_dist:
+                # Deterministic sampling: rank 0 generates global indices, broadcasts to all ranks
+                E_indices_global = None
+                U_indices_global = None
+                
+                if rank == 0:
+                    # Rank 0: Generate global E/U indices deterministically
+                    random.seed(master_seed)
+                    all_indices = list(range(dataset_size))
+                    
+                    # Ensure we have enough samples for both batches
+                    total_needed = B_E + B_U
+                    if dataset_size < total_needed:
+                        self.logger.warning(f"Dataset size {dataset_size} < needed samples {total_needed}")
+                        # Extend indices by repeating
+                        all_indices = all_indices * ((total_needed // dataset_size) + 1)
+                    
+                    # Sample E and U indices without overlap
+                    sampled_indices = random.sample(all_indices, min(total_needed, len(all_indices)))
+                    E_indices_global = sampled_indices[:B_E]
+                    U_indices_global = sampled_indices[B_E:B_E + B_U]
+                    
+                    self.logger.info(f"Rank 0 generated {len(E_indices_global)} E indices, {len(U_indices_global)} U indices")
+                
+                # Broadcast indices from rank 0 to all ranks
+                E_indices_global = distributed_helpers.broadcast_int_list(root_rank=0, indices=E_indices_global)
+                U_indices_global = distributed_helpers.broadcast_int_list(root_rank=0, indices=U_indices_global)
+                
+                # Create local shards per rank
+                E_indices_local = E_indices_global[rank::world_size]
+                U_indices_local = U_indices_global[rank::world_size]
+                
+                B_E_local = len(E_indices_local)
+                B_U_local = len(U_indices_local)
+                
+                self.logger.info(f"Rank {rank}: E_local={B_E_local}, U_local={B_U_local}")
+                
+            else:
+                # Single GPU: use all indices locally
+                E_indices_local = None  # Will trigger random sampling in sample_batch
+                U_indices_local = None
+                B_E_local = B_E
+                B_U_local = B_U
+                
+                self.logger.info(f"Single GPU: using random sampling")
+            
+            # Phase 0: Sample two batches using deterministic indices (if available)
             self.logger.info("Phase 0: Sampling E and U batches")
             phase0_start = time.time()
             
-            E_batch = self.probe_components.sample_batch(B=B_E, G=self.config['batch_config']['G'])
-            U_batch = self.probe_components.sample_batch(B=B_U, G=self.config['batch_config']['G'])
+            E_batch = self.probe_components.sample_batch(
+                B=B_E_local if is_dist else B_E, 
+                G=self.config['batch_config']['G'],
+                indices=E_indices_local
+            )
+            U_batch = self.probe_components.sample_batch(
+                B=B_U_local if is_dist else B_U, 
+                G=self.config['batch_config']['G'],
+                indices=U_indices_local
+            )
             
             phase0_time = time.time() - phase0_start
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
@@ -506,16 +575,30 @@ class OfflineEntropyProbe:
             phase2_time = time.time() - phase2_start
             self.logger.info(f"Phase 2 complete: {phase2_time:.2f}s, B_U_local={B_U_local}")
             
-            # Phase 3: Compute means and δH₁
-            self.logger.info("Phase 3: Computing means and δH₁")
+            # Phase 3: All-reduce and compute means and δH₁  
+            self.logger.info("Phase 3: All-reduce and computing means and δH₁")
             phase3_start = time.time()
             
-            # For Stage 1 (single GPU), use local counts
-            # TODO: For DDP, these would be all-reduced
-            B_E_global = B_E_local
-            B_U_global = B_U_local
+            # Stage 3: All-reduce counts and parameter buffers
+            if is_dist:
+                self.logger.info("Multi-GPU: All-reducing counts and parameter buffers")
+                
+                # All-reduce counts
+                B_E_global = distributed_helpers.count_global(B_E_local)
+                B_U_global = distributed_helpers.count_global(B_U_local)
+                
+                # All-reduce parameter buffers (in-place)
+                distributed_helpers.all_reduce_param_buffer_(sum_X_buf)
+                distributed_helpers.all_reduce_param_buffer_(sum_Y_buf)
+                
+                self.logger.info(f"All-reduced: B_E_global={B_E_global}, B_U_global={B_U_global}")
+            else:
+                # Single GPU: use local counts
+                B_E_global = B_E_local
+                B_U_global = B_U_local
+                self.logger.info(f"Single GPU: B_E={B_E_global}, B_U={B_U_global}")
             
-            # Compute means: μ_X = ΣX / B_E, μ_Y = ΣY / B_U
+            # Compute means: μ_X = ΣX / B_E_global, μ_Y = ΣY / B_U_global
             mu_X = {param_id: buf_tensor / max(B_E_global, 1) 
                    for param_id, buf_tensor in sum_X_buf.items()}
             mu_Y = {param_id: buf_tensor / max(B_U_global, 1) 
@@ -547,9 +630,6 @@ class OfflineEntropyProbe:
                 self.logger.info("Phase 4: Computing variance components V_X and V_Y")
                 phase4_start = time.time()
                 
-                # Import distributed helpers for all-reduce operations
-                from . import distributed_helpers
-                
                 # Compute V_X via per-unit scalar projections on E batch
                 V_X_local = self.probe_components.compute_VX(
                     E_batch, mu_X, mu_Y, mb_size_prompts, weighting_mode
@@ -560,9 +640,18 @@ class OfflineEntropyProbe:
                     U_batch, mu_X, mu_Y, mb_size_prompts, self.adam_preconditioner
                 )
                 
-                # All-reduce variance components (no-op for single GPU)
-                V_X = distributed_helpers.all_reduce_scalar_(V_X_local)
-                V_Y = distributed_helpers.all_reduce_scalar_(V_Y_local)
+                # All-reduce variance components via tensor all-reduce
+                if is_dist:
+                    V_X = distributed_helpers.all_reduce_scalar_sum(
+                        torch.tensor(V_X_local, dtype=torch.float64, device='cpu')
+                    )
+                    V_Y = distributed_helpers.all_reduce_scalar_sum(
+                        torch.tensor(V_Y_local, dtype=torch.float64, device='cpu')
+                    )
+                    self.logger.info(f"All-reduced variances: V_X_sum={V_X:.10f}, V_Y_sum={V_Y:.10f}")
+                else:
+                    V_X = V_X_local
+                    V_Y = V_Y_local
                 
                 # Apply final normalization: V_X /= (B_E * max(B_E-1, 1))
                 V_X = V_X / (B_E_global * max(B_E_global - 1, 1))

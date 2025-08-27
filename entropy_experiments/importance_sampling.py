@@ -14,6 +14,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import logging
 import time
 import math
+from . import distributed_helpers
 
 
 class ImportanceSampler:
@@ -753,61 +754,115 @@ class ImportanceSampler:
     
     def _compute_snis_two_batch(self, S_upd: torch.Tensor, logw: torch.Tensor,
                                report_per_token: bool, E_batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Compute SNIS entropy estimate for two-batch method."""
+        """Compute SNIS entropy estimate for two-batch method with multi-GPU support."""
+        is_dist, rank, world_size = distributed_helpers.get_dist_info()
+        
         # Stabilize weights in log domain
         logw_max = logw.max()
         w_shift = torch.exp(logw - logw_max)  # [batch_size, G]
         
-        # SNIS entropy estimate
-        w_sum = w_shift.sum()
-        wS_sum = (w_shift * S_upd).sum()
-        H_upd = -wS_sum / w_sum
+        # Compute local sums
+        w_sum_local = w_shift.sum()
+        wS_sum_local = (w_shift * S_upd).sum()
+        w_sq_sum_local = (w_shift**2).sum()  # For ESS computation
+        
+        # All-reduce sums across ranks for multi-GPU
+        if is_dist:
+            w_sum_global = distributed_helpers.all_reduce_scalar_sum(w_sum_local)
+            wS_sum_global = distributed_helpers.all_reduce_scalar_sum(wS_sum_local)
+            w_sq_sum_global = distributed_helpers.all_reduce_scalar_sum(w_sq_sum_local)
+            
+            self.logger.debug(f"Rank {rank}: local w_sum={w_sum_local.item():.6f}, global w_sum={w_sum_global:.6f}")
+        else:
+            w_sum_global = w_sum_local.item()
+            wS_sum_global = wS_sum_local.item()
+            w_sq_sum_global = w_sq_sum_local.item()
+        
+        # Compute SNIS entropy estimate from global sums
+        H_upd = -wS_sum_global / w_sum_global if w_sum_global != 0 else 0.0
+        
+        # Compute diagnostics
+        ESS = (w_sum_global**2) / w_sq_sum_global if w_sq_sum_global != 0 else 0.0
         
         results = {
-            'H_upd': H_upd.item(),
+            'H_upd': H_upd,
             'diagnostics': {
-                'ESS': (w_sum**2 / (w_shift**2).sum()).item(),
+                'ESS': ESS,
                 'w_max': w_shift.max().item(),
-                'w_min': w_shift.min().item()
+                'w_min': w_shift.min().item(),
+                'w_sum_global': w_sum_global
             }
         }
         
         # Per-token estimate if requested
         if report_per_token:
             lengths = self._get_generation_lengths(E_batch)  # [batch_size, G]
-            wL_sum = (w_shift * lengths).sum()
-            H_upd_tok = -wS_sum / wL_sum if wL_sum > 0 else 0.0
-            results['H_upd_tok'] = H_upd_tok.item()
+            wL_sum_local = (w_shift * lengths).sum()
+            
+            if is_dist:
+                wL_sum_global = distributed_helpers.all_reduce_scalar_sum(wL_sum_local)
+            else:
+                wL_sum_global = wL_sum_local.item()
+                
+            H_upd_tok = -wS_sum_global / wL_sum_global if wL_sum_global > 0 else 0.0
+            results['H_upd_tok'] = H_upd_tok
         
         return results
     
     def _compute_clip_is_two_batch(self, S_upd: torch.Tensor, logw: torch.Tensor,
                                   clip_c: float, report_per_token: bool, E_batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Compute clipped IS entropy estimate for two-batch method.""" 
+        """Compute clipped IS entropy estimate for two-batch method with multi-GPU support.""" 
+        is_dist, rank, world_size = distributed_helpers.get_dist_info()
+        
         # Convert to linear weights and clip
         w = torch.exp(logw)  # [batch_size, G]
         w_clipped = torch.clamp(w, max=clip_c)
         
-        # Clipped IS entropy estimate
-        w_sum = w_clipped.sum()
-        wS_sum = (w_clipped * S_upd).sum()
-        H_upd = -wS_sum / w_sum
+        # Compute local sums
+        w_sum_local = w_clipped.sum()
+        wS_sum_local = (w_clipped * S_upd).sum()
+        
+        # All-reduce sums across ranks for multi-GPU
+        if is_dist:
+            w_sum_global = distributed_helpers.all_reduce_scalar_sum(w_sum_local)
+            wS_sum_global = distributed_helpers.all_reduce_scalar_sum(wS_sum_local)
+        else:
+            w_sum_global = w_sum_local.item()
+            wS_sum_global = wS_sum_local.item()
+        
+        # Compute clipped IS entropy estimate from global sums
+        H_upd = -wS_sum_global / w_sum_global if w_sum_global != 0 else 0.0
+        
+        # Compute diagnostics (using local values for metrics that don't need global reduction)
+        w_sq_sum_local = (w_clipped**2).sum()
+        if is_dist:
+            w_sq_sum_global = distributed_helpers.all_reduce_scalar_sum(w_sq_sum_local)
+            ESS = (w_sum_global**2) / w_sq_sum_global if w_sq_sum_global != 0 else 0.0
+        else:
+            ESS = (w_sum_global**2) / w_sq_sum_local.item() if w_sq_sum_local.item() != 0 else 0.0
         
         results = {
-            'H_upd': H_upd.item(),
+            'H_upd': H_upd,
             'diagnostics': {
-                'ESS': (w_sum**2 / (w_clipped**2).sum()).item(),
+                'ESS': ESS,
                 'clipped_fraction': (w > clip_c).float().mean().item(),
-                'w_max': w_clipped.max().item()
+                'w_max': w_clipped.max().item(),
+                'w_sum_global': w_sum_global
             }
         }
         
         # Per-token estimate if requested
         if report_per_token:
             lengths = self._get_generation_lengths(E_batch)  # [batch_size, G]
-            wL_sum = (w_clipped * lengths).sum()
-            H_upd_tok = -wS_sum / wL_sum if wL_sum > 0 else 0.0
-            results['H_upd_tok'] = H_upd_tok.item()
+            wL_sum_local = (w_clipped * lengths).sum()
+            
+            if is_dist:
+                wL_sum_global = distributed_helpers.all_reduce_scalar_sum(wL_sum_local)
+            else:
+                wL_sum_global = wL_sum_local.item()
+                
+            H_upd_tok = -wS_sum_global / wL_sum_global if wL_sum_global > 0 else 0.0
+            results['H_upd_tok'] = H_upd_tok
         
         return results
     

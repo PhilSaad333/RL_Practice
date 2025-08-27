@@ -12,11 +12,20 @@
 ✅ **GPU utilization optimized (32x batch size + teacher forcing)**  
 
 ## Critical Session Startup Protocol
-1. **Always read** CLAUDE_GUIDE.md, NEW_TRAINING_WORKFLOW.md, and lambda/LAMBDA_SETUP_GUIDE.md
+1. **Always read** CLAUDE_GUIDE.md, NEW_TRAINING_WORKFLOW.md, and lambda_cloud/LAMBDA_SETUP_GUIDE.md
 2. **Ask for current Lambda instance IP** (changes between sessions)
 3. **SSH key location**: `~/.ssh/lambda_new`
 4. **Never assume setup** - always inspect Lambda filesystem first
 5. **Git workflow**: Make changes locally → push → pull on Lambda
+
+## CLAUDE.md Update Protocol
+**IMPORTANT**: Before updating this CLAUDE.md file with new information:
+1. **Always ask Lord Krang for permission first**
+2. Suggest what should be added and why it would be useful long-term
+3. Only update after explicit approval
+4. Focus on information that will be valuable across multiple sessions
+5. Examples of good updates: new workflows, critical fixes, architectural changes
+6. Examples to avoid: temporary debugging info, session-specific details
 
 ## Core Workflow (WORKING PERFECTLY)
 

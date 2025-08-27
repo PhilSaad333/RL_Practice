@@ -8,7 +8,7 @@ in RL_studies.pdf and the implementation strategy in offline_entropy_probe_strat
 Main components:
 - OfflineEntropyProbe: Main orchestrator class
 - ProbeComponents: Core gradient computation and microbatching
-- AdamPreconditioner: Extract and apply P^{1/2} from Adam optimizer state
+- AdamPreconditioner: Extract and apply P from Adam optimizer state
 - ImportanceSampler: Self-normalized importance sampling for actual ΔH
 - UStatisticsCalculator: U-statistic computation and variance estimation
 - DistributedHelpers: Multi-GPU scalar communication helpers
