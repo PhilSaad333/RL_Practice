@@ -357,6 +357,10 @@ class ImportanceSampler:
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                     logits = self.model(micro_seqs, attention_mask=micro_masks).logits
                 
+                temp = self.config['generation'].get('temperature', 1.0)
+                if temp != 1.0:
+                    logits = logits / temp
+
                 # Convert to float32 for numerical stability (like dr_grpo.py)
                 logits = logits.float()
                 

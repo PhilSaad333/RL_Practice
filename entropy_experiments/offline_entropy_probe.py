@@ -620,13 +620,17 @@ class OfflineEntropyProbe:
             self.logger.info(f"Phase 3 complete: {phase3_time:.2f}s")
             
             # ================================================================
-            # STAGE 2: Variance Components (V_X, V_Y) - Optional
+            # STAGE 2: Variance Components - Optional (configurable)
             # ================================================================
-            variance_enabled = self.config.get('probe_rework', {}).get('variance_enabled', False)
-            V_X, V_Y, SE_deltaH1, frac_var = 0.0, 0.0, 0.0, 0.0
+            probe_config = self.config.get('probe_rework', {})
+            compute_vx_vy_variance = probe_config.get('compute_vx_vy_variance', False)
+            compute_conditional_variance = probe_config.get('compute_conditional_variance', False)
+            
+            V_X, V_Y, SE_deltaH1 = 0.0, 0.0, 0.0
+            SE_conditional = 0.0
             phase4_time, phase5_time = 0.0, 0.0
             
-            if variance_enabled:
+            if compute_vx_vy_variance:
                 self.logger.info("Phase 4: Computing variance components V_X and V_Y")
                 phase4_start = time.time()
                 
@@ -657,19 +661,61 @@ class OfflineEntropyProbe:
                 V_X = V_X / (B_E_global * max(B_E_global - 1, 1))
                 V_Y = V_Y / (B_U_global * max(B_U_global - 1, 1))
                 
-                # Compute standard error and fractional variance
+                # Compute standard error (no more fractional variance)
                 SE_deltaH1 = learning_rate * math.sqrt(max(V_X, 0.0) + max(V_Y, 0.0))
-                frac_var = (V_X + V_Y) / max(bars_dot, 1e-12)**2
                 
                 phase4_time = time.time() - phase4_start
-                self.logger.info(f"🔍 [VARIANCE] V_X={V_X:.10f}, V_Y={V_Y:.10f}")
-                self.logger.info(f"🔍 [VARIANCE] SE_deltaH1={SE_deltaH1:.10f}, frac_var={frac_var:.6f}")
+                self.logger.info(f"🔍 [V_X+V_Y VARIANCE] V_X={V_X:.10f}, V_Y={V_Y:.10f}")
+                self.logger.info(f"🔍 [V_X+V_Y VARIANCE] SE_deltaH1={SE_deltaH1:.10f}")
                 self.logger.info(f"Phase 4 complete: {phase4_time:.2f}s")
             
             # ================================================================
-            # STAGE 2: Two-Batch Ground-Truth Entropy Change - Optional
+            # STAGE 2b: Conditional Variance Var_E(δH₁ | U) - Optional
             # ================================================================
-            importance_enabled = self.config.get('importance', {}).get('enabled', False)
+            if compute_conditional_variance:
+                self.logger.info("Phase 4b: Computing conditional variance Var_E(δH₁ | U)")
+                phase4b_start = time.time()
+                
+                # Compute conditional variance using scalar projections
+                sum_s_local, sum_s2_local, B_E_local = self.probe_components.compute_conditional_variance_over_E(
+                    E_batch, mu_Y, mb_size_prompts, weighting_mode
+                )
+                
+                # All-reduce scalar statistics
+                if is_dist:
+                    S1 = distributed_helpers.all_reduce_scalar_sum(
+                        torch.tensor(sum_s_local, dtype=torch.float64, device='cpu')
+                    )
+                    S2 = distributed_helpers.all_reduce_scalar_sum(
+                        torch.tensor(sum_s2_local, dtype=torch.float64, device='cpu')
+                    )
+                    B_E_cond = distributed_helpers.all_reduce_scalar_sum(
+                        torch.tensor(B_E_local, dtype=torch.float64, device='cpu')  
+                    )
+                    self.logger.info(f"All-reduced conditional stats: S1={S1:.10f}, S2={S2:.10f}, B_E={B_E_cond:.0f}")
+                else:
+                    S1, S2, B_E_cond = sum_s_local, sum_s2_local, B_E_local
+                
+                # Compute conditional variance and standard error
+                if B_E_cond >= 2:
+                    s_bar = S1 / B_E_cond
+                    sample_var_s = (S2 - B_E_cond * s_bar * s_bar) / (B_E_cond - 1)
+                    var_cond_E = (learning_rate * learning_rate) * sample_var_s / B_E_cond
+                    SE_conditional = learning_rate * math.sqrt(max(sample_var_s / B_E_cond, 0.0))
+                else:
+                    sample_var_s, var_cond_E, SE_conditional = 0.0, 0.0, 0.0
+                    self.logger.warning("B_E < 2, cannot compute conditional variance")
+                
+                phase4b_time = time.time() - phase4b_start
+                self.logger.info(f"🔍 [CONDITIONAL VARIANCE] Var_E(δH₁|U)={var_cond_E:.10f}")
+                self.logger.info(f"🔍 [CONDITIONAL VARIANCE] SE_E(δH₁|U)={SE_conditional:.10f}")
+                self.logger.info(f"Phase 4b complete: {phase4b_time:.2f}s")
+            
+            # ================================================================
+            # STAGE 2c: Two-Batch Ground-Truth Entropy Change - Optional
+            # ================================================================
+            compute_importance_sampling = probe_config.get('compute_importance_sampling', False)
+            importance_enabled = self.config.get('importance', {}).get('enabled', False) or compute_importance_sampling
             ground_truth_results = {}
             
             if importance_enabled:
@@ -729,15 +775,23 @@ class OfflineEntropyProbe:
             }
             
             # Add Stage 2 variance results if computed
-            if variance_enabled:
+            if compute_vx_vy_variance:
                 results.update({
                     "V_X": V_X,
                     "V_Y": V_Y, 
                     "SE_deltaH1": SE_deltaH1,
-                    "frac_var": frac_var,
-                    "variance_enabled": True
+                    "compute_vx_vy_variance": True
                 })
                 results["timing"]["phase4_variance"] = phase4_time
+            
+            # Add conditional variance results if computed
+            if compute_conditional_variance:
+                results.update({
+                    "SE_conditional": SE_conditional,
+                    "compute_conditional_variance": True
+                })
+                if "phase4b_time" in locals():
+                    results["timing"]["phase4b_conditional"] = phase4b_time
             
             # Add Stage 2 ground-truth results if computed
             if importance_enabled:
@@ -747,7 +801,7 @@ class OfflineEntropyProbe:
                 })
                 results["timing"]["phase5_importance"] = phase5_time
             
-            stage = "Stage 1+2" if (variance_enabled or importance_enabled) else "Stage 1"
+            stage = "Stage 1+2" if (compute_vx_vy_variance or compute_conditional_variance or importance_enabled) else "Stage 1"
             self.logger.info(f"{stage} Mixed probe analysis completed in {total_time:.2f}s")
             return results
             

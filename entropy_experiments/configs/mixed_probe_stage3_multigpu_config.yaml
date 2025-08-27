@@ -21,7 +21,12 @@ probe_rework:
   mb_size_prompts: 6                 # Microbatch size (prompts per microbatch) - increased 50% for higher GPU utilization
   buffers_dtype: "float32"           # Buffer precision (keep fp32 for stability)
   weighting_mode: "dr_grpo"          # Weighting mode
-  variance_enabled: true             # Enable Stage 2 variance computation
+  
+  # Variance estimation options (choose which to compute)
+  compute_vx_vy_variance: true       # Original V_X + V_Y estimator
+  compute_conditional_variance: true # NEW: V_E|U estimator (variance over E with U fixed)
+  compute_importance_sampling: true  # ΔH_true with model update (expensive but most accurate)
+  
   ddp_allreduce: true                # Enable DDP all-reduce
   master_seed: 42                    # Deterministic seed for multi-GPU consistency
 
@@ -62,7 +67,7 @@ memory_config:
   dtype: "bfloat16"                 # H100-optimized precision
 
 # Learning rate - used consistently throughout probe computation
-learning_rate: 2e-6
+learning_rate: 1e-6
 
 # Use extracted checkpoint path (will be updated after extraction)
 checkpoint:

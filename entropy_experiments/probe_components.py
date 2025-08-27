@@ -306,7 +306,7 @@ class ProbeComponents:
             self.model.train(was_training)
         
         # 🔍 DEBUG: Check S tensor gradient requirements
-        self.logger.info(f"🔍 [S-TENSOR] S.requires_grad={S.requires_grad}, S.grad_fn={S.grad_fn}")
+        #self.logger.info(f"🔍 [S-TENSOR] S.requires_grad={S.requires_grad}, S.grad_fn={S.grad_fn}")
         
         return {
             'S': S,  # [batch_size, G] with requires_grad=True
@@ -336,7 +336,7 @@ class ProbeComponents:
         """
         G, total_len = sequences.shape
         
-        # ✅ G-MICROBATCHING: Process sequences in smaller chunks to reduce memory
+        # G-MICROBATCHING: Process sequences in smaller chunks to reduce memory
         teacher_force_microbatch_size = self.config.get('memory_config', {}).get('teacher_force_microbatch_size', 2)
         self.logger.debug(f"Using teacher_force_microbatch_size={teacher_force_microbatch_size} for gradient computation")
         
@@ -347,9 +347,16 @@ class ProbeComponents:
             g_end = min(g_start + teacher_force_microbatch_size, G)
             micro_sequences = sequences[g_start:g_end]  # [g_micro, total_len]
             
-            # Teacher forcing forward pass on microbatch
+            # Create attention mask for teacher forcing (padding only - causality handled by model architecture)
+            if hasattr(self._tokenizer, 'pad_token_id') and self._tokenizer.pad_token_id is not None:
+                attention_mask = (micro_sequences != self._tokenizer.pad_token_id).long()
+            else:
+                attention_mask = torch.ones_like(micro_sequences, dtype=torch.long)
+            
+            # Teacher forcing forward pass on microbatch with attention mask
+            # Note: Causal attention is handled automatically by the model architecture
             with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                logits = self.model(micro_sequences).logits  # [g_micro, total_len, vocab_size]
+                logits = self.model(micro_sequences, attention_mask=attention_mask).logits  # [g_micro, total_len, vocab_size]
                 
             # Apply temperature if configured
             temp = self.config['generation'].get('temperature', 1.0)
@@ -587,8 +594,8 @@ class ProbeComponents:
                 # Detached coefficient
                 coeff_b = (S_w_b - S_w_LOO_b).detach()
             
-            # L_X for this prompt: mean_g(coeff * S)
-            prompt_loss = (coeff_b * S_b).mean()
+            # L_X for this prompt: - mean_g(coeff * S)
+            prompt_loss = -(coeff_b * S_b).mean()
             total_loss = total_loss + prompt_loss
             total_count += 1
         
@@ -949,6 +956,75 @@ class ProbeComponents:
         # This returns the local contribution
         self.logger.info(f"V_Y computation complete: sum_sq_proj_Y = {sum_sq_proj_Y:.6f}")
         return sum_sq_proj_Y
+
+    def compute_conditional_variance_over_E(self, E_batch: Dict[str, Any], 
+                                          muY_buf: Dict[int, torch.Tensor],
+                                          mb_size_prompts: int,
+                                          weighting_mode: str) -> Tuple[float, float, int]:
+        """
+        Compute conditional variance Var_E(δH₁ | U) using scalar projections.
+        
+        This implements the new variance estimator that fixes U and computes variance
+        over E only. Returns variance, standard error, and batch count.
+        
+        From variance_estimator_change.txt:
+        - s_n := μ_Y^T X_n (scalar projection for each prompt n in E)
+        - sample_var_s = (Σs_n² - B_E·s̄²) / (B_E-1)  
+        - Var_E(δH₁|U) = η²·sample_var_s/B_E
+        - SE_E(δH₁|U) = η·√(sample_var_s/B_E)
+        
+        Args:
+            E_batch: Evaluation batch (used for X gradients)
+            muY_buf: Fixed mean Y buffer (from U batch) 
+            mb_size_prompts: Microbatch size for processing
+            weighting_mode: Weighting mode for loss computation
+            
+        Returns:
+            (sample_var_s, scalar_mean, B_E_local): Statistics for global computation
+        """
+        sum_s_local = 0.0
+        sum_s2_local = 0.0
+        B_E_local = 0
+        
+        # Check if model is wrapped in DDP for no_sync context
+        is_ddp = hasattr(self.model, 'no_sync')
+        no_sync_context = self.model.no_sync if is_ddp else nullcontext
+        
+        self.logger.debug("Computing conditional variance over E using scalar projections")
+        
+        # Process each prompt unit individually
+        with no_sync_context():  # Prevent DDP gradient averaging
+            for unit in self._iter_units(E_batch):
+                # Clear gradients
+                self.model.zero_grad(set_to_none=True)
+                
+                # Forward pass with teacher forcing for single unit
+                S_dict = self._teacher_force_logprobs(unit)
+                
+                # Build X-loss with LOO baseline and minus sign (as per variance_estimator_change.txt)
+                L_X_u = -self.build_LX_from_S(S_dict, weighting_mode)  # Note the minus sign
+                
+                # Backward pass - get raw X_n in param.grad (no preconditioning)
+                L_X_u.backward()
+                
+                # Compute scalar projection: s_n = μ_Y^T X_n  
+                s_n = 0.0
+                for param in self.model.parameters():
+                    if param.requires_grad and param.grad is not None:
+                        param_id = id(param)
+                        if param_id in muY_buf:
+                            s_n += (param.grad * muY_buf[param_id]).sum().item()
+                
+                # Accumulate statistics
+                sum_s_local += s_n
+                sum_s2_local += s_n * s_n
+                B_E_local += 1
+                
+                # Clear gradients for next unit
+                self.model.zero_grad(set_to_none=True)
+        
+        self.logger.debug(f"Conditional variance over E: B_E_local={B_E_local}, sum_s={sum_s_local:.6f}")
+        return sum_s_local, sum_s2_local, B_E_local
     
     def _iter_units(self, batch_dict: Dict[str, Any]):
         """

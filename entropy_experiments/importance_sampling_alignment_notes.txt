@@ -1,0 +1,48 @@
+Audit: Alignment Between Probe Y, DR-GRPO, and IS Update Step
+
+Question
+- Are we using the same objective in three places?
+  1) ProbeComponents Y-loss (ΔH₁ path)
+  2) DR-GRPO training objective (1 epoch; ratios≈1)
+  3) ImportanceSampler update step used for ground-truth ΔH (two-batch)
+
+Findings (concise)
+- Probe Y-loss (correct):
+  - L_Y = mean_g((A / L_max) * S), where S = sum of log p(token | prefix) over generated tokens.
+  - backward() → ∇θ L_Y = mean_g((A / L_max) * ∑ ∇ log p) (sign corresponds to maximising J).
+  - Matches policy-gradient form for GRPO when ratios=1 and no clipping.
+
+- DR-GRPO training (matching when epochs=1 and ratios≈1):
+  - Token-level PPO surrogate with ratios = exp(new_logp − old_logp); loss per prompt normalised by (G * L_max).
+  - If we ignore clipping and take one epoch with old==new (so ratios≈1), gradient reduces to −(A / (G*L_max))∑ ∇ log p per prompt.
+  - This is the negative of the probe’s Y-gradient (because training minimises −J), so directions match (J vs −loss).
+
+- ImportanceSampler update step (mismatch today):
+  - IS step uses streaming backward of token-level cross-entropy (NLL) without advantage or L_max weighting; gradients averaged by total_tokens.
+  - This is not the GRPO objective, nor the probe’s Y-loss. The step direction differs (MLE instead of RL), and the per-token normalisation also differs.
+  - Additionally, in _compute_logprobs_for_sequences (E entropy eval), the model forward does not pass attention_mask; DR-GRPO always passes it. This can change logprobs.
+
+Consequences
+- The “true ΔH” measured on E after the IS update is taken with a different update rule than the one used in ΔH₁ and training. This can alter both magnitude and sign.
+- Not passing attention_mask for E logprobs (original/updated) can bias entropy estimates relative to training.
+
+Recommended alignment (for Claude; keep backward+microbatch)
+1) Align IS training step to GRPO objective:
+   - Option A (sequence-level): per microbatch, compute S (sum log p on generated tokens) via teacher forcing and build
+       L_rl_mb = − mean_over_prompts_g( (A / L_max) * S )
+     backward() immediately; accumulate grads; normalise by prompts (or total sequences) at the end if desired.
+   - Option B (token-level, closer to dr_grpo): compute `new_logp` (B,G,T_g) and set `loss = −mean_b ( sum_{g,t} A_b,g * gen_mask / (G * L_max_b) * new_logp )`; backward per micro.
+   - Keep using the actual optimiser (AdamW) to apply P implicitly during step.
+
+2) Use attention_mask in E logprob eval:
+   - In ImportanceSampler._compute_logprobs_for_sequences, call `self.model(..., attention_mask=micro_masks)` and keep float32 log_softmax like dr_grpo.
+
+3) Normalisation semantics:
+   - Match probe/training by dividing per prompt by (G * L_max). Avoid global total_tokens scaling for RL step — it changes per-prompt weighting.
+
+4) Minor: ensure left padding and prompt_len logic identical to probe/training (start from prompt_len; mask padding tokens).
+
+Validation
+- After alignment, the two-batch ΔH_true should correlate better with ΔH₁ (same sign more often, closer magnitude for small steps).
+- Compare ΔH_true before/after alignment on the same E/U batch and checkpoint.
+

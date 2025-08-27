@@ -1,0 +1,69 @@
+# Test config for new variance estimator implementation
+# Small scale test to verify all 4 fixes work correctly
+
+# Core sampling parameters - small for fast testing
+batch_config:
+  B: 8                               # Small batch size for quick test
+  B_E: 8                             # Small evaluation batch 
+  B_U: 8                             # Small update batch
+  G: 4                               # Few generations per prompt
+  rollout_batch_size: 16             # Small rollout batch
+  dataset_name: "gsm8k_r1_template" 
+  split: "train"
+
+# Probe computation mode
+probe_config:
+  mode: "exact"                      # Use exact computation
+  M: null                            
+
+# NEW: Test all variance estimator options
+probe_rework:
+  mb_size_prompts: 2                 # Small microbatch for testing
+  buffers_dtype: "float32"           
+  weighting_mode: "dr_grpo"          
+  
+  # Test all three variance estimation options
+  compute_vx_vy_variance: true       # Original V_X + V_Y estimator
+  compute_conditional_variance: true # NEW: V_E|U estimator (fixes issue #2)
+  compute_importance_sampling: false # Skip expensive importance sampling for now
+  
+  ddp_allreduce: false               # Single GPU test
+  master_seed: 42                    
+
+# Memory settings
+memory_config:
+  microbatch_size: 2                 # Small for testing
+  teacher_force_microbatch_size: 4   # Small for testing
+  amp: false                         # Disable for debugging
+  dtype: "float32"                   # Full precision for debugging
+
+# Learning rate
+learning_rate: 1e-6
+
+# Checkpoint - will need to be updated with valid path
+checkpoint:
+  checkpoint_path: "TBD_AFTER_SETUP"
+  optimizer_path: "TBD_AFTER_SETUP"
+  model_config_path: "Qwen/Qwen2.5-1.5B"
+
+# Generation settings
+generation:
+  max_new_tokens: 50                 # Short for quick test
+  temperature: 0.7
+  top_p: 1.0
+  do_sample: true
+  pad_token_id: null
+
+# Output settings
+output:
+  save_results: true
+  results_path: "test_new_variance_estimator_results.json"
+  log_level: "DEBUG"                 # Verbose logging for debugging
+  save_samples: false
+
+# Test Notes:
+# This config tests:
+# 1. ✅ _compute_sequence_logprobs uses attention mask (fix #1)  
+# 2. ✅ compute_conditional_variance: new V_E|U estimator (fix #2)
+# 3. ✅ Granular config options for probe components (fix #3)
+# 4. ✅ No fractional variance logging (fix #4)

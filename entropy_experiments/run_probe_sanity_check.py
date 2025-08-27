@@ -82,16 +82,8 @@ def extract_key_metrics(results, config):
         metrics['clipped_fraction'] = None
         metrics['w_sum_global'] = None
     
-    # Compute fractional variance: (V_X + V_Y) / bars_dot²
-    # Note: δH₁ = lr * bars_dot, so bars_dot = δH₁ / lr
-    # Fractional variance = Var(δH₁) / δH₁² = lr² * (V_X + V_Y) / δH₁²
-    # = lr² * (V_X + V_Y) / (lr * bars_dot)² = (V_X + V_Y) / bars_dot²
-    if metrics['V_X'] is not None and metrics['V_Y'] is not None and metrics['deltaH1'] != 0:
-        learning_rate = float(config.get('learning_rate', 2e-6))  # Use config learning rate, ensure float
-        bars_dot = metrics['deltaH1'] / learning_rate
-        metrics['frac_var'] = (metrics['V_X'] + metrics['V_Y']) / (bars_dot ** 2)
-    else:
-        metrics['frac_var'] = None
+    # Add conditional variance if available
+    metrics['SE_conditional'] = results.get('SE_conditional', None)
     
     # Compute bias: δH₁ - ΔH_true
     if metrics['deltaH_true'] is not None:
@@ -145,8 +137,10 @@ def run_sanity_check(config_path: str, checkpoint_path: str, n_runs: int, rank: 
             if metrics['deltaH_true'] is not None:
                 logger.info(f"  ΔH_true: {metrics['deltaH_true']:.6f}")
                 logger.info(f"  Bias: {metrics['bias']:.6f}")
-            if metrics['frac_var'] is not None:
-                logger.info(f"  Frac_var: {metrics['frac_var']:.6f}")
+            if metrics['SE_deltaH1'] is not None:
+                logger.info(f"  SE(δH₁): {metrics['SE_deltaH1']:.6f}")
+            if metrics['SE_conditional'] is not None:
+                logger.info(f"  SE_E(δH₁|U): {metrics['SE_conditional']:.6f}")
             if metrics['ESS'] is not None:
                 logger.info(f"  ESS: {metrics['ESS']:.1f}")
             
@@ -161,14 +155,15 @@ def run_sanity_check(config_path: str, checkpoint_path: str, n_runs: int, rank: 
                     
             logger.info(f"  Runtime: {metrics['runtime']:.1f}s")
             
-            # Quick feedback on targets
-            if metrics['frac_var'] is not None:
-                if metrics['frac_var'] < 0.05:
-                    logger.info(f"  ✅ Fractional variance looks good")
-                elif metrics['frac_var'] < 0.1:
-                    logger.info(f"  ⚠️  Fractional variance acceptable")
+            # Quick feedback on standard errors
+            if metrics['SE_conditional'] is not None and metrics['deltaH1'] != 0:
+                relative_se = abs(metrics['SE_conditional'] / metrics['deltaH1'])
+                if relative_se < 0.1:
+                    logger.info(f"  ✅ Conditional SE looks good (SE/δH₁ = {relative_se:.3f})")
+                elif relative_se < 0.2:
+                    logger.info(f"  ⚠️  Conditional SE acceptable (SE/δH₁ = {relative_se:.3f})")
                 else:
-                    logger.info(f"  ❌ Fractional variance high - may need larger batch")
+                    logger.info(f"  ❌ Conditional SE high (SE/δH₁ = {relative_se:.3f}) - may need larger batch")
                     
             # IS ratio feedback
             if metrics['w_max'] is not None and metrics['w_min'] is not None:
@@ -209,25 +204,29 @@ def analyze_results(results, logger, total_time):
     logger.info(f"  CV:   {deltaH1_std / abs(deltaH1_mean):.4f}")
     logger.info(f"  Range: [{min(deltaH1_values):.6f}, {max(deltaH1_values):.6f}]")
     
-    # Fractional variance analysis
-    frac_vars = [r['frac_var'] for r in results if r['frac_var'] is not None]
-    if frac_vars:
-        frac_var_mean = np.mean(frac_vars)
-        frac_var_median = np.median(frac_vars)
-        logger.info(f"")
-        logger.info(f"📈 Fractional Variance Analysis:")
-        logger.info(f"  Mean: {frac_var_mean:.6f}")
-        logger.info(f"  Median: {frac_var_median:.6f}")
-        logger.info(f"  Range: [{min(frac_vars):.6f}, {max(frac_vars):.6f}]")
+    # Conditional standard error analysis
+    se_conditionals = [r['SE_conditional'] for r in results if r['SE_conditional'] is not None]
+    deltaH1_values_for_se = [r['deltaH1'] for r in results if r['SE_conditional'] is not None]
+    
+    if se_conditionals and deltaH1_values_for_se:
+        relative_ses = [abs(se / dh1) if dh1 != 0 else float('inf') for se, dh1 in zip(se_conditionals, deltaH1_values_for_se)]
+        se_mean = np.mean(se_conditionals)
+        relative_se_median = np.median([r for r in relative_ses if r != float('inf')])
         
-        if frac_var_median < 0.05:
-            logger.info(f"  ✅ GOOD: Fractional variance is low (< 0.05)")
+        logger.info(f"")
+        logger.info(f"📈 Conditional Standard Error Analysis:")
+        logger.info(f"  SE_E(δH₁|U) mean: {se_mean:.6f}")
+        logger.info(f"  Relative SE (SE/|δH₁|) median: {relative_se_median:.3f}")
+        logger.info(f"  SE range: [{min(se_conditionals):.6f}, {max(se_conditionals):.6f}]")
+        
+        if relative_se_median < 0.1:
+            logger.info(f"  ✅ GOOD: Conditional SE is low (< 10% of δH₁)")
             logger.info(f"      → Batch size appears sufficient")
-        elif frac_var_median < 0.1:
-            logger.info(f"  ⚠️  OK: Fractional variance is acceptable (< 0.1)")
+        elif relative_se_median < 0.2:
+            logger.info(f"  ⚠️  OK: Conditional SE is acceptable (< 20% of δH₁)")
             logger.info(f"      → Could consider slightly larger batches")
         else:
-            logger.info(f"  ❌ HIGH: Fractional variance is high (≥ 0.1)")
+            logger.info(f"  ❌ HIGH: Conditional SE is high (≥ 20% of δH₁)")
             logger.info(f"      → Should increase batch size for better precision")
     
     # Bias analysis (δH₁ vs ΔH_true)
@@ -318,9 +317,12 @@ def analyze_results(results, logger, total_time):
     logger.info(f"🏁 OVERALL VERDICT:")
     
     all_good = True
-    if frac_vars and np.median(frac_vars) >= 0.1:
-        all_good = False
-        logger.info(f"  ❌ Fractional variance too high - increase batch size")
+    if se_conditionals and deltaH1_values_for_se:
+        relative_ses = [abs(se / dh1) if dh1 != 0 else float('inf') for se, dh1 in zip(se_conditionals, deltaH1_values_for_se)]
+        relative_se_median = np.median([r for r in relative_ses if r != float('inf')])
+        if relative_se_median >= 0.2:
+            all_good = False
+            logger.info(f"  ❌ Conditional SE too high - increase batch size")
     
     if biases and abs(np.mean(biases)) >= 0.01:
         all_good = False
@@ -349,10 +351,10 @@ def analyze_results(results, logger, total_time):
             'cv': deltaH1_std / abs(deltaH1_mean),
             'values': deltaH1_values
         },
-        'frac_var_stats': {
-            'mean': np.mean(frac_vars) if frac_vars else None,
-            'median': np.median(frac_vars) if frac_vars else None,
-            'values': frac_vars
+        'se_conditional_stats': {
+            'mean': np.mean(se_conditionals) if se_conditionals else None,
+            'relative_se_median': relative_se_median if se_conditionals and deltaH1_values_for_se else None,
+            'values': se_conditionals
         },
         'bias_stats': {
             'mean': np.mean(biases) if biases else None,
