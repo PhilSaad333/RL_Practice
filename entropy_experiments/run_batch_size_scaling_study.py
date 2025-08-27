@@ -141,8 +141,11 @@ def run_batch_size_study(base_config: str, checkpoint: str, results_dir: Path, l
                 metrics = run_single_test(str(config_path), checkpoint, run_id)
                 batch_results.append(metrics)
                 
-                logger.info(f"    δH₁: {metrics['deltaH1']:.2e}, SE: {metrics['SE_conditional']:.2e}, "
-                           f"Rel SE: {metrics['relative_se']:.3f}, Time: {metrics['runtime_seconds']:.1f}s")
+                deltaH1_str = f"{metrics['deltaH1']:.2e}" if metrics['deltaH1'] is not None else "None"
+                se_str = f"{metrics['SE_conditional']:.2e}" if metrics['SE_conditional'] is not None else "None"
+                rel_se_str = f"{metrics['relative_se']:.3f}" if metrics['relative_se'] is not None else "None"
+                logger.info(f"    δH₁: {deltaH1_str}, SE: {se_str}, "
+                           f"Rel SE: {rel_se_str}, Time: {metrics['runtime_seconds']:.1f}s")
                 
             except Exception as e:
                 logger.error(f"    Test failed: {e}")
@@ -231,7 +234,11 @@ def generate_summary_report(results: Dict[str, Any], results_dir: Path, logger: 
                 rel_se_mean = r['relative_se']['mean']
                 runtime_total = r['runtime_seconds']['total']
                 
-                f.write(f"| {B_E} | {deltaH1_mean:.2e} | {se_mean:.2e} | {rel_se_mean:.3f} | {runtime_total:.1f}s |\n")
+                deltaH1_str = f"{deltaH1_mean:.2e}" if deltaH1_mean is not None else "N/A"
+                se_str = f"{se_mean:.2e}" if se_mean is not None else "N/A"
+                rel_se_str = f"{rel_se_mean:.3f}" if rel_se_mean is not None else "N/A"
+                runtime_str = f"{runtime_total:.1f}s" if runtime_total is not None else "N/A"
+                f.write(f"| {B_E} | {deltaH1_str} | {se_str} | {rel_se_str} | {runtime_str} |\n")
         
         # Analysis
         f.write("\n## Analysis\n\n")
