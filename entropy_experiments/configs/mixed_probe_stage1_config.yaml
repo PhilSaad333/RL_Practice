@@ -3,6 +3,7 @@
 
 # Core sampling parameters - separate E and U batches
 batch_config:
+  B: 16                             # Fallback batch size for compatibility
   B_E: 16                           # Evaluation batch size
   B_U: 16                           # Update batch size  
   G: 8                              # Keep at target value
