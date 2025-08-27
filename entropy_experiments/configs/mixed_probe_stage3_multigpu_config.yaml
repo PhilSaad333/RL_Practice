@@ -1,13 +1,13 @@
 # Stage 3 Multi-GPU Mixed E/U Batch Probe Configuration
 # Optimized for 2×H100 80GB GPUs with deterministic sampling
 
-# Core sampling parameters - larger batches for multi-GPU
+# Core sampling parameters - H100-optimized for high utilization
 batch_config:
-  B: 32                              # Base batch size (for ProbeComponents)
-  B_E: 32                            # Evaluation batch size (16 per GPU)
-  B_U: 32                            # Update batch size (16 per GPU)  
+  B: 128                             # Base batch size (for ProbeComponents)
+  B_E: 128                           # Evaluation batch size (64 per GPU)
+  B_U: 128                           # Update batch size (64 per GPU)  
   G: 8                               # Generations per prompt
-  rollout_batch_size: 64             # Larger batches for H100s
+  rollout_batch_size: 256            # Larger batches for H100s
   dataset_name: "gsm8k_r1_template" 
   split: "train"
 
@@ -18,7 +18,7 @@ probe_config:
 
 # Stage 1+2+3 Mixed Probe Configuration
 probe_rework:
-  mb_size_prompts: 2                 # Microbatch size (prompts per microbatch)
+  mb_size_prompts: 4                 # Microbatch size (prompts per microbatch) - increased for H100
   buffers_dtype: "float32"           # Buffer precision (keep fp32 for stability)
   weighting_mode: "dr_grpo"          # Weighting mode
   variance_enabled: true             # Enable Stage 2 variance computation
@@ -53,10 +53,10 @@ stats_config:
   compute_plugin_se: true           # Compute plug-in variance estimates
   compute_jackknife_se: false       # Skip jackknife (computationally expensive)
 
-# Memory and performance - H100 optimized
+# Memory and performance - H100 optimized for high utilization
 memory_config:
-  microbatch_size: 2                # Larger microbatches for H100
-  teacher_force_microbatch_size: 4  # Larger G-microbatches
+  microbatch_size: 4                # Larger microbatches for H100 high utilization
+  teacher_force_microbatch_size: 8  # Larger G-microbatches  
   amp: true                         # Use automatic mixed precision
   dtype: "bfloat16"                 # H100-optimized precision
 
@@ -66,9 +66,9 @@ checkpoint:
   optimizer_path: "TBD_AFTER_EXTRACTION"
   model_config_path: "Qwen/Qwen2.5-1.5B"
 
-# Generation settings
+# Generation settings - increased for better probe signal
 generation:
-  max_new_tokens: 100
+  max_new_tokens: 200
   temperature: 0.7
   top_p: 1.0
   do_sample: true
