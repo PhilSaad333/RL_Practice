@@ -1,0 +1,79 @@
+# Stage 3 Multi-GPU Mixed E/U Batch Probe Configuration
+# Optimized for 2×H100 80GB GPUs with deterministic sampling
+
+# Core sampling parameters - larger batches for multi-GPU
+batch_config:
+  B_E: 32                            # Evaluation batch size (16 per GPU)
+  B_U: 32                            # Update batch size (16 per GPU)  
+  G: 8                               # Generations per prompt
+  rollout_batch_size: 64             # Larger batches for H100s
+  dataset_name: "gsm8k_r1_template" 
+  split: "train"
+
+# Stage 1+2+3 Mixed Probe Configuration
+probe_rework:
+  mb_size_prompts: 2                 # Microbatch size (prompts per microbatch)
+  buffers_dtype: "float32"           # Buffer precision (keep fp32 for stability)
+  weighting_mode: "dr_grpo"          # Weighting mode
+  variance_enabled: true             # Enable Stage 2 variance computation
+  ddp_allreduce: true                # Enable DDP all-reduce
+  master_seed: 42                    # Deterministic seed for multi-GPU consistency
+
+# Stage 3 Multi-GPU specific settings
+distributed:
+  find_unused_parameters: true      # Required for DDP compatibility
+  reduce_dtype: "float32"           # Standard precision for reductions
+  barriers: true                    # Insert barriers for profiling
+
+# Stage 2 Importance Sampling Configuration  
+importance:
+  enabled: true                     # Enable Stage 2 two-batch ground-truth
+  is_mode: "snis"                   # Self-normalized importance sampling
+  clip_c: 10.0                      # Clipping constant (unused for SNIS)
+  training_loss: "nll"              # Training loss type
+  snapshot_device: "cpu"            # CPU snapshots to save VRAM
+  importance_microbatch_size: 1     # Conservative for stability
+  report_per_token: false           # Disable for faster computation
+
+# Memory and performance - H100 optimized
+memory_config:
+  microbatch_size: 2                # Larger microbatches for H100
+  teacher_force_microbatch_size: 4  # Larger G-microbatches
+  amp: true                         # Use automatic mixed precision
+  dtype: "bfloat16"                 # H100-optimized precision
+
+# Use extracted checkpoint path (will be updated after extraction)
+checkpoint:
+  checkpoint_path: "TBD_AFTER_EXTRACTION"
+  optimizer_path: "TBD_AFTER_EXTRACTION"
+  model_config_path: "Qwen/Qwen2.5-1.5B"
+
+# Generation settings
+generation:
+  max_new_tokens: 100
+  temperature: 0.7
+  top_p: 1.0
+  do_sample: true
+  pad_token_id: null
+
+# Output and logging  
+output:
+  save_results: true
+  results_path: "stage3_multigpu_probe_results.json"
+  log_level: "INFO"
+  save_samples: false
+
+# Advanced options
+advanced:
+  force_recompute: true
+  validation_mode: false
+  profile_memory: true
+  profile_timing: true
+
+# Stage 3 Acceptance Criteria Notes:
+# - Deterministic E/U indices across ranks
+# - Identical μ_X/μ_Y buffers on all GPUs  
+# - Consistent bars_dot without extra reduction
+# - Correct global batch sizes (B_E_global=32, B_U_global=32)
+# - No-sync during probe phases, normal sync during training step
+# - All results computed with multi-GPU coordination
