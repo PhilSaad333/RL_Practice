@@ -3,11 +3,11 @@
 
 # Core sampling parameters - H100-optimized for high utilization
 batch_config:
-  B: 128                             # Base batch size (for ProbeComponents)
-  B_E: 128                           # Evaluation batch size (64 per GPU)
-  B_U: 128                           # Update batch size (64 per GPU)  
+  B: 256                             # Base batch size (for ProbeComponents) - doubled for lower variance
+  B_E: 256                           # Evaluation batch size (128 per GPU) - doubled for lower variance
+  B_U: 256                           # Update batch size (128 per GPU) - doubled for lower variance
   G: 8                               # Generations per prompt
-  rollout_batch_size: 256            # Larger batches for H100s
+  rollout_batch_size: 384            # Increased 50% for higher GPU utilization
   dataset_name: "gsm8k_r1_template" 
   split: "train"
 
@@ -18,7 +18,7 @@ probe_config:
 
 # Stage 1+2+3 Mixed Probe Configuration
 probe_rework:
-  mb_size_prompts: 4                 # Microbatch size (prompts per microbatch) - increased for H100
+  mb_size_prompts: 6                 # Microbatch size (prompts per microbatch) - increased 50% for higher GPU utilization
   buffers_dtype: "float32"           # Buffer precision (keep fp32 for stability)
   weighting_mode: "dr_grpo"          # Weighting mode
   variance_enabled: true             # Enable Stage 2 variance computation
@@ -39,7 +39,7 @@ importance:
   training_loss: "rl"               # Use RL-aligned training loss (was "nll")
   rl_grad_accum: 1                  # RL gradient accumulation steps
   snapshot_device: "cpu"            # CPU snapshots to save VRAM
-  importance_microbatch_size: 1     # Conservative for stability
+  importance_microbatch_size: 2     # Increased for higher GPU utilization
   report_per_token: false           # Disable for faster computation
 
 # Importance sampling details
@@ -56,8 +56,8 @@ stats_config:
 
 # Memory and performance - H100 optimized for high utilization
 memory_config:
-  microbatch_size: 4                # Larger microbatches for H100 high utilization
-  teacher_force_microbatch_size: 8  # Larger G-microbatches  
+  microbatch_size: 6                # Increased 50% for higher GPU utilization
+  teacher_force_microbatch_size: 12 # Increased 50% for higher GPU utilization  
   amp: true                         # Use automatic mixed precision
   dtype: "bfloat16"                 # H100-optimized precision
 
