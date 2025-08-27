@@ -22,6 +22,7 @@ probe_rework:
   mb_size_prompts: 2                   # Memory-efficient
   buffers_dtype: "float32"
   weighting_mode: "dr_grpo"
+  conditional_variance_batch_size: 6   # Efficient batching
   
   # Single tests focus on the new conditional variance estimator
   compute_vx_vy_variance: false

@@ -22,6 +22,7 @@ probe_rework:
   mb_size_prompts: 2                   # Small for detailed logging
   buffers_dtype: "float32"             # Full precision for debug accuracy
   weighting_mode: "dr_grpo"
+  conditional_variance_batch_size: 4   # Small batches for debugging
   
   # Debug mode enables all estimators for comparison
   compute_vx_vy_variance: true         # Test old estimator

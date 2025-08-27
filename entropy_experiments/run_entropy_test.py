@@ -650,6 +650,7 @@ def load_config_template(config_path: str) -> Dict:
                 'mb_size_prompts': 2,
                 'buffers_dtype': 'float32',
                 'weighting_mode': 'dr_grpo',
+                'conditional_variance_batch_size': 6,
                 'compute_conditional_variance': True,
                 'compute_vx_vy_variance': False,
                 'compute_importance_sampling': False,

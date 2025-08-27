@@ -22,6 +22,7 @@ probe_rework:
   mb_size_prompts: 4                   # Slightly larger for validation
   buffers_dtype: "float32"
   weighting_mode: "dr_grpo"
+  conditional_variance_batch_size: 8   # Larger batches for validation
   
   # For sanity check, we can test all variance estimators
   compute_vx_vy_variance: true         # Test old V_X + V_Y estimator

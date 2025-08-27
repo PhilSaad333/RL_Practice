@@ -399,6 +399,269 @@ class ProbeComponents:
         seq_log_probs = (gen_token_log_probs * gen_mask).sum(dim=1)  # [G]
         
         return seq_log_probs
+    
+    def _batched_teacher_force_logprobs(self, prompt_batches: List[Dict[str, Any]], 
+                                       batch_size: int = 6) -> List[Dict[str, Any]]:
+        """
+        Compute sequence log-probabilities for multiple prompts in batches with proper padding.
+        
+        This method processes multiple prompts together for efficiency while maintaining
+        per-prompt accuracy. Uses left-padding + right-padding strategy to align 
+        prompt-generation boundaries.
+        
+        Args:
+            prompt_batches: List of single-prompt batch dicts (from _iter_units)
+            batch_size: Number of prompts to process together (default: 6)
+            
+        Returns:
+            List of S_dict results (same as _teacher_force_logprobs output)
+        """
+        results = []
+        
+        # Process prompts in groups of batch_size
+        for i in range(0, len(prompt_batches), batch_size):
+            batch_group = prompt_batches[i:i + batch_size]
+            
+            # Convert single-prompt batches to multi-prompt batch with aligned padding
+            aligned_batch = self._align_prompt_batch_with_padding(batch_group)
+            
+            # Process the aligned batch efficiently
+            batch_S_dict = self._compute_aligned_batch_logprobs(aligned_batch)
+            
+            # Split results back to per-prompt format
+            per_prompt_results = self._split_batch_results(batch_S_dict, batch_group)
+            results.extend(per_prompt_results)
+            
+        return results
+        
+    def _align_prompt_batch_with_padding(self, prompt_batches: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Align multiple single-prompt batches using left-padding + right-padding strategy.
+        
+        Layout: [left_pad][prompt][generation][right_pad]
+        - All prompts end at the same index (max_prompt_len) 
+        - All generations start at the same index (max_prompt_len)
+        - Longest prompt has no left padding
+        - Longest generation has no right padding
+        
+        Args:
+            prompt_batches: List of single-prompt batch dicts
+            
+        Returns:
+            Aligned batch dict with shape [num_prompts, G, total_aligned_len]
+        """
+        num_prompts = len(prompt_batches)
+        if num_prompts == 0:
+            raise ValueError("Empty prompt batch list")
+            
+        # Extract info from each prompt
+        all_sequences = []
+        all_prompt_lens = []
+        all_advantages = []
+        all_max_lengths = []
+        
+        for prompt_batch in prompt_batches:
+            # Each prompt_batch has shape [1, G, seq_len] - extract the single prompt
+            sequences = prompt_batch['sequences'][0]  # [G, seq_len]  
+            prompt_len = prompt_batch['prompt_lens'][0]  # scalar
+            advantages = prompt_batch['advantages'][0]  # [G]
+            max_length = prompt_batch['max_lengths'][0]  # scalar
+            
+            all_sequences.append(sequences)
+            all_prompt_lens.append(prompt_len)
+            all_advantages.append(advantages)
+            all_max_lengths.append(max_length)
+            
+        # Determine padding requirements
+        max_prompt_len = max(all_prompt_lens)
+        G = all_sequences[0].shape[0]  # Number of generations per prompt
+        
+        # Calculate generation lengths for each prompt 
+        gen_lengths = []
+        for i, seq in enumerate(all_sequences):
+            gen_len = seq.shape[1] - all_prompt_lens[i]  # total - prompt = generation
+            gen_lengths.append(gen_len)
+        max_gen_len = max(gen_lengths)
+        
+        total_aligned_len = max_prompt_len + max_gen_len
+        
+        # Create aligned sequences with proper padding
+        aligned_sequences = []
+        aligned_prompt_lens = []  # All will be max_prompt_len after alignment
+        aligned_advantages = []
+        aligned_max_lengths = []
+        
+        for i, seq in enumerate(all_sequences):
+            prompt_len = all_prompt_lens[i]
+            gen_len = gen_lengths[i]
+            
+            # Split original sequence: [prompt_tokens][gen_tokens] 
+            prompt_tokens = seq[:, :prompt_len]  # [G, prompt_len]
+            gen_tokens = seq[:, prompt_len:]     # [G, gen_len]
+            
+            # Apply padding: [left_pad][prompt][gen][right_pad]
+            left_pad_len = max_prompt_len - prompt_len
+            right_pad_len = max_gen_len - gen_len
+            
+            # Create padded sequence for each generation
+            padded_seqs = []
+            for g in range(G):
+                # Left padding
+                if left_pad_len > 0:
+                    left_pad = torch.full((left_pad_len,), self._tokenizer.pad_token_id, 
+                                        dtype=seq.dtype, device=seq.device)
+                else:
+                    left_pad = torch.empty(0, dtype=seq.dtype, device=seq.device)
+                
+                # Right padding  
+                if right_pad_len > 0:
+                    right_pad = torch.full((right_pad_len,), self._tokenizer.pad_token_id,
+                                         dtype=seq.dtype, device=seq.device) 
+                else:
+                    right_pad = torch.empty(0, dtype=seq.dtype, device=seq.device)
+                    
+                # Concatenate: [left_pad][prompt][gen][right_pad]
+                padded_seq = torch.cat([left_pad, prompt_tokens[g], gen_tokens[g], right_pad], dim=0)
+                padded_seqs.append(padded_seq)
+                
+            aligned_seq = torch.stack(padded_seqs, dim=0)  # [G, total_aligned_len]
+            aligned_sequences.append(aligned_seq)
+            aligned_prompt_lens.append(max_prompt_len)  # All prompts now end at same index
+            aligned_advantages.append(all_advantages[i])
+            aligned_max_lengths.append(all_max_lengths[i])
+            
+        # Stack into final batch format
+        batch_sequences = torch.stack(aligned_sequences, dim=0)  # [num_prompts, G, total_aligned_len]
+        
+        # Create attention masks for aligned sequences
+        attention_masks = []
+        for seq in aligned_sequences:
+            if hasattr(self._tokenizer, 'pad_token_id') and self._tokenizer.pad_token_id is not None:
+                mask = (seq != self._tokenizer.pad_token_id).long()
+            else:
+                mask = torch.ones_like(seq, dtype=torch.long)
+            attention_masks.append(mask)
+        batch_attention_masks = torch.stack(attention_masks, dim=0)  # [num_prompts, G, total_aligned_len]
+        
+        return {
+            'sequences': batch_sequences,
+            'prompt_lens': aligned_prompt_lens,  # All are max_prompt_len 
+            'attention_masks': batch_attention_masks,
+            'advantages': torch.stack(aligned_advantages, dim=0),
+            'max_lengths': aligned_max_lengths,
+            'total_aligned_len': total_aligned_len,
+            'max_prompt_len': max_prompt_len,
+            'max_gen_len': max_gen_len,
+            'original_prompt_lens': all_prompt_lens,  # Keep originals for reference
+            'gen_lengths': gen_lengths
+        }
+        
+    def _compute_aligned_batch_logprobs(self, aligned_batch: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compute log probabilities for aligned batch efficiently.
+        
+        Since all prompts now have the same prompt boundary (max_prompt_len),
+        we can process them together efficiently.
+        
+        Args:
+            aligned_batch: Batch with aligned padding from _align_prompt_batch_with_padding
+            
+        Returns:
+            S_dict with batched results
+        """
+        sequences = aligned_batch['sequences']  # [num_prompts, G, total_aligned_len]
+        attention_masks = aligned_batch['attention_masks'] 
+        max_prompt_len = aligned_batch['max_prompt_len']
+        
+        num_prompts, G, total_len = sequences.shape
+        
+        # Ensure model is in training mode for gradients
+        was_training = self.model.training
+        self.model.train()
+        
+        try:
+            # Reshape for efficient processing: [num_prompts * G, total_len]
+            flat_sequences = sequences.view(num_prompts * G, total_len)
+            flat_attention_masks = attention_masks.view(num_prompts * G, total_len)
+            
+            # Single forward pass for all sequences
+            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                logits = self.model(flat_sequences, attention_mask=flat_attention_masks).logits
+                
+            # Apply temperature
+            temp = self.config['generation'].get('temperature', 1.0)
+            if temp != 1.0:
+                logits = logits / temp
+                
+            # Convert to log probabilities  
+            log_probs = F.log_softmax(logits.float(), dim=-1)  # [num_prompts * G, total_len, vocab_size]
+            
+            # Extract log probs of actual tokens (causal shift)
+            target_ids = flat_sequences[:, 1:].unsqueeze(-1)  # [num_prompts * G, total_len-1, 1]
+            token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)  # [num_prompts * G, total_len-1]
+            
+            # Reshape back to batch format
+            token_log_probs = token_log_probs.view(num_prompts, G, total_len - 1)  # [num_prompts, G, total_len-1]
+            
+            # Extract generation tokens only (all prompts end at max_prompt_len-1 due to causal shift)
+            gen_start = max_prompt_len - 1
+            gen_token_log_probs = token_log_probs[:, :, gen_start:]  # [num_prompts, G, gen_len]
+            
+            # Create masks for real generation tokens (not padding)
+            gen_sequences = sequences[:, :, max_prompt_len:]  # [num_prompts, G, gen_len]
+            if hasattr(self._tokenizer, 'pad_token_id') and self._tokenizer.pad_token_id is not None:
+                gen_masks = (gen_sequences != self._tokenizer.pad_token_id).float()
+            else:
+                gen_masks = torch.ones_like(gen_sequences).float()
+                
+            # Handle potential shape mismatches
+            if gen_masks.shape != gen_token_log_probs.shape:
+                min_len = min(gen_masks.shape[2], gen_token_log_probs.shape[2])
+                gen_masks = gen_masks[:, :, :min_len]
+                gen_token_log_probs = gen_token_log_probs[:, :, :min_len]
+            
+            # Sum log probs over real generation tokens for each sequence
+            S_batch = (gen_token_log_probs * gen_masks).sum(dim=2)  # [num_prompts, G]
+            
+        finally:
+            self.model.train(was_training)
+            
+        return {
+            'S': S_batch,  # [num_prompts, G] 
+            'sequences': sequences,
+            'advantages': aligned_batch['advantages'],
+            'max_lengths': aligned_batch['max_lengths']
+        }
+        
+    def _split_batch_results(self, batch_S_dict: Dict[str, Any], 
+                           original_batches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Split batched results back to per-prompt format compatible with existing code.
+        
+        Args:
+            batch_S_dict: Results from _compute_aligned_batch_logprobs
+            original_batches: Original single-prompt batches for reference
+            
+        Returns:
+            List of per-prompt S_dict results (same format as _teacher_force_logprobs)
+        """
+        S_batch = batch_S_dict['S']  # [num_prompts, G]
+        
+        results = []
+        for i, original_batch in enumerate(original_batches):
+            # Extract results for prompt i
+            S_single = S_batch[i:i+1]  # [1, G] - maintain batch dimension
+            
+            # Create result dict matching _teacher_force_logprobs output format
+            result = {
+                'S': S_single,
+                'sequences': original_batch['sequences'],  # Use original sequences
+                'advantages': original_batch['advantages'], 
+                'max_lengths': original_batch['max_lengths']
+            }
+            results.append(result)
+            
+        return results
         
     def _trim_at_stop_tag(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Trim token sequence at first occurrence of stop tag."""
@@ -1009,14 +1272,21 @@ class ProbeComponents:
         
         self.logger.debug("Computing conditional variance over E using scalar projections")
         
-        # Process each prompt unit individually
+        # NEW BATCHED APPROACH: Process prompts in groups for efficiency
+        # Get conditional variance batch size from config (default: 6)
+        cv_batch_size = self.config.get('probe_rework', {}).get('conditional_variance_batch_size', 6)
+        
+        # Convert E_batch to list of single-prompt units for batching
+        prompt_units = list(self._iter_units(E_batch))
+        
         with no_sync_context():  # Prevent DDP gradient averaging
-            for unit in self._iter_units(E_batch):
+            # Process teacher forcing in batches, but keep per-prompt loss computation
+            batch_S_results = self._batched_teacher_force_logprobs(prompt_units, batch_size=cv_batch_size)
+            
+            # Process each prompt individually for loss computation and scalar projection
+            for i, S_dict in enumerate(batch_S_results):
                 # Clear gradients
                 self.model.zero_grad(set_to_none=True)
-                
-                # Forward pass with teacher forcing for single unit
-                S_dict = self._teacher_force_logprobs(unit)
                 
                 # Build X-loss with LOO baseline and minus sign (as per variance_estimator_change.txt)
                 L_X_u = -self.build_LX_from_S(S_dict, weighting_mode)  # Note the minus sign

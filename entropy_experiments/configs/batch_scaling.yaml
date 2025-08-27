@@ -22,6 +22,7 @@ probe_rework:
   mb_size_prompts: 2                   # Memory-efficient microbatch size
   buffers_dtype: "float32"             # Precision for gradients
   weighting_mode: "dr_grpo"            # Standard weighting
+  conditional_variance_batch_size: 6   # Efficient prompt batching
   
   # Focus on NEW conditional variance estimator (the one we're testing!)
   compute_vx_vy_variance: false        # Turn OFF old V_X + V_Y estimator
