@@ -402,9 +402,12 @@ class OfflineEntropyProbe:
             
     def _sample_batch(self) -> Dict[str, Any]:
         """Sample batch of prompts and responses."""
-        # This will be implemented by ProbeComponents
+        # Use first B_E value from the unified config format
+        B_E_values = self.config['batch_config']['B_E_values']
+        B_E = B_E_values[0] if isinstance(B_E_values, list) else B_E_values
+        
         return self.probe_components.sample_batch(
-            B=self.config['batch_config']['B'],
+            B=B_E,
             G=self.config['batch_config']['G']
         )
         

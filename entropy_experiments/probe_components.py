@@ -42,8 +42,7 @@ class ProbeComponents:
         self.use_amp = config['memory_config']['amp']
         self.amp_dtype = getattr(torch, config['memory_config']['dtype'])
         
-        # Sampling parameters
-        self.B = config['batch_config']['B']  # prompts per batch
+        # Sampling parameters (B_E passed as parameter, no instance variable)
         self.G = config['batch_config']['G']  # responses per prompt
         self.microbatch_size = config['memory_config']['microbatch_size']
         
@@ -51,7 +50,7 @@ class ProbeComponents:
         self.mode = config['probe_config']['mode']  # "exact" or "blocks"
         self.M = config['probe_config'].get('M', None)  # number of blocks if mode="blocks"
         
-        self.logger.info(f"ProbeComponents initialized: mode={self.mode}, B={self.B}, G={self.G}")
+        self.logger.info(f"ProbeComponents initialized: mode={self.mode}, G={self.G}")
         
     def sample_batch(self, B: int, G: int, indices: Optional[List[int]] = None) -> Dict[str, Any]:
         """
