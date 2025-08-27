@@ -48,6 +48,11 @@ importance_sampling:
   ess_threshold: 0.5                # Effective sample size threshold
   resample_on_low_ess: false        # Don't resample on low ESS
 
+# Statistics configuration
+stats_config:
+  compute_plugin_se: true           # Compute plug-in variance estimates
+  compute_jackknife_se: false       # Skip jackknife (computationally expensive)
+
 # Memory and performance - H100 optimized
 memory_config:
   microbatch_size: 2                # Larger microbatches for H100
