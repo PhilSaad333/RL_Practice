@@ -82,9 +82,14 @@ def extract_key_metrics(results):
         metrics['clipped_fraction'] = None
         metrics['w_sum_global'] = None
     
-    # Compute fractional variance: (V_X + V_Y) / δH₁²
+    # Compute fractional variance: (V_X + V_Y) / bars_dot²
+    # Note: δH₁ = lr * bars_dot, so bars_dot = δH₁ / lr
+    # Fractional variance = Var(δH₁) / δH₁² = lr² * (V_X + V_Y) / δH₁²
+    # = lr² * (V_X + V_Y) / (lr * bars_dot)² = (V_X + V_Y) / bars_dot²
     if metrics['V_X'] is not None and metrics['V_Y'] is not None and metrics['deltaH1'] != 0:
-        metrics['frac_var'] = (metrics['V_X'] + metrics['V_Y']) / (metrics['deltaH1'] ** 2)
+        learning_rate = 2e-6  # Extract from results if available, otherwise use known value
+        bars_dot = metrics['deltaH1'] / learning_rate
+        metrics['frac_var'] = (metrics['V_X'] + metrics['V_Y']) / (bars_dot ** 2)
     else:
         metrics['frac_var'] = None
     
