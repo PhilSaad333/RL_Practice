@@ -1,0 +1,103 @@
+Stage 1 Implementation Instructions: Mixed E/U Entropy Probe (Core ΔH₁)
+
+Summary
+- Implement Phases 1–3 of the plan using separate E (evaluation) and U (update) batches.
+- Single-GPU first (works under DDP as well), with strict microbatching and backward() for both X and Y.
+- Output I^X, I^Y, bars_dot, and ΔH₁ = lr * (I^X ⋅ I^Y). Defer variance (V_X, V_Y) and two-batch IS to later stages.
+
+Scope (Stage 1)
+- New orchestration entry: offline_entropy_probe.run_mixed_probe(E, U, ...)
+- New ProbeComponents helpers: accumulate_sum_X, accumulate_sum_Y, and buffer utilities (zeros, add, dot).
+- Use backward() for X and Y passes with microbatches; avoid autograd.grad to prevent None grads.
+- Keep parameter buffers (IΣX, IΣY, and means) in fp32; permit CPU accumulation to minimize VRAM.
+
+Config additions (backward compatible)
+- In probe_config or a new section (probe_rework):
+  - mb_size_prompts: int (default 2)
+  - buffers_dtype: {"float32","float16"} (default "float32")
+  - weighting_mode: {"dr_grpo","per_token_avg"} (default "dr_grpo")
+- In batch_config:
+  - B_E: int (evaluation prompts)
+  - B_U: int (update prompts)
+  - Reuse G, rollout_batch_size
+
+File: entropy_experiments/offline_entropy_probe.py
+1) Add a new method run_mixed_probe(self) that:
+   - Loads or uses existing model/optimizer as today.
+   - Samples two batches via ProbeComponents.sample_batch: E_batch with B_E, U_batch with B_U.
+   - Calls new ProbeComponents.accumulate_sum_X(E_batch, mb_size_prompts) → returns (sum_X_buf, B_E_local)
+   - Calls new ProbeComponents.accumulate_sum_Y(U_batch, mb_size_prompts, adam_preconditioner) → returns (sum_Y_buf, B_U_local)
+   - For Stage 1 (single GPU), set B_E = B_E_local, B_U = B_U_local. Under DDP (later), all-reduce these counts and buffers.
+   - Compute means: I^X = sum_X_buf / max(B_E, 1); I^Y = sum_Y_buf / max(B_U, 1).
+   - Compute bars_dot = dot_param_buffers(I^X, I^Y) and deltaH1 = learning_rate * bars_dot.
+   - Return a dict with {"bars_dot", "deltaH1", "B_E", "B_U", "timing"}.
+
+2) Keep existing run_offline_analysis unchanged; Stage 1 is additive via a new entrypoint.
+
+File: entropy_experiments/probe_components.py
+3) Add buffer utilities near class methods:
+   - zeros_like_params(self, dtype: torch.dtype, device: str|torch.device|"cpu") → dict[param_id → tensorview]
+     - Iterate model parameters with requires_grad; allocate zeros with same shape, requested dtype, and device.
+   - add_into_param_buffer(self, buf, scale: float = 1.0): add current param.grad into buf[id(p)] with .add_(grad * scale), skipping None.
+     - If buf is on CPU, convert grad via grad.detach().to('cpu', dtype=buf.dtype) before adding.
+   - dot_param_buffers(self, buf_a, buf_b) → float: sum over params (buf_a[id] * buf_b[id]).sum().item(). If on CPU tensors, compute on CPU.
+
+4) Add build_LX_from_S(self, S_dict, weighting_mode) and build_LY_from_S(self, S_dict):
+   - Inputs: S_dict has keys: 'S' [batch_size, G], 'advantages' [batch_size, G], 'max_lengths' [batch_size], 'gen_lengths' [batch_size, G] (add if easy), 'prompt_lens', 'attention_masks'.
+   - For X: compute S_w per prompt per response under no_grad depending on weighting_mode:
+     - dr_grpo: w = 1/L_max(prompt) applied per token → at sequence level, multiply S by 1/L_max(prompt). For LOO baseline, compute mean over responses excluding g.
+     - per_token_avg: w = m_k / L_eff(sequence) → equivalent to S / L_eff; baseline uses response-level means similarly.
+     - L_X_prompt = mean_g( detach(S_w − S_w_LOO) * S ); total = mean over prompts.
+   - For Y: L_Y_prompt = mean_g( (A / L_max(prompt)) * S ); total = mean over prompts.
+   - Return scalar tensors with requires_grad=True.
+
+5) Add accumulate_sum_X(self, E_batch, mb_size_prompts) → (sum_X_buf, B_local):
+   - Set up: params = [p for p in self.model.parameters() if p.requires_grad].
+   - sum_X_buf = zeros_like_params(dtype=torch.float32, device='cpu') for safety.
+   - Iterate microbatches of E_batch (slice along prompt dimension) size=mb_size_prompts:
+     - Build S_dict via teacher_force_logprobs(microbatch) with requires_grad=True; use AMP autocast.
+     - L_X_mb = build_LX_from_S(S_dict, weighting_mode)
+     - self.model.zero_grad(set_to_none=True)
+     - Use DDP guard: with self.model.no_sync() if DDP else contextmanager that does nothing.
+       - L_X_mb.backward()  # X grads in .grad
+     - add_into_param_buffer(sum_X_buf)
+     - self.model.zero_grad(set_to_none=True)
+   - Return sum_X_buf, B_local = number of prompts in E_batch.
+
+6) Add accumulate_sum_Y(self, U_batch, mb_size_prompts, adam_preconditioner) → (sum_Y_buf, B_local):
+   - Same structure as X, but:
+     - L_Y_mb = build_LY_from_S(...)
+     - After backward(), in-place transform .grad: for each param with grad, grad.copy_(adam_preconditioner.apply_preconditioner(grad, param))
+     - add_into_param_buffer(sum_Y_buf)
+   - Return sum_Y_buf, B_local = number of prompts in U_batch.
+
+7) Teacher-forcing logprobs reuse:
+   - Reuse existing _teacher_force_logprobs but ensure it returns correct S for microbatches and (optionally) per-response generation lengths for per_token_avg weighting.
+   - Ensure attention_mask is honored (pass to model forward) and that sequences/masks are moved from CPU→GPU per microbatch slice via .to(self.device, non_blocking=True).
+
+8) Microbatch iteration helpers:
+   - iter_microbatches(batch_dict, size): yields micro-sliced dicts across prompt dimension for sequences, prompt_lens, advantages, max_lengths, attention_masks, prompt_ids.
+
+Stage 1 acceptance criteria
+- On a single A100 40GB, with modest config (e.g., B_E=16, B_U=16, G=8, max_new_tokens=100, mb_size_prompts=2):
+  - Completes without OOM; peak VRAM bounded by microbatch.
+  - Nonzero bars_dot and deltaH1 for typical checkpoints (log with %.10f to confirm non-rounding).
+  - Logging: B_E, B_U, bars_dot, deltaH1, timing per phase present.
+
+Testing checklist
+- Smoke test: run with tiny B_E=B_U=4, G=2 to validate nonzero ΔH₁.
+- Scale test: increase B_E/B_U to 16–32; check stable memory and consistent sign/magnitude.
+- Compare ΔH₁ with the previous single-batch pipeline on small configs to ensure rough consistency in sign and trend.
+
+Notes for Claude Code
+- Prefer CPU accumulation for sum_X_buf/sum_Y_buf in fp32; this avoids extra VRAM pressure. Dot can be computed on CPU.
+- Guard ddp.no_sync(): only active if isinstance(model, DDP). In Stage 1, single-GPU path will just run without it.
+- Keep AMP autocast aligned with training dtype (bf16). Do not wrap probe passes in no_grad.
+- Do not change existing run scripts; Stage 1 introduces new entrypoints only. You can create a new runner file (e.g., run_mixed_probe.py) if needed, but coordinate with user.
+
+Deferred to Stage 2+
+- Phase 4 variance V_X, V_Y via scalar projections; implement compute_VX/compute_VY similarly with backward per unit.
+- Two-batch IS ground-truth on E with a microbatched optimizer step on U and snapshot/restore of weights.
+- DDP all-reduce/broadcast for param-sized buffers and scalars.
+- Rich logging, config flags (is_mode, clip), and tests across multi-GPU.
+

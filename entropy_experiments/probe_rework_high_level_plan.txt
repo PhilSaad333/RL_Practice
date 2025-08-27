@@ -1,0 +1,238 @@
+TITLE: Mixed E–U Batch Entropy Probe (Exact, Microbatched, DDP) — Implementation Plan
+
+GOAL
+====
+Implement a new probe that:
+  • Uses separate batches: E (evaluation) for X = ∇H_w, and U (update) for Y = P ∇J
+  • Uses backward() for both X- and Y-side, with microbatching and DDP
+  • Computes δH₁ = η ( X̄ · Ȳ ), where X̄ = mean_E X_n and Ȳ = mean_U Y_p
+  • Estimates Var(δH₁) via the delta-method terms only: V_X + V_Y (ignore cross term by default)
+  • Compares δH₁ to a two-batch “true” entropy change measured on E with θ → θ⁺ using importance sampling
+  • Respects tight VRAM: microbatch size 2–4 prompts; gradient checkpointing on; optional CPU offload for ΣX, ΣY
+
+FILES TO TOUCH
+==============
+- probe_components.py      (new microbatched DDP paths for mixed E/U)
+- offline_entropy_probe.py (top-level orchestration, logging, config)
+- distributed_helpers.py   (small utilities: all_reduce for param-buffers and scalars)
+- importance_sampling.py   (add two-batch evaluation option; SNIS / clipping)
+- adam_preconditioner.py   (no math change; docstrings should say P = 1/(sqrt(v)+eps), not P^{1/2})
+
+KEY DEFINITIONS
+===============
+Token-weighted logprob (per sequence):
+  S   = sum_k m_k * s_k                                  # unnormalized per-seq score
+  S_w = sum_k w_k * s_k                                  # weighted score (w_k θ-independent)
+Common choices for w_k (build under no_grad):
+  • per-token average in a sequence: w_k = m_k / L_eff(t)
+  • DR-GRPO-style:               w_k = m_k / L_max(prompt)
+
+X-loss (per unit = prompt), with LOO + stop-grad on coefficient:
+  L_X = mean_over_responses( detach(S_w - S_w^LOO) * S )
+  backward() gives raw X_n in .grad
+
+Y-loss (per unit = prompt), θ-independent weight:
+  L_Y = mean_over_responses( (A / L_max) * S )
+  backward() then apply preconditioner P in-place to grads to get Y_n = P ∇J
+
+Estimator:
+  δH₁ = η * ( X̄ · Ȳ ), where X̄ = (1/B_E) Σ_{n∈E} X_n and Ȳ = (1/B_U) Σ_{p∈U} Y_p.
+Variance (delta-method only):
+  Var( X̄·Ȳ ) ≈ ( μ_Yᵀ Σ_X μ_Y )/B_E + ( μ_Xᵀ Σ_Y μ_X )/B_U
+  with μ_X ≈ X̄, μ_Y ≈ Ȳ, and sample covariances evaluated via scalar projections:
+    V_X = [1/(B_E (B_E-1))] Σ_n [ ( (X_n - μ_X) · μ_Y )^2 ]
+    V_Y = [1/(B_U (B_U-1))] Σ_p [ ( (Y_p - μ_Y) · μ_X )^2 ]
+  SE(δH₁) = η * sqrt(V_X + V_Y)
+
+DISTRIBUTED (DDP) DESIGN
+========================
+Each rank r receives local E_r and U_r. Operations are strictly rank-local except where noted.
+
+Buffers:
+  ΣX_local: {id(p) -> tensor_like(p)}  # raw sum over local E_r
+  ΣY_local: {id(p) -> tensor_like(p)}  # preconditioned sum over local U_r
+All-reduce once each to obtain ΣX_global and ΣY_global. Means: μ_X = ΣX_global / B_E_global; μ_Y = ΣY_global / B_U_global.
+
+IMPORTANT: During X-backward microbatches, wrap in ddp.no_sync() so DDP does not average .grad across ranks.
+
+PIPELINE (WITH MICROBATC HES)
+=============================
+Let mb_size_prompts ∈ {2,3,4}. Let B_E_local = |E_r|, B_U_local = |U_r|. Let B_E = Σ_r B_E_local (all-reduce), same for B_U.
+
+Phase 0. Make E_r and U_r
+  - Use your existing sampler to produce two batches per rank: E_r, U_r
+  - Each is a list/struct of per-prompt groups (prompts, responses, masks, advantages, L_max, etc.)
+  - Ensure no grad is enabled here (just data)
+
+Phase 1. Accumulate ΣX (raw) on each rank, then all-reduce
+  ΣX_local = zeros_like_params()
+  For microbatch in iter_microbatches(E_r, size=mb_size_prompts):
+    zero_grad()
+    S_dict = teacher_force_logprobs(microbatch)              # requires_grad=True; AMP ok
+    L_X_mb = build_LX_from_S(S_dict)                         # detach coefficient!
+    with ddp.no_sync():                                       # avoid DDP grad averaging
+      L_X_mb.backward()                                      # adds X_mb to .grad
+    add_into_param_buffer(ΣX_local, .grad)                   # raw X
+    zero_grad()
+  ΣX_global = all_reduce_param_buffer(ΣX_local)
+
+Phase 2. Accumulate ΣY (preconditioned) on each rank, then all-reduce
+  ΣY_local = zeros_like_params()
+  For microbatch in iter_microbatches(U_r, size=mb_size_prompts):
+    zero_grad()
+    S_dict = teacher_force_logprobs(microbatch)
+    L_Y_mb = build_LY_from_S(S_dict)                         # (A/Lmax)*S
+    with ddp.no_sync():                                       # safe; no DDP reducer via autograd.grad or backward
+      L_Y_mb.backward()                                      # puts ∇J into .grad
+    apply_preconditioner_P_inplace(.grad)                    # turn ∇J into Y_mb = P ∇J
+    add_into_param_buffer(ΣY_local, .grad)
+    zero_grad()
+  ΣY_global = all_reduce_param_buffer(ΣY_local)
+
+Phase 3. Compute δH₁ and broadcast μ_X, μ_Y to all ranks
+  μ_X = ΣX_global / B_E_global
+  μ_Y = ΣY_global / B_U_global
+  bars_dot = dot_param_buffers(μ_X, μ_Y)                     # scalar
+  δH₁ = η * bars_dot
+  Broadcast (or all-reduce then divide) μ_X, μ_Y so all ranks hold the same tensors.
+
+Phase 4. Variance pieces V_X and V_Y (delta-method) — second passes, scalar-only reductions
+  # V_X pass over E_r
+  sum_sq_proj_X_local = 0.0
+  For unit in iter_units(E_r):                               # unit = single prompt group
+    zero_grad()
+    L_X_u = build_LX(unit); backward();                      # raw X_u in .grad
+    proj = dot_param_grad_minus_mean_with(μ_Y, μ_X)          # ( (X_u - μ_X) · μ_Y )
+    sum_sq_proj_X_local += proj*proj
+    zero_grad()
+  V_X_local = sum_sq_proj_X_local / (B_E_global * max(B_E_global - 1, 1))
+  V_X = all_reduce_scalar(V_X_local)
+
+  # V_Y pass over U_r
+  sum_sq_proj_Y_local = 0.0
+  For unit in iter_units(U_r):
+    zero_grad()
+    L_Y_u = build_LY(unit); backward(); apply_P_inplace();
+    proj = dot_param_grad_minus_mean_with(μ_X, μ_Y)          # ( (Y_u - μ_Y) · μ_X )
+    sum_sq_proj_Y_local += proj*proj
+    zero_grad()
+  V_Y_local = sum_sq_proj_Y_local / (B_U_global * max(B_U_global - 1, 1))
+  V_Y = all_reduce_scalar(V_Y_local)
+
+  SE_deltaH1 = η * sqrt(V_X + V_Y)
+  frac_var   = (V_X + V_Y) / max(bars_dot, 1e-12)^2          # diagnostic
+
+Phase 5. Cleanup
+  - Delete ΣX_local/ΣY_local (and any per-unit temp buffers) to free VRAM; keep E_r and U_r for the ground-truth comparison.
+
+Phase 6. Ground-truth entropy change on E via importance sampling (two-batch)
+  - Compute H(θ;E)  = mean( -S_w(θ;E) ) with no_grad
+  - Take a single optimizer step on U (θ → θ⁺). Use your standard RL loss (DR-GRPO) with microbatches.
+  - Recompute:
+      S(θ;E)   and S(θ⁺;E)   per sequence (teacher-forced, no_grad)
+      w_i = exp( S(θ⁺;E_i) - S(θ;E_i) )                       # likelihood ratio
+    Choose IS scheme:
+      • SNIS:  ẑ = ( Σ_i w_i f_i ) / ( Σ_i w_i ), with f_i = -S_w(θ⁺;E_i)
+      • or clipped IS with w_i ← min(w_i, c) to reduce variance (log-domain stable)
+  - Define ΔH_true = Ĥ(θ⁺;E) - Ĥ(θ;E).
+  - Restore θ from a saved snapshot so training state is unchanged by the probe.
+
+ORDERING AND LIFECYCLE
+======================
+Prefer the following order to avoid retain_graph=True and minimize peak VRAM:
+  • In all passes, for each unit/microbatch:
+      - Forward for L_•, backward(), immediately consume .grad into the appropriate scalar or param-buffer, zero_grad(), proceed.
+  • Never reuse the same forward activations for both X and Y of a unit; always do two separate forwards (X then Y, or vice versa).
+  • Use AMP autocast with the same dtype as training; keep parameter buffers (ΣX, ΣY, μ_X, μ_Y) in fp32 unless you’ve validated fp16.
+
+DDP / COMMUNICATION
+===================
+- Accumulate ΣX_local and ΣY_local locally; all-reduce those param-sized buffers once each.
+- All scalar diagnostics (B_E, B_U, bars_dot via dot then all-reduce if needed, V_X_local, V_Y_local) should be reduced via dist.all_reduce(SUM).
+- Disable DDP gradient synchronization during probe backward calls (ddp.no_sync()) to prevent inadvertent averaging.
+
+API / HOOKUP POINTS
+===================
+probe_components.py (new/changed)
+---------------------------------
++ def build_LX_from_S(S_dict) -> scalar:
+     # Compute S_w and S; LOO over responses inside the unit; coeff = detach(S_w - LOO); return mean(coeff * S)
++ def build_LY_from_S(S_dict) -> scalar:
+     # S only; weights (A/Lmax) detach; return mean(weights * S)
+
++ def accumulate_sum_X(self, E_batch, mb_size) -> (sum_buf, B_local):
+     # Phase 1; DDP no_sync; returns ΣX_local and local count
+
++ def accumulate_sum_Y(self, U_batch, mb_size, adam_prec) -> (sum_buf, B_local):
+     # Phase 2; backward + apply P in-place; returns ΣY_local and local count
+
++ def compute_VX(self, E_batch, muX, muY, mb_size) -> scalar:
+     # Phase 4 (X part); returns V_X_local
+
++ def compute_VY(self, U_batch, muX, muY, mb_size, adam_prec) -> scalar:
+     # Phase 4 (Y part); returns V_Y_local
+
+Utility (local):
+  - zeros_like_params(), add_into_param_buffer(), dot_param_buffers(), dot_param_grad_minus_mean_with(direction, mean)
+  - teacher_force_logprobs(unit_or_mb): forward with requires_grad=True; returns per-token logprobs + masks
+  - iter_microbatches(b, size) and iter_units(b): generators over prompt groups
+
+offline_entropy_probe.py (driver)
+---------------------------------
++ def run_mixed_probe(self, E_batch, U_batch, optimizer, adam_prec, lr, cfg):
+     # orchestrates Phases 1..6
+     # returns dict with δH₁, SE, frac_var, ΔH_true, and supporting scalars (bars_dot, V_X, V_Y, B_E, B_U)
+  - Provide config flags:
+     cfg.mb_size_prompts (2..4)
+     cfg.weighting_mode in {"per_token_avg", "dr_grpo"}
+     cfg.is_mode in {"snis", "clip"} with cfg.is_clip_c
+     cfg.use_grad_ckpt (bool) → turn on model.gradient_checkpointing_enable()
+     cfg.buffers_dtype in {"fp32","fp16"} for ΣX/ΣY/μ_X/μ_Y storage
+
+distributed_helpers.py
+----------------------
++ all_reduce_param_buffer_(buf_by_param)
++ all_reduce_scalar_(tensor_scalar)
++ count_global(n_local) -> int
++ broadcast_param_buffer_(buf_by_param) [optional]
+
+importance_sampling.py
+----------------------
++ def entropy_change_two_batch(self, model, E_batch, U_batch, optimizer, lr, weighting_mode, is_mode, is_clip_c):
+     # Snapshot θ and opt state
+     # H(θ;E): compute with no_grad
+     # Optimizer step on U (microbatched, normal RL loss)
+     # Compute S(θ;E) and S(θ⁺;E); compute IS weights; compute Ĥ(θ⁺;E) via SNIS or clipped IS
+     # ΔH_true = Ĥ(θ⁺;E) - Ĥ(θ;E)
+     # Restore θ and opt state; return ΔH_true
+
+TESTING / SANITY
+================
+1) Tiny model, single GPU:
+   - Verify δH₁ ≈ (ΣX · ΣY) / (B_E B_U) * η
+   - Verify V_X, V_Y positive and scale ~ 1/B_E, 1/B_U
+   - Compare δH₁ to ΔH_true for small η; correlation should be high; sign match frequent
+
+2) Multi-GPU (2–4 GPUs):
+   - Check that μ_X and μ_Y identical across ranks after all-reduce
+   - Turning off no_sync() should change results (catch accidental sync)
+
+3) Memory:
+   - With mb_size_prompts ∈ {2,3,4}, peak VRAM should be ~ microbatch-only
+   - Enable gradient checkpointing; confirm ~15–25% drop in activations
+
+PERF / MEMORY NOTES
+===================
+- Keep ΣX/ΣY/μ_X/μ_Y in fp32 for safety; if memory is tight, allow fp16 buffers with a config flag (validate impacts).
+- You can CPU-offload ΣX/ΣY between phases if needed (torch.cuda.empty_cache() between passes).
+- Avoid storing per-unit full vectors; projections computed immediately as scalars. Only μ_X and μ_Y persist parameter-sized.
+- Autocast like training; do not use inference_mode() in probe passes (we need grads).
+
+EDGE CASES
+==========
+- If B_E<2 or B_U<2, set V_X or V_Y to 0.0 respectively and warn.
+- If bars_dot is ~0, frac_var can blow up; cap denominator with epsilon in logs.
+
+LOGGING
+=======
+Log per step: B_E, B_U, bars_dot, δH₁, V_X, V_Y, SE, frac_var, ΔH_true, timing per phase.

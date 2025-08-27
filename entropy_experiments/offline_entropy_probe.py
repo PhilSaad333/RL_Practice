@@ -419,6 +419,126 @@ class OfflineEntropyProbe:
     def _compute_actual_entropy_change(self, batch_data: Dict[str, Any]) -> Dict[str, Any]:
         """Compute actual entropy change via importance sampling."""
         return self.importance_sampler.compute_entropy_change(batch_data, self.optimizer)
+    
+    def run_mixed_probe(self) -> Dict[str, Any]:
+        """
+        STAGE 1: Run mixed E/U batch entropy probe analysis.
+        
+        This implements the new approach with separate evaluation (E) and update (U) batches:
+        - E batch: Used for computing X gradients (∇H_w)
+        - U batch: Used for computing Y gradients (P∇J, preconditioned)
+        - Estimator: δH₁ = lr * (X̄ · Ȳ)
+        
+        Returns:
+            Dict with deltaH1, bars_dot, B_E, B_U, timing, and diagnostics
+        """
+        start_time = time.time()
+        
+        try:
+            self.logger.info("Starting Stage 1 Mixed E/U Batch Probe Analysis")
+            
+            # Get config parameters
+            B_E = self.config['batch_config'].get('B_E', self.config['batch_config']['B'])
+            B_U = self.config['batch_config'].get('B_U', self.config['batch_config']['B'])
+            mb_size_prompts = self.config.get('probe_rework', {}).get('mb_size_prompts', 2)
+            weighting_mode = self.config.get('probe_rework', {}).get('weighting_mode', 'dr_grpo')
+            
+            self.logger.info(f"Mixed probe config: B_E={B_E}, B_U={B_U}, mb_size={mb_size_prompts}, weighting={weighting_mode}")
+            
+            # Phase 0: Sample two batches
+            self.logger.info("Phase 0: Sampling E and U batches")
+            phase0_start = time.time()
+            
+            E_batch = self.probe_components.sample_batch(B=B_E, G=self.config['batch_config']['G'])
+            U_batch = self.probe_components.sample_batch(B=B_U, G=self.config['batch_config']['G'])
+            
+            phase0_time = time.time() - phase0_start
+            self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
+            
+            # Phase 1: Accumulate ΣX (raw gradients from E batch)
+            self.logger.info("Phase 1: Accumulating ΣX from E batch")
+            phase1_start = time.time()
+            
+            sum_X_buf, B_E_local = self.probe_components.accumulate_sum_X(
+                E_batch, mb_size_prompts, weighting_mode
+            )
+            
+            phase1_time = time.time() - phase1_start
+            self.logger.info(f"Phase 1 complete: {phase1_time:.2f}s, B_E_local={B_E_local}")
+            
+            # Phase 2: Accumulate ΣY (preconditioned gradients from U batch)
+            self.logger.info("Phase 2: Accumulating ΣY from U batch")
+            phase2_start = time.time()
+            
+            sum_Y_buf, B_U_local = self.probe_components.accumulate_sum_Y(
+                U_batch, mb_size_prompts, self.adam_preconditioner
+            )
+            
+            phase2_time = time.time() - phase2_start
+            self.logger.info(f"Phase 2 complete: {phase2_time:.2f}s, B_U_local={B_U_local}")
+            
+            # Phase 3: Compute means and δH₁
+            self.logger.info("Phase 3: Computing means and δH₁")
+            phase3_start = time.time()
+            
+            # For Stage 1 (single GPU), use local counts
+            # TODO: For DDP, these would be all-reduced
+            B_E_global = B_E_local
+            B_U_global = B_U_local
+            
+            # Compute means: μ_X = ΣX / B_E, μ_Y = ΣY / B_U
+            mu_X = {param_id: buf_tensor / max(B_E_global, 1) 
+                   for param_id, buf_tensor in sum_X_buf.items()}
+            mu_Y = {param_id: buf_tensor / max(B_U_global, 1) 
+                   for param_id, buf_tensor in sum_Y_buf.items()}
+            
+            # Compute dot product: bars_dot = μ_X · μ_Y
+            bars_dot = self.probe_components.dot_param_buffers(mu_X, mu_Y)
+            
+            # Get learning rate and compute δH₁
+            learning_rate = self.probe_components._get_learning_rate(self.optimizer)
+            delta_h1 = learning_rate * bars_dot
+            
+            phase3_time = time.time() - phase3_start
+            
+            # Log results with high precision
+            self.logger.info(f"🔍 [RESULTS] bars_dot={bars_dot:.10f}")
+            self.logger.info(f"🔍 [RESULTS] learning_rate={learning_rate:.2e}")
+            self.logger.info(f"🔍 [RESULTS] deltaH1={delta_h1:.10f}")
+            self.logger.info(f"Phase 3 complete: {phase3_time:.2f}s")
+            
+            # Compile results
+            total_time = time.time() - start_time
+            results = {
+                # Core results
+                "bars_dot": bars_dot,
+                "deltaH1": delta_h1,
+                "learning_rate": learning_rate,
+                
+                # Batch sizes
+                "B_E": B_E_global,
+                "B_U": B_U_global,
+                
+                # Configuration
+                "mb_size_prompts": mb_size_prompts,
+                "weighting_mode": weighting_mode,
+                
+                # Timing breakdown
+                "timing": {
+                    "total_time": total_time,
+                    "phase0_sampling": phase0_time,
+                    "phase1_sum_X": phase1_time,
+                    "phase2_sum_Y": phase2_time,
+                    "phase3_delta_h1": phase3_time,
+                }
+            }
+            
+            self.logger.info(f"Mixed probe analysis completed in {total_time:.2f}s")
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error during mixed probe analysis: {e}")
+            raise
         
     def _compile_results(self, delta_h1_results: Dict[str, Any], 
                         actual_entropy_results: Dict[str, Any]) -> Dict[str, Any]:

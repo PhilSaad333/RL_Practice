@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from typing import Dict, List, Tuple, Optional, Any, Union
+from contextlib import nullcontext
 import logging
 from collections import defaultdict
 import time
@@ -558,6 +559,12 @@ class ProbeComponents:
         for param in params:
             Y_sum[id(param)] = torch.zeros_like(param, device='cpu', dtype=torch.float32)
             
+        # 🔍 SAVE X GRADIENTS before Y-pass (since backward() overwrites param.grad)
+        X_gradients_saved = {}
+        for param in params:
+            if param.grad is not None:
+                X_gradients_saved[id(param)] = param.grad.clone()
+            
         # Accumulate Y gradients over microbatches
         first_microbatch = True
         for microbatch in self._iter_prompt_microbatches(batch_data, microbatch_size):
@@ -568,34 +575,17 @@ class ProbeComponents:
             # 🔍 DEBUG: Check L_Y_mb gradient requirements
             self.logger.info(f"🔍 [L_Y] requires_grad={L_Y_mb.requires_grad}, grad_fn={L_Y_mb.grad_fn}")
             
-            # 🔍 DIAGNOSTIC TEST: Test backward() vs autograd.grad() on first microbatch only
-            if first_microbatch:
-                # Clear any existing gradients first
-                for param in params:
-                    if param.grad is not None:
-                        param.grad = None
+            # 🔍 Clear gradients before Y computation
+            for param in params:
+                param.grad = None
                         
-                # Try backward() to see if gradients flow
-                L_Y_mb.backward(retain_graph=True)
-                
-                # Check how many params have gradients after backward
-                backward_grad_count = sum(1 for param in params if param.grad is not None)
-                self.logger.info(f"🔍 [DIAGNOSTIC] backward() test: {backward_grad_count}/{len(params)} params have gradients")
-                
-                # Clear gradients again for autograd.grad test
-                for param in params:
-                    if param.grad is not None:
-                        param.grad = None
-                        
-                first_microbatch = False
+            # Use backward() instead of autograd.grad (more reliable)
+            L_Y_mb.backward()
             
-            # Get Y gradients via autograd.grad
-            y_grads = torch.autograd.grad(L_Y_mb, params, allow_unused=True)
-            
-            # Apply preconditioner and accumulate into ΣY (CPU)
-            for param, y_grad in zip(params, y_grads):
-                if y_grad is not None:
-                    preconditioned_grad = adam_preconditioner.apply_preconditioner(y_grad, param)
+            # Apply preconditioner and accumulate Y gradients into ΣY (CPU)
+            for param in params:
+                if param.grad is not None:
+                    preconditioned_grad = adam_preconditioner.apply_preconditioner(param.grad, param)
                     # Move gradient to CPU in float32 for accumulation
                     grad_cpu = preconditioned_grad.detach().to('cpu', dtype=torch.float32)
                     Y_sum[id(param)].add_(grad_cpu)
@@ -1218,3 +1208,327 @@ class ProbeComponents:
             lr = self.config.get('learning_rate', 1e-6)  # Default fallback
             self.logger.warning(f"🔍 [LR] Using fallback learning rate: {lr:.2e} (may be incorrect!)")
             return lr
+    
+    # ========================================================================
+    # STAGE 1: Mixed E/U Batch Probe - Buffer Utilities
+    # ========================================================================
+    
+    def zeros_like_params(self, dtype: torch.dtype = torch.float32, device: str = "cpu") -> Dict[int, torch.Tensor]:
+        """
+        Create zero buffers matching model parameters.
+        
+        Args:
+            dtype: Data type for buffers (default float32 for stability)
+            device: Device for buffers ("cpu" or "cuda")
+            
+        Returns:
+            Dict mapping param id to zero tensor with same shape as parameter
+        """
+        param_buffers = {}
+        for param in self.model.parameters():
+            if param.requires_grad:
+                param_buffers[id(param)] = torch.zeros_like(param, dtype=dtype, device=device)
+        return param_buffers
+    
+    def add_into_param_buffer(self, buf: Dict[int, torch.Tensor], scale: float = 1.0) -> None:
+        """
+        Add current param.grad into buffer with optional scaling.
+        
+        Args:
+            buf: Parameter buffer dict from zeros_like_params()
+            scale: Scaling factor for gradients
+        """
+        for param in self.model.parameters():
+            if param.requires_grad and param.grad is not None:
+                param_id = id(param)
+                if param_id in buf:
+                    # Convert gradient to buffer's dtype and device
+                    grad = param.grad.detach()
+                    if buf[param_id].device != grad.device or buf[param_id].dtype != grad.dtype:
+                        grad = grad.to(buf[param_id].device, dtype=buf[param_id].dtype)
+                    buf[param_id].add_(grad, alpha=scale)
+    
+    def dot_param_buffers(self, buf_a: Dict[int, torch.Tensor], buf_b: Dict[int, torch.Tensor]) -> float:
+        """
+        Compute dot product between two parameter buffers.
+        
+        Args:
+            buf_a: First parameter buffer
+            buf_b: Second parameter buffer
+            
+        Returns:
+            Scalar dot product as float
+        """
+        total_dot = 0.0
+        for param in self.model.parameters():
+            if param.requires_grad:
+                param_id = id(param)
+                if param_id in buf_a and param_id in buf_b:
+                    dot_contrib = (buf_a[param_id] * buf_b[param_id]).sum().item()
+                    total_dot += dot_contrib
+        return total_dot
+    
+    # ========================================================================
+    # STAGE 1: Mixed E/U Batch Probe - Loss Builders
+    # ========================================================================
+    
+    def build_LX_from_S(self, S_dict: Dict[str, Any], weighting_mode: str = "dr_grpo") -> torch.Tensor:
+        """
+        Build X-loss: L_X = mean_over_responses(detach(S_w - S_w_LOO) * S)
+        
+        Args:
+            S_dict: Dict with 'S' [batch_size, G], 'max_lengths' [batch_size], etc.
+            weighting_mode: "dr_grpo" (1/L_max) or "per_token_avg" (1/L_eff)
+            
+        Returns:
+            Scalar loss tensor with requires_grad=True
+        """
+        S = S_dict['S']  # [batch_size, G] - sequence log-probabilities
+        max_lengths = S_dict['max_lengths']  # [batch_size] - max length per prompt
+        batch_size, G = S.shape
+        
+        total_loss = 0.0
+        total_count = 0
+        
+        for b in range(batch_size):
+            S_b = S[b]  # [G] - responses for prompt b
+            L_max_b = max_lengths[b]
+            
+            # Compute weighted scores S_w based on weighting mode
+            with torch.no_grad():  # Weights are θ-independent
+                if weighting_mode == "dr_grpo":
+                    # S_w = S / L_max (DR-GRPO style)
+                    S_w_b = S_b / L_max_b
+                elif weighting_mode == "per_token_avg":
+                    # S_w = S / L_eff - need generation lengths
+                    if 'gen_lengths' in S_dict:
+                        gen_lengths_b = S_dict['gen_lengths'][b]  # [G]
+                        S_w_b = S_b / gen_lengths_b.clamp(min=1.0)
+                    else:
+                        # Fallback to dr_grpo if gen_lengths not available
+                        S_w_b = S_b / L_max_b
+                else:
+                    raise ValueError(f"Unknown weighting_mode: {weighting_mode}")
+                
+                # Compute leave-one-out baselines S_w_LOO
+                S_w_LOO_b = torch.zeros_like(S_w_b)
+                for g in range(G):
+                    # LOO mean excluding response g
+                    mask = torch.ones(G, dtype=torch.bool, device=S_w_b.device)
+                    mask[g] = False
+                    if mask.sum() > 0:
+                        S_w_LOO_b[g] = S_w_b[mask].mean()
+                    else:
+                        S_w_LOO_b[g] = 0.0  # Edge case: G=1
+                
+                # Detached coefficient
+                coeff_b = (S_w_b - S_w_LOO_b).detach()
+            
+            # L_X for this prompt: mean_g(coeff * S)
+            prompt_loss = (coeff_b * S_b).mean()
+            total_loss = total_loss + prompt_loss
+            total_count += 1
+        
+        # Return average loss across prompts
+        return total_loss / total_count if total_count > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
+    
+    def build_LY_from_S(self, S_dict: Dict[str, Any]) -> torch.Tensor:
+        """
+        Build Y-loss: L_Y = mean_over_responses((A / L_max) * S)
+        
+        Args:
+            S_dict: Dict with 'S' [batch_size, G], 'advantages' [batch_size, G], 'max_lengths' [batch_size]
+            
+        Returns:
+            Scalar loss tensor with requires_grad=True
+        """
+        S = S_dict['S']  # [batch_size, G]
+        advantages = S_dict['advantages']  # [batch_size, G]
+        max_lengths = S_dict['max_lengths']  # [batch_size]
+        batch_size, G = S.shape
+        
+        total_loss = 0.0
+        total_count = 0
+        
+        for b in range(batch_size):
+            S_b = S[b]  # [G]
+            A_b = advantages[b]  # [G]
+            L_max_b = max_lengths[b]  # scalar
+            
+            # L_Y for this prompt: mean_g((A / L_max) * S)
+            weights_b = A_b / L_max_b  # θ-independent weights
+            prompt_loss = (weights_b * S_b).mean()
+            total_loss = total_loss + prompt_loss
+            total_count += 1
+        
+        # Return average loss across prompts
+        return total_loss / total_count if total_count > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
+    
+    def iter_microbatches(self, batch_dict: Dict[str, Any], size: int):
+        """
+        Iterate over microbatches by slicing along the prompt dimension.
+        
+        Args:
+            batch_dict: Batch dictionary with tensors/lists indexed by prompt
+            size: Microbatch size (number of prompts per microbatch)
+            
+        Yields:
+            Microbatch dictionaries with sliced tensors
+        """
+        # Determine batch size from one of the batch dimensions
+        if 'sequences' in batch_dict:
+            batch_size = len(batch_dict['sequences'])
+        elif 'advantages' in batch_dict and hasattr(batch_dict['advantages'], 'shape'):
+            batch_size = batch_dict['advantages'].shape[0]
+        elif 'max_lengths' in batch_dict:
+            batch_size = len(batch_dict['max_lengths'])
+        else:
+            raise ValueError("Cannot determine batch size from batch_dict")
+        
+        # Iterate over microbatches
+        for start_idx in range(0, batch_size, size):
+            end_idx = min(start_idx + size, batch_size)
+            microbatch = {}
+            
+            # Slice each key in the batch
+            for key, value in batch_dict.items():
+                if isinstance(value, torch.Tensor):
+                    # Slice tensor along first dimension
+                    microbatch[key] = value[start_idx:end_idx]
+                elif isinstance(value, (list, tuple)):
+                    # Slice list/tuple
+                    microbatch[key] = value[start_idx:end_idx]
+                else:
+                    # Keep scalar values as-is
+                    microbatch[key] = value
+            
+            yield microbatch
+    
+    # ========================================================================
+    # STAGE 1: Mixed E/U Batch Probe - Accumulation Methods  
+    # ========================================================================
+    
+    def accumulate_sum_X(self, E_batch: Dict[str, Any], mb_size_prompts: int, weighting_mode: str = "dr_grpo") -> tuple:
+        """
+        Phase 1: Accumulate ΣX (raw gradients) from evaluation batch E.
+        
+        Args:
+            E_batch: Evaluation batch dictionary
+            mb_size_prompts: Microbatch size (number of prompts per microbatch)
+            weighting_mode: Weighting mode for X-loss
+            
+        Returns:
+            (sum_X_buf, B_local): Parameter sum buffer and local batch size
+        """
+        # Get trainable parameters  
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        
+        # Initialize sum buffer on CPU in fp32
+        sum_X_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
+        
+        # Count prompts processed
+        B_local = 0
+        
+        # Check if model is wrapped in DDP for no_sync context
+        is_ddp = hasattr(self.model, 'no_sync')
+        no_sync_context = self.model.no_sync if is_ddp else nullcontext
+        
+        self.logger.debug(f"Starting X accumulation with {mb_size_prompts} prompts per microbatch")
+        
+        # Process microbatches
+        with no_sync_context():  # Prevent DDP gradient averaging
+            for microbatch in self.iter_microbatches(E_batch, mb_size_prompts):
+                # Clear gradients
+                self.model.zero_grad(set_to_none=True)
+                
+                # Forward pass with teacher forcing
+                S_dict = self._teacher_force_logprobs(microbatch)
+                
+                # Build X-loss with detached LOO coefficient
+                L_X_mb = self.build_LX_from_S(S_dict, weighting_mode)
+                
+                # Backward pass - populates param.grad with raw X gradients  
+                L_X_mb.backward()
+                
+                # Accumulate gradients into sum buffer
+                self.add_into_param_buffer(sum_X_buf)
+                
+                # Count prompts in this microbatch
+                if 'sequences' in microbatch:
+                    B_local += len(microbatch['sequences'])
+                elif hasattr(microbatch.get('advantages'), 'shape'):
+                    B_local += microbatch['advantages'].shape[0]
+                else:
+                    B_local += len(microbatch.get('max_lengths', []))
+                
+                # Clear gradients for next microbatch
+                self.model.zero_grad(set_to_none=True)
+        
+        self.logger.info(f"X accumulation complete: {B_local} prompts processed")
+        return sum_X_buf, B_local
+    
+    def accumulate_sum_Y(self, U_batch: Dict[str, Any], mb_size_prompts: int, 
+                        adam_preconditioner) -> tuple:
+        """
+        Phase 2: Accumulate ΣY (preconditioned gradients) from update batch U.
+        
+        Args:
+            U_batch: Update batch dictionary
+            mb_size_prompts: Microbatch size (number of prompts per microbatch)
+            adam_preconditioner: Preconditioner to apply after backward()
+            
+        Returns:
+            (sum_Y_buf, B_local): Parameter sum buffer and local batch size
+        """
+        # Get trainable parameters
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        
+        # Initialize sum buffer on CPU in fp32
+        sum_Y_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
+        
+        # Count prompts processed
+        B_local = 0
+        
+        # Check if model is wrapped in DDP for no_sync context
+        is_ddp = hasattr(self.model, 'no_sync')
+        no_sync_context = self.model.no_sync if is_ddp else nullcontext
+        
+        self.logger.debug(f"Starting Y accumulation with {mb_size_prompts} prompts per microbatch")
+        
+        # Process microbatches
+        with no_sync_context():  # Prevent DDP gradient averaging
+            for microbatch in self.iter_microbatches(U_batch, mb_size_prompts):
+                # Clear gradients
+                self.model.zero_grad(set_to_none=True)
+                
+                # Forward pass with teacher forcing
+                S_dict = self._teacher_force_logprobs(microbatch)
+                
+                # Build Y-loss with advantage weighting
+                L_Y_mb = self.build_LY_from_S(S_dict)
+                
+                # Backward pass - populates param.grad with raw ∇J
+                L_Y_mb.backward()
+                
+                # Apply preconditioner in-place: grad ← P(grad) 
+                for param in params:
+                    if param.grad is not None:
+                        preconditioned_grad = adam_preconditioner.apply_preconditioner(param.grad, param)
+                        param.grad.copy_(preconditioned_grad)
+                
+                # Accumulate preconditioned gradients into sum buffer  
+                self.add_into_param_buffer(sum_Y_buf)
+                
+                # Count prompts in this microbatch
+                if 'sequences' in microbatch:
+                    B_local += len(microbatch['sequences'])
+                elif hasattr(microbatch.get('advantages'), 'shape'):
+                    B_local += microbatch['advantages'].shape[0]
+                else:
+                    B_local += len(microbatch.get('max_lengths', []))
+                
+                # Clear gradients for next microbatch
+                self.model.zero_grad(set_to_none=True)
+        
+        self.logger.info(f"Y accumulation complete: {B_local} prompts processed")
+        return sum_Y_buf, B_local
