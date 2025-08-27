@@ -94,21 +94,21 @@ def run_single_test(config_path: str, checkpoint_path: str, run_id: int) -> Dict
     }
     
     for line in lines:
-        # Parse δH₁ value
-        if '  δH₁: ' in line:
+        # Parse δH₁ value: "09:32:39 - RANK0 - INFO -   δH₁: -0.000105"
+        if '   δH₁: ' in line:
             try:
-                metrics['deltaH1'] = float(line.split('  δH₁: ')[1].strip())
+                metrics['deltaH1'] = float(line.split('   δH₁: ')[1].strip())
             except (ValueError, IndexError):
                 pass
         
-        # Parse SE_E(δH₁|U) value
-        elif '  SE_E(δH₁|U): ' in line:
+        # Parse SE_E(δH₁|U) value: "09:32:39 - RANK0 - INFO -   SE_E(δH₁|U): 0.012279"
+        elif '   SE_E(δH₁|U): ' in line:
             try:
-                metrics['SE_conditional'] = float(line.split('  SE_E(δH₁|U): ')[1].strip())
+                metrics['SE_conditional'] = float(line.split('   SE_E(δH₁|U): ')[1].strip())
             except (ValueError, IndexError):
                 pass
         
-        # Parse relative SE from the warning/info line: "SE/δH₁ = 2.187"
+        # Parse relative SE: "09:32:39 - RANK0 - INFO -   ❌ Conditional SE high (SE/δH₁ = 116.540)"
         elif 'SE/δH₁ = ' in line:
             try:
                 # Extract the number after "SE/δH₁ = " and before ")"
