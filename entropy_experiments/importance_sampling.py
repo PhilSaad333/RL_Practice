@@ -739,15 +739,15 @@ class ImportanceSampler:
         
         all_logprobs = []
         
-        # Process each prompt individually to bound memory
+        # Process each prompt individually to bound memory  
         for b in range(batch_size):
-            seq_b = sequences[b]  # [G, max_len]
-            mask_b = attention_masks[b]  # [G, max_len]
-            prompt_len = prompt_lens[b]
+            seq_b = sequences[b:b+1]  # [1, G, max_len] - keep batch dimension
+            mask_b = attention_masks[b:b+1]  # [1, G, max_len]
+            prompt_len = [prompt_lens[b]]  # [1] - make it a list
             
-            # Compute logprobs for this prompt's sequences
-            logprobs_b = self._compute_logprobs_for_sequences(seq_b, prompt_len, mask_b, mb_size)
-            all_logprobs.append(logprobs_b)
+            # Compute logprobs for this single-prompt batch
+            logprobs_b = self._compute_logprobs_for_sequences(seq_b, prompt_len, mask_b)
+            all_logprobs.append(logprobs_b.squeeze(0))  # Remove batch dimension
         
         return torch.stack(all_logprobs, dim=0)  # [batch_size, G]
     
