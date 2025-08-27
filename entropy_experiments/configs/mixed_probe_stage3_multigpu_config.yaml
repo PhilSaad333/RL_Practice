@@ -3,12 +3,18 @@
 
 # Core sampling parameters - larger batches for multi-GPU
 batch_config:
+  B: 32                              # Base batch size (for ProbeComponents)
   B_E: 32                            # Evaluation batch size (16 per GPU)
   B_U: 32                            # Update batch size (16 per GPU)  
   G: 8                               # Generations per prompt
   rollout_batch_size: 64             # Larger batches for H100s
   dataset_name: "gsm8k_r1_template" 
   split: "train"
+
+# Probe computation mode
+probe_config:
+  mode: "exact"                      # Use exact computation (not blocks)
+  M: null                            # Not used for exact mode
 
 # Stage 1+2+3 Mixed Probe Configuration
 probe_rework:
