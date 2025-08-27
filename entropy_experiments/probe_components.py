@@ -399,6 +399,48 @@ class ProbeComponents:
         seq_log_probs = (gen_token_log_probs * gen_mask).sum(dim=1)  # [G]
         
         return seq_log_probs
+        
+    def build_LX_vector_from_S(self, S_dict: Dict[str, Any], weighting_mode: str = "dr_grpo") -> torch.Tensor:
+        """
+        Vectorized per-prompt X-losses for α-trick conditional variance.
+        
+        Args:
+            S_dict: Dictionary containing:
+                - S: [k, G] tensor of per-response sequence log-probs (requires_grad=True)
+                - max_lengths: List of length k with L_max per prompt (DR-GRPO style)
+            weighting_mode: Loss weighting method
+            
+        Returns:
+            L_vec: [k] tensor, one scalar loss per prompt (requires_grad=True)
+            Convention: ∇_θ L_vec[b] = ∇_θ H for prompt b (minus sign included)
+        """
+        S = S_dict["S"]  # [k, G], requires_grad=True
+        assert S.dim() == 2, f"S must be [k, G], got shape {S.shape}"
+        
+        if weighting_mode == "dr_grpo":
+            # Divide each response score by L_max(prompt): broadcast [k, 1]
+            if isinstance(S_dict["max_lengths"], list):
+                Lmax = torch.tensor(S_dict["max_lengths"], device=S.device, dtype=S.dtype).view(-1, 1)
+            else:
+                Lmax = S_dict["max_lengths"].to(device=S.device, dtype=S.dtype).view(-1, 1)
+            S_w = S / Lmax  # [k, G]
+        elif weighting_mode == "per_token_avg":
+            # Expect gen_lengths [k, G] with per-response effective token counts
+            genL = S_dict["gen_lengths"].to(device=S.device, dtype=S.dtype)
+            S_w = S / genL.clamp_min(1.0)
+        else:
+            raise ValueError(f"Unknown weighting_mode: {weighting_mode}")
+            
+        # Leave-One-Out mean for each response within its prompt: [k, G]
+        G = S.size(1)
+        sum_Sw = S_w.sum(dim=1, keepdim=True)           # [k, 1]
+        S_w_LOO = (sum_Sw - S_w) / max(G - 1, 1)       # [k, G]
+        
+        # Coefficient with stop-grad; MINUS sign so ∇ L_X = ∇ H
+        coeff = (S_w - S_w_LOO).detach()                # [k, G]
+        L_vec = -(coeff * S).mean(dim=1)                # [k]
+        
+        return L_vec
     
     def _batched_teacher_force_logprobs(self, prompt_batches: List[Dict[str, Any]], 
                                        batch_size: int = 6) -> List[Dict[str, Any]]:
@@ -1272,51 +1314,120 @@ class ProbeComponents:
         
         self.logger.debug("Computing conditional variance over E using scalar projections")
         
-        # NEW BATCHED APPROACH: Process prompts in groups for efficiency
-        # Get conditional variance batch size from config (default: 6)  
-        cv_batch_size = self.config.get('probe_rework', {}).get('conditional_variance_batch_size', 6)
+        # Use α-trick conditional variance for efficient computation
+        cv_batch_size = self.config.get('probe_rework', {}).get('conditional_variance_batch_size', 8)
         
-        # Convert E_batch to list of single-prompt units for batching
-        prompt_units = list(self._iter_units(E_batch))
+        # Convert E_batch to list of single-prompt units  
+        E_units = list(self._iter_units(E_batch))
         
-        with no_sync_context():  # Prevent DDP gradient averaging
-            # Process prompts in groups to avoid computational graph issues
-            for i in range(0, len(prompt_units), cv_batch_size):
-                batch_group = prompt_units[i:i + cv_batch_size]
-                
-                # Process teacher forcing for this batch group
-                batch_S_results = self._batched_teacher_force_logprobs(batch_group, batch_size=len(batch_group))
-                
-                # Immediately process each prompt in this batch for loss computation
-                for S_dict in batch_S_results:
-                    # Clear gradients
-                    self.model.zero_grad(set_to_none=True)
-                    
-                    # Build X-loss with LOO baseline and minus sign (as per variance_estimator_change.txt)
-                    L_X_u = -self.build_LX_from_S(S_dict, weighting_mode)  # Note the minus sign
-                    
-                    # Backward pass - get raw X_n in param.grad (no preconditioning)
-                    L_X_u.backward()
-                    
-                    # Compute scalar projection: s_n = μ_Y^T X_n  
-                    s_n = 0.0
-                    for param in self.model.parameters():
-                        if param.requires_grad and param.grad is not None:
-                            param_id = id(param)
-                            if param_id in muY_buf:
-                                # Ensure both tensors are on same device
-                                muY_param = muY_buf[param_id].to(param.grad.device)
-                                s_n += (param.grad * muY_param).sum().item()
-                    
-                    # Accumulate statistics
-                    sum_s_local += s_n
-                    sum_s2_local += s_n * s_n
-                    B_E_local += 1
-                    
-                    # Clear gradients for next unit
-                    self.model.zero_grad(set_to_none=True)
+        # Call the α-trick method to compute all scalar projections efficiently
+        sum_s_local, sum_s2_local, B_E_local = self.compute_conditional_variance_over_E_alpha(
+            E_units=E_units,
+            muY_buf=muY_buf,
+            weighting_mode=weighting_mode,
+            cv_batch_size=cv_batch_size
+        )
         
         self.logger.debug(f"Conditional variance over E: B_E_local={B_E_local}, sum_s={sum_s_local:.6f}")
+        return sum_s_local, sum_s2_local, B_E_local
+    
+    def compute_conditional_variance_over_E_alpha(self, 
+                                                 E_units: List[Dict[str, Any]], 
+                                                 muY_buf: Dict[int, torch.Tensor],
+                                                 weighting_mode: str = "dr_grpo",
+                                                 cv_batch_size: int = 8) -> Tuple[float, float, int]:
+        """
+        Fast E-only conditional variance using the α-trick.
+        
+        Computes scalar projections s_n = μ_Y^T X_n for all prompts using just two 
+        backward passes per batch group instead of one backward pass per prompt.
+        
+        Args:
+            E_units: List of prompt unit dictionaries (from _iter_units)
+            muY_buf: Preconditioned mean gradients from U batch {param_id: tensor}
+            weighting_mode: Loss weighting method (dr_grpo, per_token_avg)
+            cv_batch_size: Number of prompts to process per batch group
+            
+        Returns:
+            (sum_s_local, sum_s2_local, B_E_local): Local statistics for global reduction
+        """
+        from contextlib import nullcontext
+        import torch
+        
+        device = next(self.model.parameters()).device
+        sum_s_local = 0.0
+        sum_s2_local = 0.0  
+        B_E_local = 0
+        
+        # DDP: suppress reducer; we are not updating weights
+        no_sync_ctx = self.model.no_sync if hasattr(self.model, "no_sync") else nullcontext
+        
+        self.logger.debug(f"α-trick: Processing {len(E_units)} prompts in groups of {cv_batch_size}")
+        
+        # Process prompts in groups
+        for i in range(0, len(E_units), cv_batch_size):
+            group = E_units[i:i + cv_batch_size]
+            if len(group) == 0:
+                continue
+                
+            k = len(group)  # Number of prompts in this group
+            self.logger.debug(f"α-trick: Processing group {i//cv_batch_size + 1} with {k} prompts")
+            
+            # 1) One TF forward for this group using existing batched teacher forcing
+            batch_S_list = self._batched_teacher_force_logprobs(group, batch_size=k)
+            
+            # 2) Normalize to a single S_dict with S [k, G] and max_lengths
+            S_cat = torch.cat([d["S"].view(1, -1) for d in batch_S_list], dim=0)  # [k, G]
+            S_dict = {"S": S_cat}
+            
+            if "max_lengths" in batch_S_list[0]:
+                # Extract max_lengths from each prompt's dict
+                if isinstance(batch_S_list[0]["max_lengths"], list):
+                    max_lengths = [d["max_lengths"][0] for d in batch_S_list]  # Each is [1] -> scalar
+                else:
+                    max_lengths = [d["max_lengths"] for d in batch_S_list]
+                S_dict["max_lengths"] = max_lengths
+            
+            if "gen_lengths" in batch_S_list[0]:
+                gen_lengths_list = [d["gen_lengths"] for d in batch_S_list]
+                S_dict["gen_lengths"] = torch.stack(gen_lengths_list, dim=0)
+                
+            with no_sync_ctx():
+                # 3) Per-prompt losses L_vec [k] - vectorized X-loss computation
+                L_vec = self.build_LX_vector_from_S(S_dict, weighting_mode=weighting_mode)  # [k]
+                
+                # 4) α-trick setup: α is the "selector"; ∂h/∂α gives s (all s_n at once)
+                alpha = torch.ones_like(L_vec, requires_grad=True)  # [k]
+                L = (alpha * L_vec).sum()  # Scalar combined loss
+                
+                # 5) First reverse pass: g = ∇_θ L (keep graph for second pass)
+                params = [p for p in self.model.parameters() if p.requires_grad]
+                g_list = torch.autograd.grad(
+                    L, params, create_graph=True, allow_unused=True, retain_graph=False
+                )
+                
+                # 6) Contract with μY: h = Σ_p <g_p, μY_p>  
+                h = torch.zeros((), device=device, dtype=L.dtype)
+                for p, gi in zip(params, g_list):
+                    if gi is None:
+                        continue
+                    param_id = id(p)
+                    if param_id in muY_buf:
+                        mu = muY_buf[param_id].to(device=gi.device, dtype=gi.dtype)
+                        h = h + (gi * mu).sum()
+                
+                # 7) Second reverse pass: s = ∂h/∂α → [k] (all scalar projections!)
+                s = torch.autograd.grad(h, alpha, allow_unused=False, retain_graph=False)[0].detach()
+                
+            # 8) Accumulate scalars
+            sum_s_local += float(s.sum().item())
+            sum_s2_local += float((s * s).sum().item())
+            B_E_local += int(s.numel())
+            
+            # 9) Clear gradients to keep memory bounded
+            self.model.zero_grad(set_to_none=True)
+            
+        self.logger.debug(f"α-trick complete: B_E_local={B_E_local}, sum_s={sum_s_local:.6f}")
         return sum_s_local, sum_s2_local, B_E_local
     
     def _iter_units(self, batch_dict: Dict[str, Any]):
