@@ -1407,7 +1407,7 @@ class ProbeComponents:
                 )
                 
                 # 6) Contract with μY: h = Σ_p <g_p, μY_p>  
-                h = torch.zeros((), device=device, dtype=L.dtype)
+                h = torch.tensor(0.0, device=device, dtype=L.dtype, requires_grad=True)
                 for p, gi in zip(params, g_list):
                     if gi is None:
                         continue
@@ -1415,6 +1415,11 @@ class ProbeComponents:
                     if param_id in muY_buf:
                         mu = muY_buf[param_id].to(device=gi.device, dtype=gi.dtype)
                         h = h + (gi * mu).sum()
+                
+                # Check if h has gradients before second backward pass
+                if not h.requires_grad:
+                    self.logger.error(f"α-trick: h tensor has no gradients! h={h}, h.requires_grad={h.requires_grad}")
+                    raise RuntimeError("h tensor in α-trick has no gradients - gradient flow broken")
                 
                 # 7) Second reverse pass: s = ∂h/∂α → [k] (all scalar projections!)
                 s = torch.autograd.grad(h, alpha, allow_unused=False, retain_graph=False)[0].detach()
