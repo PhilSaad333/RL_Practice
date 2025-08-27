@@ -3,8 +3,8 @@
 
 # Core sampling parameters - UPDATED: Much larger batch size for testing
 batch_config:
-  B: 2048                            # Large batch size for testing
-  B_E: 2048                          # Large evaluation batch 
+  B: 512                             # Reasonable batch size for testing
+  B_E: 512                           # Large evaluation batch (but not too big)
   B_U: 128                           # Keep update batch fixed
   G: 8                               # Generations per prompt
   rollout_batch_size: 64             # For generation efficiency
