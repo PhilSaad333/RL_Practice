@@ -249,109 +249,9 @@ class ProbeComponents:
         self.logger.info(f"Successfully sampled batch: {B} prompts × {G} responses")
         return batch_data
         
-    def compute_delta_h1(self, batch_data: Dict[str, Any], 
-                        adam_preconditioner: 'AdamPreconditioner',
-                        u_statistics: 'UStatisticsCalculator', 
-                        distributed_helpers: Optional['DistributedHelpers'] = None,
-                        optimizer: Optional[torch.optim.Optimizer] = None) -> Dict[str, Any]:
-        """
-        Compute first-order entropy change prediction δH₁.
-        
-        This is the main computation pipeline implementing the U-statistic approach
-        described in offline_entropy_probe_strategy.txt.
-        
-        Args:
-            batch_data: Sampled batch from sample_batch()
-            adam_preconditioner: Component for applying P
-            u_statistics: Component for U-statistic computation
-            distributed_helpers: Component for distributed coordination
-            
-        Returns:
-            Dictionary with δH₁ results and diagnostics
-        """
-        start_time = time.time()
-        
-        if self.mode == "exact":
-            return self._compute_delta_h1_exact(
-                batch_data, adam_preconditioner, u_statistics, distributed_helpers, optimizer
-            )
-        elif self.mode == "blocks":
-            return self._compute_delta_h1_blocks(
-                batch_data, adam_preconditioner, u_statistics, distributed_helpers  
-            )
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
-    
     # =====================================================================
     # MICROBATCHED HELPER METHODS - Added for memory optimization
     # =====================================================================
-    
-    def _iter_prompt_microbatches(self, batch_data: Dict[str, Any], microbatch_size: int):
-        """
-        Iterate over microbatches of prompts for memory-efficient processing.
-        
-        Args:
-            batch_data: Full batch data from sample_batch()
-            microbatch_size: Number of prompts per microbatch
-            
-        Yields:
-            Dictionary with sliced batch data for this microbatch
-        """
-        sequences = batch_data['sequences']  # [B, G, max_len]
-        prompt_lens = batch_data['prompt_lens']  # [B]
-        advantages = batch_data['advantages']  # [B, G] 
-        max_lengths = batch_data['max_lengths']  # [B]
-        attention_masks = batch_data['attention_masks']  # [B, G, max_len]
-        prompt_ids = batch_data['prompt_ids']  # [B]
-        
-        B = sequences.shape[0]
-        
-        for start_idx in range(0, B, microbatch_size):
-            end_idx = min(start_idx + microbatch_size, B)
-            
-            microbatch = {
-                'sequences': sequences[start_idx:end_idx],
-                'prompt_lens': prompt_lens[start_idx:end_idx],
-                'advantages': advantages[start_idx:end_idx],
-                'max_lengths': max_lengths[start_idx:end_idx], 
-                'attention_masks': attention_masks[start_idx:end_idx],
-                'prompt_ids': prompt_ids[start_idx:end_idx],
-                'num_prompts': end_idx - start_idx
-            }
-            
-            yield microbatch
-    
-    def _iter_prompts_as_units(self, batch_data: Dict[str, Any]):
-        """
-        Iterate over individual prompts as units for diagonal computation.
-        
-        Args:
-            batch_data: Full batch data from sample_batch()
-            
-        Yields:
-            Dictionary with data for single prompt (unit)
-        """
-        sequences = batch_data['sequences']  # [B, G, max_len]
-        prompt_lens = batch_data['prompt_lens']  # [B]
-        advantages = batch_data['advantages']  # [B, G]
-        max_lengths = batch_data['max_lengths']  # [B]
-        attention_masks = batch_data['attention_masks']  # [B, G, max_len]
-        prompt_ids = batch_data['prompt_ids']  # [B]
-        
-        B = sequences.shape[0]
-        
-        for b in range(B):
-            unit = {
-                'sequences': sequences[b:b+1],  # Keep batch dimension
-                'prompt_lens': prompt_lens[b:b+1],
-                'advantages': advantages[b:b+1],
-                'max_lengths': max_lengths[b:b+1],
-                'attention_masks': attention_masks[b:b+1],
-                'prompt_ids': prompt_ids[b:b+1],
-                'num_prompts': 1
-            }
-            
-            yield unit, b  # Return unit and original index
     
     def _teacher_force_logprobs(self, prompt_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -407,90 +307,16 @@ class ProbeComponents:
             'attention_masks': attention_masks
         }
     
-    def _build_probe_loss_X_from_S(self, S_dict: Dict[str, Any]) -> torch.Tensor:
-        """
-        Build L_X probe loss from pre-computed sequence log-probabilities.
-        
-        L_X = mean_b mean_g ((S_{b,g} - LOO_mean_{b,g}) * S_{b,g})
-        
-        Args:
-            S_dict: Dictionary from _teacher_force_logprobs with 'S' key
-            
-        Returns:
-            Scalar probe loss tensor with gradients enabled
-        """
-        S = S_dict['S']  # [batch_size, G] 
-        batch_size, G = S.shape
-        
-        total_loss = 0.0
-        total_count = 0
-        
-        for b in range(batch_size):
-            S_b = S[b]  # [G] sequence log-probs for this prompt
-            
-            # Compute leave-one-out means
-            # Do with torch no grad
-            with torch.no_grad():
-                loo_means = torch.zeros_like(S_b)
-                for g in range(G):
-                    if G > 1:
-                        mask = torch.ones(G, dtype=torch.bool, device=self.device)
-                        mask[g] = False
-                        loo_means[g] = S_b[mask].mean()
-                    else:
-                        loo_means[g] = S_b[g]  # If G=1, use itself
-                
-            # L_X for this prompt: mean_g((S - S_loo) * S)
-            # The factor (S-S_loo) is detached
-            coeff = (S_b - loo_means).detach()
-            prompt_loss = (coeff * S_b).mean()
-            total_loss = total_loss + prompt_loss  # Keep as tensor
-            total_count += 1
-            
-        return total_loss / total_count if total_count > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
-    
-    def _build_probe_loss_Y_from_S(self, S_dict: Dict[str, Any]) -> torch.Tensor:
-        """
-        Build L_Y probe loss from pre-computed sequence log-probabilities.
-        
-        L_Y = mean_b mean_g ((A_{b,g} / L_max_b) * S_{b,g})
-        
-        Args:
-            S_dict: Dictionary from _teacher_force_logprobs
-            
-        Returns:
-            Scalar probe loss tensor with gradients enabled
-        """
-        S = S_dict['S']  # [batch_size, G]
-        advantages = S_dict['advantages']  # [batch_size, G] 
-        max_lengths = S_dict['max_lengths']  # [batch_size]
-        
-        batch_size, G = S.shape
-        
-        total_loss = 0.0
-        total_count = 0
-        
-        for b in range(batch_size):
-            S_b = S[b]  # [G]
-            A_b = advantages[b]  # [G] 
-            L_max_b = max_lengths[b]  # scalar
-            
-            # L_Y for this prompt: mean_g((A / L_max) * S)
-            prompt_loss = (A_b / L_max_b * S_b).mean()
-            total_loss = total_loss + prompt_loss  # Keep as tensor
-            total_count += 1
-            
-        return total_loss / total_count if total_count > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
-            
-    def _compute_delta_h1_exact(self, batch_data: Dict[str, Any],
-                               adam_preconditioner: 'AdamPreconditioner', 
-                               u_statistics: 'UStatisticsCalculator',
-                               distributed_helpers: Optional['DistributedHelpers'],
-                               optimizer: Optional[torch.optim.Optimizer] = None) -> Dict[str, Any]:
-        """
-        Compute δH₁ using exact per-prompt U-statistic with microbatched processing.
-            - Uses microbatched gradient computation to bound VRAM by microbatch size
-            - Computes U_cross = (B/(B-1)) * bars_dot - (1/(B(B-1))) * diag_sum
+    # =====================================================================
+    # DELETED LEGACY METHODS (Old U-statistic approach)
+    # =====================================================================
+    # - _compute_delta_h1_exact: Old exact per-prompt U-statistic implementation (~240 lines)
+    # - _compute_delta_h1_blocks: Old block-level U-statistic implementation (~190 lines)  
+    # - _build_prompt_probe_loss: Used by old exact computation
+    # - _build_block_probe_loss: Used by old blocks method
+    # - _compute_block_diagonal_contribution: Helper for block approach
+    # Total deleted: ~500 lines of legacy U-statistic code
+    # =====================================================================
         """
         start_time = time.time()
         self.logger.info("Computing δH₁ using microbatched exact per-prompt method")
