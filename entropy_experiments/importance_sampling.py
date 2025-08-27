@@ -10,6 +10,7 @@ of responses by treating the post-update model as the target distribution.
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from typing import Dict, List, Tuple, Optional, Any
 import logging
 import time
@@ -466,9 +467,9 @@ class ImportanceSampler:
         cnt_local = torch.tensor(logprobs.numel(), device=logprobs.device, dtype=neg_sum_local.dtype)
         
         # All-reduce across ranks if DDP is active
-        if distributed_helpers.is_distributed():
-            distributed_helpers.all_reduce(neg_sum_local)
-            distributed_helpers.all_reduce(cnt_local)
+        if dist.is_initialized():
+            dist.all_reduce(neg_sum_local, op=dist.ReduceOp.SUM)
+            dist.all_reduce(cnt_local, op=dist.ReduceOp.SUM)
             
         # Global mean
         original_entropy = (neg_sum_local / cnt_local).item()
@@ -632,9 +633,9 @@ class ImportanceSampler:
         neg_sum_local = (-S_orig).sum()
         cnt_local = torch.tensor(S_orig.numel(), device=S_orig.device, dtype=neg_sum_local.dtype)
         
-        if distributed_helpers.is_distributed():
-            distributed_helpers.all_reduce(neg_sum_local)
-            distributed_helpers.all_reduce(cnt_local)
+        if dist.is_initialized():
+            dist.all_reduce(neg_sum_local, op=dist.ReduceOp.SUM)
+            dist.all_reduce(cnt_local, op=dist.ReduceOp.SUM)
             
         H_orig = (neg_sum_local / cnt_local).item()
         
@@ -1042,9 +1043,9 @@ class ImportanceSampler:
         neg_sum_local = (-S_orig).sum()
         cnt_local = torch.tensor(S_orig.numel(), device=S_orig.device, dtype=neg_sum_local.dtype)
         
-        if distributed_helpers.is_distributed():
-            distributed_helpers.all_reduce(neg_sum_local)
-            distributed_helpers.all_reduce(cnt_local)
+        if dist.is_initialized():
+            dist.all_reduce(neg_sum_local, op=dist.ReduceOp.SUM)
+            dist.all_reduce(cnt_local, op=dist.ReduceOp.SUM)
             
         H_orig = (neg_sum_local / cnt_local).item()
         
