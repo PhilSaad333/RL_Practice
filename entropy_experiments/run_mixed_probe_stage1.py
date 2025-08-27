@@ -17,10 +17,10 @@ import torch
 import logging
 from pathlib import Path
 
-# Add entropy_experiments to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from offline_entropy_probe import OfflineEntropyProbe
+from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
 
 
 def setup_logging(level="INFO"):
