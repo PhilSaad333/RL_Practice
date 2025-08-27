@@ -66,8 +66,10 @@ def create_config_for_batch_size(base_config_path: str, B_E: int, output_path: s
 
 def run_single_test(config_path: str, checkpoint_path: str, run_id: int) -> Dict[str, Any]:
     """Run a single probe test and return results."""
+    # Use different port for each run to avoid conflicts
+    port = 29500 + run_id
     cmd = [
-        "torchrun", "--nproc_per_node=2",
+        "torchrun", "--nproc_per_node=2", f"--master_port={port}",
         "entropy_experiments/run_probe_sanity_check.py",
         "--config", config_path,
         "--checkpoint", checkpoint_path,
