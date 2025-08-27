@@ -94,12 +94,34 @@ def run_single_test(config_path: str, checkpoint_path: str, run_id: int) -> Dict
     }
     
     for line in lines:
-        if 'δH₁:' in line:
-            metrics['deltaH1'] = float(line.split('δH₁:')[1].strip())
-        elif 'SE_E(δH₁|U):' in line:
-            metrics['SE_conditional'] = float(line.split('SE_E(δH₁|U):')[1].strip())
-        elif 'SE/δH₁' in line and '=' in line:
-            metrics['relative_se'] = float(line.split('=')[1].split(')')[0].strip())
+        # Parse δH₁ value
+        if '  δH₁: ' in line:
+            try:
+                metrics['deltaH1'] = float(line.split('  δH₁: ')[1].strip())
+            except (ValueError, IndexError):
+                pass
+        
+        # Parse SE_E(δH₁|U) value
+        elif '  SE_E(δH₁|U): ' in line:
+            try:
+                metrics['SE_conditional'] = float(line.split('  SE_E(δH₁|U): ')[1].strip())
+            except (ValueError, IndexError):
+                pass
+        
+        # Parse relative SE from the warning/info line: "SE/δH₁ = 2.187"
+        elif 'SE/δH₁ = ' in line:
+            try:
+                # Extract the number after "SE/δH₁ = " and before ")"
+                start = line.find('SE/δH₁ = ') + len('SE/δH₁ = ')
+                end = line.find(')', start)
+                if end == -1:  # No closing paren, take to end of number
+                    # Find where the number ends (space or end of line)
+                    value_str = line[start:].split()[0]
+                else:
+                    value_str = line[start:end]
+                metrics['relative_se'] = float(value_str)
+            except (ValueError, IndexError):
+                pass
     
     return metrics
 
