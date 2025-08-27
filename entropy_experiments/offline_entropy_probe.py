@@ -420,7 +420,7 @@ class OfflineEntropyProbe:
         """Compute actual entropy change via importance sampling."""
         return self.importance_sampler.compute_entropy_change(batch_data, self.optimizer)
     
-    def run_mixed_probe(self) -> Dict[str, Any]:
+    def run_mixed_probe(self, checkpoint_path: str = None) -> Dict[str, Any]:
         """
         STAGE 1: Run mixed E/U batch entropy probe analysis.
         
@@ -436,6 +436,34 @@ class OfflineEntropyProbe:
         
         try:
             self.logger.info("Starting Stage 1 Mixed E/U Batch Probe Analysis")
+            
+            # Load checkpoint if provided, otherwise use config paths
+            if checkpoint_path is None:
+                checkpoint_path = self.config['checkpoint']['checkpoint_path']
+            
+            # Load model and optimizer (following run_offline_analysis pattern)
+            self.logger.info(f"Loading checkpoint from {checkpoint_path}")
+            
+            # Load checkpoint
+            if checkpoint_path.endswith('.pt') or checkpoint_path.endswith('.pth'):
+                checkpoint = torch.load(checkpoint_path, map_location='cpu')
+                self.model = self._initialize_model_from_checkpoint(checkpoint)
+            else:
+                # LoRA checkpoint directory
+                self.model = self._load_lora_model(checkpoint_path)
+            
+            # Load optimizer state
+            optimizer_path = self.config['checkpoint']['optimizer_path']
+            if os.path.exists(optimizer_path):
+                self.logger.info(f"Loading optimizer state from {optimizer_path}")
+                optimizer_state = torch.load(optimizer_path, map_location='cpu')
+                self.optimizer = self._initialize_optimizer_from_state(optimizer_state)
+            else:
+                self.logger.warning(f"Optimizer path not found: {optimizer_path}, creating fresh optimizer")
+                self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-6)
+            
+            # Initialize components
+            self._initialize_components()
             
             # Get config parameters
             B_E = self.config['batch_config'].get('B_E', self.config['batch_config']['B'])
