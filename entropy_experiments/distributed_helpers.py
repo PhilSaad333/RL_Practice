@@ -321,3 +321,103 @@ class DistributedHelpers:
         except Exception as e:
             self.logger.error(f"Distributed validation failed: {e}")
             return False
+
+
+# ========================================================================
+# STAGE 2: Simple standalone functions for mixed E/U batch probe
+# ========================================================================
+
+def is_distributed() -> bool:
+    """Check if we're running under distributed training."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def all_reduce_scalar_(tensor_scalar: Union[float, torch.Tensor]) -> float:
+    """
+    All-reduce a scalar value across all ranks.
+    
+    Args:
+        tensor_scalar: Scalar tensor or float value
+        
+    Returns:
+        Reduced scalar as float
+    """
+    if not is_distributed():
+        # Single GPU/CPU - return as-is
+        if isinstance(tensor_scalar, torch.Tensor):
+            return tensor_scalar.item()
+        return float(tensor_scalar)
+    
+    # Convert to tensor if needed
+    if isinstance(tensor_scalar, (int, float)):
+        tensor = torch.tensor(tensor_scalar, dtype=torch.float32)
+    else:
+        tensor = tensor_scalar.float()
+    
+    # Move to GPU if available for communication
+    device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+    tensor = tensor.to(device)
+    
+    # All-reduce sum
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    
+    return tensor.item()
+
+
+def count_global(n_local: int) -> int:
+    """
+    Aggregate local count across all ranks to get global count.
+    
+    Args:
+        n_local: Local count (e.g., local batch size)
+        
+    Returns:
+        Global count across all ranks
+    """
+    if not is_distributed():
+        return n_local
+    
+    # Convert to tensor and all-reduce
+    tensor = torch.tensor(n_local, dtype=torch.int64)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+    tensor = tensor.to(device)
+    
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    
+    return tensor.item()
+
+
+def all_reduce_param_buffer_(buf_by_param: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
+    """
+    All-reduce parameter buffers across all ranks.
+    
+    Each tensor in the buffer dictionary is summed across ranks.
+    Operates in-place on the buffer.
+    
+    Args:
+        buf_by_param: Dictionary mapping param id to tensor buffer
+        
+    Returns:
+        The same buffer dictionary (modified in-place)
+    """
+    if not is_distributed():
+        # Single GPU/CPU - no-op
+        return buf_by_param
+    
+    # All-reduce each parameter buffer
+    for param_id, tensor_buf in buf_by_param.items():
+        # Ensure tensor is on GPU for efficient communication
+        device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+        
+        # Move to communication device if needed
+        if tensor_buf.device != device:
+            # Create temporary tensor on communication device
+            comm_tensor = tensor_buf.to(device)
+            dist.all_reduce(comm_tensor, op=dist.ReduceOp.SUM)
+            # Move back to original device
+            buf_by_param[param_id] = comm_tensor.to(tensor_buf.device)
+        else:
+            # All-reduce in-place
+            dist.all_reduce(tensor_buf, op=dist.ReduceOp.SUM)
+    
+    return buf_by_param

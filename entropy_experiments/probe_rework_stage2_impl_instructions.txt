@@ -1,0 +1,168 @@
+Stage 2 Implementation Instructions: Variance + Two‑Batch Ground‑Truth ΔH (Microbatched, DDP‑Ready)
+
+Summary
+- Extend Stage 1’s mixed E/U probe with:
+  1) Delta‑method variance components V_X and V_Y via per‑unit scalar projections.
+  2) Two‑batch ground‑truth entropy change on E after a single optimizer step on U (microbatched), with snapshot/restore.
+- Maintain strict microbatching and use backward() for all gradient paths. Avoid autograd.grad.
+- Keep param‑sized buffers on CPU fp32; all‑reduce once per buffer under DDP.
+
+Prereqs
+- Stage 1 landmarks exist:
+  - offline_entropy_probe.run_mixed_probe(E, U, …) returning sum_X (or I^X), sum_Y (or I^Y), bars_dot, deltaH1.
+  - ProbeComponents: accumulate_sum_X, accumulate_sum_Y, zeros/add/dot buffer utils, build_LX_from_S, build_LY_from_S, teacher_force_logprobs, iter_microbatches.
+
+Config additions (backward compatible)
+- probe_rework:
+  - variance_enabled: true
+  - mb_size_prompts: int (reuse from Stage 1)
+  - buffers_dtype: {"float32","float16"} (keep default "float32")
+  - weighting_mode: {"dr_grpo","per_token_avg"} (reuse from Stage 1)
+  - ddp_allreduce: true  # no‑op on single GPU
+- importance:
+  - enabled: true
+  - is_mode: {"snis","clip"} (default "snis")
+  - clip_c: float (default 10.0)
+  - training_loss: {"nll","rl"} (default "nll")
+  - snapshot_device: {"cpu","gpu"} (default "cpu")
+  - importance_microbatch_size: int (default 1)
+  - report_per_token: false  # if true, compute bits/token and nats/token (optional; see notes)
+
+Part A — Variance components (V_X, V_Y)
+Files: entropy_experiments/probe_components.py, distributed_helpers.py, offline_entropy_probe.py
+
+1) New ProbeComponents helpers
+- compute_VX(self, E_batch, muX_buf, muY_buf, mb_size) -> float
+  - For each prompt unit in E_batch (use iter_units):
+    - zero_grad(set_to_none=True)
+    - S_u = teacher_force_logprobs(unit)  # requires_grad=True, AMP ok
+    - L_X_u = build_LX_from_S(S_u)
+    - backward() → X_u in .grad (raw, not preconditioned)
+    - proj = dot( (X_u − muX), muY )
+    - accumulate sum_sq_proj_X += proj*proj
+    - zero_grad()
+  - V_X_local = sum_sq_proj_X / (B_E_global * max(B_E_global−1,1))
+  - Return V_X_local (float); reduce to global in driver.
+
+- compute_VY(self, U_batch, muX_buf, muY_buf, mb_size, adam_prec) -> float
+  - For each prompt unit in U_batch:
+    - zero_grad(set_to_none=True)
+    - S_u = teacher_force_logprobs(unit)
+    - L_Y_u = build_LY_from_S(S_u)
+    - backward() → ∇J in .grad
+    - In‑place apply preconditioner: grad.copy_(P(grad)) to get Y_u
+    - proj = dot( (Y_u − muY), muX )
+    - accumulate sum_sq_proj_Y += proj*proj
+    - zero_grad()
+  - V_Y_local = sum_sq_proj_Y / (B_U_global * max(B_U_global−1,1))
+  - Return V_Y_local.
+
+Notes
+- muX_buf, muY_buf are mean buffers from Stage 1: I^X and I^Y.
+- dot(…): re‑use Stage 1’s dot_param_buffers and an additional helper dot_param_grad_minus_mean_with(direction_buf, mean_buf):
+  - For each param p: v = (p.grad − mean_buf[id(p)]) ; acc += (v * direction_buf[id(p)]).sum().item()
+- Keep all buffers on CPU fp32; cast p.grad.detach().to('cpu', torch.float32) when subtracting means and dotting.
+
+2) DDP reductions (distributed_helpers.py)
+- all_reduce_scalar_(tensor_scalar): SUM then convert back to float.
+- count_global(n_local): all_reduce SUM over int.
+- all_reduce_param_buffer_(buf_by_param): for each tensor in dict, all_reduce SUM on the same dtype/device.
+
+3) Driver wiring (offline_entropy_probe.run_mixed_probe)
+- After Stage 1 means I^X, I^Y, compute global counts B_E, B_U (DDP SUM if enabled).
+- If variance_enabled:
+  - V_X_local = probe_components.compute_VX(E_batch, I^X, I^Y, mb_size)
+  - V_Y_local = probe_components.compute_VY(U_batch, I^X, I^Y, mb_size, adam_preconditioner)
+  - V_X = all_reduce_scalar_(torch.tensor(V_X_local, device='cuda' or 'cpu'))
+  - V_Y = all_reduce_scalar_(…)
+  - SE_deltaH1 = lr * math.sqrt(max(V_X,0.0) + max(V_Y,0.0))
+  - frac_var = (V_X + V_Y) / max(bars_dot, 1e-12)**2
+  - Add to results dict.
+
+Acceptance checks (variance)
+- V_X, V_Y ≥ 0 (up to numerical jitter) and scale roughly ~1/B_E, 1/B_U when B increases.
+- SE_deltaH1 finite; frac_var finite (cap denominator with epsilon in logs to avoid inf when bars_dot≈0).
+
+Part B — Two‑batch ground‑truth entropy change on E
+Files: entropy_experiments/importance_sampling.py (new method) and offline_entropy_probe.py (invoke)
+
+4) New method: ImportanceSampler.entropy_change_two_batch(model, E_batch, U_batch, optimizer, cfg_importance) -> dict
+Inputs
+- model: current model (I_w)
+- E_batch: evaluation batch (same structure as Stage 1)
+- U_batch: update batch (same structure)
+- optimizer: same optimizer used for training (AdamW)
+- cfg_importance: {training_loss, importance_microbatch_size, is_mode, clip_c, report_per_token}
+
+Steps
+A) Snapshot
+- Save param.data to CPU: cpu_snaps = [p.detach().to('cpu').clone() for p in model.parameters()]
+- Save optimizer.state (optional but recommended): deep copy state dict to CPU
+  - opt_state = {k: v.clone().cpu() if tensor else v for …}  # keys: exp_avg, exp_avg_sq, step
+
+B) Original entropy on E (no_grad)
+- Compute S_orig and lengths (if report_per_token) via existing logprob microbatch path; ensure attention_mask passed; no_grad, eval() mode.
+- For sequence‑level: H_orig = −S_orig.mean()
+- For per‑token (optional): H_orig_tok = −Σ S_orig / Σ lengths
+
+C) Take one optimizer step on U (microbatched)
+- optimizer.zero_grad(set_to_none=True)
+- For each E/U prompt microbatch (on U):
+  - Build training loss per cfg_importance.training_loss:
+    - "nll": use existing ImportanceSampler._build_training_loss‑like logic but streaming backward per microbatch; normalize grads by total tokens at the end.
+    - "rl": if available, call your DR‑GRPO loss on U microbatches; otherwise leave a TODO.
+  - With backward() per microbatch: accumulate grads; don’t hold a giant graph.
+- After loop: optionally scale grads by total tokens to match mean loss semantics.
+- optimizer.step()
+
+D) Updated entropy on E (no_grad)
+- Recompute S_upd and lengths on E with the updated model (same microbatch path; no_grad).
+
+E) IS estimator on E
+- logw = S_upd − S_orig (log‑weights in nats)
+- For SNIS:
+  - w_shift = exp(logw − max(logw)) for stability
+  - Seq‑level: H_upd = −(Σ w_shift·S_upd)/(Σ w_shift)
+  - Per‑token (optional): H_upd_tok = −(Σ w_shift·S_upd)/(Σ w_shift·lengths)
+- For clipped IS:
+  - w = exp(logw); w_clipped = clamp(w, max=clip_c)
+  - Same formulas with w_clipped in place of w_shift; compute in log‑domain where possible.
+- ΔH_true = H_upd − H_orig (or per‑token variant if requested)
+
+F) Restore
+- with torch.no_grad(): copy cpu_snaps back into param.data; optimizer.zero_grad(set_to_none=True)
+- If optimizer.state was saved, restore it as well (step counters and exp_avgs).
+
+G) Return
+- {"H_orig": H_orig, "H_upd": H_upd, "deltaH_true": ΔH_true, "ESS": optional, "diagnostics": weight stats}
+- For DDP: compute SNIS via global sums: each rank returns sum_w_local and sum_wS_local (and sum_wL_local if per‑token), then all‑reduce SUM; form the ratio on rank 0.
+
+5) Driver wiring (offline_entropy_probe.run_mixed_probe)
+- If importance.enabled:
+  - gt = importance_sampler.entropy_change_two_batch(self.model, E_batch, U_batch, self.optimizer, cfg_importance)
+  - results.update(gt)
+
+Memory & microbatching guarantees
+- All gradient‑bearing passes use backward() per microbatch/unit with zero_grad before and after; no retain_graph.
+- Logprob evaluation uses no_grad and eval() to keep memory low; always pass attention_mask and slice prompts to GPU per microbatch to bound peak.
+- Keep param buffers and cpu_snaps on CPU; only grads/transient logits reside on GPU.
+
+DDP specifics
+- Variance: reduce V_X_local and V_Y_local via all_reduce SUM; divide as specified in driver.
+- Ground‑truth IS: reduce sums across ranks (sum_w, sum_wS[, sum_wL]).
+- Disable DDP gradient synchronization during probe backward calls (ddp.no_sync()) — the probe is not training and should not trigger DDP reducers.
+
+Logging
+- Add to results/logs: B_E, B_U, bars_dot, deltaH1, V_X, V_Y, SE_deltaH1, frac_var, H_orig, H_upd, deltaH_true, timing per phase.
+- Print with high precision (%.10f for scalars) to avoid rounding‑to‑zero confusion.
+
+Acceptance criteria (Stage 2)
+- Completes on A100‑40GB with B_E,B_U ∈ {16,32}, G=8, mb_size_prompts=2, importance_microbatch_size=1.
+- V_X, V_Y positive; SE_deltaH1 reasonable and correlates inversely with bars_dot magnitude.
+- deltaH_true present; sign and rough scale agree with deltaH1 for small steps (not necessarily equal).
+- No CUDA OOM; peak memory stable across microbatches.
+
+Notes / Options
+- Per‑token reporting can be enabled once lengths are returned from the logprob helper; see previous per‑token proposal doc for details on masks/EOS.
+- If RL loss is plugged in later, ensure microbatch backward per unit and normalize grads appropriately (e.g., by total tokens or prompts) before optimizer.step().
+

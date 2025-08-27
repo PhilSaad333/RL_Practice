@@ -22,6 +22,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import logging
 import time
+import math
 import os
 from typing import Dict, List, Tuple, Optional, Any, Union
 from pathlib import Path
@@ -535,10 +536,87 @@ class OfflineEntropyProbe:
             self.logger.info(f"🔍 [RESULTS] deltaH1={delta_h1:.10f}")
             self.logger.info(f"Phase 3 complete: {phase3_time:.2f}s")
             
-            # Compile results
+            # ================================================================
+            # STAGE 2: Variance Components (V_X, V_Y) - Optional
+            # ================================================================
+            variance_enabled = self.config.get('probe_rework', {}).get('variance_enabled', False)
+            V_X, V_Y, SE_deltaH1, frac_var = 0.0, 0.0, 0.0, 0.0
+            phase4_time, phase5_time = 0.0, 0.0
+            
+            if variance_enabled:
+                self.logger.info("Phase 4: Computing variance components V_X and V_Y")
+                phase4_start = time.time()
+                
+                # Import distributed helpers for all-reduce operations
+                from . import distributed_helpers
+                
+                # Compute V_X via per-unit scalar projections on E batch
+                V_X_local = self.probe_components.compute_VX(
+                    E_batch, mu_X, mu_Y, mb_size_prompts, weighting_mode
+                )
+                
+                # Compute V_Y via per-unit scalar projections on U batch
+                V_Y_local = self.probe_components.compute_VY(
+                    U_batch, mu_X, mu_Y, mb_size_prompts, self.adam_preconditioner
+                )
+                
+                # All-reduce variance components (no-op for single GPU)
+                V_X = distributed_helpers.all_reduce_scalar_(V_X_local)
+                V_Y = distributed_helpers.all_reduce_scalar_(V_Y_local)
+                
+                # Apply final normalization: V_X /= (B_E * max(B_E-1, 1))
+                V_X = V_X / (B_E_global * max(B_E_global - 1, 1))
+                V_Y = V_Y / (B_U_global * max(B_U_global - 1, 1))
+                
+                # Compute standard error and fractional variance
+                SE_deltaH1 = learning_rate * math.sqrt(max(V_X, 0.0) + max(V_Y, 0.0))
+                frac_var = (V_X + V_Y) / max(bars_dot, 1e-12)**2
+                
+                phase4_time = time.time() - phase4_start
+                self.logger.info(f"🔍 [VARIANCE] V_X={V_X:.10f}, V_Y={V_Y:.10f}")
+                self.logger.info(f"🔍 [VARIANCE] SE_deltaH1={SE_deltaH1:.10f}, frac_var={frac_var:.6f}")
+                self.logger.info(f"Phase 4 complete: {phase4_time:.2f}s")
+            
+            # ================================================================
+            # STAGE 2: Two-Batch Ground-Truth Entropy Change - Optional
+            # ================================================================
+            importance_enabled = self.config.get('importance', {}).get('enabled', False)
+            ground_truth_results = {}
+            
+            if importance_enabled:
+                self.logger.info("Phase 5: Computing two-batch ground-truth entropy change")
+                phase5_start = time.time()
+                
+                # Initialize importance sampler if not already done
+                if not hasattr(self, 'importance_sampler') or self.importance_sampler is None:
+                    from .importance_sampling import ImportanceSampler
+                    self.importance_sampler = ImportanceSampler(self.model, self.config, self.logger)
+                
+                # Extract importance sampling configuration
+                cfg_importance = {
+                    'training_loss': self.config.get('importance', {}).get('training_loss', 'nll'),
+                    'importance_microbatch_size': self.config.get('importance', {}).get('importance_microbatch_size', 1),
+                    'is_mode': self.config.get('importance', {}).get('is_mode', 'snis'),
+                    'clip_c': self.config.get('importance', {}).get('clip_c', 10.0),
+                    'report_per_token': self.config.get('importance', {}).get('report_per_token', False),
+                    'snapshot_device': self.config.get('importance', {}).get('snapshot_device', 'cpu')
+                }
+                
+                # Compute ground-truth entropy change
+                ground_truth_results = self.importance_sampler.entropy_change_two_batch(
+                    self.model, E_batch, U_batch, self.optimizer, cfg_importance
+                )
+                
+                phase5_time = time.time() - phase5_start
+                self.logger.info(f"🔍 [GROUND-TRUTH] deltaH_true={ground_truth_results['deltaH_true']:.10f}")
+                self.logger.info(f"Phase 5 complete: {phase5_time:.2f}s")
+            
+            # ================================================================
+            # Compile Final Results  
+            # ================================================================
             total_time = time.time() - start_time
             results = {
-                # Core results
+                # Core Stage 1 results
                 "bars_dot": bars_dot,
                 "deltaH1": delta_h1,
                 "learning_rate": learning_rate,
@@ -561,7 +639,27 @@ class OfflineEntropyProbe:
                 }
             }
             
-            self.logger.info(f"Mixed probe analysis completed in {total_time:.2f}s")
+            # Add Stage 2 variance results if computed
+            if variance_enabled:
+                results.update({
+                    "V_X": V_X,
+                    "V_Y": V_Y, 
+                    "SE_deltaH1": SE_deltaH1,
+                    "frac_var": frac_var,
+                    "variance_enabled": True
+                })
+                results["timing"]["phase4_variance"] = phase4_time
+            
+            # Add Stage 2 ground-truth results if computed
+            if importance_enabled:
+                results.update({
+                    **ground_truth_results,
+                    "importance_enabled": True
+                })
+                results["timing"]["phase5_importance"] = phase5_time
+            
+            stage = "Stage 1+2" if (variance_enabled or importance_enabled) else "Stage 1"
+            self.logger.info(f"{stage} Mixed probe analysis completed in {total_time:.2f}s")
             return results
             
         except Exception as e:

@@ -500,3 +500,398 @@ class ImportanceSampler:
         except Exception as e:
             self.logger.error(f"Importance sampling validation failed: {e}")
             return False
+    
+    # ========================================================================
+    # STAGE 2: Two-Batch Ground-Truth Entropy Change
+    # ========================================================================
+    
+    def entropy_change_two_batch(self, model: torch.nn.Module, E_batch: Dict[str, Any], 
+                                U_batch: Dict[str, Any], optimizer: torch.optim.Optimizer,
+                                cfg_importance: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compute ground-truth entropy change using two-batch approach.
+        
+        Process:
+        1. Snapshot model state
+        2. Compute H(θ;E) with original model
+        3. Take one optimizer step on U batch  
+        4. Compute H(θ⁺;E) with updated model using importance sampling
+        5. Restore original model state
+        6. Return ΔH_true = H(θ⁺;E) - H(θ;E)
+        
+        Args:
+            model: Current model  
+            E_batch: Evaluation batch for entropy measurement
+            U_batch: Update batch for optimizer step
+            optimizer: Optimizer to use for update step
+            cfg_importance: Configuration dict with keys:
+                - training_loss: "nll" or "rl" 
+                - importance_microbatch_size: microbatch size for processing
+                - is_mode: "snis" or "clip" 
+                - clip_c: clipping constant for IS (if using clipped IS)
+                - report_per_token: whether to compute per-token metrics
+                - snapshot_device: "cpu" or "gpu" for model snapshots
+                
+        Returns:
+            Dictionary with ground-truth entropy change results
+        """
+        start_time = time.time()
+        self.logger.info("Starting two-batch ground-truth entropy change computation")
+        
+        # Extract config parameters
+        training_loss = cfg_importance.get('training_loss', 'nll')
+        importance_mb_size = cfg_importance.get('importance_microbatch_size', 1)
+        is_mode = cfg_importance.get('is_mode', 'snis')
+        clip_c = cfg_importance.get('clip_c', 10.0)
+        report_per_token = cfg_importance.get('report_per_token', False)
+        snapshot_device = cfg_importance.get('snapshot_device', 'cpu')
+        
+        # ====================================================================
+        # STEP A: Snapshot model and optimizer state
+        # ====================================================================
+        self.logger.debug("Snapshotting model and optimizer state")
+        
+        # Save model parameters to CPU
+        cpu_snaps = {}
+        for name, param in model.named_parameters():
+            cpu_snaps[name] = param.detach().to(snapshot_device).clone()
+        
+        # Save optimizer state (optional but recommended)
+        opt_state_snapshot = None
+        if hasattr(optimizer, 'state_dict'):
+            opt_state_dict = optimizer.state_dict()
+            opt_state_snapshot = {}
+            for key, value in opt_state_dict.items():
+                if isinstance(value, dict):
+                    # Handle optimizer state for each parameter
+                    opt_state_snapshot[key] = {}
+                    for param_key, param_value in value.items():
+                        if isinstance(param_value, torch.Tensor):
+                            opt_state_snapshot[key][param_key] = param_value.detach().to(snapshot_device).clone()
+                        else:
+                            opt_state_snapshot[key][param_key] = param_value
+                elif isinstance(value, torch.Tensor):
+                    opt_state_snapshot[key] = value.detach().to(snapshot_device).clone()
+                else:
+                    opt_state_snapshot[key] = value
+        
+        # ====================================================================
+        # STEP B: Compute original entropy H(θ;E) 
+        # ====================================================================
+        self.logger.debug("Computing original entropy H(θ;E)")
+        
+        # Compute log probabilities for E batch with original model
+        with torch.no_grad():
+            model.eval()
+            S_orig = self._compute_logprobs_microbatched(E_batch, importance_mb_size)
+        
+        # Compute sequence-level entropy
+        H_orig = -S_orig.mean().item()
+        
+        # Compute per-token entropy if requested
+        H_orig_tok = None
+        if report_per_token:
+            lengths = self._get_generation_lengths(E_batch)
+            total_tokens = lengths.sum().item() 
+            H_orig_tok = -S_orig.sum().item() / total_tokens if total_tokens > 0 else 0.0
+        
+        self.logger.info(f"Original entropy: H(θ;E) = {H_orig:.6f}")
+        
+        # ====================================================================
+        # STEP C: Take one optimizer step on U batch
+        # ====================================================================
+        self.logger.debug("Taking optimizer step on U batch")
+        
+        # Accumulate gradients from U batch using microbatched training loss
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        
+        total_loss = 0.0
+        total_tokens = 0
+        
+        # Process U batch in microbatches
+        for microbatch in self._iter_microbatches(U_batch, importance_mb_size):
+            mb_loss, mb_tokens = self._compute_training_loss_microbatch(microbatch, training_loss)
+            
+            # Backward pass per microbatch
+            mb_loss.backward()
+            
+            total_loss += mb_loss.item() * mb_tokens
+            total_tokens += mb_tokens
+        
+        # Normalize gradients by total tokens for mean loss semantics
+        if total_tokens > 0:
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.div_(total_tokens)
+        
+        # Take optimizer step
+        optimizer.step()
+        
+        self.logger.info(f"Optimizer step completed: avg_loss = {total_loss/total_tokens:.6f}")
+        
+        # ====================================================================
+        # STEP D: Compute updated entropy H(θ⁺;E) via importance sampling
+        # ====================================================================
+        self.logger.debug("Computing updated entropy H(θ⁺;E) via importance sampling")
+        
+        # Compute log probabilities for E batch with updated model
+        with torch.no_grad():
+            model.eval()
+            S_upd = self._compute_logprobs_microbatched(E_batch, importance_mb_size)
+        
+        # Compute IS weights: logw = S_upd - S_orig (in log domain)
+        logw = S_upd - S_orig  # [batch_size, G]
+        
+        # Apply importance sampling estimator
+        if is_mode == "snis":
+            # Self-normalized importance sampling
+            is_results = self._compute_snis_two_batch(S_upd, logw, report_per_token, E_batch)
+        elif is_mode == "clip":
+            # Clipped importance sampling  
+            is_results = self._compute_clip_is_two_batch(S_upd, logw, clip_c, report_per_token, E_batch)
+        else:
+            raise ValueError(f"Unknown is_mode: {is_mode}")
+        
+        H_upd = is_results['H_upd']
+        H_upd_tok = is_results.get('H_upd_tok')
+        
+        self.logger.info(f"Updated entropy: H(θ⁺;E) = {H_upd:.6f}")
+        
+        # ====================================================================
+        # STEP F: Restore model and optimizer state
+        # ====================================================================
+        self.logger.debug("Restoring model and optimizer state")
+        
+        # Restore model parameters
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                param.data.copy_(cpu_snaps[name].to(param.device))
+        
+        # Restore optimizer state
+        if opt_state_snapshot is not None:
+            try:
+                # Reconstruct state dict and load
+                restored_state = {}
+                for key, value in opt_state_snapshot.items():
+                    if isinstance(value, dict):
+                        restored_state[key] = {}
+                        for param_key, param_value in value.items():
+                            if isinstance(param_value, torch.Tensor):
+                                # Move back to original device
+                                restored_state[key][param_key] = param_value.to(optimizer.param_groups[0]['params'][0].device)
+                            else:
+                                restored_state[key][param_key] = param_value
+                    else:
+                        restored_state[key] = value
+                        
+                optimizer.load_state_dict(restored_state)
+            except Exception as e:
+                self.logger.warning(f"Failed to restore optimizer state: {e}")
+        
+        # Clear any remaining gradients
+        optimizer.zero_grad(set_to_none=True)
+        
+        # ====================================================================
+        # STEP G: Compute ground-truth entropy change
+        # ====================================================================
+        deltaH_true = H_upd - H_orig
+        deltaH_true_tok = (H_upd_tok - H_orig_tok) if H_upd_tok is not None and H_orig_tok is not None else None
+        
+        compute_time = time.time() - start_time
+        
+        self.logger.info(f"Ground-truth entropy change: ΔH_true = {deltaH_true:.10f}")
+        if deltaH_true_tok is not None:
+            self.logger.info(f"Per-token entropy change: ΔH_true_tok = {deltaH_true_tok:.10f}")
+        
+        # Return results
+        results = {
+            'H_orig': H_orig,
+            'H_upd': H_upd, 
+            'deltaH_true': deltaH_true,
+            'timing': {
+                'total_time': compute_time
+            },
+            'diagnostics': {
+                'is_mode': is_mode,
+                'training_loss': training_loss,
+                'total_tokens': total_tokens,
+                **is_results.get('diagnostics', {})
+            }
+        }
+        
+        # Add per-token results if computed
+        if deltaH_true_tok is not None:
+            results.update({
+                'H_orig_tok': H_orig_tok,
+                'H_upd_tok': H_upd_tok,
+                'deltaH_true_tok': deltaH_true_tok
+            })
+        
+        return results
+    
+    def _compute_logprobs_microbatched(self, batch: Dict[str, Any], mb_size: int) -> torch.Tensor:
+        """Compute log probabilities using microbatched forward passes."""
+        sequences = batch['sequences']  # [batch_size, G, max_len]
+        prompt_lens = batch['prompt_lens']  # [batch_size]
+        attention_masks = batch['attention_masks']  # [batch_size, G, max_len]
+        batch_size = len(sequences)
+        
+        all_logprobs = []
+        
+        # Process each prompt individually to bound memory
+        for b in range(batch_size):
+            seq_b = sequences[b]  # [G, max_len]
+            mask_b = attention_masks[b]  # [G, max_len]
+            prompt_len = prompt_lens[b]
+            
+            # Compute logprobs for this prompt's sequences
+            logprobs_b = self._compute_logprobs_for_sequences(seq_b, prompt_len, mask_b, mb_size)
+            all_logprobs.append(logprobs_b)
+        
+        return torch.stack(all_logprobs, dim=0)  # [batch_size, G]
+    
+    def _compute_snis_two_batch(self, S_upd: torch.Tensor, logw: torch.Tensor,
+                               report_per_token: bool, E_batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute SNIS entropy estimate for two-batch method."""
+        # Stabilize weights in log domain
+        logw_max = logw.max()
+        w_shift = torch.exp(logw - logw_max)  # [batch_size, G]
+        
+        # SNIS entropy estimate
+        w_sum = w_shift.sum()
+        wS_sum = (w_shift * S_upd).sum()
+        H_upd = -wS_sum / w_sum
+        
+        results = {
+            'H_upd': H_upd.item(),
+            'diagnostics': {
+                'ESS': (w_sum**2 / (w_shift**2).sum()).item(),
+                'w_max': w_shift.max().item(),
+                'w_min': w_shift.min().item()
+            }
+        }
+        
+        # Per-token estimate if requested
+        if report_per_token:
+            lengths = self._get_generation_lengths(E_batch)  # [batch_size, G]
+            wL_sum = (w_shift * lengths).sum()
+            H_upd_tok = -wS_sum / wL_sum if wL_sum > 0 else 0.0
+            results['H_upd_tok'] = H_upd_tok.item()
+        
+        return results
+    
+    def _compute_clip_is_two_batch(self, S_upd: torch.Tensor, logw: torch.Tensor,
+                                  clip_c: float, report_per_token: bool, E_batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute clipped IS entropy estimate for two-batch method.""" 
+        # Convert to linear weights and clip
+        w = torch.exp(logw)  # [batch_size, G]
+        w_clipped = torch.clamp(w, max=clip_c)
+        
+        # Clipped IS entropy estimate
+        w_sum = w_clipped.sum()
+        wS_sum = (w_clipped * S_upd).sum()
+        H_upd = -wS_sum / w_sum
+        
+        results = {
+            'H_upd': H_upd.item(),
+            'diagnostics': {
+                'ESS': (w_sum**2 / (w_clipped**2).sum()).item(),
+                'clipped_fraction': (w > clip_c).float().mean().item(),
+                'w_max': w_clipped.max().item()
+            }
+        }
+        
+        # Per-token estimate if requested
+        if report_per_token:
+            lengths = self._get_generation_lengths(E_batch)  # [batch_size, G]
+            wL_sum = (w_clipped * lengths).sum()
+            H_upd_tok = -wS_sum / wL_sum if wL_sum > 0 else 0.0
+            results['H_upd_tok'] = H_upd_tok.item()
+        
+        return results
+    
+    def _compute_training_loss_microbatch(self, microbatch: Dict[str, Any], training_loss: str) -> Tuple[torch.Tensor, int]:
+        """Compute training loss for a microbatch."""
+        if training_loss == "nll":
+            # Use negative log-likelihood (teacher forcing) loss
+            return self._compute_nll_loss_microbatch(microbatch)
+        elif training_loss == "rl":
+            # TODO: Implement RL loss when available
+            self.logger.warning("RL training loss not implemented, falling back to NLL")
+            return self._compute_nll_loss_microbatch(microbatch)
+        else:
+            raise ValueError(f"Unknown training_loss: {training_loss}")
+    
+    def _compute_nll_loss_microbatch(self, microbatch: Dict[str, Any]) -> Tuple[torch.Tensor, int]:
+        """Compute NLL loss for a microbatch."""
+        sequences = microbatch['sequences']  # [mb_size, G, max_len]  
+        attention_masks = microbatch['attention_masks']  # [mb_size, G, max_len]
+        prompt_lens = microbatch['prompt_lens']  # [mb_size]
+        
+        mb_size, G, max_len = sequences.shape
+        total_loss = 0.0
+        total_tokens = 0
+        
+        # Process each prompt in microbatch
+        for b in range(mb_size):
+            for g in range(G):
+                seq = sequences[b, g]  # [max_len]
+                mask = attention_masks[b, g]  # [max_len]
+                prompt_len = prompt_lens[b]
+                
+                # Forward pass
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                    logits = self.model(seq.unsqueeze(0)).logits  # [1, max_len, vocab_size]
+                
+                # Compute NLL loss for generation tokens
+                targets = seq[1:prompt_len].unsqueeze(0)  # [1, gen_len] 
+                logits_gen = logits[0, prompt_len-1:prompt_len-1+len(targets)]  # [gen_len, vocab_size]
+                
+                if len(targets) > 0:
+                    loss = F.cross_entropy(logits_gen, targets[0], reduction='sum')
+                    total_loss += loss
+                    total_tokens += len(targets)
+        
+        # Return mean loss for this microbatch and token count
+        return total_loss / max(total_tokens, 1), total_tokens
+    
+    def _get_generation_lengths(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """Get generation lengths for per-token entropy computation."""
+        if 'gen_lengths' in batch:
+            return batch['gen_lengths']
+        
+        # Fallback: compute from sequences and attention masks
+        sequences = batch['sequences']  # [batch_size, G, max_len]
+        attention_masks = batch['attention_masks']  # [batch_size, G, max_len]
+        prompt_lens = batch['prompt_lens']  # [batch_size]
+        
+        batch_size, G, max_len = sequences.shape
+        gen_lengths = torch.zeros(batch_size, G, dtype=torch.long, device=sequences.device)
+        
+        for b in range(batch_size):
+            for g in range(G):
+                mask = attention_masks[b, g]  # [max_len]
+                prompt_len = prompt_lens[b]
+                gen_mask = mask[prompt_len:]  # Generation portion
+                gen_lengths[b, g] = gen_mask.sum()
+        
+        return gen_lengths
+    
+    def _iter_microbatches(self, batch: Dict[str, Any], mb_size: int):
+        """Iterate over microbatches by slicing along prompt dimension."""
+        batch_size = len(batch['sequences'])
+        
+        for start_idx in range(0, batch_size, mb_size):
+            end_idx = min(start_idx + mb_size, batch_size)
+            microbatch = {}
+            
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    microbatch[key] = value[start_idx:end_idx]
+                elif isinstance(value, (list, tuple)):
+                    microbatch[key] = value[start_idx:end_idx]
+                else:
+                    microbatch[key] = value
+            
+            yield microbatch

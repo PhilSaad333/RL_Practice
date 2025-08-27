@@ -1532,3 +1532,195 @@ class ProbeComponents:
         
         self.logger.info(f"Y accumulation complete: {B_local} prompts processed")
         return sum_Y_buf, B_local
+    
+    # ========================================================================
+    # STAGE 2: Variance Computation - Helper Methods
+    # ========================================================================
+    
+    def dot_param_grad_minus_mean_with(self, direction_buf: Dict[int, torch.Tensor], 
+                                     mean_buf: Dict[int, torch.Tensor]) -> float:
+        """
+        Compute dot product of (current param.grad - mean_buf) with direction_buf.
+        
+        This is used for scalar projections in variance computation:
+        proj = (X_u - μ_X) · μ_Y  or  (Y_u - μ_Y) · μ_X
+        
+        Args:
+            direction_buf: Direction buffer (e.g., μ_Y for X variance)
+            mean_buf: Mean buffer to subtract (e.g., μ_X for X variance) 
+            
+        Returns:
+            Scalar projection as float
+        """
+        total_proj = 0.0
+        for param in self.model.parameters():
+            if param.requires_grad and param.grad is not None:
+                param_id = id(param)
+                if param_id in direction_buf and param_id in mean_buf:
+                    # Convert grad to CPU fp32 for computation
+                    grad = param.grad.detach().to('cpu', dtype=torch.float32)
+                    
+                    # Compute (grad - mean) dot direction
+                    diff = grad - mean_buf[param_id]
+                    dot_contrib = (diff * direction_buf[param_id]).sum().item()
+                    total_proj += dot_contrib
+                    
+        return total_proj
+    
+    # ========================================================================
+    # STAGE 2: Variance Computation - V_X and V_Y Methods
+    # ========================================================================
+    
+    def compute_VX(self, E_batch: Dict[str, Any], muX_buf: Dict[int, torch.Tensor], 
+                   muY_buf: Dict[int, torch.Tensor], mb_size_prompts: int, 
+                   weighting_mode: str = "dr_grpo") -> float:
+        """
+        Compute V_X variance component via per-unit scalar projections.
+        
+        V_X = [1/(B_E(B_E-1))] Σ_n [(X_n - μ_X) · μ_Y]²
+        
+        Args:
+            E_batch: Evaluation batch (same as used for X accumulation)
+            muX_buf: Mean X buffer (I^X from Stage 1)
+            muY_buf: Mean Y buffer (I^Y from Stage 1)  
+            mb_size_prompts: Microbatch size for processing
+            weighting_mode: Weighting mode for X-loss
+            
+        Returns:
+            V_X_local as float (for all-reduce in driver)
+        """
+        sum_sq_proj_X = 0.0
+        
+        # Check if model is wrapped in DDP for no_sync context
+        is_ddp = hasattr(self.model, 'no_sync')
+        no_sync_context = self.model.no_sync if is_ddp else nullcontext
+        
+        self.logger.debug("Computing V_X via per-unit scalar projections")
+        
+        # Process each prompt unit individually (not microbatched for variance)
+        with no_sync_context():  # Prevent DDP gradient averaging
+            for unit in self._iter_units(E_batch):
+                # Clear gradients
+                self.model.zero_grad(set_to_none=True)
+                
+                # Forward pass with teacher forcing for single unit
+                S_dict = self._teacher_force_logprobs(unit)
+                
+                # Build X-loss for this unit
+                L_X_u = self.build_LX_from_S(S_dict, weighting_mode)
+                
+                # Backward pass - get raw X_u in param.grad
+                L_X_u.backward()
+                
+                # Compute projection: (X_u - μ_X) · μ_Y
+                proj = self.dot_param_grad_minus_mean_with(muY_buf, muX_buf)
+                
+                # Accumulate squared projection
+                sum_sq_proj_X += proj * proj
+                
+                # Clear gradients for next unit
+                self.model.zero_grad(set_to_none=True)
+        
+        # Note: Global B_E and division by B_E(B_E-1) handled in driver
+        # This returns the local contribution
+        self.logger.info(f"V_X computation complete: sum_sq_proj_X = {sum_sq_proj_X:.6f}")
+        return sum_sq_proj_X
+    
+    def compute_VY(self, U_batch: Dict[str, Any], muX_buf: Dict[int, torch.Tensor],
+                   muY_buf: Dict[int, torch.Tensor], mb_size_prompts: int,
+                   adam_preconditioner) -> float:
+        """
+        Compute V_Y variance component via per-unit scalar projections.
+        
+        V_Y = [1/(B_U(B_U-1))] Σ_p [(Y_p - μ_Y) · μ_X]²
+        
+        Args:
+            U_batch: Update batch (same as used for Y accumulation)  
+            muX_buf: Mean X buffer (I^X from Stage 1)
+            muY_buf: Mean Y buffer (I^Y from Stage 1)
+            mb_size_prompts: Microbatch size for processing
+            adam_preconditioner: Preconditioner to apply after backward()
+            
+        Returns:
+            V_Y_local as float (for all-reduce in driver)
+        """
+        sum_sq_proj_Y = 0.0
+        
+        # Check if model is wrapped in DDP for no_sync context
+        is_ddp = hasattr(self.model, 'no_sync')
+        no_sync_context = self.model.no_sync if is_ddp else nullcontext
+        
+        self.logger.debug("Computing V_Y via per-unit scalar projections")
+        
+        # Process each prompt unit individually 
+        with no_sync_context():  # Prevent DDP gradient averaging
+            for unit in self._iter_units(U_batch):
+                # Clear gradients
+                self.model.zero_grad(set_to_none=True)
+                
+                # Forward pass with teacher forcing for single unit
+                S_dict = self._teacher_force_logprobs(unit)
+                
+                # Build Y-loss for this unit
+                L_Y_u = self.build_LY_from_S(S_dict)
+                
+                # Backward pass - get raw ∇J in param.grad
+                L_Y_u.backward()
+                
+                # Apply preconditioner in-place: grad ← P(grad)
+                for param in self.model.parameters():
+                    if param.requires_grad and param.grad is not None:
+                        preconditioned_grad = adam_preconditioner.apply_preconditioner(param.grad, param)
+                        param.grad.copy_(preconditioned_grad)
+                
+                # Compute projection: (Y_u - μ_Y) · μ_X  
+                proj = self.dot_param_grad_minus_mean_with(muX_buf, muY_buf)
+                
+                # Accumulate squared projection
+                sum_sq_proj_Y += proj * proj
+                
+                # Clear gradients for next unit
+                self.model.zero_grad(set_to_none=True)
+        
+        # Note: Global B_U and division by B_U(B_U-1) handled in driver
+        # This returns the local contribution
+        self.logger.info(f"V_Y computation complete: sum_sq_proj_Y = {sum_sq_proj_Y:.6f}")
+        return sum_sq_proj_Y
+    
+    def _iter_units(self, batch_dict: Dict[str, Any]):
+        """
+        Iterate over individual prompt units (single prompts).
+        
+        Args:
+            batch_dict: Batch dictionary with tensors/lists indexed by prompt
+            
+        Yields:
+            Unit dictionaries with single prompt data
+        """
+        # Determine batch size
+        if 'sequences' in batch_dict:
+            batch_size = len(batch_dict['sequences'])
+        elif 'advantages' in batch_dict and hasattr(batch_dict['advantages'], 'shape'):
+            batch_size = batch_dict['advantages'].shape[0]
+        elif 'max_lengths' in batch_dict:
+            batch_size = len(batch_dict['max_lengths'])
+        else:
+            raise ValueError("Cannot determine batch size from batch_dict")
+        
+        # Iterate over individual units (prompts)
+        for idx in range(batch_size):
+            unit = {}
+            
+            # Extract single prompt data
+            for key, value in batch_dict.items():
+                if isinstance(value, torch.Tensor):
+                    # Extract single prompt: [idx] -> [1, ...] to maintain batch dimension
+                    unit[key] = value[idx:idx+1]
+                elif isinstance(value, (list, tuple)):
+                    # Extract single element but keep as list for compatibility
+                    unit[key] = [value[idx]]
+                else:
+                    # Keep scalar values as-is
+                    unit[key] = value
+            
+            yield unit
