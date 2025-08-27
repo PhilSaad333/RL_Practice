@@ -41,6 +41,13 @@ importance:
   importance_microbatch_size: 1     # Conservative for stability
   report_per_token: false           # Disable for faster computation
 
+# Importance sampling details
+importance_sampling:
+  use_snis: true                    # Use self-normalized importance sampling
+  use_psis: false                   # Don't use Pareto-smoothed importance sampling
+  ess_threshold: 0.5                # Effective sample size threshold
+  resample_on_low_ess: false        # Don't resample on low ESS
+
 # Memory and performance - H100 optimized
 memory_config:
   microbatch_size: 2                # Larger microbatches for H100
