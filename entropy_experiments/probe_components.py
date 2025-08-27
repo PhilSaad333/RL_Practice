@@ -455,7 +455,7 @@ class ProbeComponents:
         """Extract learning rate, prioritizing config over optimizer."""
         # Check config first - this allows manual override
         if 'learning_rate' in self.config:
-            lr = self.config['learning_rate']
+            lr = float(self.config['learning_rate'])  # Ensure it's a float
             self.logger.info(f"🔍 [LR] Using learning rate from config: {lr:.2e}")
             return lr
         elif optimizer is not None:
