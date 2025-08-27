@@ -87,7 +87,7 @@ def extract_key_metrics(results, config):
     # Fractional variance = Var(δH₁) / δH₁² = lr² * (V_X + V_Y) / δH₁²
     # = lr² * (V_X + V_Y) / (lr * bars_dot)² = (V_X + V_Y) / bars_dot²
     if metrics['V_X'] is not None and metrics['V_Y'] is not None and metrics['deltaH1'] != 0:
-        learning_rate = config.get('learning_rate', 2e-6)  # Use config learning rate
+        learning_rate = float(config.get('learning_rate', 2e-6))  # Use config learning rate, ensure float
         bars_dot = metrics['deltaH1'] / learning_rate
         metrics['frac_var'] = (metrics['V_X'] + metrics['V_Y']) / (bars_dot ** 2)
     else:
