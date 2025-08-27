@@ -1,0 +1,89 @@
+# Debug config for testing metrics parsing - very small batch sizes for fast runs
+# Core sampling parameters - tiny for debugging
+batch_config:
+  B: 16                              # Small batch size 
+  B_E: 8                             # Small evaluation batch 
+  B_U: 8                             # Small update batch
+  G: 2                               # Few generations per prompt
+  rollout_batch_size: 8              # Small rollout batch
+  dataset_name: "gsm8k_r1_template" 
+  split: "train"
+
+# Probe computation mode
+probe_config:
+  mode: "exact"                      # Use exact computation
+  M: null                            
+
+# NEW: Test conditional variance estimator only
+probe_rework:
+  mb_size_prompts: 2                 # Very small microbatch for debugging
+  buffers_dtype: "float32"           
+  weighting_mode: "dr_grpo"          
+  
+  # Test ONLY the new conditional variance estimator
+  compute_vx_vy_variance: false      # Turn OFF original V_X + V_Y 
+  compute_conditional_variance: true # Turn ON new V_E|U estimator
+  compute_importance_sampling: false # Turn OFF expensive importance sampling
+  
+  ddp_allreduce: true                # Enable for multi-GPU
+  master_seed: 42                    
+
+# Multi-GPU settings
+distributed:
+  find_unused_parameters: true      # Required for DDP
+  reduce_dtype: "float32"           
+  barriers: true                    
+
+# Stage 2 Importance Sampling Configuration (disabled)
+importance:
+  enabled: false                    # Disable Stage 2 two-batch ground-truth
+  is_mode: "snis"                   # Self-normalized importance sampling
+  clip_c: 10.0                      # Clipping constant (unused for SNIS)
+  training_loss: "rl"               # Use RL-aligned training loss
+  rl_grad_accum: 1                  # RL gradient accumulation steps
+  snapshot_device: "cpu"            # CPU snapshots to save VRAM
+  importance_microbatch_size: 2     # Microbatch size
+  report_per_token: false           # Disable for faster computation
+
+# Importance sampling details
+importance_sampling:
+  use_snis: true                    # Use self-normalized importance sampling
+  use_psis: false                   # Don't use Pareto-smoothed importance sampling
+  ess_threshold: 0.5                # Effective sample size threshold
+  resample_on_low_ess: false        # Don't resample on low ESS
+
+# Statistics configuration
+stats_config:
+  compute_plugin_se: true           # Compute plug-in variance estimates
+  compute_jackknife_se: false       # Skip jackknife (computationally expensive)
+
+# Memory settings - small for debugging
+memory_config:
+  microbatch_size: 2                 # Small for debugging
+  teacher_force_microbatch_size: 4   # Small for debugging
+  amp: true                          # Use mixed precision
+  dtype: "bfloat16"                  # H100 optimized
+
+# Learning rate
+learning_rate: 2e-6                  # Match the checkpoint's lr
+
+# Use our step_40 checkpoint with optimizer states
+checkpoint:
+  checkpoint_path: "/home/ubuntu/localfs/stage3_checkpoints/step_40"
+  optimizer_path: "/home/ubuntu/localfs/stage3_checkpoints/step_40/optimizer.pt"
+  model_config_path: "Qwen/Qwen2.5-1.5B"
+
+# Generation settings
+generation:
+  max_new_tokens: 100                # Short for quick test
+  temperature: 0.7
+  top_p: 1.0
+  do_sample: true
+  pad_token_id: null
+
+# Output settings
+output:
+  save_results: true
+  results_path: "debug_metrics_results.json"
+  log_level: "INFO"                 
+  save_samples: false
