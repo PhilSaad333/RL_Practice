@@ -479,9 +479,23 @@ class OfflineEntropyProbe:
             # Initialize components
             self._initialize_components()
             
-            # Get config parameters
-            B_E = self.config['batch_config'].get('B_E', self.config['batch_config']['B'])
-            B_U = self.config['batch_config'].get('B_U', self.config['batch_config']['B'])
+            # Get config parameters - handle unified B_E_values format
+            batch_config = self.config['batch_config']
+            
+            # Handle B_E: could be direct value or from B_E_values list
+            if 'B_E' in batch_config:
+                B_E = batch_config['B_E']
+            elif 'B_E_values' in batch_config:
+                B_E_values = batch_config['B_E_values']
+                B_E = B_E_values[0] if isinstance(B_E_values, list) else B_E_values
+            else:
+                raise KeyError("Config must contain either 'B_E' or 'B_E_values' in batch_config")
+                
+            # Handle B_U: direct value
+            if 'B_U' in batch_config:
+                B_U = batch_config['B_U']  
+            else:
+                raise KeyError("Config must contain 'B_U' in batch_config")
             mb_size_prompts = self.config.get('probe_rework', {}).get('mb_size_prompts', 2)
             weighting_mode = self.config.get('probe_rework', {}).get('weighting_mode', 'dr_grpo')
             
