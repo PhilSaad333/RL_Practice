@@ -1013,7 +1013,9 @@ class ProbeComponents:
                     if param.requires_grad and param.grad is not None:
                         param_id = id(param)
                         if param_id in muY_buf:
-                            s_n += (param.grad * muY_buf[param_id]).sum().item()
+                            # Ensure both tensors are on same device
+                            muY_param = muY_buf[param_id].to(param.grad.device)
+                            s_n += (param.grad * muY_param).sum().item()
                 
                 # Accumulate statistics
                 sum_s_local += s_n
