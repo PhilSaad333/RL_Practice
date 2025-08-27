@@ -1,0 +1,87 @@
+# 🧪 Sanity Check Configuration
+# For validation runs to ensure probe is working correctly
+# Single B_E value with many runs for statistical analysis
+
+# Core batch configuration - validation focused
+batch_config:
+  B_E_values: [256]                    # Single value for validation
+  B_U: 32                              # Standard B_U
+  runs_per_batch: 15                   # Many runs for statistics
+  G: 8                                 # Standard generations
+  rollout_batch_size: 64               # Higher batch for validation
+  dataset_name: "gsm8k_r1_template"
+  split: "train"
+
+# Probe computation mode
+probe_config:
+  mode: "exact"
+  M: null
+
+# Probe analysis - validation mode can test all estimators
+probe_rework:
+  mb_size_prompts: 4                   # Slightly larger for validation
+  buffers_dtype: "float32"
+  weighting_mode: "dr_grpo"
+  
+  # For sanity check, we can test all variance estimators
+  compute_vx_vy_variance: true         # Test old V_X + V_Y estimator
+  compute_conditional_variance: true   # Test new V_E|U estimator
+  compute_importance_sampling: true    # Test importance sampling
+  
+  ddp_allreduce: false
+  master_seed: 42
+
+# Single-GPU settings
+distributed:
+  find_unused_parameters: false
+  reduce_dtype: "float32"
+  barriers: false
+
+# Enable importance sampling for validation
+importance:
+  enabled: true                        # Enable for comprehensive validation
+  is_mode: "snis"
+  clip_c: 10.0
+  training_loss: "rl"
+  rl_grad_accum: 1
+  snapshot_device: "cpu"
+  importance_microbatch_size: 2
+  report_per_token: false
+
+importance_sampling:
+  use_snis: true
+  use_psis: false
+  ess_threshold: 0.5
+  resample_on_low_ess: false
+
+# Statistics configuration
+stats_config:
+  compute_plugin_se: true
+  compute_jackknife_se: true           # Enable jackknife for validation
+
+# Memory settings - validation can use more memory
+memory_config:
+  microbatch_size: 4                   # Larger for validation
+  teacher_force_microbatch_size: 4
+  amp: true
+  dtype: "bfloat16"
+
+learning_rate: 2e-6
+
+checkpoint:
+  checkpoint_path: ""
+  optimizer_path: ""
+  model_config_path: "Qwen/Qwen2.5-1.5B"
+
+generation:
+  max_new_tokens: 50
+  temperature: 0.7
+  top_p: 1.0
+  do_sample: true
+  pad_token_id: null
+
+output:
+  save_results: true
+  results_path: ""
+  log_level: "INFO"
+  save_samples: false

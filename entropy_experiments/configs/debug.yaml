@@ -1,0 +1,87 @@
+# 🔍 Debug Configuration
+# For detailed debugging and analysis with full logging
+# Captures gradient information, parameter states, and timing
+
+# Core batch configuration - debug optimized
+batch_config:
+  B_E_values: [16, 32]                 # Small values for quick debug iterations
+  B_U: 32
+  runs_per_batch: 1                    # Single run for debugging
+  G: 4                                 # Fewer generations for faster debugging
+  rollout_batch_size: 16               # Smaller for debug visibility
+  dataset_name: "gsm8k_r1_template"
+  split: "train"
+
+# Probe computation mode
+probe_config:
+  mode: "exact"
+  M: null
+
+# Probe analysis - debug mode tests all estimators with full logging
+probe_rework:
+  mb_size_prompts: 2                   # Small for detailed logging
+  buffers_dtype: "float32"             # Full precision for debug accuracy
+  weighting_mode: "dr_grpo"
+  
+  # Debug mode enables all estimators for comparison
+  compute_vx_vy_variance: true         # Test old estimator
+  compute_conditional_variance: true   # Test new estimator
+  compute_importance_sampling: true    # Test importance sampling
+  
+  ddp_allreduce: false
+  master_seed: 42                      # Fixed seed for reproducible debugging
+
+# Single-GPU settings
+distributed:
+  find_unused_parameters: false
+  reduce_dtype: "float32"
+  barriers: false
+
+# Enable importance sampling for comprehensive debugging
+importance:
+  enabled: true                        # Enable for debug comparison
+  is_mode: "snis"
+  clip_c: 10.0
+  training_loss: "rl"
+  rl_grad_accum: 1
+  snapshot_device: "cpu"
+  importance_microbatch_size: 2
+  report_per_token: false
+
+importance_sampling:
+  use_snis: true
+  use_psis: false
+  ess_threshold: 0.5
+  resample_on_low_ess: false
+
+# Statistics configuration - full debugging
+stats_config:
+  compute_plugin_se: true
+  compute_jackknife_se: true           # Enable for debug comparison
+
+# Memory settings - debug focused
+memory_config:
+  microbatch_size: 1                   # Smallest for maximum debug visibility
+  teacher_force_microbatch_size: 1     # Match microbatch
+  amp: false                           # Disable AMP for debug precision
+  dtype: "float32"                     # Full precision for debugging
+
+learning_rate: 2e-6
+
+checkpoint:
+  checkpoint_path: ""
+  optimizer_path: ""
+  model_config_path: "Qwen/Qwen2.5-1.5B"
+
+generation:
+  max_new_tokens: 25                   # Shorter for faster debug iterations
+  temperature: 0.7
+  top_p: 1.0
+  do_sample: true
+  pad_token_id: null
+
+output:
+  save_results: true
+  results_path: ""
+  log_level: "DEBUG"                   # Always debug level for debug mode
+  save_samples: true                   # Save samples for debugging

@@ -1,0 +1,91 @@
+# Single test config for batch size convergence analysis
+# Start with B_E=256, B_U=32 to test basic functionality
+
+# Core sampling parameters - reasonable size for single test
+batch_config:
+  B: 288                             # B_E + B_U = 256 + 32
+  B_E: 256                           # Evaluation batch 
+  B_U: 32                            # Update batch (fixed)
+  G: 8                               # Standard generations per prompt
+  rollout_batch_size: 32             # Reasonable rollout batch
+  dataset_name: "gsm8k_r1_template" 
+  split: "train"
+
+# Probe computation mode
+probe_config:
+  mode: "exact"                      # Use exact computation
+  M: null                            
+
+# Conditional variance estimator settings
+probe_rework:
+  mb_size_prompts: 8                 # Reasonable microbatch size
+  buffers_dtype: "float32"           
+  weighting_mode: "dr_grpo"          
+  
+  # Enable ONLY the new conditional variance estimator
+  compute_vx_vy_variance: false      # Turn OFF original V_X + V_Y 
+  compute_conditional_variance: true # Turn ON new V_E|U estimator
+  compute_importance_sampling: false # Turn OFF expensive importance sampling
+  
+  ddp_allreduce: false               # Single GPU
+  master_seed: 42                    
+
+# Single-GPU settings  
+distributed:
+  find_unused_parameters: false     # Single GPU
+  reduce_dtype: "float32"           
+  barriers: false                   
+
+# Stage 2 Importance Sampling Configuration (disabled)
+importance:
+  enabled: false                    # Disable Stage 2 two-batch ground-truth
+  is_mode: "snis"                   
+  clip_c: 10.0                      
+  training_loss: "rl"               
+  rl_grad_accum: 1                  
+  snapshot_device: "cpu"            
+  importance_microbatch_size: 2     
+  report_per_token: false           
+
+# Importance sampling details (disabled)
+importance_sampling:
+  use_snis: true                    
+  use_psis: false                   
+  ess_threshold: 0.5                
+  resample_on_low_ess: false        
+
+# Statistics configuration
+stats_config:
+  compute_plugin_se: true           
+  compute_jackknife_se: false       
+
+# Memory settings - reasonable for H100
+memory_config:
+  microbatch_size: 8                 # Standard microbatch
+  teacher_force_microbatch_size: 16  # Teacher forcing microbatch
+  amp: true                          
+  dtype: "bfloat16"                  
+
+# Learning rate - use the good value
+learning_rate: 2e-4                  # Use the larger learning rate that worked well
+
+# Use our step_40 checkpoint with optimizer states
+checkpoint:
+  checkpoint_path: "/lambda/nfs/localfs/training_runs/run_2025-08-21_07-09-53/training_state/step_40"
+  optimizer_path: "/lambda/nfs/localfs/training_runs/run_2025-08-21_07-09-53/training_state/step_40/optimizer.pt" 
+  model_config_path: "Qwen/Qwen2.5-1.5B"
+
+# Generation settings
+generation:
+  max_new_tokens: 200                
+  temperature: 0.7
+  top_p: 1.0
+  do_sample: true
+  pad_token_id: null
+
+# Output settings
+output:
+  save_results: true
+  results_path: "single_batch_test_results.json"
+  log_level: "INFO"                  # Less verbose logging
+  save_samples: false
