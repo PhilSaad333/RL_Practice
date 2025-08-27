@@ -69,6 +69,19 @@ def extract_key_metrics(results):
         'runtime': sum(results.get('timing', {}).values()),
     }
     
+    # Extract importance sampling diagnostics
+    diagnostics = results.get('diagnostics', {})
+    if diagnostics:
+        metrics['w_max'] = diagnostics.get('w_max')
+        metrics['w_min'] = diagnostics.get('w_min')
+        metrics['clipped_fraction'] = diagnostics.get('clipped_fraction')
+        metrics['w_sum_global'] = diagnostics.get('w_sum_global')
+    else:
+        metrics['w_max'] = None
+        metrics['w_min'] = None
+        metrics['clipped_fraction'] = None
+        metrics['w_sum_global'] = None
+    
     # Compute fractional variance: (V_X + V_Y) / δH₁²
     if metrics['V_X'] is not None and metrics['V_Y'] is not None and metrics['deltaH1'] != 0:
         metrics['frac_var'] = (metrics['V_X'] + metrics['V_Y']) / (metrics['deltaH1'] ** 2)
@@ -129,6 +142,18 @@ def run_sanity_check(config_path: str, checkpoint_path: str, n_runs: int, rank: 
                 logger.info(f"  Bias: {metrics['bias']:.6f}")
             if metrics['frac_var'] is not None:
                 logger.info(f"  Frac_var: {metrics['frac_var']:.6f}")
+            if metrics['ESS'] is not None:
+                logger.info(f"  ESS: {metrics['ESS']:.1f}")
+            
+            # Importance sampling ratio diagnostics  
+            if metrics['w_max'] is not None and metrics['w_min'] is not None:
+                logger.info(f"  IS ratios: [{metrics['w_min']:.3f}, {metrics['w_max']:.3f}]")
+                ratio_range = metrics['w_max'] / metrics['w_min'] if metrics['w_min'] > 0 else float('inf')
+                logger.info(f"  Ratio range: {ratio_range:.1f}x")
+                
+                if metrics['clipped_fraction'] is not None:
+                    logger.info(f"  Clipped: {metrics['clipped_fraction']:.1%}")
+                    
             logger.info(f"  Runtime: {metrics['runtime']:.1f}s")
             
             # Quick feedback on targets
@@ -139,6 +164,15 @@ def run_sanity_check(config_path: str, checkpoint_path: str, n_runs: int, rank: 
                     logger.info(f"  ⚠️  Fractional variance acceptable")
                 else:
                     logger.info(f"  ❌ Fractional variance high - may need larger batch")
+                    
+            # IS ratio feedback
+            if metrics['w_max'] is not None and metrics['w_min'] is not None:
+                if metrics['w_max'] < 10 and metrics['w_min'] > 0.1:
+                    logger.info(f"  ✅ IS ratios look healthy")
+                elif metrics['w_max'] < 100:
+                    logger.info(f"  ⚠️  IS ratios acceptable")
+                else:
+                    logger.info(f"  ❌ Extreme IS ratios - model may be unstable")
             
             logger.info("")
     
@@ -225,6 +259,41 @@ def analyze_results(results, logger, total_time):
                 logger.info(f"  ⚠️  Distribution may have outliers")
                 logger.info(f"      → {within_2sigma}/{len(biases)} ({pct_within_2sigma:.1%}) within 2σ")
     
+    # Importance sampling ratio analysis
+    ess_values = [r['ESS'] for r in results if r['ESS'] is not None]
+    w_max_values = [r['w_max'] for r in results if r['w_max'] is not None]
+    w_min_values = [r['w_min'] for r in results if r['w_min'] is not None]
+    
+    if ess_values:
+        logger.info(f"")
+        logger.info(f"⚖️  Importance Sampling Analysis:")
+        logger.info(f"  ESS: {np.mean(ess_values):.1f} ± {np.std(ess_values):.1f}")
+        logger.info(f"  ESS range: [{min(ess_values):.1f}, {max(ess_values):.1f}]")
+        
+        if w_max_values and w_min_values:
+            logger.info(f"  Max ratio: {np.mean(w_max_values):.3f} ± {np.std(w_max_values):.3f}")
+            logger.info(f"  Min ratio: {np.mean(w_min_values):.3f} ± {np.std(w_min_values):.3f}")
+            
+            # Check for extreme ratios
+            extreme_max = [w for w in w_max_values if w > 100]
+            extreme_min = [w for w in w_min_values if w < 0.01]
+            
+            if extreme_max:
+                logger.info(f"  ⚠️  {len(extreme_max)} runs with w_max > 100")
+            if extreme_min:
+                logger.info(f"  ⚠️  {len(extreme_min)} runs with w_min < 0.01")
+        
+        # ESS health check
+        total_samples = 128 * 8  # B_E * G for current config
+        avg_ess_frac = np.mean(ess_values) / total_samples
+        if avg_ess_frac > 0.1:
+            logger.info(f"  ✅ GOOD: ESS = {avg_ess_frac:.1%} of total samples")
+        elif avg_ess_frac > 0.05:
+            logger.info(f"  ⚠️  OK: ESS = {avg_ess_frac:.1%} of total samples")
+        else:
+            logger.info(f"  ❌ LOW: ESS = {avg_ess_frac:.1%} of total samples")
+            logger.info(f"      → Poor importance sampling coverage")
+
     # Performance summary
     runtimes = [r['runtime'] for r in results]
     avg_runtime = np.mean(runtimes)
