@@ -18,7 +18,7 @@ probe_config:
 
 # NEW: Test conditional variance estimator only
 probe_rework:
-  mb_size_prompts: 6                 # Microbatch size
+  mb_size_prompts: 8                 # Microbatch size
   buffers_dtype: "float32"           
   weighting_mode: "dr_grpo"          
   
@@ -61,8 +61,8 @@ stats_config:
 
 # Memory settings - H100 optimized
 memory_config:
-  microbatch_size: 6                 # For processing
-  teacher_force_microbatch_size: 12  # For teacher forcing
+  microbatch_size: 8                 # For processing
+  teacher_force_microbatch_size: 16  # For teacher forcing
   amp: true                          # Use mixed precision
   dtype: "bfloat16"                  # H100 optimized
 

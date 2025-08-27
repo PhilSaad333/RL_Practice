@@ -124,8 +124,11 @@ def main():
     # Run test
     stdout, stderr, runtime = run_single_test_debug(config_path, checkpoint_path, output_file)
     
-    # Test parsing
-    metrics = test_parsing_logic(stdout)
+    # Test parsing on stderr (where the actual output goes)
+    print(f"📊 Stdout length: {len(stdout)} chars")
+    print(f"📊 Stderr length: {len(stderr)} chars")
+    print("🔍 Using stderr for parsing (where probe output actually goes)")
+    metrics = test_parsing_logic(stderr)
     
     # Summary
     print("\n📋 FINAL RESULTS:")

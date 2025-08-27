@@ -83,8 +83,8 @@ def run_single_test(config_path: str, checkpoint_path: str, run_id: int) -> Dict
     if result.returncode != 0:
         raise RuntimeError(f"Test failed: {result.stderr}")
     
-    # Parse results from stdout
-    lines = result.stdout.split('\n')
+    # Parse results from stderr (where probe output actually goes)
+    lines = result.stderr.split('\n')
     metrics = {
         'run_id': run_id,
         'runtime_seconds': end_time - start_time,
