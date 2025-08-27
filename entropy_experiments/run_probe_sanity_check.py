@@ -57,7 +57,7 @@ def load_config(config_path: str):
         return yaml.safe_load(f)
 
 
-def extract_key_metrics(results):
+def extract_key_metrics(results, config):
     """Extract the key metrics we care about for sanity checking."""
     metrics = {
         'deltaH1': results['deltaH1'],
@@ -87,7 +87,7 @@ def extract_key_metrics(results):
     # Fractional variance = Var(δH₁) / δH₁² = lr² * (V_X + V_Y) / δH₁²
     # = lr² * (V_X + V_Y) / (lr * bars_dot)² = (V_X + V_Y) / bars_dot²
     if metrics['V_X'] is not None and metrics['V_Y'] is not None and metrics['deltaH1'] != 0:
-        learning_rate = 2e-6  # Extract from results if available, otherwise use known value
+        learning_rate = config.get('learning_rate', 2e-6)  # Use config learning rate
         bars_dot = metrics['deltaH1'] / learning_rate
         metrics['frac_var'] = (metrics['V_X'] + metrics['V_Y']) / (bars_dot ** 2)
     else:
@@ -136,7 +136,7 @@ def run_sanity_check(config_path: str, checkpoint_path: str, n_runs: int, rank: 
         run_results = probe.run_mixed_probe()
         
         # Extract key metrics
-        metrics = extract_key_metrics(run_results)
+        metrics = extract_key_metrics(run_results, config)
         metrics['run_id'] = run_id
         results.append(metrics)
         

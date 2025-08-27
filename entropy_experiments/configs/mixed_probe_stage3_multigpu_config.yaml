@@ -61,6 +61,9 @@ memory_config:
   amp: true                         # Use automatic mixed precision
   dtype: "bfloat16"                 # H100-optimized precision
 
+# Learning rate - used consistently throughout probe computation
+learning_rate: 2e-6
+
 # Use extracted checkpoint path (will be updated after extraction)
 checkpoint:
   checkpoint_path: "TBD_AFTER_EXTRACTION"

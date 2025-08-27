@@ -452,8 +452,13 @@ class ProbeComponents:
         
                 
     def _get_learning_rate(self, optimizer: Optional[torch.optim.Optimizer] = None) -> float:
-        """Extract learning rate from optimizer for deltaH1 computation."""
-        if optimizer is not None:
+        """Extract learning rate, prioritizing config over optimizer."""
+        # Check config first - this allows manual override
+        if 'learning_rate' in self.config:
+            lr = self.config['learning_rate']
+            self.logger.info(f"🔍 [LR] Using learning rate from config: {lr:.2e}")
+            return lr
+        elif optimizer is not None:
             lr = optimizer.param_groups[0]['lr']
             self.logger.info(f"🔍 [LR] Extracted learning rate from optimizer: {lr:.2e}")
             return lr
@@ -462,9 +467,9 @@ class ProbeComponents:
             self.logger.info(f"🔍 [LR] Extracted learning rate from model.optimizer: {lr:.2e}")
             return lr
         else:
-            # Use from config as fallback
-            lr = self.config.get('learning_rate', 1e-6)  # Default fallback
-            self.logger.warning(f"🔍 [LR] Using fallback learning rate: {lr:.2e} (may be incorrect!)")
+            # Final fallback
+            lr = 1e-6
+            self.logger.warning(f"🔍 [LR] Using default fallback learning rate: {lr:.2e}")
             return lr
     
     # ========================================================================
