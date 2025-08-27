@@ -36,7 +36,8 @@ importance:
   enabled: true                     # Enable Stage 2 two-batch ground-truth
   is_mode: "snis"                   # Self-normalized importance sampling
   clip_c: 10.0                      # Clipping constant (unused for SNIS)
-  training_loss: "nll"              # Training loss type
+  training_loss: "rl"               # Use RL-aligned training loss (was "nll")
+  rl_grad_accum: 1                  # RL gradient accumulation steps
   snapshot_device: "cpu"            # CPU snapshots to save VRAM
   importance_microbatch_size: 1     # Conservative for stability
   report_per_token: false           # Disable for faster computation

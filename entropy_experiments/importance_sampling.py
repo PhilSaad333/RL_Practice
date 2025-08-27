@@ -536,11 +536,16 @@ class ImportanceSampler:
         Returns:
             Dictionary with ground-truth entropy change results
         """
+        # DISPATCH: Route to RL-aligned implementation when training_loss='rl'
+        training_loss = cfg_importance.get('training_loss', 'nll')
+        if training_loss == 'rl':
+            self.logger.info("Routing to RL-aligned two-batch entropy change computation")
+            return self.entropy_change_two_batch_rl(model, E_batch, U_batch, optimizer, cfg_importance)
+        
         start_time = time.time()
-        self.logger.info("Starting two-batch ground-truth entropy change computation")
+        self.logger.info("Starting two-batch ground-truth entropy change computation (NLL mode)")
         
         # Extract config parameters
-        training_loss = cfg_importance.get('training_loss', 'nll')
         importance_mb_size = cfg_importance.get('importance_microbatch_size', 1)
         is_mode = cfg_importance.get('is_mode', 'snis')
         clip_c = cfg_importance.get('clip_c', 10.0)
@@ -940,6 +945,407 @@ class ImportanceSampler:
                 gen_lengths[b, g] = gen_mask.sum()
         
         return gen_lengths
+    
+    # ========================================================================
+    # STAGE 3: RL-ALIGNED IMPORTANCE SAMPLING IMPLEMENTATION
+    # ========================================================================
+    
+    def entropy_change_two_batch_rl(self, model: torch.nn.Module, E_batch: Dict[str, Any],
+                                   U_batch: Dict[str, Any], optimizer: torch.optim.Optimizer,
+                                   cfg_importance: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compute ground-truth entropy change using RL-aligned two-batch approach.
+        
+        This fixes the fundamental misalignment by using the same GRPO RL objective
+        as the probe's Y-loss and DR-GRPO training, instead of NLL loss.
+        
+        Args:
+            model: Current model
+            E_batch: Evaluation batch for entropy measurement
+            U_batch: Update batch for RL-aligned optimizer step
+            optimizer: Optimizer to use for update step
+            cfg_importance: Configuration dict with RL-specific parameters
+                
+        Returns:
+            Dictionary with aligned ground-truth entropy change results
+        """
+        start_time = time.time()
+        self.logger.info("Starting RL-aligned two-batch ground-truth entropy change computation")
+        
+        # Extract config parameters
+        training_loss = cfg_importance.get('training_loss', 'rl')
+        rl_grad_accum = cfg_importance.get('rl_grad_accum', 1)
+        importance_mb_size = cfg_importance.get('importance_microbatch_size', 1)
+        is_mode = cfg_importance.get('is_mode', 'snis')
+        clip_c = cfg_importance.get('clip_c', 10.0)
+        report_per_token = cfg_importance.get('report_per_token', False)
+        snapshot_device = cfg_importance.get('snapshot_device', 'cpu')
+        
+        if training_loss != 'rl':
+            self.logger.warning(f"RL-aligned method called with training_loss='{training_loss}', forcing to 'rl'")
+            training_loss = 'rl'
+        
+        # ====================================================================
+        # STEP A: Snapshot model and optimizer state
+        # ====================================================================
+        model_snapshot = self._snapshot_state(model, optimizer, snapshot_device)
+        
+        # ====================================================================
+        # STEP B: Compute original entropy H(θ;E)
+        # ====================================================================
+        S_orig = self._eval_logprobs_on_batch(E_batch, importance_mb_size)
+        H_orig = -S_orig.mean().item()
+        
+        # Per-token entropy if requested
+        H_orig_tok = None
+        if report_per_token:
+            lengths = self._get_generation_lengths(E_batch)
+            total_tokens = lengths.sum().item()
+            H_orig_tok = -S_orig.sum().item() / total_tokens if total_tokens > 0 else 0.0
+            
+        self.logger.info(f"Original entropy: H(θ;E) = {H_orig:.6f}")
+        
+        # ====================================================================
+        # STEP C: Take RL-aligned optimizer step on U batch
+        # ====================================================================
+        self._rl_update_streaming(U_batch, optimizer, rl_grad_accum, importance_mb_size)
+        
+        # ====================================================================
+        # STEP D: Compute updated entropy H(θ⁺;E) via importance sampling
+        # ====================================================================
+        S_upd = self._eval_logprobs_on_batch(E_batch, importance_mb_size)
+        
+        # Compute IS weights: logw = S_upd - S_orig (in log domain)
+        logw = S_upd - S_orig  # [B_E, G]
+        
+        # Apply importance sampling estimator
+        if is_mode == "snis":
+            is_results = self._compute_snis_two_batch(S_upd, logw, report_per_token, E_batch)
+        elif is_mode == "clip":
+            is_results = self._compute_clip_is_two_batch(S_upd, logw, clip_c, report_per_token, E_batch)
+        else:
+            raise ValueError(f"Unknown is_mode: {is_mode}")
+        
+        H_upd = is_results['H_upd']
+        H_upd_tok = is_results.get('H_upd_tok')
+        
+        self.logger.info(f"Updated entropy: H(θ⁺;E) = {H_upd:.6f}")
+        
+        # ====================================================================
+        # STEP E: Restore model and optimizer state
+        # ====================================================================
+        self._restore_state(model, optimizer, model_snapshot)
+        
+        # ====================================================================
+        # STEP F: Compute ground-truth entropy change
+        # ====================================================================
+        deltaH_true = H_upd - H_orig
+        deltaH_true_tok = (H_upd_tok - H_orig_tok) if H_upd_tok is not None and H_orig_tok is not None else None
+        
+        compute_time = time.time() - start_time
+        
+        self.logger.info(f"RL-aligned ground-truth entropy change: ΔH_true = {deltaH_true:.10f}")
+        if deltaH_true_tok is not None:
+            self.logger.info(f"Per-token entropy change: ΔH_true_tok = {deltaH_true_tok:.10f}")
+        
+        # Return results
+        results = {
+            'H_orig': H_orig,
+            'H_upd': H_upd,
+            'deltaH_true': deltaH_true,
+            'timing': {
+                'total_time': compute_time
+            },
+            'diagnostics': {
+                'is_mode': is_mode,
+                'training_loss': training_loss,
+                'rl_grad_accum': rl_grad_accum,
+                **is_results.get('diagnostics', {})
+            }
+        }
+        
+        # Add per-token results if computed
+        if deltaH_true_tok is not None:
+            results.update({
+                'H_orig_tok': H_orig_tok,
+                'H_upd_tok': H_upd_tok,
+                'deltaH_true_tok': deltaH_true_tok
+            })
+        
+        return results
+    
+    def _eval_logprobs_on_batch(self, batch: Dict[str, Any], mb_size: int) -> torch.Tensor:
+        """
+        Compute log probabilities for batch with eval mode, attention_mask, and AMP bf16.
+        
+        This replaces the existing _compute_logprobs_for_sequences with proper attention_mask
+        support and alignment with DR-GRPO forward passes.
+        
+        Args:
+            batch: Batch data with sequences, attention_masks, prompt_lens
+            mb_size: Microbatch size for memory efficiency
+            
+        Returns:
+            [B, G] sequence log probabilities (sum over generated tokens)
+        """
+        sequences = batch['sequences']  # [B, G, max_len]
+        prompt_lens = batch['prompt_lens']  # [B]
+        attention_masks = batch['attention_masks']  # [B, G, max_len]
+        
+        B, G, max_len = sequences.shape
+        all_logprobs = []
+        
+        # Set eval mode and use no_grad for inference
+        was_training = self.model.training
+        self.model.eval()
+        
+        try:
+            with torch.no_grad():
+                for b in range(B):
+                    batch_seqs = sequences[b]  # [G, max_len]
+                    prompt_len = prompt_lens[b]
+                    batch_masks = attention_masks[b]  # [G, max_len]
+                    
+                    # Microbatch the G sequences for memory efficiency
+                    prompt_logprobs = []
+                    for g_start in range(0, G, mb_size):
+                        g_end = min(g_start + mb_size, G)
+                        micro_seqs = batch_seqs[g_start:g_end]  # [micro_size, max_len]
+                        micro_masks = batch_masks[g_start:g_end]  # [micro_size, max_len]
+                        
+                        # Forward pass with attention_mask (aligned with DR-GRPO)
+                        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                            logits = self.model(micro_seqs, attention_mask=micro_masks).logits
+                        
+                        # Convert to float32 for numerical stability (like DR-GRPO)
+                        logits = logits.float()
+                        log_probs = F.log_softmax(logits, dim=-1)  # [micro_size, max_len, vocab_size]
+                        
+                        # Extract log probs of actual tokens (causal shift)
+                        target_ids = micro_seqs[:, 1:].unsqueeze(-1)  # [micro_size, max_len-1, 1]
+                        token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)  # [micro_size, max_len-1]
+                        
+                        # Sum over generation tokens only (align with DR-GRPO and probe)
+                        gen_start = prompt_len - 1  # -1 for causal shift
+                        gen_token_log_probs = token_log_probs[:, gen_start:]  # [micro_size, gen_len]
+                        
+                        # Create mask for generation tokens (exclude padding)
+                        gen_mask = micro_masks[:, prompt_len:].float()  # [micro_size, gen_len]
+                        if gen_mask.shape[1] > gen_token_log_probs.shape[1]:
+                            gen_mask = gen_mask[:, :gen_token_log_probs.shape[1]]
+                        elif gen_mask.shape[1] < gen_token_log_probs.shape[1]:
+                            gen_token_log_probs = gen_token_log_probs[:, :gen_mask.shape[1]]
+                        
+                        # Compute sequence log probabilities (sum over generation tokens)
+                        seq_log_probs = (gen_token_log_probs * gen_mask).sum(dim=1)  # [micro_size]
+                        prompt_logprobs.append(seq_log_probs)
+                    
+                    # Concatenate microbatched results for this prompt
+                    all_seq_logprobs = torch.cat(prompt_logprobs, dim=0)  # [G]
+                    all_logprobs.append(all_seq_logprobs)
+        finally:
+            self.model.train(was_training)
+        
+        return torch.stack(all_logprobs, dim=0)  # [B, G]
+    
+    def _snapshot_state(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, 
+                       snapshot_device: str) -> Dict[str, Any]:
+        """
+        Snapshot model parameters and optimizer state to specified device.
+        
+        Args:
+            model: Model to snapshot
+            optimizer: Optimizer to snapshot 
+            snapshot_device: Device to store snapshots ('cpu' or 'gpu')
+            
+        Returns:
+            Dictionary containing model and optimizer snapshots
+        """
+        self.logger.debug(f"Snapshotting model and optimizer state to {snapshot_device}")
+        
+        # Snapshot model parameters
+        model_snapshot = {}
+        for name, param in model.named_parameters():
+            model_snapshot[name] = param.detach().to(snapshot_device).clone()
+        
+        # Snapshot optimizer state (deep copy to handle exp_avg, exp_avg_sq, etc.)
+        optimizer_snapshot = None
+        try:
+            import copy
+            optimizer_snapshot = copy.deepcopy(optimizer.state_dict())
+            
+            # Move tensors in optimizer state to snapshot device
+            def move_to_device(obj):
+                if isinstance(obj, torch.Tensor):
+                    return obj.detach().to(snapshot_device).clone()
+                elif isinstance(obj, dict):
+                    return {k: move_to_device(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [move_to_device(item) for item in obj]
+                else:
+                    return obj
+            
+            optimizer_snapshot = move_to_device(optimizer_snapshot)
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to snapshot optimizer state: {e}")
+            optimizer_snapshot = None
+        
+        return {
+            'model': model_snapshot,
+            'optimizer': optimizer_snapshot,
+            'snapshot_device': snapshot_device
+        }
+    
+    def _restore_state(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
+                      snapshot: Dict[str, Any]):
+        """
+        Restore model parameters and optimizer state from snapshot.
+        
+        Args:
+            model: Model to restore
+            optimizer: Optimizer to restore
+            snapshot: Snapshot dictionary from _snapshot_state
+        """
+        self.logger.debug("Restoring model and optimizer state from snapshot")
+        
+        # Restore model parameters
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in snapshot['model']:
+                    param.data.copy_(snapshot['model'][name].to(param.device))
+        
+        # Restore optimizer state if available
+        if snapshot['optimizer'] is not None:
+            try:
+                # Move optimizer state back to original device
+                def move_to_device(obj, target_device):
+                    if isinstance(obj, torch.Tensor):
+                        return obj.to(target_device)
+                    elif isinstance(obj, dict):
+                        return {k: move_to_device(v, target_device) for k, v in obj.items()}
+                    elif isinstance(obj, list):
+                        return [move_to_device(item, target_device) for item in obj]
+                    else:
+                        return obj
+                
+                # Get target device from first model parameter
+                target_device = next(model.parameters()).device
+                restored_opt_state = move_to_device(snapshot['optimizer'], target_device)
+                optimizer.load_state_dict(restored_opt_state)
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to restore optimizer state: {e}")
+        
+        # Clear gradients for safety
+        optimizer.zero_grad(set_to_none=True)
+    
+    def _rl_update_streaming(self, U_batch: Dict[str, Any], optimizer: torch.optim.Optimizer,
+                           rl_grad_accum: int, importance_mb_size: int):
+        """
+        Perform RL-aligned update step using GRPO objective with gradient accumulation.
+        
+        This implements the same RL objective as probe Y-loss and DR-GRPO:
+        Loss_mb = -mean_over_prompts[sum_{g,t}(A_b,g * gen_mask_b,g,t * new_logp_b,g,t) / (G * L_max_b)]
+        
+        Args:
+            U_batch: Update batch with sequences, advantages, max_lengths
+            optimizer: Optimizer for taking the step
+            rl_grad_accum: Number of microbatches to accumulate before step
+            importance_mb_size: Sequences per forward pass
+        """
+        self.logger.debug("Taking RL-aligned optimizer step on U batch")
+        
+        sequences = U_batch['sequences']  # [B_U, G, max_len]
+        prompt_lens = U_batch['prompt_lens']  # [B_U]
+        attention_masks = U_batch['attention_masks']  # [B_U, G, max_len]
+        advantages = U_batch['advantages']  # [B_U, G]
+        max_lengths = U_batch['max_lengths']  # [B_U]
+        
+        B_U, G, max_len = sequences.shape
+        
+        # Set training mode and clear gradients
+        self.model.train()
+        optimizer.zero_grad(set_to_none=True)
+        
+        # Process U batch in microbatches for memory efficiency
+        mb_size_prompts = importance_mb_size
+        total_loss = 0.0
+        num_microbatches = 0
+        
+        for start_b in range(0, B_U, mb_size_prompts):
+            end_b = min(start_b + mb_size_prompts, B_U)
+            B_mb = end_b - start_b
+            
+            # Extract microbatch
+            mb_seqs = sequences[start_b:end_b]  # [B_mb, G, max_len]
+            mb_masks = attention_masks[start_b:end_b]  # [B_mb, G, max_len]
+            mb_advantages = advantages[start_b:end_b]  # [B_mb, G]
+            mb_max_lengths = max_lengths[start_b:end_b]  # [B_mb]
+            mb_prompt_lens = prompt_lens[start_b:end_b]  # [B_mb]
+            
+            # Flatten sequences for model forward: [B_mb * G, max_len]
+            flat_seqs = mb_seqs.view(-1, max_len)
+            flat_masks = mb_masks.view(-1, max_len)
+            
+            # Forward pass with autocast and attention_mask (aligned with DR-GRPO)
+            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                logits = self.model(flat_seqs, attention_mask=flat_masks).logits  # [B_mb*G, max_len, vocab_size]
+            
+            # Convert to float32 for numerical stability (like DR-GRPO)
+            logits = logits.float()
+            logp_all = F.log_softmax(logits, dim=-1)  # [B_mb*G, max_len, vocab_size]
+            
+            # Gather next-token log probabilities
+            targets = flat_seqs[:, 1:].unsqueeze(-1)  # [B_mb*G, max_len-1, 1]
+            new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)  # [B_mb*G, max_len-1]
+            
+            # Reshape back to [B_mb, G, max_len-1]
+            new_logp = new_logp.view(B_mb, G, -1)
+            
+            # Compute RL loss per prompt (token-level, GRPO normalization)
+            mb_loss_terms = []
+            for b in range(B_mb):
+                prompt_len = mb_prompt_lens[b]
+                A_b = mb_advantages[b]  # [G] - advantages for this prompt
+                L_max_b = max(mb_max_lengths[b], 1)  # Avoid division by zero
+                
+                # Extract generation region: last T_g tokens
+                gen_start = prompt_len - 1  # -1 for causal shift
+                new_logp_gen = new_logp[b, :, gen_start:]  # [G, T_g]
+                gen_mask = mb_masks[b, :, prompt_len:].float()  # [G, T_g]
+                
+                # Align tensor shapes
+                min_gen_len = min(new_logp_gen.shape[1], gen_mask.shape[1])
+                new_logp_gen = new_logp_gen[:, :min_gen_len]  # [G, min_gen_len]
+                gen_mask = gen_mask[:, :min_gen_len]  # [G, min_gen_len]
+                
+                # Expand advantages to token level: [G, 1] -> [G, min_gen_len]
+                A_expanded = A_b.unsqueeze(1).expand(-1, min_gen_len)  # [G, min_gen_len]
+                
+                # Compute loss for this prompt: -sum_{g,t}(A_b,g * gen_mask * new_logp) / (G * L_max_b)
+                weighted_logp = A_expanded * gen_mask * new_logp_gen  # [G, min_gen_len]
+                loss_b = -weighted_logp.sum() / (G * L_max_b)
+                mb_loss_terms.append(loss_b)
+            
+            # Mean loss over prompts in microbatch
+            mb_loss = torch.stack(mb_loss_terms).mean()
+            
+            # Scale for gradient accumulation (to match global mean)
+            scale = B_mb / B_U  # This ensures proper gradient scaling
+            scaled_loss = mb_loss * scale
+            
+            # Backward pass per microbatch
+            scaled_loss.backward()
+            
+            total_loss += mb_loss.item() * B_mb  # For logging
+            num_microbatches += 1
+        
+        # Take optimizer step after accumulating gradients
+        optimizer.step()
+        
+        avg_loss = total_loss / B_U if B_U > 0 else 0.0
+        self.logger.info(f"RL-aligned optimizer step completed: avg_loss = {avg_loss:.6f}, {num_microbatches} microbatches")
     
     def _iter_microbatches(self, batch: Dict[str, Any], mb_size: int):
         """Iterate over microbatches by slicing along prompt dimension."""
