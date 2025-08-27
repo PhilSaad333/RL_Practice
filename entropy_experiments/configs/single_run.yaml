@@ -43,7 +43,7 @@ importance:
 
 importance_sampling:
   use_snis: true
-  use_psis: false
+  use_psis: false  
   ess_threshold: 0.5
   resample_on_low_ess: false
 

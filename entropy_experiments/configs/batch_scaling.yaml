@@ -42,7 +42,7 @@ importance:
   enabled: false                       # Disable expensive Stage 2
 
 importance_sampling:
-  use_snis: true                       # If enabled, use SNIS
+  use_snis: true
   use_psis: false
   ess_threshold: 0.5
   resample_on_low_ess: false
