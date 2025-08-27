@@ -11,6 +11,10 @@ batch_config:
   dataset_name: "gsm8k_r1_template" # Dataset to sample prompts from
   split: "train"                    # Dataset split to use
 
+# Probe configuration (for compatibility with existing code)
+probe_config:
+  mode: "exact"                     # Legacy mode (not used in Stage 1, but needed for initialization)
+
 # Stage 1 Mixed Probe Configuration
 probe_rework:
   mb_size_prompts: 2                # Microbatch size (prompts per microbatch)
@@ -20,8 +24,22 @@ probe_rework:
 # Memory and performance - Conservative for testing
 memory_config:
   microbatch_size: 1                # For importance sampling (if needed)
+  importance_microbatch_size: 1     # Conservative
+  teacher_force_microbatch_size: 2  # G-microbatching for gradients
   amp: true                         # Use automatic mixed precision
   dtype: "bfloat16"                 # Match training configuration
+
+# Variance estimation (for compatibility)
+stats_config:
+  compute_plugin_se: true           # Plug-in standard error estimate
+  compute_jackknife_se: true        # Jackknife standard error estimate
+
+# Importance sampling (for compatibility)
+importance_sampling:
+  use_snis: true                    # Self-normalized importance sampling
+  use_psis: false                   # Skip PSIS for now
+  ess_threshold: 0.5                # Effective sample size threshold
+  resample_on_low_ess: false        # Don't resample for testing
 
 # Checkpoint paths - using extracted RL training checkpoint
 checkpoint:
