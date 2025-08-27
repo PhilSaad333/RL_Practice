@@ -1273,44 +1273,48 @@ class ProbeComponents:
         self.logger.debug("Computing conditional variance over E using scalar projections")
         
         # NEW BATCHED APPROACH: Process prompts in groups for efficiency
-        # Get conditional variance batch size from config (default: 6)
+        # Get conditional variance batch size from config (default: 6)  
         cv_batch_size = self.config.get('probe_rework', {}).get('conditional_variance_batch_size', 6)
         
         # Convert E_batch to list of single-prompt units for batching
         prompt_units = list(self._iter_units(E_batch))
         
         with no_sync_context():  # Prevent DDP gradient averaging
-            # Process teacher forcing in batches, but keep per-prompt loss computation
-            batch_S_results = self._batched_teacher_force_logprobs(prompt_units, batch_size=cv_batch_size)
-            
-            # Process each prompt individually for loss computation and scalar projection
-            for i, S_dict in enumerate(batch_S_results):
-                # Clear gradients
-                self.model.zero_grad(set_to_none=True)
+            # Process prompts in groups to avoid computational graph issues
+            for i in range(0, len(prompt_units), cv_batch_size):
+                batch_group = prompt_units[i:i + cv_batch_size]
                 
-                # Build X-loss with LOO baseline and minus sign (as per variance_estimator_change.txt)
-                L_X_u = -self.build_LX_from_S(S_dict, weighting_mode)  # Note the minus sign
+                # Process teacher forcing for this batch group
+                batch_S_results = self._batched_teacher_force_logprobs(batch_group, batch_size=len(batch_group))
                 
-                # Backward pass - get raw X_n in param.grad (no preconditioning)
-                L_X_u.backward()
-                
-                # Compute scalar projection: s_n = μ_Y^T X_n  
-                s_n = 0.0
-                for param in self.model.parameters():
-                    if param.requires_grad and param.grad is not None:
-                        param_id = id(param)
-                        if param_id in muY_buf:
-                            # Ensure both tensors are on same device
-                            muY_param = muY_buf[param_id].to(param.grad.device)
-                            s_n += (param.grad * muY_param).sum().item()
-                
-                # Accumulate statistics
-                sum_s_local += s_n
-                sum_s2_local += s_n * s_n
-                B_E_local += 1
-                
-                # Clear gradients for next unit
-                self.model.zero_grad(set_to_none=True)
+                # Immediately process each prompt in this batch for loss computation
+                for S_dict in batch_S_results:
+                    # Clear gradients
+                    self.model.zero_grad(set_to_none=True)
+                    
+                    # Build X-loss with LOO baseline and minus sign (as per variance_estimator_change.txt)
+                    L_X_u = -self.build_LX_from_S(S_dict, weighting_mode)  # Note the minus sign
+                    
+                    # Backward pass - get raw X_n in param.grad (no preconditioning)
+                    L_X_u.backward()
+                    
+                    # Compute scalar projection: s_n = μ_Y^T X_n  
+                    s_n = 0.0
+                    for param in self.model.parameters():
+                        if param.requires_grad and param.grad is not None:
+                            param_id = id(param)
+                            if param_id in muY_buf:
+                                # Ensure both tensors are on same device
+                                muY_param = muY_buf[param_id].to(param.grad.device)
+                                s_n += (param.grad * muY_param).sum().item()
+                    
+                    # Accumulate statistics
+                    sum_s_local += s_n
+                    sum_s2_local += s_n * s_n
+                    B_E_local += 1
+                    
+                    # Clear gradients for next unit
+                    self.model.zero_grad(set_to_none=True)
         
         self.logger.debug(f"Conditional variance over E: B_E_local={B_E_local}, sum_s={sum_s_local:.6f}")
         return sum_s_local, sum_s2_local, B_E_local
