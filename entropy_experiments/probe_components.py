@@ -518,6 +518,12 @@ class ProbeComponents:
                         grad = grad.to(buf[param_id].device, dtype=buf[param_id].dtype)
                     buf[param_id].add_(grad, alpha=scale)
     
+    def scale_param_gradients(self, scale_factor: float):
+        """Scale all parameter gradients by a factor."""
+        for param in self.model.parameters():
+            if param.grad is not None:
+                param.grad.data *= scale_factor
+    
     def dot_param_buffers(self, buf_a: Dict[int, torch.Tensor], buf_b: Dict[int, torch.Tensor]) -> float:
         """
         Compute dot product between two parameter buffers.
@@ -717,19 +723,25 @@ class ProbeComponents:
                 # Build X-loss with detached LOO coefficient
                 L_X_mb = self.build_LX_from_S(S_dict, weighting_mode)
                 
+                # Count prompts in this microbatch
+                if 'sequences' in microbatch:
+                    mb_prompt_count = len(microbatch['sequences'])
+                elif hasattr(microbatch.get('advantages'), 'shape'):
+                    mb_prompt_count = microbatch['advantages'].shape[0]
+                else:
+                    mb_prompt_count = len(microbatch.get('max_lengths', []))
+                
                 # Backward pass - populates param.grad with raw X gradients  
                 L_X_mb.backward()
+                
+                # Scale gradients by microbatch size to convert from average to sum
+                # build_LX_from_S returns average over prompts, but we need sum
+                self.scale_param_gradients(mb_prompt_count)
                 
                 # Accumulate gradients into sum buffer
                 self.add_into_param_buffer(sum_X_buf)
                 
-                # Count prompts in this microbatch
-                if 'sequences' in microbatch:
-                    B_local += len(microbatch['sequences'])
-                elif hasattr(microbatch.get('advantages'), 'shape'):
-                    B_local += microbatch['advantages'].shape[0]
-                else:
-                    B_local += len(microbatch.get('max_lengths', []))
+                B_local += mb_prompt_count
                 
                 # Clear gradients for next microbatch
                 self.model.zero_grad(set_to_none=True)
@@ -777,8 +789,20 @@ class ProbeComponents:
                 # Build Y-loss with advantage weighting
                 L_Y_mb = self.build_LY_from_S(S_dict)
                 
+                # Count prompts in this microbatch
+                if 'sequences' in microbatch:
+                    mb_prompt_count = len(microbatch['sequences'])
+                elif hasattr(microbatch.get('advantages'), 'shape'):
+                    mb_prompt_count = microbatch['advantages'].shape[0]
+                else:
+                    mb_prompt_count = len(microbatch.get('max_lengths', []))
+                
                 # Backward pass - populates param.grad with raw ∇J
                 L_Y_mb.backward()
+                
+                # Scale gradients by microbatch size to convert from average to sum
+                # build_LY_from_S returns average over prompts, but we need sum
+                self.scale_param_gradients(mb_prompt_count)
                 
                 # Apply preconditioner in-place: grad ← P(grad) 
                 for param in params:
@@ -789,13 +813,7 @@ class ProbeComponents:
                 # Accumulate preconditioned gradients into sum buffer  
                 self.add_into_param_buffer(sum_Y_buf)
                 
-                # Count prompts in this microbatch
-                if 'sequences' in microbatch:
-                    B_local += len(microbatch['sequences'])
-                elif hasattr(microbatch.get('advantages'), 'shape'):
-                    B_local += microbatch['advantages'].shape[0]
-                else:
-                    B_local += len(microbatch.get('max_lengths', []))
+                B_local += mb_prompt_count
                 
                 # Clear gradients for next microbatch
                 self.model.zero_grad(set_to_none=True)
