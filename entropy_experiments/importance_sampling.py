@@ -70,11 +70,12 @@ class ImportanceSampler:
         
         self.logger.info(f"Computing entropy change via importance sampling for {B}x{G} responses")
         
-        # Step 1: Compute original model log probabilities π_θ
+        # Step 1: Compute original model log probabilities π_θ once
         logprobs_original = self._compute_logprobs_for_sequences(sequences, prompt_lens, attention_masks)
         
         # Step 2: Take optimizer step and compute updated model log probabilities π_{θ+δθ}
-        logprobs_updated = self._compute_updated_logprobs(batch_data, optimizer)
+        # Pass cached S_orig to avoid redundant recomputation
+        logprobs_updated, _ = self._compute_updated_logprobs(batch_data, optimizer, cached_S_orig=logprobs_original)
         
         # Step 3: Compute importance weights
         log_weights = logprobs_updated - logprobs_original  # [B, G]
@@ -151,7 +152,7 @@ class ImportanceSampler:
             }
         }
         
-    def _compute_updated_logprobs(self, batch_data: Dict[str, Any], optimizer: torch.optim.Optimizer) -> torch.Tensor:
+    def _compute_updated_logprobs(self, batch_data: Dict[str, Any], optimizer: torch.optim.Optimizer, cached_S_orig: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute log probabilities under the updated model π_{θ+δθ} after a real optimizer step.
         
@@ -162,9 +163,10 @@ class ImportanceSampler:
         Args:
             batch_data: Batch data containing sequences
             optimizer: Optimizer to take a step with
+            cached_S_orig: Optional pre-computed original log probabilities to avoid recomputation
             
         Returns:
-            Updated log probabilities S⁺ for the same sequences
+            Tuple of (updated log probabilities S⁺, original log probabilities S_orig)
         """
         sequences = batch_data['sequences']  # [B, G, max_len]
         prompt_lens = batch_data['prompt_lens']  # [B] 
@@ -172,8 +174,13 @@ class ImportanceSampler:
         
         B, G, max_len = sequences.shape
         
-        # STEP 1: Compute original log-probs S before step
-        original_logprobs = self._compute_logprobs_for_sequences(sequences, prompt_lens, attention_masks)
+        # STEP 1: Use cached S_orig if provided, otherwise compute original log-probs
+        if cached_S_orig is not None:
+            original_logprobs = cached_S_orig
+            self.logger.debug("Using cached original log-probs to avoid redundant computation")
+        else:
+            original_logprobs = self._compute_logprobs_for_sequences(sequences, prompt_lens, attention_masks)
+            self.logger.debug("Computing original log-probs (no cache provided)")
         
         # STEP 2: Take training step using streaming backward (avoids massive computation graph)
         # Snapshot parameters to CPU for proper restore after AdamW step  
@@ -182,7 +189,15 @@ class ImportanceSampler:
             if param.requires_grad:
                 cpu_snapshots.append(param.detach().to('cpu').clone())
         
-        self.logger.debug("Taking optimizer step for importance sampling with streaming backward")
+        # Snapshot optimizer state to prevent drift in training state
+        opt_state_cpu = optimizer.state_dict()  # Shallow copy of Python objects
+        # Deep-copy tensors to CPU to be safe
+        for state in opt_state_cpu.get('state', {}).values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.detach().cpu().clone()
+        
+        self.logger.debug("Taking optimizer step for importance sampling with streaming backward (params & optimizer state saved)")
         
         # STEP 3: Accumulate gradients using streaming backward (no memory buildup)
         optimizer.zero_grad(set_to_none=True)
@@ -211,11 +226,20 @@ class ImportanceSampler:
                     param.data.copy_(cpu_snapshots[param_idx].to(param.device))
                     param_idx += 1
         
+        # Restore optimizer state to prevent training state drift
+        optimizer.load_state_dict(opt_state_cpu)
+        # Move any tensors in optimizer state back to correct device
+        device = next(self.model.parameters()).device
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device)
+        
         optimizer.zero_grad(set_to_none=True)
                     
-        self.logger.debug("Restored original model parameters after importance sampling step")
+        self.logger.debug("Restored original model parameters and optimizer state after importance sampling step")
         
-        return updated_logprobs
+        return updated_logprobs, original_logprobs
         
     def _compute_logprobs_for_sequences(self, sequences: torch.Tensor, 
                                       prompt_lens: List[int], 
@@ -257,7 +281,7 @@ class ImportanceSampler:
                 try:
                     with torch.no_grad():  # CRITICAL: No gradients needed - saves ~50% memory
                         with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                            logits = self.model(micro_seqs).logits  # [micro_size, max_len, vocab_size]
+                            logits = self.model(micro_seqs, attention_mask=micro_masks).logits  # [micro_size, max_len, vocab_size]
                     
                     # Convert to log probabilities in float32 for stability (like dr_grpo.py)
                     log_probs = F.log_softmax(logits.float(), dim=-1)  # [micro_size, max_len, vocab_size]
@@ -433,9 +457,22 @@ class ImportanceSampler:
         }
         
     def _compute_original_entropy(self, logprobs: torch.Tensor) -> float:
-        """Compute entropy of original model π_θ."""
+        """Compute entropy of original model π_θ with proper DDP all-reduce."""
         # For the original model, entropy is just -E[log π(x)]
-        return -logprobs.mean().item()
+        # Use global mean in multi-GPU settings
+        
+        # Local tensors
+        neg_sum_local = (-logprobs).sum()
+        cnt_local = torch.tensor(logprobs.numel(), device=logprobs.device, dtype=neg_sum_local.dtype)
+        
+        # All-reduce across ranks if DDP is active
+        if distributed_helpers.is_distributed():
+            distributed_helpers.all_reduce(neg_sum_local)
+            distributed_helpers.all_reduce(cnt_local)
+            
+        # Global mean
+        original_entropy = (neg_sum_local / cnt_local).item()
+        return original_entropy
         
     def _apply_psis_smoothing(self, log_weights: torch.Tensor) -> Dict[str, Any]:
         """
@@ -591,8 +628,15 @@ class ImportanceSampler:
             model.eval()
             S_orig = self._compute_logprobs_microbatched(E_batch, importance_mb_size)
         
-        # Compute sequence-level entropy
-        H_orig = -S_orig.mean().item()
+        # Compute sequence-level entropy with proper DDP all-reduce
+        neg_sum_local = (-S_orig).sum()
+        cnt_local = torch.tensor(S_orig.numel(), device=S_orig.device, dtype=neg_sum_local.dtype)
+        
+        if distributed_helpers.is_distributed():
+            distributed_helpers.all_reduce(neg_sum_local)
+            distributed_helpers.all_reduce(cnt_local)
+            
+        H_orig = (neg_sum_local / cnt_local).item()
         
         # Compute per-token entropy if requested
         H_orig_tok = None
@@ -902,7 +946,7 @@ class ImportanceSampler:
                 
                 # Forward pass
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                    logits = self.model(seq.unsqueeze(0)).logits  # [1, max_len, vocab_size]
+                    logits = self.model(seq.unsqueeze(0), attention_mask=mask.unsqueeze(0)).logits  # [1, max_len, vocab_size]
                 
                 # Compute NLL loss for generation tokens only
                 gen_tokens = seq[prompt_len:]  # Generation tokens [gen_len]
@@ -994,7 +1038,15 @@ class ImportanceSampler:
         # STEP B: Compute original entropy H(θ;E)
         # ====================================================================
         S_orig = self._eval_logprobs_on_batch(E_batch, importance_mb_size)
-        H_orig = -S_orig.mean().item()
+        # Compute sequence-level entropy with proper DDP all-reduce
+        neg_sum_local = (-S_orig).sum()
+        cnt_local = torch.tensor(S_orig.numel(), device=S_orig.device, dtype=neg_sum_local.dtype)
+        
+        if distributed_helpers.is_distributed():
+            distributed_helpers.all_reduce(neg_sum_local)
+            distributed_helpers.all_reduce(cnt_local)
+            
+        H_orig = (neg_sum_local / cnt_local).item()
         
         # Per-token entropy if requested
         H_orig_tok = None
