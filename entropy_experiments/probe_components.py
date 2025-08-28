@@ -28,7 +28,7 @@ import logging
 from collections import defaultdict
 import time
 import math
-from conditional_variance import ConditionalVarianceEstimator
+from .conditional_variance import ConditionalVarianceEstimator
 
 
 class ProbeComponents:
