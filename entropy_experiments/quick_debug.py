@@ -21,15 +21,30 @@ def main():
     print("🧪 Testing random advantages debug mode")
     
     # Initialize probe with minimal settings
+    config = {
+        'checkpoint': {
+            'model_config_path': "Qwen/Qwen2.5-1.5B",
+            'checkpoint_path': "/home/ubuntu/localfs/rl_training_runs/training_state/step_60"
+        },
+        'distributed': {
+            'find_unused_parameters': False
+        },
+        'memory_config': {
+            'microbatch_size': 2,
+            'teacher_force_microbatch_size': 2,
+            'amp': True,
+            'dtype': 'bfloat16'
+        },
+        'generation': {
+            'max_new_tokens': 50,
+            'temperature': 1.0,
+            'top_p': 1.0,
+            'do_sample': True
+        }
+    }
+    
     try:
-        probe = OfflineEntropyProbe(
-            rank=0, 
-            world_size=1,
-            base_model_id="Qwen/Qwen2.5-1.5B",
-            adapter_path="/home/ubuntu/localfs/rl_training_runs/training_state/step_60/model",
-            optimizer_path="/home/ubuntu/localfs/rl_training_runs/training_state/step_60/optimizer.pt",
-            device_id=0
-        )
+        probe = OfflineEntropyProbe(config)
         
         # Run a very small probe test with B_E=4, B_U=4
         print("📊 Running minimal probe test...")
