@@ -71,6 +71,11 @@ def create_experiment_config(base_config_path: str, learning_rate: float,
     config.setdefault('gns_probe', {})['enabled'] = False
     config.setdefault('entropy_probe', {})['enabled'] = False
     
+    # Ensure uniform sampling by disabling rejection filters
+    config['reward_var_thresh'] = 0.0    # Accept all variance levels
+    config['reject_all_zero'] = False    # Accept even if all rewards are 0
+    config['reject_all_max'] = False     # Accept even if all rewards are equal
+    
     # Create run-specific config file
     config_path = output_dir / f"config_lr_{learning_rate:.0e}_{run_id}.yaml"
     with open(config_path, 'w') as f:
