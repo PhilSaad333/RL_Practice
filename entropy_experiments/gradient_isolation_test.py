@@ -212,13 +212,33 @@ class GradientIsolationTest:
             dummy_optimizer.load_state_dict(optimizer_state)
             logger.info("✅ Optimizer state loaded successfully")
             
-            # Analyze Adam state for LoRA parameters  
+            # DEBUGGING: Check ALL Adam states in optimizer, not just our LoRA params
+            logger.info("🔍 DEBUGGING: Analyzing ALL optimizer states...")
+            total_states = len(dummy_optimizer.state)
+            nonzero_states = 0
+            state_norms = []
+            
+            for param_id, state in dummy_optimizer.state.items():
+                if "exp_avg_sq" in state:
+                    norm = float(state["exp_avg_sq"].norm().item())
+                    state_norms.append(norm)
+                    if norm > 1e-8:
+                        nonzero_states += 1
+            
+            logger.info(f"Total optimizer states: {total_states}")
+            logger.info(f"States with nonzero exp_avg_sq: {nonzero_states}")
+            logger.info(f"First 10 exp_avg_sq norms: {state_norms[:10]}")
+            
+            # Now check our LoRA parameter matching
             # Note: optimizer has ALL parameters, but we only care about LoRA ones
             lora_params = [p for n, p in self.model.named_parameters() 
                           if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
             
             adam_analysis = {
                 "total_lora_params": len(lora_params),
+                "total_optimizer_states": total_states,
+                "nonzero_optimizer_states": nonzero_states,
+                "first_10_state_norms": state_norms[:10],
                 "params_with_exp_avg": 0,
                 "params_with_exp_avg_sq": 0,
                 "nonzero_exp_avg_sq": 0,
