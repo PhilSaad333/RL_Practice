@@ -37,7 +37,7 @@ def main():
         '--checkpoint', args.checkpoint,
         '--base-config', str(base_config),
         '--learning-rates', '1e-7,1e-6,1e-5',  # Just 3 learning rates
-        '--num-repeats', '3',                   # Just 3 repeats
+        '--num-repeats', '8',                   # 8 repeats per LR
         '--output-dir', args.output_dir
     ]
     
