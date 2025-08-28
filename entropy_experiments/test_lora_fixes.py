@@ -6,11 +6,16 @@ This will run our PEFT adapter diagnostics and α-trick to verify fixes work.
 
 import sys
 import os
+
+# Ensure we can import our modules
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
 import logging
-from offline_entropy_probe import OfflineEntropyProbe
+
+# Import from the parent package to avoid relative import issues
+from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
 
 # Configure logging to see our debug messages
 logging.basicConfig(
