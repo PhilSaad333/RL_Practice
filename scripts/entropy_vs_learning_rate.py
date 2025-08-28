@@ -23,7 +23,8 @@ Usage:
 Requirements:
     - 2x H100 GPUs (uses DDP)
     - Checkpoint with model/ + optimizer.pt + scheduler.pt
-    - Buffer size 128 (configurable)
+    - Buffer size 64 (configurable)
+    - Saves comprehensive experimental data and analysis results
 """
 
 import os
@@ -54,8 +55,8 @@ def create_experiment_config(base_config_path: str, learning_rate: float,
     # Modify config for entropy measurement experiment
     config['lr'] = learning_rate
     config['total_steps'] = 2  # Exactly 2 steps for before/after entropy measurement
-    config['save_every'] = 1   # Save after each step
-    config['buffer_size'] = 128  # Use standard 2-GPU buffer size
+    config['save_every'] = 10   # High value so it never activates during 2 steps
+    config['buffer_size'] = 64  # Reduced buffer size
     config['microbatch_size'] = 4  # Optimal for 2x H100
     
     # Enable simple entropy probe for measurements
@@ -336,7 +337,7 @@ def main():
                        help='Path to base YAML config file')
     parser.add_argument('--learning-rates', default='1e-8,1e-7,1e-6,1e-5,1e-4',
                        help='Comma-separated learning rates to test')
-    parser.add_argument('--num-repeats', type=int, default=5,
+    parser.add_argument('--num-repeats', type=int, default=16,
                        help='Number of repeat experiments per learning rate')
     parser.add_argument('--output-dir', default='entropy_lr_results',
                        help='Output directory for results')
@@ -396,13 +397,19 @@ def main():
             # Clean up config file
             config_path.unlink()
     
-    # Analyze results
+    # Analyze results  
     print(f"\\n🔍 ANALYZING RESULTS...")
     analyze_results(all_results, output_dir)
     
-    # Save raw results
+    # Save complete experimental data
     with open(output_dir / 'raw_results.json', 'w') as f:
         json.dump(all_results, f, indent=2, default=str)
+    
+    print(f"\\n💾 SAVED DATA:")
+    print(f"  - raw_results.json: All experimental measurements")
+    print(f"  - analysis.json: Statistical analysis and linear fit")
+    print(f"  - *.png: Visualization plots")
+    print(f"  - lr_*/result.json: Individual experiment details")
     
     print(f"\\n✅ Experiment complete! Results saved to {output_dir}/")
     
