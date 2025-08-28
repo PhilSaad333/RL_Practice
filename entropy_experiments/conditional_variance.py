@@ -361,19 +361,54 @@ class ConditionalVarianceEstimator:
                 if not S_batch.requires_grad or S_batch.grad_fn is None:
                     raise RuntimeError("S_batch lost its grad_fn; check TF pipeline and masking.")
                 
-                # --- Robust TF probe for QLoRA/LoRA ---
-                # Prove S backprops into trainable LoRA params (not the frozen embeddings).
-                probe = S_batch[0].sum()  # scalar
-                lora_params = [p for n, p in self.model.named_parameters()
+                # 🔧 COMPREHENSIVE TF probe for QLoRA/LoRA (from fix.txt)
+                # Apply same PEFT instance consistency as _teacher_force_logprobs
+                peft_model = self.model.module if hasattr(self.model, "module") else self.model
+                
+                # Make sure adapter is active 
+                if hasattr(peft_model, "set_adapter"):
+                    peft_model.set_adapter("default")
+                active = getattr(peft_model, "active_adapter", None)
+                if active is None:
+                    raise RuntimeError("TF probe: No active adapter on PEFT model in aligned batch computation")
+                
+                # Quick on/off adapter check for this batch computation too
+                if num_prompts >= 1:  # Only test if we have data
+                    test_seq = flat_sequences[0:1]  # [1, total_len]
+                    test_mask = flat_attention_masks[0:1] if flat_attention_masks is not None else None
+                    
+                    with torch.no_grad():
+                        logits_on = peft_model(test_seq, attention_mask=test_mask).logits
+                        with peft_model.disable_adapter():
+                            logits_off = peft_model(test_seq, attention_mask=test_mask).logits
+                    
+                    delta = (logits_on - logits_off).abs().max().item()
+                    self.logger.debug(f"🔧 [ALIGNED-BATCH-DEBUG] LoRA on/off delta: {delta:.2e}")
+                    if delta < 1e-7:
+                        raise RuntimeError("🔧 LoRA appears inactive in aligned batch computation: on/off logits nearly identical.")
+                
+                # Collect LoRA params from same PEFT instance used for forward pass
+                lora_params = [p for n, p in peft_model.named_parameters()
                                if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
-                if len(lora_params) == 0:
-                    raise RuntimeError("TF probe: no trainable LoRA params found (adapters missing/merged/disabled).")
+                extra = [p for n, p in peft_model.named_parameters()
+                         if p.requires_grad and n.endswith("lm_head.weight")]
+                params_for_probe = lora_params + extra
+                
+                if len(params_for_probe) == 0:
+                    raise RuntimeError("TF probe: no trainable LoRA params found on PEFT model (adapters missing/merged/disabled).")
 
-                g_lora = torch.autograd.grad(probe, lora_params, retain_graph=True, allow_unused=True)
+                # Test gradient flow from S to LoRA params
+                probe = S_batch[0].sum()  # scalar
+                g_lora = torch.autograd.grad(probe, params_for_probe, retain_graph=True, allow_unused=True)
+                non_none_count = sum(g is not None for g in g_lora)
+                
+                # Enhanced diagnostic logging
+                self.logger.debug(f"🔧 [ALIGNED-BATCH-DEBUG] S→LoRA probe: {non_none_count}/{len(params_for_probe)} params got gradients")
+                
                 if not any(g is not None for g in g_lora):
-                    raise RuntimeError("TF probe: S does not backprop to LoRA params. "
-                                       "Ensure the TF forward uses the PEFT-wrapped model and adapters are active.")
-                # --- end probe ---
+                    raise RuntimeError("🔧 TF probe: S does not backprop to LoRA params in aligned batch computation. "
+                                       "Forward pass not using adapters despite activation checks.")
+                # --- end comprehensive probe ---
 
         finally:
             self.model.train(was_training)
