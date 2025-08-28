@@ -338,9 +338,9 @@ class ImportanceSampler:
         # Ensure model is in training mode for gradients  
         self.model.train()
         
-        # Enable gradient checkpointing for memory efficiency
-        if hasattr(self.model, 'gradient_checkpointing_enable'):
-            self.model.gradient_checkpointing_enable()
+        # Disable gradient checkpointing for entropy probe - needed for clean autograd graphs
+        # if hasattr(self.model, 'gradient_checkpointing_enable'):
+        #     self.model.gradient_checkpointing_enable()
         
         for b in range(B):
             batch_seqs = sequences[b]  # [G, max_len]

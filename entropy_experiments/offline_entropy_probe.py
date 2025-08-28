@@ -235,7 +235,8 @@ class OfflineEntropyProbe:
             quantization_config=bnb
         )
         base = prepare_model_for_kbit_training(base)  # PEFT/QLoRA prep
-        base.gradient_checkpointing_enable()
+        # Disable gradient checkpointing for entropy probe - needed for clean autograd graphs
+        # base.gradient_checkpointing_enable()
         base.config.use_cache = False
         
         # Load LoRA adapter (exact copy from rl_runner.py pattern)
@@ -278,9 +279,10 @@ class OfflineEntropyProbe:
             local_files_only=True
         )
         
-        # Enable training mode and gradients
+        # Enable training mode and gradients  
         model.train()
-        model.gradient_checkpointing_enable()
+        # Disable gradient checkpointing for entropy probe - needed for clean autograd graphs
+        # model.gradient_checkpointing_enable()
         model.config.use_cache = False
         
         self.logger.info(f"Loaded full model from: {checkpoint_path}")
