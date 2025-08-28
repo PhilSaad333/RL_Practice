@@ -32,6 +32,20 @@ class ProbeComponents:
     storing parameter-sized vectors through clever use of scalar probe losses.
     """
     
+    def _assert_grad_context(self, where: str):
+        """Assert that we're in a valid gradient context for probe computations."""
+        # Inference mode cannot be turned back on locally; never enter it for probe passes.
+        if torch.is_inference_mode_enabled():
+            raise RuntimeError(
+                f"{where}: torch.inference_mode() is enabled. "
+                "This disables autograd globally; rerun probe outside inference_mode."
+            )
+        if not torch.is_grad_enabled():
+            raise RuntimeError(
+                f"{where}: torch.no_grad() is active. "
+                "Enable grad (remove no_grad) for probe computations."
+            )
+    
     def __init__(self, model: torch.nn.Module, config: Dict[str, Any], logger: logging.Logger):
         self.model = model
         self.config = config  
@@ -277,6 +291,7 @@ class ProbeComponents:
                 - 'advantages': advantages 
                 - 'max_lengths': max lengths per prompt
         """
+        self._assert_grad_context("_teacher_force_logprobs")
         sequences = prompt_batch['sequences']  # [batch_size, G, max_len]  
         prompt_lens = prompt_batch['prompt_lens']  # [batch_size]
         attention_masks = prompt_batch['attention_masks']  # [batch_size, G, max_len]
@@ -612,6 +627,7 @@ class ProbeComponents:
           advantages: [num_prompts, G] (if present in your pipeline)
           max_lengths: list[int] or tensor [num_prompts]
         """
+        self._assert_grad_context("_compute_aligned_batch_logprobs")
         sequences = aligned_batch['sequences']
         attention_masks = aligned_batch['attention_masks']
         max_prompt_len = aligned_batch['max_prompt_len']
@@ -632,6 +648,13 @@ class ProbeComponents:
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                     outputs = self.model(flat_sequences, attention_mask=flat_attention_masks)
                     logits = outputs.logits  # [B, T, V]
+
+                # Assert logits are connected to autograd graph
+                if not logits.requires_grad or logits.grad_fn is None:
+                    raise RuntimeError(
+                        "TF logits are not connected to autograd graph "
+                        "(likely due to surrounding inference_mode/no_grad)."
+                    )
 
                 # Apply temperature (keeping consistent with existing behavior)
                 temp = self.config['generation'].get('temperature', 1.0)
@@ -665,7 +688,10 @@ class ProbeComponents:
 
                 # Sequence log-prob per response (sum over generated tokens)
                 S_batch = (gen_token_log_probs * gen_masks).sum(dim=2)  # [num_prompts, G]
-                # S_batch.requires_grad should be True if logits path is live
+                
+                # Assert S_batch is connected to autograd graph
+                if not S_batch.requires_grad or S_batch.grad_fn is None:
+                    raise RuntimeError("S_batch lost its grad_fn; check TF pipeline and masking.")
 
         finally:
             self.model.train(was_training)
@@ -1008,6 +1034,7 @@ class ProbeComponents:
         Returns:
             (sum_X_buf, B_local): Parameter sum buffer and local batch size
         """
+        self._assert_grad_context("accumulate_sum_X")
         # Get trainable parameters  
         params = [p for p in self.model.parameters() if p.requires_grad]
         
@@ -1074,6 +1101,7 @@ class ProbeComponents:
         Returns:
             (sum_Y_buf, B_local): Parameter sum buffer and local batch size
         """
+        self._assert_grad_context("accumulate_sum_Y")
         # Get trainable parameters
         params = [p for p in self.model.parameters() if p.requires_grad]
         
@@ -1351,6 +1379,7 @@ class ProbeComponents:
         Returns (sum_s_local, sum_s2_local, B_E_local) as Python floats/ints.
         Caller assembles Var_E = η^2 * [ (Σ s^2 − B s̄^2) / (B − 1) ] / B, SE_E = η * sqrt( ... ).
         """
+        self._assert_grad_context("compute_conditional_variance_over_E_alpha")
         from contextlib import nullcontext
         device = next(self.model.parameters()).device
         sum_s_local = 0.0
@@ -1397,7 +1426,11 @@ class ProbeComponents:
                 non_none = sum(int(gi is not None) for gi in g_list)
                 _dbg(f"α-trick: non-None parameter grads in first pass = {non_none}/{len(g_list)}")
                 if non_none == 0:
-                    raise RuntimeError("α-trick: No gradient terms to contract with μY (check TF forward & X-loss).")
+                    raise RuntimeError(
+                        "α-trick: No parameter received a gradient from L. "
+                        "Most likely the model forward happened under inference_mode/no_grad "
+                        "in a higher-level caller (cannot be overridden locally)."
+                    )
 
                 # 4) Contract with μY: h = Σ_p <g_p, μY_p>
                 h = torch.zeros((), device=device, dtype=L.dtype)

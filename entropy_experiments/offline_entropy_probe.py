@@ -522,6 +522,10 @@ class OfflineEntropyProbe:
         Returns:
             Dict with deltaH1, bars_dot, B_E, B_U, timing, and diagnostics
         """
+        # Guard against probe being called under inference_mode or no_grad
+        if torch.is_inference_mode_enabled():
+            raise RuntimeError("Probe entrypoint called under torch.inference_mode(); remove that context.")
+        
         start_time = time.time()
         
         try:
