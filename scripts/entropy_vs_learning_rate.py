@@ -55,7 +55,8 @@ def create_experiment_config(base_config_path: str, learning_rate: float,
     # Modify config for entropy measurement experiment
     config['lr'] = learning_rate
     config['total_steps'] = 2  # Exactly 2 steps for before/after entropy measurement
-    config['save_every'] = 10   # High value so it never activates during 2 steps
+    config['save_every'] = 999   # Never save during training (higher than total_steps)
+    config['disable_checkpoints'] = True  # Disable ALL checkpoint saving including final
     config['buffer_size'] = 128  # Use standard 2-GPU buffer size
     config['microbatch_size'] = 4  # Optimal for 2x H100
     

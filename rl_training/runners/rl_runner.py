@@ -346,9 +346,12 @@ class RLRunner:
                 mem_after_cleanup = torch.cuda.memory_allocated() / 1024**3
                 print(f"[MEMORY] Rank {self.rank} GPU memory after cleanup: {mem_after_cleanup:.2f}GB")
             
-            if self.step_id % self.save_every == 0:
+            if self.step_id % self.save_every == 0 and not self.cfg.get('disable_checkpoints', False):
                 self._save_ckpt()
-        self._save_ckpt(final=True)
+        
+        # Only save final checkpoint if not explicitly disabled
+        if not self.cfg.get('disable_checkpoints', False):
+            self._save_ckpt(final=True)
 
     def _train_one_buffer(self, rb, K, ga_steps, B, entropy_grads=None):
         print(f"[DEBUG] Rank {self.rank} entered _train_one_buffer with {len(rb)} prompts, K={K}, ga_steps={ga_steps}, B={B}")
