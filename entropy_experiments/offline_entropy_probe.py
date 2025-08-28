@@ -279,23 +279,24 @@ class OfflineEntropyProbe:
             weight_decay=weight_decay,
         )
         
-        # Load the saved state
+        # Load the saved state with custom parameter ID mapping
         try:
-            # Handle different state formats
+            # Handle different state formats and extract the actual optimizer state dict
             if isinstance(optimizer_state, dict):
                 if 'state_dict' in optimizer_state:
-                    # State wrapped in a dictionary
-                    optimizer.load_state_dict(optimizer_state['state_dict'])
+                    state_dict = optimizer_state['state_dict']
                 elif 'param_groups' in optimizer_state:
-                    # Direct optimizer state dict
-                    optimizer.load_state_dict(optimizer_state)
+                    state_dict = optimizer_state
                 else:
-                    # Assume the whole thing is the state dict
-                    optimizer.load_state_dict(optimizer_state)
+                    state_dict = optimizer_state
             else:
                 raise ValueError(f"Unexpected optimizer_state type: {type(optimizer_state)}")
-                
-            self.logger.info("Successfully loaded optimizer state")
+            
+            # Custom parameter ID remapping to handle model reconstruction
+            remapped_state_dict = self._remap_optimizer_state_ids(state_dict, optimizer)
+            optimizer.load_state_dict(remapped_state_dict)
+            
+            self.logger.info("Successfully loaded optimizer state with ID remapping")
             
             # Validate that optimizer has state (exp_avg_sq for Adam preconditioning)
             param_count = len(list(self.model.parameters()))
@@ -318,6 +319,81 @@ class OfflineEntropyProbe:
                 weight_decay=weight_decay,
             )
             return fresh_optimizer
+    
+    def _remap_optimizer_state_ids(self, saved_state_dict: dict, current_optimizer: torch.optim.Optimizer) -> dict:
+        """
+        Remap parameter IDs in saved optimizer state to match current model parameters.
+        
+        This handles the common issue where model reconstruction creates new parameter IDs
+        that don't match the saved optimizer state keys.
+        
+        Args:
+            saved_state_dict: Original optimizer state dict with old parameter IDs
+            current_optimizer: Current optimizer with new parameter IDs
+            
+        Returns:
+            Remapped state dict with current parameter IDs as keys
+        """
+        # Extract current parameter list (in order)
+        current_params = []
+        for group in current_optimizer.param_groups:
+            current_params.extend(group['params'])
+            
+        # Extract saved parameter IDs and states (in order)
+        saved_state = saved_state_dict.get('state', {})
+        saved_param_groups = saved_state_dict.get('param_groups', [])
+        
+        # Get saved parameter IDs in the same order they were saved
+        saved_param_ids = []
+        for group in saved_param_groups:
+            if 'params' in group:
+                saved_param_ids.extend(group['params'])
+        
+        self.logger.info(f"Remapping optimizer IDs: {len(saved_param_ids)} saved → {len(current_params)} current")
+        
+        if len(saved_param_ids) != len(current_params):
+            self.logger.warning(f"Parameter count mismatch: saved={len(saved_param_ids)}, current={len(current_params)}")
+            self.logger.warning("This might indicate model architecture changes - some optimizer state may be lost")
+        
+        # Create ID mapping: old_id → new_id based on position
+        id_mapping = {}
+        min_count = min(len(saved_param_ids), len(current_params))
+        for i in range(min_count):
+            old_id = saved_param_ids[i]
+            new_id = id(current_params[i])
+            id_mapping[old_id] = new_id
+            
+        # Remap the state dict
+        remapped_state = {}
+        successful_remaps = 0
+        for old_id, param_state in saved_state.items():
+            if old_id in id_mapping:
+                new_id = id_mapping[old_id]
+                remapped_state[new_id] = param_state
+                successful_remaps += 1
+            else:
+                self.logger.debug(f"Skipping unmappable parameter ID: {old_id}")
+                
+        # Update param_groups with new IDs
+        remapped_param_groups = []
+        for i, group in enumerate(saved_param_groups):
+            new_group = group.copy()
+            if 'params' in group:
+                # Map old param IDs to new param IDs
+                old_param_ids = group['params']
+                new_param_ids = []
+                for old_id in old_param_ids:
+                    if old_id in id_mapping:
+                        new_param_ids.append(id_mapping[old_id])
+                new_group['params'] = new_param_ids
+            remapped_param_groups.append(new_group)
+        
+        self.logger.info(f"Successfully remapped {successful_remaps}/{len(saved_state)} parameter states")
+        
+        return {
+            'state': remapped_state,
+            'param_groups': remapped_param_groups
+        }
         
     def _initialize_components(self) -> None:
         """Initialize all probe components after model/optimizer are loaded."""
