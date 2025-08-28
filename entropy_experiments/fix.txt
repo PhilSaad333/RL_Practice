@@ -1,50 +1,279 @@
-I can see exactly why your α-trick path is failing in the aligned-batch code: in conditional_variance.py::_compute_aligned_batch_logprobs you compute the logits before you activate the adapter and on self.model rather than the canonical PEFT module. You only call set_adapter("default") later in the “🔧 TF probe” section—so the S_batch you differentiate was produced without LoRA active. That explains the “S does not backprop to LoRA params” error even though your on/off check appears fine (the check is done on a different forward run that does enable the adapter). 
+================================================================================
+LoRA-Simple Probe Migration Plan (No Quantization, Single GPU, No Checkpointing)
+Goal
 
-Two concrete actions:
+Run the entropy/variance probe with the simplest, most stable autograd stack:
 
-Minimal fix (variance path): move adapter activation before the forward that builds S_batch, and call the same PEFT module for the forward that you used to build the parameter registry, i.e. peft_model = self.model.module if hasattr(self.model,"module") else self.model and then outputs = peft_model(...). This should be done in _compute_aligned_batch_logprobs (and any sibling path that computes S for the α-trick). The rest of your parameter registry patching was fine. 
+No 4-bit quantization (no BitsAndBytes; no prepare_model_for_kbit_training)
 
-Run an isolated debugger that reproduces the aligned-batch computation and contrasts “forward via wrapper” vs “forward via PEFT object,” with adapters activated before the forward. I’ve prepared such a script:
+No gradient checkpointing
 
-file: variance_grad_debug.py
+Single GPU, no DDP for the probe binaries
 
-location: /mnt/data/variance_grad_debug.py
-Download the script
+Keep your LoRA adapter (trained under QLoRA) and load it into an fp16/bf16 base
 
-Usage:
+Result: gradients (including α-trick / second derivatives) and optimizer steps over LoRA params become straightforward and robust.
 
-python variance_grad_debug.py \
-  --base Qwen/Qwen2.5-1.5B \
-  --adapter /path/to/training_state/step_XX/model \
-  --batch 6 --G 4 --prompt-lens 48 --gen-lens 64
+Files you will touch
 
+offline_entropy_probe.py (model loading entry point)
 
-What it prints:
+probe_components.py (already has the canonical param registry; keep it)
 
-A sanity “LoRA on/off delta” on a tiny sample.
+conditional_variance.py (already patched to use the registry; keep it)
 
-Variant A: forward via the PEFT module, with set_adapter("default") before the forward. Reports whether S requires grad and how many LoRA tensors get non-None grads.
+You do not need BitsAndBytes or DDP for this probe.
 
-Variant B: simulates the wrapper call but still activates the adapter before the forward. You should again see non-None gradients for LoRA.
+Prereqs
 
-If Variant A works in the debugger while your repo code still fails, it’s a clear signal that your repo’s _compute_aligned_batch_logprobs computes S_batch prior to adapter activation and/or on the wrong module object.
+pip install transformers peft accelerate torch (bitsandbytes is not required now)
 
-Patch sketch (precise lines to change)
+A single CUDA GPU with enough memory for Qwen2.5-1.5B in bf16/fp16 (comfortably <10 GB)
 
-In conditional_variance.py::_compute_aligned_batch_logprobs:
+Environment flags (recommended)
 
--                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
--                    outputs = self.model(flat_sequences, attention_mask=flat_attention_masks)
--                    logits = outputs.logits  # [B, T, V]
-+                # Resolve PEFT model and ensure adapter is active BEFORE forward
-+                peft_model = self.model.module if hasattr(self.model, "module") else self.model
-+                if hasattr(peft_model, "set_adapter"):
-+                    peft_model.set_adapter("default")
-+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-+                    outputs = peft_model(input_ids=flat_sequences, attention_mask=flat_attention_masks)
-+                    logits = outputs.logits  # [B, T, V]
+Set these when running your probe:
+
+export CUDA_VISIBLE_DEVICES=0
+export ENTROPY_PROBE_MODE=lora_simple
+export ENTROPY_PROBE_SINGLE_GPU=1
 
 
-Leave the later on/off diagnostic in place if you like, but it is no longer the mechanism that “enables” adapters.
+(We use these below to gate behavior without disrupting other scripts.)
 
-For completeness, make the same “use canonical PEFT module” adjustment anywhere else you compute S for α-trick. In your ProbeComponents forward path for teacher forcing you already resolve peft_model and set adapter, so first-order paths (bars·dot) were fine; it’s this batched/aligned variant that regressed. 
+PATCH A — Replace QLoRA loader with LoRA-simple loader (no 4-bit)
+
+Add this loader near the top of offline_entropy_probe.py (or in a small
+entropy_model_loading.py helper and import it). It cleanly supports two modes;
+for now you’ll run mode="lora_simple".
+
+# === Begin: LoRA-simple / QLoRA loader ===
+from typing import Optional
+import torch
+
+def load_peft_for_probe(
+    base_id: str,
+    adapter_path: str,
+    *,
+    mode: str = "lora_simple",   # "lora_simple" or "qlora"
+    dtype: str = "bf16",         # "bf16" or "fp16"
+    device_map: str = "cuda",
+    use_checkpointing: bool = False
+):
+    from transformers import AutoModelForCausalLM
+    from peft import PeftModel
+
+    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
+
+    if mode == "lora_simple":
+        # Plain fp16/bf16 base — NO quantization, NO k-bit preparation
+        base = AutoModelForCausalLM.from_pretrained(
+            base_id, device_map=device_map, torch_dtype=torch_dtype
+        )
+        # Ensure no checkpointing and cache is allowed (deterministic probe)
+        if hasattr(base, "gradient_checkpointing_disable"):
+            base.gradient_checkpointing_disable()
+        if hasattr(base.config, "use_cache"):
+            base.config.use_cache = True
+
+        peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
+        # For safety with some HF versions; helps when you later enable ckpting elsewhere
+        if hasattr(peft, "enable_input_require_grads"):
+            peft.enable_input_require_grads()
+
+        return peft
+
+    elif mode == "qlora":
+        # Keep original QLoRA path if you ever want to compare—but you won't use it now
+        from transformers import BitsAndBytesConfig
+        from peft import prepare_model_for_kbit_training
+
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch_dtype,
+        )
+        base = AutoModelForCausalLM.from_pretrained(
+            base_id, device_map=device_map, torch_dtype=torch_dtype, quantization_config=bnb_cfg
+        )
+        base = prepare_model_for_kbit_training(base)
+        if use_checkpointing and hasattr(base, "gradient_checkpointing_enable"):
+            base.gradient_checkpointing_enable()
+            if hasattr(base.config, "use_cache"):
+                base.config.use_cache = False
+        peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
+        if hasattr(peft, "enable_input_require_grads"):
+            peft.enable_input_require_grads()
+        return peft
+
+    else:
+        raise ValueError("mode must be 'lora_simple' or 'qlora'")
+# === End: LoRA-simple / QLoRA loader ===
+
+
+Now replace your current model-loading block in offline_entropy_probe.py
+(where you previously used BitsAndBytesConfig / prepare_model_for_kbit_training)
+with this explicit call:
+
+# Obtain configuration from your existing args/config
+base_id       = cfg.model_name_or_path          # e.g., "Qwen/Qwen2.5-1.5B"
+adapter_path  = cfg.adapter_dir                 # e.g., ".../training_state/step_X/model"
+dtype         = "bf16"                          # or "fp16" if you prefer
+mode          = "lora_simple"                   # <<<<<<<<<<<<<<<< THE KEY CHANGE
+device_map    = "cuda"
+
+self.model = load_peft_for_probe(
+    base_id=base_id,
+    adapter_path=adapter_path,
+    mode=mode,
+    dtype=dtype,
+    device_map=device_map,
+    use_checkpointing=False
+)
+
+# Single-GPU probe: no DDP; keep deterministic eval unless you explicitly step
+self.model.to("cuda")
+self.model.eval()
+# IMPORTANT: ensure adapter is active BEFORE any forward that produces S/logits
+if hasattr(self.model, "set_adapter"):
+    self.model.set_adapter("default")
+
+
+If your file previously imported BitsAndBytesConfig at module scope, you can remove that import; it’s not needed in this mode.
+
+PATCH B — Disable DDP & checkpointing in probe code paths
+
+In your probe binaries only (not general training), guard any distributed
+initialization or no_sync usage. For example in offline_entropy_probe.py
+(or wherever you set up process groups):
+
+import os
+from contextlib import nullcontext
+
+SINGLE_GPU = os.getenv("ENTROPY_PROBE_SINGLE_GPU", "1") == "1"
+
+# If you had: dist.init_process_group("nccl") ...
+if SINGLE_GPU:
+    # Skip DDP entirely for the probe
+    pass
+else:
+    import torch.distributed as dist
+    dist.init_process_group("nccl")
+
+
+If you used no_sync() in accumulation loops, define:
+
+def ddp_no_sync(model):
+    return nullcontext()  # always, in single-GPU probe
+
+
+…and use with ddp_no_sync(self.model): in place of conditional no_sync.
+
+Also ensure no gradient checkpointing is enabled for the probe (already handled in the loader). If you had explicit calls like model.gradient_checkpointing_enable(), remove them from the probe path.
+
+PATCH C — Optimizer over LoRA trainables (for the later step portion)
+
+Even though .requires_grad=True filters to LoRA params, make the intent explicit.
+In the place you construct the optimizer for the probe’s step section (not the X/Y
+accumulation of the metric, but the part where you intentionally step):
+
+# Assuming you added the canonical registry earlier:
+peft_model = self.model.module if hasattr(self.model, "module") else self.model
+trainable_named = [(n,p) for (n,p) in peft_model.named_parameters() if p.requires_grad]
+trainable_params = [p for _, p in trainable_named]
+
+from torch.optim import AdamW
+opt = AdamW(trainable_params, lr=cfg.lr_for_probe, weight_decay=cfg.weight_decay_for_probe)
+
+# One tiny update step example (if/where you already do this):
+loss = your_probe_loss  # scalar
+opt.zero_grad(set_to_none=True)
+loss.backward()
+opt.step()
+
+
+This keeps parameter identity and the optimizer state trivial in LoRA-simple mode.
+
+PATCH D — Ensure adapter is active BEFORE forward in variance path
+
+In conditional_variance.py::_compute_aligned_batch_logprobs (and any sibling
+function that computes S for α-trick), make sure adapter activation precedes
+the logits forward on the exact PEFT module you use elsewhere:
+
+- with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+-     outputs = self.model(flat_sequences, attention_mask=flat_attention_masks)
++ peft_model = self.model.module if hasattr(self.model, "module") else self.model
++ if hasattr(peft_model, "set_adapter"):
++     peft_model.set_adapter("default")   # activate BEFORE forward
++ with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
++     outputs = peft_model(input_ids=flat_sequences, attention_mask=flat_attention_masks)
+
+
+This mirrors what worked in your α-trick debug script and aligns with the canonical
+parameter registry you already added.
+
+PATCH E — Keep the canonical parameter registry (already added)
+
+You already introduced:
+
+self._peft, self._trainable_named, self._trainable_params
+
+(optionally) self._lora_named, self._lora_params
+
+Continue to use those exact lists:
+
+For buffer creation, accumulation, dot products (bars·dot)
+
+For Y-path preconditioning (when enabled again)
+
+For α-trick vector-Jacobian products and contractions
+
+The LoRA-simple mode makes those ops straightforward.
+
+Sanity checks (run after the patches)
+
+LoRA on/off delta on a tiny batch (any file; once per run):
+
+peft_model = self.model.module if hasattr(self.model, "module") else self.model
+import torch
+with torch.no_grad():
+    x = torch.randint(10, peft_model.config.vocab_size-1, (1,16), device="cuda")
+    m = torch.ones_like(x)
+    peft_model.set_adapter("default")
+    logits_on  = peft_model(x, attention_mask=m).logits
+    with peft_model.disable_adapter():
+        logits_off = peft_model(x, attention_mask=m).logits
+    delta = (logits_on - logits_off).abs().max().item()
+self.logger.info(f"[sanity] LoRA on/off delta: {delta:.3e}")
+
+
+You should see a clearly non-zero delta.
+
+bars·dot path (first-order): log buffer norms after accumulation:
+
+||sum_X||₂ and ||sum_Y||₂  should be > 0
+bars_dot = μ_X · μ_Y       should be > 0 for realistic batches
+
+
+α-trick (second-order): run the three α cases from your working script
+(ones, random, basis) and check:
+
+||g_back|| ~ ||g_auto||  and  ||g_back - g_auto|| is tiny (≪ 1e-4 relative)
+non-None grad count over LoRA tensors is high
+
+Notes on using a QLoRA-trained adapter in LoRA-simple
+
+OK to reuse: The adapter was trained against your base model topology; it
+holds the A/B matrices (and config: r, α, target modules). Loading it into an
+fp16/bf16 backbone applies the same low-rank delta to the unquantized base.
+
+Do not quantize the base in this mode; load it directly in bf16/fp16.
+
+Do not enable gradient checkpointing in the probe; this keeps autograd
+graphs simple and avoids enable_input_require_grads()-related pitfalls.
+
+Keep single GPU; no DDP/no-sync/no all-reduce makes the μ-buffers and α-trick
+free of wrapper semantics.
+
+================================================================================

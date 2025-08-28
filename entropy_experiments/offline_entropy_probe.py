@@ -17,6 +17,70 @@ Usage:
     results = probe.run_offline_analysis(checkpoint_path)
 """
 
+# === Begin: LoRA-simple / QLoRA loader ===
+from typing import Optional
+import torch
+
+def load_peft_for_probe(
+    base_id: str,
+    adapter_path: str,
+    *,
+    mode: str = "lora_simple",   # "lora_simple" or "qlora"
+    dtype: str = "bf16",         # "bf16" or "fp16"
+    device_map: str = "cuda",
+    use_checkpointing: bool = False
+):
+    from transformers import AutoModelForCausalLM
+    from peft import PeftModel
+
+    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
+
+    if mode == "lora_simple":
+        # Plain fp16/bf16 base — NO quantization, NO k-bit preparation
+        base = AutoModelForCausalLM.from_pretrained(
+            base_id, device_map=device_map, torch_dtype=torch_dtype
+        )
+        # Ensure no checkpointing and cache is allowed (deterministic probe)
+        if hasattr(base, "gradient_checkpointing_disable"):
+            base.gradient_checkpointing_disable()
+        if hasattr(base.config, "use_cache"):
+            base.config.use_cache = True
+
+        peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
+        # For safety with some HF versions; helps when you later enable ckpting elsewhere
+        if hasattr(peft, "enable_input_require_grads"):
+            peft.enable_input_require_grads()
+
+        return peft
+
+    elif mode == "qlora":
+        # Keep original QLoRA path if you ever want to compare—but you won't use it now
+        from transformers import BitsAndBytesConfig
+        from peft import prepare_model_for_kbit_training
+
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch_dtype,
+        )
+        base = AutoModelForCausalLM.from_pretrained(
+            base_id, device_map=device_map, torch_dtype=torch_dtype, quantization_config=bnb_cfg
+        )
+        base = prepare_model_for_kbit_training(base)
+        if use_checkpointing and hasattr(base, "gradient_checkpointing_enable"):
+            base.gradient_checkpointing_enable()
+            if hasattr(base.config, "use_cache"):
+                base.config.use_cache = False
+        peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
+        if hasattr(peft, "enable_input_require_grads"):
+            peft.enable_input_require_grads()
+        return peft
+
+    else:
+        raise ValueError("mode must be 'lora_simple' or 'qlora'")
+# === End: LoRA-simple / QLoRA loader ===
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -56,10 +120,19 @@ class OfflineEntropyProbe:
         self.config = config
         self.logger = self._setup_logging()
         
-        # Initialize distributed if needed
-        self.distributed = dist.is_initialized()
-        self.rank = dist.get_rank() if self.distributed else 0
-        self.world_size = dist.get_world_size() if self.distributed else 1
+        # Single GPU mode for probe (from fix.txt)
+        self.SINGLE_GPU = os.getenv("ENTROPY_PROBE_SINGLE_GPU", "1") == "1"
+        
+        # Initialize distributed if needed (disabled in single GPU mode)
+        if self.SINGLE_GPU:
+            # Skip DDP entirely for the probe
+            self.distributed = False
+            self.rank = 0
+            self.world_size = 1
+        else:
+            self.distributed = dist.is_initialized()
+            self.rank = dist.get_rank() if self.distributed else 0
+            self.world_size = dist.get_world_size() if self.distributed else 1
         
         # Initialize components
         self.probe_components = None
@@ -213,37 +286,28 @@ class OfflineEntropyProbe:
             return self._load_full_model_checkpoint(checkpoint_path)
             
     def _load_lora_model(self, lora_path: str) -> torch.nn.Module:
-        """Load LoRA model following rl_runner.py pattern."""
-        # Import here to match rl_runner.py pattern
-        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-        from peft import PeftModel, prepare_model_for_kbit_training
-        
-        # Get backbone from config or infer from LoRA adapter
+        """Load LoRA model using LoRA-Simple approach (no quantization)."""
+        # Get backbone from config
         backbone = self.config['checkpoint'].get('model_config_path', 'Qwen/Qwen2.5-1.5B')
         
-        # Setup quantization config (exact copy from rl_runner.py)
-        bnb = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16
+        # Use LoRA-Simple loader (no quantization, no checkpointing)
+        model = load_peft_for_probe(
+            base_id=backbone,
+            adapter_path=lora_path,
+            mode="lora_simple",
+            dtype="bf16",
+            device_map="cuda",
+            use_checkpointing=False
         )
         
-        # Load base model (exact copy from rl_runner.py pattern)
-        base = AutoModelForCausalLM.from_pretrained(
-            backbone,
-            torch_dtype=torch.bfloat16,
-            quantization_config=bnb
-        )
-        base = prepare_model_for_kbit_training(base)  # PEFT/QLoRA prep
-        # Disable gradient checkpointing for entropy probe - needed for clean autograd graphs
-        # base.gradient_checkpointing_enable()
-        base.config.use_cache = False
+        # Single-GPU probe: no DDP; keep deterministic eval
+        model.to("cuda")
+        model.eval()
+        # IMPORTANT: ensure adapter is active BEFORE any forward that produces S/logits
+        if hasattr(model, "set_adapter"):
+            model.set_adapter("default")
         
-        # Load LoRA adapter (exact copy from rl_runner.py pattern)
-        model = PeftModel.from_pretrained(base, lora_path, is_trainable=True)
-        model.enable_input_require_grads()
-        
-        # DIAGNOSTICS: Verify LoRA adapters are active and trainable (from fix.txt)
+        # DIAGNOSTICS: Verify LoRA adapters are active and trainable
         self.logger.info(f"Active adapters: {getattr(model, 'active_adapter', None)}")
         
         # Count trainable parameters and show LoRA names
