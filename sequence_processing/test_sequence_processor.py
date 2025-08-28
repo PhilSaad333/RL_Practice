@@ -59,8 +59,8 @@ def load_peft_for_test(
 def main():
     print("=== SequenceProcessor Test on Lambda H100 ===")
     
-    # Checkpoint path on Lambda
-    checkpoint_path = "/home/ubuntu/localfs/training_runs/run_2025-08-24_22-13-22/training_state/step_40"
+    # Checkpoint path on Lambda - the LoRA adapter is in the model/ subdirectory
+    checkpoint_path = "/home/ubuntu/localfs/training_runs/run_2025-08-24_22-13-22/training_state/step_40/model"
     base_model_id = "Qwen/Qwen2.5-1.5B"
     
     print(f"Checkpoint path: {checkpoint_path}")
