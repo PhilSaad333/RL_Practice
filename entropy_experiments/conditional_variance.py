@@ -328,8 +328,8 @@ class ConditionalVarianceEstimator:
                 flat_sequences = sequences.view(num_prompts * G, total_len)
                 flat_attention_masks = attention_masks.view(num_prompts * G, total_len)
 
-                # Resolve PEFT model and ensure adapter is active BEFORE forward
-                peft_model = self.model.module if hasattr(self.model, "module") else self.model
+                # Use canonical PEFT model and ensure adapter is active BEFORE forward
+                peft_model = self._peft
                 if hasattr(peft_model, "set_adapter"):
                     peft_model.set_adapter("default")
                 
@@ -491,8 +491,8 @@ class ConditionalVarianceEstimator:
         batch_size, G, max_len = sequences.shape
         
         # 🔧 FIX 1: Ensure PEFT wrapper and active adapter (from fix.txt §1)
-        # Resolve the PEFT-wrapped module regardless of DDP
-        peft_model = self.model.module if hasattr(self.model, "module") else self.model
+        # Use canonical PEFT module from registry 
+        peft_model = self._peft
         
         # Make sure an adapter is active and trainable
         if hasattr(peft_model, "set_adapter"):

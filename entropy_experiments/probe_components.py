@@ -826,7 +826,7 @@ class ProbeComponents:
         
         # 🔧 FIX: Apply same PEFT adapter activation as conditional_variance.py
         # Resolve the PEFT-wrapped module regardless of DDP
-        peft_model = self.model.module if hasattr(self.model, "module") else self.model
+        peft_model = self._peft
         
         # Make sure an adapter is active and trainable
         if hasattr(peft_model, "set_adapter"):
