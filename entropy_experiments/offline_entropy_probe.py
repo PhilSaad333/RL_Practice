@@ -760,132 +760,122 @@ class OfflineEntropyProbe:
             phase0_time = time.time() - phase0_start
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
             
-            # Phase 1: Accumulate ΣX (raw gradients from E batch)
-            self.logger.info("Phase 1: Accumulating ΣX from E batch")
-            phase1_start = time.time()
+            # Check if δH₁ computation should be performed
+            probe_config = self.config.get('probe_rework', {})
+            compute_delta_h1 = probe_config.get('compute_delta_h1', True)
             
-            sum_X_buf, B_E_local = self.probe_components.accumulate_sum_X(
-                E_batch, mb_size_prompts, weighting_mode
-            )
+            # Initialize variables for potential use in later stages
+            delta_h1 = 0.0
+            bars_dot = 0.0
+            learning_rate = 0.0
+            phase1_time = phase2_time = phase3_time = 0.0
+            B_E_global = B_E_local if not is_dist else None
+            B_U_global = B_U_local if not is_dist else None
             
-            phase1_time = time.time() - phase1_start
-            self.logger.info(f"Phase 1 complete: {phase1_time:.2f}s, B_E_local={B_E_local}")
-            
-            # Phase 2: Accumulate ΣY (preconditioned gradients from U batch)
-            self.logger.info("Phase 2: Accumulating ΣY from U batch")
-            phase2_start = time.time()
-            
-            sum_Y_buf, B_U_local = self.probe_components.accumulate_sum_Y(
-                U_batch, mb_size_prompts, self.adam_preconditioner
-            )
-            
-            phase2_time = time.time() - phase2_start
-            self.logger.info(f"Phase 2 complete: {phase2_time:.2f}s, B_U_local={B_U_local}")
-            
-            # Phase 3: All-reduce and compute means and δH₁  
-            self.logger.info("Phase 3: All-reduce and computing means and δH₁")
-            phase3_start = time.time()
-            
-            # Stage 3: All-reduce counts and parameter buffers
-            if is_dist:
-                self.logger.info("Multi-GPU: All-reducing counts and parameter buffers")
+            if compute_delta_h1:
+                # Phase 1: Accumulate ΣX (raw gradients from E batch)
+                self.logger.info("Phase 1: Accumulating ΣX from E batch")
+                phase1_start = time.time()
                 
-                # All-reduce counts
-                B_E_global = distributed_helpers.count_global(B_E_local)
-                B_U_global = distributed_helpers.count_global(B_U_local)
+                sum_X_buf, B_E_local = self.probe_components.accumulate_sum_X(
+                    E_batch, mb_size_prompts, weighting_mode
+                )
+            
+                phase1_time = time.time() - phase1_start
+                self.logger.info(f"Phase 1 complete: {phase1_time:.2f}s, B_E_local={B_E_local}")
                 
-                # All-reduce parameter buffers (in-place)
-                distributed_helpers.all_reduce_param_buffer_(sum_X_buf)
-                distributed_helpers.all_reduce_param_buffer_(sum_Y_buf)
+                # Phase 2: Accumulate ΣY (preconditioned gradients from U batch)
+                self.logger.info("Phase 2: Accumulating ΣY from U batch")
+                phase2_start = time.time()
                 
-                self.logger.info(f"All-reduced: B_E_global={B_E_global}, B_U_global={B_U_global}")
+                sum_Y_buf, B_U_local = self.probe_components.accumulate_sum_Y(
+                    U_batch, mb_size_prompts, self.adam_preconditioner
+                )
+                
+                phase2_time = time.time() - phase2_start
+                self.logger.info(f"Phase 2 complete: {phase2_time:.2f}s, B_U_local={B_U_local}")
+                
+                # Phase 3: All-reduce and compute means and δH₁  
+                self.logger.info("Phase 3: All-reduce and computing means and δH₁")
+                phase3_start = time.time()
+                
+                # Stage 3: All-reduce counts and parameter buffers
+                if is_dist:
+                    self.logger.info("Multi-GPU: All-reducing counts and parameter buffers")
+                    
+                    # All-reduce counts
+                    B_E_global = distributed_helpers.count_global(B_E_local)
+                    B_U_global = distributed_helpers.count_global(B_U_local)
+                    
+                    # All-reduce parameter buffers (in-place)
+                    distributed_helpers.all_reduce_param_buffer_(sum_X_buf)
+                    distributed_helpers.all_reduce_param_buffer_(sum_Y_buf)
+                    
+                    self.logger.info(f"All-reduced: B_E_global={B_E_global}, B_U_global={B_U_global}")
+                else:
+                    # Single GPU: use local counts
+                    B_E_global = B_E_local
+                    B_U_global = B_U_local
+                    self.logger.info(f"Single GPU: B_E={B_E_global}, B_U={B_U_global}")
+                
+                # Compute means: μ_X = ΣX / B_E_global, μ_Y = ΣY / B_U_global
+                mu_X = {param_id: buf_tensor / max(B_E_global, 1) 
+                       for param_id, buf_tensor in sum_X_buf.items()}
+                mu_Y = {param_id: buf_tensor / max(B_U_global, 1) 
+                       for param_id, buf_tensor in sum_Y_buf.items()}
+                
+                # Instrumentation to confirm numerical stability (from fix.txt)
+                nz_X = sum(int(t.abs().sum().item() > 0) for t in mu_X.values())
+                nz_Y = sum(int(t.abs().sum().item() > 0) for t in mu_Y.values())
+                self.logger.info(f"[CHECK] nonzero μ_X entries: {nz_X}, nonzero μ_Y entries: {nz_Y}")
+                norm_X = sum(float((t.double().pow(2)).sum().item()) for t in mu_X.values())**0.5
+                norm_Y = sum(float((t.double().pow(2)).sum().item()) for t in mu_Y.values())**0.5
+                self.logger.info(f"[CHECK] ||μ_X||₂={norm_X:.6e}, ||μ_Y||₂={norm_Y:.6e}")
+                
+                # Compute dot product: bars_dot = μ_X · μ_Y (now uses fp64 accumulation)
+                bars_dot = self.probe_components.dot_param_buffers(mu_X, mu_Y)
+                
+                # Get learning rate and compute δH₁
+                learning_rate = self.probe_components._get_learning_rate(self.optimizer)
+                delta_h1 = learning_rate * bars_dot
+                
+                phase3_time = time.time() - phase3_start
+                
+                # Log results with high precision
+                self.logger.info(f"🔍 [RESULTS] bars_dot={bars_dot:.10f}")
+                self.logger.info(f"🔍 [RESULTS] learning_rate={learning_rate:.2e}")
+                self.logger.info(f"🔍 [RESULTS] deltaH1={delta_h1:.10f}")
+                self.logger.info(f"Phase 3 complete: {phase3_time:.2f}s")
+                
+                # Update globals for distributed case
+                if is_dist:
+                    # B_E_global and B_U_global already set above
+                    pass
+                else:
+                    B_E_global = B_E_local
+                    B_U_global = B_U_local
             else:
-                # Single GPU: use local counts
-                B_E_global = B_E_local
-                B_U_global = B_U_local
-                self.logger.info(f"Single GPU: B_E={B_E_global}, B_U={B_U_global}")
-            
-            # Compute means: μ_X = ΣX / B_E_global, μ_Y = ΣY / B_U_global
-            mu_X = {param_id: buf_tensor / max(B_E_global, 1) 
-                   for param_id, buf_tensor in sum_X_buf.items()}
-            mu_Y = {param_id: buf_tensor / max(B_U_global, 1) 
-                   for param_id, buf_tensor in sum_Y_buf.items()}
-            
-            # Instrumentation to confirm numerical stability (from fix.txt)
-            nz_X = sum(int(t.abs().sum().item() > 0) for t in mu_X.values())
-            nz_Y = sum(int(t.abs().sum().item() > 0) for t in mu_Y.values())
-            self.logger.info(f"[CHECK] nonzero μ_X entries: {nz_X}, nonzero μ_Y entries: {nz_Y}")
-            norm_X = sum(float((t.double().pow(2)).sum().item()) for t in mu_X.values())**0.5
-            norm_Y = sum(float((t.double().pow(2)).sum().item()) for t in mu_Y.values())**0.5
-            self.logger.info(f"[CHECK] ||μ_X||₂={norm_X:.6e}, ||μ_Y||₂={norm_Y:.6e}")
-            
-            # Compute dot product: bars_dot = μ_X · μ_Y (now uses fp64 accumulation)
-            bars_dot = self.probe_components.dot_param_buffers(mu_X, mu_Y)
-            
-            # Get learning rate and compute δH₁
-            learning_rate = self.probe_components._get_learning_rate(self.optimizer)
-            delta_h1 = learning_rate * bars_dot
-            
-            phase3_time = time.time() - phase3_start
-            
-            # Log results with high precision
-            self.logger.info(f"🔍 [RESULTS] bars_dot={bars_dot:.10f}")
-            self.logger.info(f"🔍 [RESULTS] learning_rate={learning_rate:.2e}")
-            self.logger.info(f"🔍 [RESULTS] deltaH1={delta_h1:.10f}")
-            self.logger.info(f"Phase 3 complete: {phase3_time:.2f}s")
+                self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
+                # Set global batch sizes for downstream use
+                if is_dist:
+                    B_E_global = distributed_helpers.count_global(B_E_local)
+                    B_U_global = distributed_helpers.count_global(B_U_local)
+                else:
+                    B_E_global = B_E_local
+                    B_U_global = B_U_local
             
             # ================================================================
             # STAGE 2: Variance Components - Optional (configurable)
             # ================================================================
-            probe_config = self.config.get('probe_rework', {})
-            compute_vx_vy_variance = probe_config.get('compute_vx_vy_variance', False)
             compute_conditional_variance = probe_config.get('compute_conditional_variance', False)
             
-            V_X, V_Y, SE_deltaH1 = 0.0, 0.0, 0.0
+            SE_deltaH1 = 0.0
             SE_conditional = 0.0
             phase4_time, phase5_time = 0.0, 0.0
             
-            if compute_vx_vy_variance:
-                self.logger.info("Phase 4: Computing variance components V_X and V_Y")
-                phase4_start = time.time()
-                
-                # Compute V_X via per-unit scalar projections on E batch
-                V_X_local = self.probe_components.compute_VX(
-                    E_batch, mu_X, mu_Y, mb_size_prompts, weighting_mode
-                )
-                
-                # Compute V_Y via per-unit scalar projections on U batch
-                V_Y_local = self.probe_components.compute_VY(
-                    U_batch, mu_X, mu_Y, mb_size_prompts, self.adam_preconditioner
-                )
-                
-                # All-reduce variance components via tensor all-reduce
-                if is_dist:
-                    V_X = distributed_helpers.all_reduce_scalar_sum(
-                        torch.tensor(V_X_local, dtype=torch.float64, device='cpu')
-                    )
-                    V_Y = distributed_helpers.all_reduce_scalar_sum(
-                        torch.tensor(V_Y_local, dtype=torch.float64, device='cpu')
-                    )
-                    self.logger.info(f"All-reduced variances: V_X_sum={V_X:.10f}, V_Y_sum={V_Y:.10f}")
-                else:
-                    V_X = V_X_local
-                    V_Y = V_Y_local
-                
-                # Apply final normalization: V_X /= (B_E * max(B_E-1, 1))
-                V_X = V_X / (B_E_global * max(B_E_global - 1, 1))
-                V_Y = V_Y / (B_U_global * max(B_U_global - 1, 1))
-                
-                # Compute standard error (no more fractional variance)
-                SE_deltaH1 = learning_rate * math.sqrt(max(V_X, 0.0) + max(V_Y, 0.0))
-                
-                phase4_time = time.time() - phase4_start
-                self.logger.info(f"🔍 [V_X+V_Y VARIANCE] V_X={V_X:.10f}, V_Y={V_Y:.10f}")
-                self.logger.info(f"🔍 [V_X+V_Y VARIANCE] SE_deltaH1={SE_deltaH1:.10f}")
-                self.logger.info(f"Phase 4 complete: {phase4_time:.2f}s")
             
             # ================================================================
-            # STAGE 2b: Conditional Variance Var_E(δH₁ | U) - Optional
+            # STAGE 2: Conditional Variance Var_E(δH₁ | U) - Optional
             # ================================================================
             if compute_conditional_variance:
                 self.logger.info("Phase 4b: Computing conditional variance Var_E(δH₁ | U)")

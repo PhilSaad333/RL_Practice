@@ -116,7 +116,7 @@ class EntropyTestRunner:
         return run_dir
         
     def _create_run_config(self, template_config: Dict, run_dir: Path, 
-                          B_E: int, B_U: int = 32) -> str:
+                          B_E: int, B_U: int = 32, no_delta_h1: bool = False) -> str:
         """Create config file for specific run."""
         config = template_config.copy()
         
@@ -133,10 +133,10 @@ class EntropyTestRunner:
         config['output']['log_level'] = 'DEBUG' if self.log_level == 'DEBUG' else 'INFO'
         config['output']['save_results'] = True
         
-        # Conditional variance focus (the new estimator we're testing)
+        # Configure which computations to perform
+        config['probe_rework']['compute_delta_h1'] = not no_delta_h1  # Main δH₁ computation (Phase 1-3)
         config['probe_rework']['compute_conditional_variance'] = True
-        config['probe_rework']['compute_vx_vy_variance'] = False
-        config['probe_rework']['compute_importance_sampling'] = False
+        config['probe_rework']['compute_importance_sampling'] = no_delta_h1  # Enable when delta_h1 is disabled
         
         # Save config to run directory
         config_path = run_dir / 'config.yaml'
@@ -228,7 +228,8 @@ class EntropyTestRunner:
             }
             
     def batch_scaling_test(self, B_E_values: List[int], B_U: int = 32, 
-                          runs_per_batch: int = 3, template_config: Dict = None) -> Dict:
+                          runs_per_batch: int = 3, template_config: Dict = None,
+                          no_delta_h1: bool = False) -> Dict:
         """Run batch scaling convergence test."""
         self.logger.info(f"🔍 BATCH SCALING TEST: δH₁ Convergence Analysis")
         self.logger.info(f"B_E values: {B_E_values}, B_U: {B_U}, runs per batch: {runs_per_batch}")
@@ -247,7 +248,7 @@ class EntropyTestRunner:
                 run_dir = self._setup_run_directory(run_name)
                 
                 # Create config for this run
-                config_path = self._create_run_config(template_config, run_dir, B_E, B_U)
+                config_path = self._create_run_config(template_config, run_dir, B_E, B_U, no_delta_h1)
                 
                 if self.log_level != 'QUIET':
                     self.logger.info(f"  Running {run_name}...")
@@ -312,7 +313,7 @@ class EntropyTestRunner:
         return summary
         
     def sanity_check_test(self, runs: int = 15, B_E: int = 256, B_U: int = 32,
-                         template_config: Dict = None) -> Dict:
+                         template_config: Dict = None, no_delta_h1: bool = False) -> Dict:
         """Run sanity check validation test."""
         self.logger.info(f"🧪 SANITY CHECK: Validation Test")
         self.logger.info(f"Runs: {runs}, B_E: {B_E}, B_U: {B_U}")
@@ -325,7 +326,7 @@ class EntropyTestRunner:
             run_name = f"run{run_id:03d}"
             run_dir = self._setup_run_directory(run_name)
             
-            config_path = self._create_run_config(template_config, run_dir, B_E, B_U)
+            config_path = self._create_run_config(template_config, run_dir, B_E, B_U, no_delta_h1)
             
             if self.log_level != 'QUIET':
                 self.logger.info(f"  Running validation {run_id}/{runs}...")
@@ -373,7 +374,8 @@ class EntropyTestRunner:
         
         return summary
         
-    def single_test(self, B_E: int, B_U: int = 32, template_config: Dict = None) -> Dict:
+    def single_test(self, B_E: int, B_U: int = 32, template_config: Dict = None,
+                   no_delta_h1: bool = False) -> Dict:
         """Run single entropy probe test."""
         self.logger.info(f"🎯 SINGLE TEST: B_E={B_E}, B_U={B_U}")
         self.logger.info(f"Experiment: {self.exp_dir}")
@@ -381,7 +383,7 @@ class EntropyTestRunner:
         run_name = f"BE{B_E:03d}_BU{B_U:03d}"
         run_dir = self._setup_run_directory(run_name)
         
-        config_path = self._create_run_config(template_config, run_dir, B_E, B_U)
+        config_path = self._create_run_config(template_config, run_dir, B_E, B_U, no_delta_h1)
         
         start_time = time.time()
         result = self._run_single_probe(run_dir, config_path)
@@ -422,7 +424,7 @@ class EntropyTestRunner:
         return summary
         
     def debug_test(self, B_E_values: List[int], B_U: int = 32, 
-                  template_config: Dict = None) -> Dict:
+                  template_config: Dict = None, no_delta_h1: bool = False) -> Dict:
         """Run debug analysis with detailed logging."""
         self.logger.info(f"🔍 DEBUG MODE: Detailed Analysis")
         self.logger.info(f"B_E values: {B_E_values}, B_U: {B_U}")
@@ -438,7 +440,7 @@ class EntropyTestRunner:
             run_name = f"debug_BE{B_E:03d}"
             run_dir = self._setup_run_directory(run_name)
             
-            config_path = self._create_run_config(template_config, run_dir, B_E, B_U)
+            config_path = self._create_run_config(template_config, run_dir, B_E, B_U, no_delta_h1)
             
             self.logger.info(f"\\n🔍 Debug analysis for B_E={B_E}")
             
@@ -651,8 +653,8 @@ def load_config_template(config_path: str) -> Dict:
                 'buffers_dtype': 'float32',
                 'weighting_mode': 'dr_grpo',
                 'conditional_variance_batch_size': 6,
+                'compute_delta_h1': True,               # Main δH₁ computation (Phase 1-3)
                 'compute_conditional_variance': True,
-                'compute_vx_vy_variance': False,
                 'compute_importance_sampling': False,
                 'ddp_allreduce': False,
                 'master_seed': 42
@@ -692,6 +694,9 @@ def main():
     # Single test arguments
     parser.add_argument("--be", type=int, default=256, help="B_E value for single test (default: 256)")
     parser.add_argument("--bu", type=int, default=32, help="B_U value (default: 32)")
+    
+    # Computation control arguments  
+    parser.add_argument("--no-delta-h1", action="store_true", help="Skip δH₁ computation (Phase 1-3), useful for importance sampling only")
     
     # Debug arguments
     parser.add_argument("--save-gradients", action="store_true", help="Save gradient information")
@@ -736,7 +741,8 @@ def main():
                 B_E_values=B_E_values,
                 B_U=args.bu,
                 runs_per_batch=args.runs,
-                template_config=template_config
+                template_config=template_config,
+                no_delta_h1=args.no_delta_h1
             )
             
         elif args.test_type == "sanity-check":
@@ -744,14 +750,16 @@ def main():
                 runs=args.runs,
                 B_E=args.be,
                 B_U=args.bu,
-                template_config=template_config
+                template_config=template_config,
+                no_delta_h1=args.no_delta_h1
             )
             
         elif args.test_type == "single":
             result = runner.single_test(
                 B_E=args.be,
                 B_U=args.bu,
-                template_config=template_config
+                template_config=template_config,
+                no_delta_h1=args.no_delta_h1
             )
             
         elif args.test_type == "debug":
@@ -759,7 +767,8 @@ def main():
             result = runner.debug_test(
                 B_E_values=B_E_values,
                 B_U=args.bu,
-                template_config=template_config
+                template_config=template_config,
+                no_delta_h1=args.no_delta_h1
             )
             
         return 0

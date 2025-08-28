@@ -63,10 +63,6 @@ class ProbeComponents:
         self.G = config['batch_config']['G']  # responses per prompt
         self.microbatch_size = config['memory_config']['microbatch_size']
         
-        # Mode configuration
-        self.mode = config['probe_config']['mode']  # "exact" or "blocks"
-        self.M = config['probe_config'].get('M', None)  # number of blocks if mode="blocks"
-        
         # Initialize tokenizer for conditional variance estimator
         if not hasattr(self, '_tokenizer'):
             from transformers import AutoTokenizer
