@@ -29,7 +29,7 @@ def test_lora_gradient_fixes():
     print("🔧 Testing comprehensive LoRA gradient flow fixes...")
     
     # Use our debug config with small batches
-    config_path = "configs/debug_scaling_config.yaml"
+    config_path = "entropy_experiments/configs/old_configs_backup/debug_scaling_config.yaml"
     checkpoint_path = "/home/ubuntu/localfs/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156"
     
     print(f"Loading config from: {config_path}")
