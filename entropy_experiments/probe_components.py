@@ -409,6 +409,11 @@ class ProbeComponents:
         return param_buffers
     
     def add_into_param_buffer(self, buf: Dict[int, torch.Tensor], scale: float = 1.0) -> None:
+        """
+        Add current param.grad into buffer with optional scaling.
+        Scaling is applied in the buffer's dtype/device (typically CPU fp32) to
+        avoid bf16/fp16 roundoff when converting average->sum.
+        """
         for p in self._trainable_params:
             if p.grad is None:
                 continue
@@ -419,22 +424,32 @@ class ProbeComponents:
             want = buf[pid]
             if want.device != g.device or want.dtype != g.dtype:
                 g = g.to(want.device, dtype=want.dtype)
-            want.add_(g, alpha=scale)
+            want.add_(g, alpha=float(scale))
     
     def scale_param_gradients(self, scale_factor: float):
+        """
+        (Optional) Keep for other call sites, but the probe accumulation
+        should no longer depend on this; we scale inside add_into_param_buffer
+        in fp32/CPU.
+        """
         for p in self._trainable_params:
             if p.grad is not None:
-                p.grad.data.mul_(scale_factor)
+                p.grad.data.mul_(float(scale_factor))
     
     def dot_param_buffers(self, buf_a: Dict[int, torch.Tensor], buf_b: Dict[int, torch.Tensor]) -> float:
-        total = 0.0
+        """
+        Compute ⟨buf_a, buf_b⟩ with high-precision accumulation.
+        Buffers can remain fp32; we upcast on-the-fly for the product/sum.
+        """
+        total = torch.zeros((), dtype=torch.float64)
         for p in self._trainable_params:
             pid = id(p)
             ta = buf_a.get(pid); tb = buf_b.get(pid)
             if ta is None or tb is None:
                 continue
-            total += (ta * tb).sum().item()
-        return total
+            # High-precision multiply-and-sum to reduce batch-size sensitivity
+            total += (ta.double() * tb.double()).sum()
+        return float(total.item())
     
     # ========================================================================
     # STAGE 1: Mixed E/U Batch Probe - Loss Builders
@@ -627,12 +642,9 @@ class ProbeComponents:
                 present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in self._trainable_params)
                 self.logger.debug(f"[X] nonzero param.grads = {present}/{len(self._trainable_params)}")
 
-                # Scale gradients by microbatch size to convert from average to sum
+                # Scale in CPU/fp32 during accumulation to avoid bf16 multiply
                 # build_LX_from_S returns average over prompts, but we need sum
-                self.scale_param_gradients(mb_prompt_count)
-                
-                # Accumulate gradients into sum buffer
-                self.add_into_param_buffer(sum_X_buf)
+                self.add_into_param_buffer(sum_X_buf, scale=float(mb_prompt_count))
                 
                 B_local += mb_prompt_count
                 
@@ -695,27 +707,24 @@ class ProbeComponents:
                 present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in params)
                 self.logger.debug(f"[Y] raw nonzero param.grads = {present}/{len(params)}")
 
-                # Scale gradients by microbatch size to convert from average to sum
-                # build_LY_from_S returns average over prompts, but we need sum
-                self.scale_param_gradients(mb_prompt_count)
-
-                # Adam preconditioning in-place, guarded
+                # Adam preconditioning in-place with fp32 precision
                 for p in params:
                     g = p.grad
                     if g is None:
                         continue
                     try:
-                        gtilde = adam_preconditioner.apply_preconditioner(g, p)
+                        # inside the Y preconditioner loop, right before using g and state tensors
+                        g32 = g.to(torch.float32)
+                        gtilde = adam_preconditioner.apply_preconditioner(g32, p)
+                        if gtilde is None:
+                            gtilde = g32
+                        # copy back (will downcast if p.grad is bf16)
+                        g.copy_(gtilde)
                     except Exception as e:
                         self.logger.warning(f"[Y] preconditioner failed on {id(p)}: {e}; using raw grad")
-                        gtilde = g
-                    if gtilde is None:
-                        # identity fallback
-                        gtilde = g
-                    g.copy_(gtilde)
                 
-                # Accumulate preconditioned gradients into sum buffer  
-                self.add_into_param_buffer(sum_Y_buf)
+                # Accumulate with fp32 scaling (average -> sum)
+                self.add_into_param_buffer(sum_Y_buf, scale=float(mb_prompt_count))
                 
                 B_local += mb_prompt_count
                 
@@ -859,9 +868,9 @@ class ProbeComponents:
             if delta < 1e-7:
                 raise RuntimeError("LoRA appears inactive in main TF: on/off logits nearly identical.")
         
-        # Ensure model is in training mode for gradients
-        was_training = self.model.training
-        self.model.train()
+        # Use deterministic forward passes (disable dropout/noise)
+        was_training = self._peft.training  # use the same PEFT instance used for forward
+        self._peft.eval()                   # turn off dropout/noise
         
         try:
             # Compute log-probabilities for all sequences in batch
@@ -880,7 +889,7 @@ class ProbeComponents:
             
         finally:
             # Restore training state
-            self.model.train(was_training)
+            self._peft.train(was_training)
         
         return {
             'S': S,  # [batch_size, G] with requires_grad=True

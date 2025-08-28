@@ -1,279 +1,209 @@
-================================================================================
-LoRA-Simple Probe Migration Plan (No Quantization, Single GPU, No Checkpointing)
-Goal
+Here’s a tight review + a small, safe patch set you can paste in. I’ll keep it focused on (i) LoRA setup sanity and (ii) making the \bar{s} (bars_dot) computation numerically robust and batch-size invariant.
 
-Run the entropy/variance probe with the simplest, most stable autograd stack:
+1) LoRA setup sanity check
 
-No 4-bit quantization (no BitsAndBytes; no prepare_model_for_kbit_training)
+You are explicitly activating the adapter on the same PEFT instance used for forward passes (and verifying with an on/off delta). That is exactly what we want; e.g. in ProbeComponents._teacher_force_logprobs you resolve the PEFT wrapper and call set_adapter("default"), then log the active adapter and compare logits with/without adapters. 
+ 
 
-No gradient checkpointing
+Similarly, in the aligned/variance path you do the same checks. 
+ 
 
-Single GPU, no DDP for the probe binaries
+You added a canonical parameter registry (self._peft, self._trainable_params) intended to be the single source of truth for trainable parameters. Good. 
 
-Keep your LoRA adapter (trained under QLoRA) and load it into an fp16/bf16 base
+⚠️ What still looks risky is duplicate utilities that sometimes iterate self.model.parameters() and sometimes self._trainable_params. For example, there are two versions of the buffer/dot helpers in the file set you shared:
 
-Result: gradients (including α-trick / second derivatives) and optimizer steps over LoRA params become straightforward and robust.
+One version iterates all model params: for param in self.model.parameters(): (this can drift from the PEFT-trainable set and re-introduce identity mismatches), including in dot_param_buffers. 
 
-Files you will touch
+Another (preferred) version iterates the canonical trainable set: for p in self._trainable_params: (this is what we want everywhere). 
 
-offline_entropy_probe.py (model loading entry point)
+If both versions exist in the file, it’s easy to call the wrong one by accident. Below I unify these.
 
-probe_components.py (already has the canonical param registry; keep it)
+2) Why bars_dot flips between exactly 0 and “too big” with batch size
 
-conditional_variance.py (already patched to use the registry; keep it)
+Two main culprits:
 
-You do not need BitsAndBytes or DDP for this probe.
+(A) Parameter set drift/identity mismatches
+If any of zeros_like_params/add_into_param_buffer/dot_param_buffers iterate a different set (or a different object identity) than the set that received gradients, the dictionary keys won’t line up. That can silently produce a zero dot even when gradients exist. The duplicate helpers above make this failure mode plausible. (We fix this by forcing all helpers to use self._trainable_params only.)
 
-Prereqs
+(B) Precision + scaling order
+Right now you (i) average losses in bf16/fp16, (ii) multiply grads by the microbatch prompt count in low precision, and (iii) only then move to CPU fp32 buffers. That “divide then multiply” in reduced precision can become batch-size dependent (tiny coefficients + bf16 rounding). Moreover, your dot currently sums in fp32 and converts each per-tensor sum to a Python float using .item(), which loses opportunities to accumulate in higher precision.
 
-pip install transformers peft accelerate torch (bitsandbytes is not required now)
+3) Minimal, safe patches (copy–paste)
 
-A single CUDA GPU with enough memory for Qwen2.5-1.5B in bf16/fp16 (comfortably <10 GB)
+Paste each replacement verbatim. These do not change the math—only how we accumulate and with which parameter set/dtype.
 
-Environment flags (recommended)
+3.1 probe_components.py — canonicalize helpers + improve precision
 
-Set these when running your probe:
+Replace the buffer helpers with this single, canonical implementation (make sure you have only one copy of each):
 
-export CUDA_VISIBLE_DEVICES=0
-export ENTROPY_PROBE_MODE=lora_simple
-export ENTROPY_PROBE_SINGLE_GPU=1
+# === Buffer utilities (canonical) ===
 
+def zeros_like_params(self,
+                      dtype: torch.dtype = torch.float32,
+                      device: str = "cpu") -> Dict[int, torch.Tensor]:
+    """
+    Create zero buffers matching the canonical trainable parameters.
+    """
+    param_buffers = {}
+    for p in self._trainable_params:
+        param_buffers[id(p)] = torch.zeros_like(p, dtype=dtype, device=device)
+    return param_buffers
 
-(We use these below to gate behavior without disrupting other scripts.)
+def add_into_param_buffer(self,
+                          buf: Dict[int, torch.Tensor],
+                          scale: float = 1.0) -> None:
+    """
+    Add current param.grad into buffer with optional scaling.
+    Scaling is applied in the buffer's dtype/device (typically CPU fp32) to
+    avoid bf16/fp16 roundoff when converting average->sum.
+    """
+    for p in self._trainable_params:
+        if p.grad is None:
+            continue
+        pid = id(p)
+        if pid not in buf:
+            continue
+        g = p.grad.detach()
+        want = buf[pid]
+        if want.device != g.device or want.dtype != g.dtype:
+            g = g.to(want.device, dtype=want.dtype)
+        want.add_(g, alpha=float(scale))
 
-PATCH A — Replace QLoRA loader with LoRA-simple loader (no 4-bit)
+def scale_param_gradients(self, scale_factor: float):
+    """
+    (Optional) Keep for other call sites, but the probe accumulation
+    should no longer depend on this; we scale inside add_into_param_buffer
+    in fp32/CPU.
+    """
+    for p in self._trainable_params:
+        if p.grad is not None:
+            p.grad.data.mul_(float(scale_factor))
 
-Add this loader near the top of offline_entropy_probe.py (or in a small
-entropy_model_loading.py helper and import it). It cleanly supports two modes;
-for now you’ll run mode="lora_simple".
-
-# === Begin: LoRA-simple / QLoRA loader ===
-from typing import Optional
-import torch
-
-def load_peft_for_probe(
-    base_id: str,
-    adapter_path: str,
-    *,
-    mode: str = "lora_simple",   # "lora_simple" or "qlora"
-    dtype: str = "bf16",         # "bf16" or "fp16"
-    device_map: str = "cuda",
-    use_checkpointing: bool = False
-):
-    from transformers import AutoModelForCausalLM
-    from peft import PeftModel
-
-    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
-
-    if mode == "lora_simple":
-        # Plain fp16/bf16 base — NO quantization, NO k-bit preparation
-        base = AutoModelForCausalLM.from_pretrained(
-            base_id, device_map=device_map, torch_dtype=torch_dtype
-        )
-        # Ensure no checkpointing and cache is allowed (deterministic probe)
-        if hasattr(base, "gradient_checkpointing_disable"):
-            base.gradient_checkpointing_disable()
-        if hasattr(base.config, "use_cache"):
-            base.config.use_cache = True
-
-        peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
-        # For safety with some HF versions; helps when you later enable ckpting elsewhere
-        if hasattr(peft, "enable_input_require_grads"):
-            peft.enable_input_require_grads()
-
-        return peft
-
-    elif mode == "qlora":
-        # Keep original QLoRA path if you ever want to compare—but you won't use it now
-        from transformers import BitsAndBytesConfig
-        from peft import prepare_model_for_kbit_training
-
-        bnb_cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch_dtype,
-        )
-        base = AutoModelForCausalLM.from_pretrained(
-            base_id, device_map=device_map, torch_dtype=torch_dtype, quantization_config=bnb_cfg
-        )
-        base = prepare_model_for_kbit_training(base)
-        if use_checkpointing and hasattr(base, "gradient_checkpointing_enable"):
-            base.gradient_checkpointing_enable()
-            if hasattr(base.config, "use_cache"):
-                base.config.use_cache = False
-        peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
-        if hasattr(peft, "enable_input_require_grads"):
-            peft.enable_input_require_grads()
-        return peft
-
-    else:
-        raise ValueError("mode must be 'lora_simple' or 'qlora'")
-# === End: LoRA-simple / QLoRA loader ===
+def dot_param_buffers(self,
+                      buf_a: Dict[int, torch.Tensor],
+                      buf_b: Dict[int, torch.Tensor]) -> float:
+    """
+    Compute ⟨buf_a, buf_b⟩ with high-precision accumulation.
+    Buffers can remain fp32; we upcast on-the-fly for the product/sum.
+    """
+    total = torch.zeros((), dtype=torch.float64)
+    for p in self._trainable_params:
+        pid = id(p)
+        ta = buf_a.get(pid); tb = buf_b.get(pid)
+        if ta is None or tb is None:
+            continue
+        # High-precision multiply-and-sum to reduce batch-size sensitivity
+        total += (ta.double() * tb.double()).sum()
+    return float(total.item())
 
 
-Now replace your current model-loading block in offline_entropy_probe.py
-(where you previously used BitsAndBytesConfig / prepare_model_for_kbit_training)
-with this explicit call:
-
-# Obtain configuration from your existing args/config
-base_id       = cfg.model_name_or_path          # e.g., "Qwen/Qwen2.5-1.5B"
-adapter_path  = cfg.adapter_dir                 # e.g., ".../training_state/step_X/model"
-dtype         = "bf16"                          # or "fp16" if you prefer
-mode          = "lora_simple"                   # <<<<<<<<<<<<<<<< THE KEY CHANGE
-device_map    = "cuda"
-
-self.model = load_peft_for_probe(
-    base_id=base_id,
-    adapter_path=adapter_path,
-    mode=mode,
-    dtype=dtype,
-    device_map=device_map,
-    use_checkpointing=False
+This removes any path that iterates self.model.parameters() for these utilities and forces double-precision dot accumulation. (You already have the canonical registry. 
 )
 
-# Single-GPU probe: no DDP; keep deterministic eval unless you explicitly step
-self.model.to("cuda")
-self.model.eval()
-# IMPORTANT: ensure adapter is active BEFORE any forward that produces S/logits
-if hasattr(self.model, "set_adapter"):
-    self.model.set_adapter("default")
+Then change the accumulation code to scale in fp32 at the point of accumulation (not in bf16 grads):
+
+In accumulate_sum_X (X path), replace:
+
+# after L_X_mb.backward()
+self.scale_param_gradients(mb_prompt_count)
+self.add_into_param_buffer(sum_X_buf)
 
 
-If your file previously imported BitsAndBytesConfig at module scope, you can remove that import; it’s not needed in this mode.
+with:
 
-PATCH B — Disable DDP & checkpointing in probe code paths
-
-In your probe binaries only (not general training), guard any distributed
-initialization or no_sync usage. For example in offline_entropy_probe.py
-(or wherever you set up process groups):
-
-import os
-from contextlib import nullcontext
-
-SINGLE_GPU = os.getenv("ENTROPY_PROBE_SINGLE_GPU", "1") == "1"
-
-# If you had: dist.init_process_group("nccl") ...
-if SINGLE_GPU:
-    # Skip DDP entirely for the probe
-    pass
-else:
-    import torch.distributed as dist
-    dist.init_process_group("nccl")
+# after L_X_mb.backward()
+# Scale in CPU/fp32 during accumulation to avoid bf16 multiply
+self.add_into_param_buffer(sum_X_buf, scale=float(mb_prompt_count))
 
 
-If you used no_sync() in accumulation loops, define:
+(You already have the surrounding structure; only these two lines change.) 
 
-def ddp_no_sync(model):
-    return nullcontext()  # always, in single-GPU probe
+In accumulate_sum_Y (Y path), replace:
 
-
-…and use with ddp_no_sync(self.model): in place of conditional no_sync.
-
-Also ensure no gradient checkpointing is enabled for the probe (already handled in the loader). If you had explicit calls like model.gradient_checkpointing_enable(), remove them from the probe path.
-
-PATCH C — Optimizer over LoRA trainables (for the later step portion)
-
-Even though .requires_grad=True filters to LoRA params, make the intent explicit.
-In the place you construct the optimizer for the probe’s step section (not the X/Y
-accumulation of the metric, but the part where you intentionally step):
-
-# Assuming you added the canonical registry earlier:
-peft_model = self.model.module if hasattr(self.model, "module") else self.model
-trainable_named = [(n,p) for (n,p) in peft_model.named_parameters() if p.requires_grad]
-trainable_params = [p for _, p in trainable_named]
-
-from torch.optim import AdamW
-opt = AdamW(trainable_params, lr=cfg.lr_for_probe, weight_decay=cfg.weight_decay_for_probe)
-
-# One tiny update step example (if/where you already do this):
-loss = your_probe_loss  # scalar
-opt.zero_grad(set_to_none=True)
-loss.backward()
-opt.step()
+# after L_Y_mb.backward()
+self.scale_param_gradients(mb_prompt_count)
+# ... preconditioner ...
+self.add_into_param_buffer(sum_Y_buf)
 
 
-This keeps parameter identity and the optimizer state trivial in LoRA-simple mode.
+with:
 
-PATCH D — Ensure adapter is active BEFORE forward in variance path
-
-In conditional_variance.py::_compute_aligned_batch_logprobs (and any sibling
-function that computes S for α-trick), make sure adapter activation precedes
-the logits forward on the exact PEFT module you use elsewhere:
-
-- with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
--     outputs = self.model(flat_sequences, attention_mask=flat_attention_masks)
-+ peft_model = self.model.module if hasattr(self.model, "module") else self.model
-+ if hasattr(peft_model, "set_adapter"):
-+     peft_model.set_adapter("default")   # activate BEFORE forward
-+ with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-+     outputs = peft_model(input_ids=flat_sequences, attention_mask=flat_attention_masks)
+# after L_Y_mb.backward()
+# ... preconditioner in-place ...
+# Accumulate with fp32 scaling (average -> sum)
+self.add_into_param_buffer(sum_Y_buf, scale=float(mb_prompt_count))
 
 
-This mirrors what worked in your α-trick debug script and aligns with the canonical
-parameter registry you already added.
+(Again, just the accumulation call changes.) 
+ 
 
-PATCH E — Keep the canonical parameter registry (already added)
+Small, recommended tweak for the preconditioner loop
+Before you divide by sqrt(exp_avg_sq), make sure the math runs in fp32:
 
-You already introduced:
-
-self._peft, self._trainable_named, self._trainable_params
-
-(optionally) self._lora_named, self._lora_params
-
-Continue to use those exact lists:
-
-For buffer creation, accumulation, dot products (bars·dot)
-
-For Y-path preconditioning (when enabled again)
-
-For α-trick vector-Jacobian products and contractions
-
-The LoRA-simple mode makes those ops straightforward.
-
-Sanity checks (run after the patches)
-
-LoRA on/off delta on a tiny batch (any file; once per run):
-
-peft_model = self.model.module if hasattr(self.model, "module") else self.model
-import torch
-with torch.no_grad():
-    x = torch.randint(10, peft_model.config.vocab_size-1, (1,16), device="cuda")
-    m = torch.ones_like(x)
-    peft_model.set_adapter("default")
-    logits_on  = peft_model(x, attention_mask=m).logits
-    with peft_model.disable_adapter():
-        logits_off = peft_model(x, attention_mask=m).logits
-    delta = (logits_on - logits_off).abs().max().item()
-self.logger.info(f"[sanity] LoRA on/off delta: {delta:.3e}")
+# inside the Y preconditioner loop, right before using g and state tensors
+g32 = g.to(torch.float32)
+gtilde = adam_preconditioner.apply_preconditioner(g32, p)
+if gtilde is None:
+    gtilde = g32
+# copy back (will downcast if p.grad is bf16)
+g.copy_(gtilde)
 
 
-You should see a clearly non-zero delta.
+(This avoids subnormal behavior if exp_avg_sq norms are ~1e-10 to 1e-8, as we observed.)
 
-bars·dot path (first-order): log buffer norms after accumulation:
+Finally, make forward passes deterministic w.r.t. dropout
+You don’t need model.train() to enable gradients; autograd works in eval() just fine. The batch-size sensitivity you’re seeing can be amplified by stochastic layers:
 
-||sum_X||₂ and ||sum_Y||₂  should be > 0
-bars_dot = μ_X · μ_Y       should be > 0 for realistic batches
+Replace the “ensure training mode” section in your TF methods:
+
+was_training = self.model.training
+self.model.train()
+try:
+    ...
+finally:
+    self.model.train(was_training)
 
 
-α-trick (second-order): run the three α cases from your working script
-(ones, random, basis) and check:
+with:
 
-||g_back|| ~ ||g_auto||  and  ||g_back - g_auto|| is tiny (≪ 1e-4 relative)
-non-None grad count over LoRA tensors is high
+was_training = self._peft.training  # use the same PEFT instance used for forward
+self._peft.eval()                   # turn off dropout/noise
+try:
+    ...
+finally:
+    self._peft.train(was_training)
 
-Notes on using a QLoRA-trained adapter in LoRA-simple
 
-OK to reuse: The adapter was trained against your base model topology; it
-holds the A/B matrices (and config: r, α, target modules). Loading it into an
-fp16/bf16 backbone applies the same low-rank delta to the unquantized base.
+(Do this in both the main TF path and the aligned-batch TF path.) 
+ 
 
-Do not quantize the base in this mode; load it directly in bf16/fp16.
+Rationale: gradients are available in eval mode as long as torch.is_grad_enabled() is True. Disabling dropout removes one common source of batch-size sensitivity.
 
-Do not enable gradient checkpointing in the probe; this keeps autograd
-graphs simple and avoids enable_input_require_grads()-related pitfalls.
+3.2 offline_entropy_probe.py — compute bars_dot in high precision
 
-Keep single GPU; no DDP/no-sync/no all-reduce makes the μ-buffers and α-trick
-free of wrapper semantics.
+No structural change needed—your means are FP32 CPU, which is fine—but you will now get the high-precision product automatically via the patched dot_param_buffers. This is the call site: 
 
-================================================================================
+If you want to be extra cautious, you may upcast the means before the dot:
+
+mu_X = {k: v.to(torch.float32) / max(B_E_global, 1) for k, v in sum_X_buf.items()}
+mu_Y = {k: v.to(torch.float32) / max(B_U_global, 1) for k, v in sum_Y_buf.items()}
+bars_dot = self.probe_components.dot_param_buffers(mu_X, mu_Y)  # now sums in fp64
+
+4) What this addresses
+
+Zero bars_dot when batch size changes → eliminated by (i) unified param set for buffers, (ii) scaling in fp32 during accumulation, (iii) double-precision reduction for the dot, and (iv) disabling stochastic layers during TF.
+
+Occasional “too large” bars_dot → most often double-counting/scale-order issues (avg-then-mul in reduced precision) or dropout. We now (a) avoid bf16 scaling, (b) sum in fp64, (c) turn off dropout.
+
+5) Quick instrumentation to confirm
+
+Before returning bars_dot, log some invariants:
+
+nz_X = sum(int(t.abs().sum().item() > 0) for t in mu_X.values())
+nz_Y = sum(int(t.abs().sum().item() > 0) for t in mu_Y.values())
+self.logger.info(f"[CHECK] nonzero μ_X entries: {nz_X}, nonzero μ_Y entries: {nz_Y}")
+self.logger.info(f"[CHECK] ||μ_X||₂={sum(float((t.double().pow(2)).sum().item()) for t in mu_X.values())**0.5:.6e}, "
+                 f"||μ_Y||₂={sum(float((t.double().pow(2)).sum().item()) for t in mu_Y.values())**0.5:.6e}")
+
+
+If either count is 0, the issue is not numerical—something upstream failed to accumulate.

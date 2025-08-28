@@ -310,19 +310,17 @@ class OfflineEntropyProbe:
         # DIAGNOSTICS: Verify LoRA adapters are active and trainable
         self.logger.info(f"Active adapters: {getattr(model, 'active_adapter', None)}")
         
-        # Count trainable parameters and show LoRA names
-        trainable_params = []
-        lora_params = 0
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                trainable_params.append(name)
-                if 'lora_A' in name or 'lora_B' in name:
-                    lora_params += 1
-                    
-        self.logger.info(f"Trainable parameters after LoRA loading: {len(trainable_params)} total, {lora_params} LoRA params")
+        # DIAGNOSTICS: Count trainable parameters (consistent with canonical registry)
+        # Get PEFT module (consistent with ProbeComponents approach)
+        peft_model = model.module if hasattr(model, "module") else model
+        trainable_named = [(n, p) for (n, p) in peft_model.named_parameters() if p.requires_grad]
+        lora_named = [(n, p) for (n, p) in trainable_named 
+                      if ("lora_a" in n.lower()) or ("lora_b" in n.lower()) or n.endswith("lm_head.weight")]
+        
+        self.logger.info(f"Trainable parameters after LoRA loading: {len(trainable_named)} total, {len(lora_named)} LoRA params")
         
         # Show first few LoRA parameter names for verification
-        lora_names = [name for name in trainable_params if 'lora_A' in name or 'lora_B' in name][:5]
+        lora_names = [name for name, _ in lora_named[:5]]
         if lora_names:
             self.logger.info(f"Sample LoRA parameters: {lora_names}")
         else:
@@ -806,7 +804,15 @@ class OfflineEntropyProbe:
             mu_Y = {param_id: buf_tensor / max(B_U_global, 1) 
                    for param_id, buf_tensor in sum_Y_buf.items()}
             
-            # Compute dot product: bars_dot = μ_X · μ_Y
+            # Instrumentation to confirm numerical stability (from fix.txt)
+            nz_X = sum(int(t.abs().sum().item() > 0) for t in mu_X.values())
+            nz_Y = sum(int(t.abs().sum().item() > 0) for t in mu_Y.values())
+            self.logger.info(f"[CHECK] nonzero μ_X entries: {nz_X}, nonzero μ_Y entries: {nz_Y}")
+            norm_X = sum(float((t.double().pow(2)).sum().item()) for t in mu_X.values())**0.5
+            norm_Y = sum(float((t.double().pow(2)).sum().item()) for t in mu_Y.values())**0.5
+            self.logger.info(f"[CHECK] ||μ_X||₂={norm_X:.6e}, ||μ_Y||₂={norm_Y:.6e}")
+            
+            # Compute dot product: bars_dot = μ_X · μ_Y (now uses fp64 accumulation)
             bars_dot = self.probe_components.dot_param_buffers(mu_X, mu_Y)
             
             # Get learning rate and compute δH₁

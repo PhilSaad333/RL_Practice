@@ -319,8 +319,8 @@ class ConditionalVarianceEstimator:
         max_prompt_len = aligned_batch['max_prompt_len']
         num_prompts, G, total_len = sequences.shape
 
-        was_training = self.model.training
-        self.model.train()  # keep modules in train/eval state consistent with caller
+        was_training = self._peft.training  # use the same PEFT instance used for forward
+        self._peft.eval()                   # turn off dropout/noise
 
         try:
             # IMPORTANT: ensure graph tracking regardless of outer context
@@ -419,7 +419,7 @@ class ConditionalVarianceEstimator:
                 # --- end comprehensive probe ---
 
         finally:
-            self.model.train(was_training)
+            self._peft.train(was_training)
 
         out = {
             'S': S_batch,
@@ -525,9 +525,9 @@ class ConditionalVarianceEstimator:
             if delta < 1e-7:
                 raise RuntimeError("LoRA appears inactive in TF: on/off logits nearly identical.")
         
-        # Ensure model is in training mode for gradients
-        was_training = self.model.training
-        self.model.train()
+        # Use deterministic forward passes (disable dropout/noise)  
+        was_training = self._peft.training  # use the same PEFT instance used for forward
+        self._peft.eval()                   # turn off dropout/noise
         
         try:
             # Compute log-probabilities for all sequences in batch
@@ -546,7 +546,7 @@ class ConditionalVarianceEstimator:
             
         finally:
             # Restore training state
-            self.model.train(was_training)
+            self._peft.train(was_training)
         
         return {
             'S': S,  # [batch_size, G] with requires_grad=True
@@ -837,8 +837,8 @@ class ConditionalVarianceEstimator:
         """
         self.logger.info("Testing minimal gradient flow...")
         
-        # Ensure model is in training mode
-        self.model.train()
+        # Use deterministic forward passes (disable dropout/noise)
+        self._peft.eval()
         
         # 1) Tiny TF forward on the PEFT model
         outs = self.model(input_ids=batch_ids, attention_mask=batch_mask)
