@@ -28,7 +28,7 @@ def main():
     
     args = parser.parse_args()
     
-    # Use the main script with quick test parameters
+    # Use the main script with updated test parameters
     main_script = Path(__file__).parent / 'entropy_vs_learning_rate.py'
     base_config = Path(__file__).parent.parent / 'rl_training/cfg/h100_dual_gns_64step.yaml'
     
@@ -36,8 +36,8 @@ def main():
         'python', str(main_script),
         '--checkpoint', args.checkpoint,
         '--base-config', str(base_config),
-        '--learning-rates', '1e-7,1e-6,1e-5',  # Just 3 learning rates
-        '--num-repeats', '8',                   # 8 repeats per LR
+        '--learning-rates', '1e-10,1e-9,1e-8,1e-7',  # Ultra-low learning rates
+        '--num-repeats', '16',                        # 16 repeats per LR
         '--output-dir', args.output_dir
     ]
     
