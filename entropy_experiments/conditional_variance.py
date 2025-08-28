@@ -31,6 +31,24 @@ class ConditionalVarianceEstimator:
         self.use_amp = config['memory_config']['amp']
         self.amp_dtype = getattr(torch, config['memory_config']['dtype'])
 
+        # --- Canonical Parameter Registry (same pattern as ProbeComponents) ---
+        self._peft = self.model.module if hasattr(self.model, "module") else self.model
+
+        self._trainable_named = [
+            (n, p) for (n, p) in self._peft.named_parameters() if p.requires_grad
+        ]
+        self._trainable_params = [p for _, p in self._trainable_named]
+        self._trainable_ids    = {id(p) for p in self._trainable_params}
+
+        self._lora_named = [
+            (n, p) for (n, p) in self._trainable_named
+            if ("lora_a" in n.lower()) or ("lora_b" in n.lower()) or n.endswith("lm_head.weight")
+        ]
+        self._lora_params = [p for _, p in self._lora_named]
+
+        if hasattr(self, "logger"):
+            self.logger.debug(f"[REGISTRY] CV: trainable={len(self._trainable_params)} lora={len(self._lora_params)}")
+
     def _assert_grad_context(self, where: str):
         """Assert that we're in a valid gradient context for probe computations."""
         # Inference mode cannot be turned back on locally; never enter it for probe passes.
@@ -387,12 +405,8 @@ class ConditionalVarianceEstimator:
                     if delta < 1e-7:
                         raise RuntimeError("🔧 LoRA appears inactive in aligned batch computation: on/off logits nearly identical.")
                 
-                # Collect LoRA params from same PEFT instance used for forward pass
-                lora_params = [p for n, p in peft_model.named_parameters()
-                               if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
-                extra = [p for n, p in peft_model.named_parameters()
-                         if p.requires_grad and n.endswith("lm_head.weight")]
-                params_for_probe = lora_params + extra
+                # Use canonical registry for LoRA params  
+                params_for_probe = self._lora_params
                 
                 if len(params_for_probe) == 0:
                     raise RuntimeError("TF probe: no trainable LoRA params found on PEFT model (adapters missing/merged/disabled).")
@@ -743,20 +757,12 @@ class ConditionalVarianceEstimator:
                     raise RuntimeError("α-trick: dL/dS is exactly zero; check L_vec construction / coefficients")
                 _dbg(f"α-trick: dL/dS.abs().sum()={dL_dS.abs().sum().item():.6f} (should be > 0)")
                 
-                # 🔧 FIX 5: Collect correct parameter list from same PEFT instance (from fix.txt §3)
-                peft_model = self.model.module if hasattr(self.model, "module") else self.model
-                lora_params = [p for n, p in peft_model.named_parameters()
-                               if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
-                
-                # OPTIONAL (QLoRA): include lm_head if requires_grad=True on your setup
-                extra = [p for n, p in peft_model.named_parameters()
-                         if p.requires_grad and n.endswith("lm_head.weight")]
-                params_for_test = lora_params + extra
-                
+                # New (use canonical registry):
+                params_for_test = self._lora_params
                 if len(params_for_test) == 0:
-                    raise RuntimeError("α-trick: no trainable LoRA params found on PEFT model.")
+                    raise RuntimeError("α‑trick: no trainable LoRA (or lm_head) params in registry.")
 
-                _dbg(f"🔧 [PARAM-DEBUG] Using {len(lora_params)} LoRA + {len(extra)} lm_head params from same PEFT instance")
+                _dbg(f"🔧 [PARAM-DEBUG] Using {len(params_for_test)} LoRA params from canonical registry")
 
                 g_test = torch.autograd.grad(L, params_for_test, retain_graph=True, allow_unused=True)
                 if not any(g is not None for g in g_test):
@@ -788,26 +794,25 @@ class ConditionalVarianceEstimator:
                 # dL/dS = -(alpha/G) * (S_w - S_w_LOO)   (alpha is broadcast over g)
                 W = - (alpha.view(-1, 1) / float(G)) * (S_w - S_w_LOO)  # [k, G]
 
-                # 🔧 FIX 6: One VJP from S back to parameters using same PEFT instance
-                # Use the same peft_model and params as diagnostic above for consistency
-                params = params_for_test  # Already collected from same PEFT instance
+                params = params_for_test  # canonical list
+
                 g_list = torch.autograd.grad(
-                    outputs=S, inputs=params, grad_outputs=W, create_graph=True, allow_unused=True, retain_graph=False
+                    outputs=S, inputs=params, grad_outputs=W,
+                    create_graph=True, allow_unused=True, retain_graph=False
                 )
                 non_none = sum(int(gi is not None) for gi in g_list)
-                _dbg(f"🔧 [VJP-DEBUG] VJP S→LoRA: non-None parameter grads = {non_none}/{len(g_list)}")
+                _dbg(f"[VJP] S→params non‑None grads = {non_none}/{len(g_list)}")
                 if non_none == 0:
-                    raise RuntimeError("🔧 α-trick VJP: S→LoRA produced no grads; TF path still not using adapters (from fix.txt §4)")
+                    raise RuntimeError("α‑trick VJP: S→params produced no grads; check TF using adapters.")
 
-                # 4) Contract with μY as before
                 h = torch.zeros((), device=S.device, dtype=S.dtype)
                 for p, gi in zip(params, g_list):
                     if gi is None:
                         continue
-                    mu = muY_buf.get(id(p), None)
+                    mu = muY_buf.get(id(p))
                     if mu is None:
-                        mu = torch.zeros_like(gi)
-                    else:
+                        continue  # strict: only contract over known μ_Y entries
+                    if mu.device != gi.device or mu.dtype != gi.dtype:
                         mu = mu.to(device=gi.device, dtype=gi.dtype)
                     h = h + (gi * mu).sum()
 
@@ -858,8 +863,8 @@ class ConditionalVarianceEstimator:
         alpha = torch.ones(S.shape[0], device=S.device, requires_grad=True)
         L = (-(alpha.view(-1, 1) * S).mean())  # minus sign; simple cross-entropy variant
         
-        # 3) Try a *known* LoRA param first (more robust than "all params")
-        lora_params = [p for n, p in self.model.named_parameters() if ("lora_A" in n or "lora_B" in n)]
+        # 3) Use canonical LoRA params from registry
+        lora_params = self._lora_params
         
         if len(lora_params) == 0:
             raise RuntimeError("Minimal test: No lora_A/B parameters found (adapters missing/merged?)")

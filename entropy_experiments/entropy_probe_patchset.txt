@@ -1,0 +1,334 @@
+
+================================================================================
+Offline Entropy Probe – Canonical Parameter Registry Patchset
+================================================================================
+
+Goal
+----
+Fix zero/None gradient and preconditioner issues by enforcing *one canonical
+parameter registry* per module and reusing it consistently across:
+  • buffer construction (zeros_like),
+  • gradient accumulation and scaling,
+  • Adam preconditioning,
+  • buffer dot-products,
+  • α‑trick VJP contractions.
+
+This removes silent mismatches between the sets (and identities) of parameters
+used in different places (DDP wrapper vs. inner PEFT, LoRA-only vs. all trainables).
+
+Files to edit
+-------------
+1) `probe_components.py`          (add registry; fix buffers, X/Y accumulation, dots)
+2) `conditional_variance.py`      (add registry; use it for α‑trick/VJP contraction)
+3) (optional) `offline_entropy_probe.py` – no code changes needed; included notes.
+
+Conventions
+-----------
+- *PEFT module normalizer:* `self._peft = self.model.module if hasattr(self.model, "module") else self.model`
+- *Trainable registry:* all `nn.Parameter` with `requires_grad=True` from `self._peft`
+- *LoRA view:* subset of registry with names containing `lora_A` or `lora_B`, plus trainable `lm_head` if present
+- All μ‑buffers are keyed by `id(p)` for `p ∈ self._trainable_params`
+
+================================================================================
+PATCH 1 — probe_components.py
+================================================================================
+
+A. Add the canonical parameter registry (in __init__)
+-----------------------------------------------------
+
+Locate `class ProbeComponents.__init__(...)` and, *after* existing assignments
+to `self.model`, `self.config`, `self.logger`, etc., insert:
+
+```python
+# --- Canonical Parameter Registry (single source of truth) ---
+self._peft = self.model.module if hasattr(self.model, "module") else self.model
+
+# Trainable parameters from the same module that performs forward passes
+self._trainable_named = [
+    (n, p) for (n, p) in self._peft.named_parameters() if p.requires_grad
+]
+self._trainable_params = [p for _, p in self._trainable_named]
+self._trainable_ids    = {id(p) for p in self._trainable_params}
+
+# LoRA-only (plus lm_head if trainable) convenience view
+self._lora_named = [
+    (n, p) for (n, p) in self._trainable_named
+    if ("lora_a" in n.lower()) or ("lora_b" in n.lower()) or n.endswith("lm_head.weight")
+]
+self._lora_params = [p for _, p in self._lora_named]
+
+self.logger.debug(f"[REGISTRY] trainable_tensors={len(self._trainable_params)} "
+                  f"lora_tensors={len(self._lora_params)}")
+```
+
+B. Make buffers iterate the registry (not the entire model)
+-----------------------------------------------------------
+
+**Replace** `zeros_like_params` body to iterate only the registry:
+
+```python
+def zeros_like_params(self, dtype: torch.dtype = torch.float32, device: str = "cpu") -> Dict[int, torch.Tensor]:
+    """
+    Create zero buffers matching the canonical trainable parameters.
+    """
+    param_buffers = {}
+    for p in self._trainable_params:
+        param_buffers[id(p)] = torch.zeros_like(p, dtype=dtype, device=device)
+    return param_buffers
+```
+
+**Replace** `add_into_param_buffer` loop to use only registry params:
+
+```python
+def add_into_param_buffer(self, buf: Dict[int, torch.Tensor], scale: float = 1.0) -> None:
+    for p in self._trainable_params:
+        if p.grad is None:
+            continue
+        pid = id(p)
+        if pid not in buf:
+            continue
+        g = p.grad.detach()
+        want = buf[pid]
+        if want.device != g.device or want.dtype != g.dtype:
+            g = g.to(want.device, dtype=want.dtype)
+        want.add_(g, alpha=scale)
+```
+
+**Replace** `scale_param_gradients` to visit only trainables:
+
+```python
+def scale_param_gradients(self, scale_factor: float):
+    for p in self._trainable_params:
+        if p.grad is not None:
+            p.grad.data.mul_(scale_factor)
+```
+
+**Replace** `dot_param_buffers` to iterate only registry params:
+
+```python
+def dot_param_buffers(self, buf_a: Dict[int, torch.Tensor], buf_b: Dict[int, torch.Tensor]) -> float:
+    total = 0.0
+    for p in self._trainable_params:
+        pid = id(p)
+        ta = buf_a.get(pid); tb = buf_b.get(pid)
+        if ta is None or tb is None:
+            continue
+        total += (ta * tb).sum().item()
+    return total
+```
+
+C. Accumulation paths: use registry everywhere
+----------------------------------------------
+
+**accumulate_sum_X** — remove the local LoRA-only list and rely on the registry.
+Add a small invariant after backward.
+
+```python
+def accumulate_sum_X(...):
+    ...
+    # params = [p for n,p in self.model.named_parameters() if ...]   # REMOVE
+    sum_X_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
+    B_local = 0
+    ...
+    with no_sync_context():
+        for microbatch in self.iter_microbatches(E_batch, mb_size_prompts):
+            self.model.zero_grad(set_to_none=True)
+            S_dict = self._teacher_force_logprobs(microbatch)
+            L_X_mb = self.build_LX_from_S(S_dict, weighting_mode)
+            ...
+            L_X_mb.backward()
+
+            # Optional invariant: count trainable grads present
+            present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in self._trainable_params)
+            self.logger.debug(f"[X] nonzero param.grads = {present}/{len(self._trainable_params)}")
+
+            self.scale_param_gradients(mb_prompt_count)
+            self.add_into_param_buffer(sum_X_buf)
+            B_local += mb_prompt_count
+            self.model.zero_grad(set_to_none=True)
+    ...
+```
+
+**accumulate_sum_Y** — select `params = self._trainable_params` for preconditioning.
+
+```python
+def accumulate_sum_Y(..., adam_preconditioner):
+    ...
+    params = self._trainable_params   # canonical
+    sum_Y_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
+    B_local = 0
+    ...
+    with no_sync_context():
+        for microbatch in self.iter_microbatches(U_batch, mb_size_prompts):
+            self.model.zero_grad(set_to_none=True)
+            S_dict = self._teacher_force_logprobs(microbatch)
+            L_Y_mb = self.build_LY_from_S(S_dict)
+            ...
+            L_Y_mb.backward()
+
+            # Optional invariant
+            present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in params)
+            self.logger.debug(f"[Y] raw nonzero param.grads = {present}/{len(params)}")
+
+            self.scale_param_gradients(mb_prompt_count)
+
+            # Adam preconditioning in-place, guarded
+            for p in params:
+                g = p.grad
+                if g is None:
+                    continue
+                try:
+                    gtilde = adam_preconditioner.apply_preconditioner(g, p)
+                except Exception as e:
+                    self.logger.warning(f"[Y] preconditioner failed on {id(p)}: {e}; using raw grad")
+                    gtilde = g
+                if gtilde is None:
+                    # identity fallback
+                    gtilde = g
+                g.copy_(gtilde)
+
+            self.add_into_param_buffer(sum_Y_buf)
+            B_local += mb_prompt_count
+            self.model.zero_grad(set_to_none=True)
+    ...
+```
+
+D. Teacher forcing should already use the same PEFT instance
+------------------------------------------------------------
+Your `_teacher_force_logprobs` already resolves `peft_model = self.model.module if ... else self.model`.
+This matches the registry we constructed from `self._peft`, so parameter identities align.
+
+================================================================================
+PATCH 2 — conditional_variance.py
+================================================================================
+
+A. Add the same registry in __init__
+------------------------------------
+
+Insert after existing assignments in `ConditionalVarianceEstimator.__init__`:
+
+```python
+# --- Canonical Parameter Registry (same pattern as ProbeComponents) ---
+self._peft = self.model.module if hasattr(self.model, "module") else self.model
+
+self._trainable_named = [
+    (n, p) for (n, p) in self._peft.named_parameters() if p.requires_grad
+]
+self._trainable_params = [p for _, p in self._trainable_named]
+self._trainable_ids    = {id(p) for p in self._trainable_params}
+
+self._lora_named = [
+    (n, p) for (n, p) in self._trainable_named
+    if ("lora_a" in n.lower()) or ("lora_b" in n.lower()) or n.endswith("lm_head.weight")
+]
+self._lora_params = [p for _, p in self._lora_named]
+
+if hasattr(self, "logger"):
+    self.logger.debug(f"[REGISTRY] CV: trainable={len(self._trainable_params)} lora={len(self._lora_params)}")
+```
+
+B. Use the registry inside α‑trick / VJP path
+---------------------------------------------
+
+In `compute_conditional_variance_over_E_alpha(...)`:
+
+1) **Remove** ad‑hoc parameter collection via `peft_model.named_parameters()`.
+2) **Replace** it with the canonical LoRA list (or `_trainable_params` if you prefer all trainables).
+
+Example replacement around the block that currently collects `params_for_test`:
+
+```python
+# Old (remove):
+# peft_model = self.model.module if hasattr(self.model, "module") else self.model
+# lora_params = [p for n,p in peft_model.named_parameters() if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
+# extra = [p for n,p in peft_model.named_parameters() if p.requires_grad and n.endswith("lm_head.weight")]
+# params_for_test = lora_params + extra
+# if len(params_for_test) == 0: ...
+
+# New (use canonical registry):
+params_for_test = self._lora_params
+if len(params_for_test) == 0:
+    raise RuntimeError("α‑trick: no trainable LoRA (or lm_head) params in registry.")
+```
+
+Then, for the actual VJP:
+
+```python
+params = params_for_test  # canonical list
+
+g_list = torch.autograd.grad(
+    outputs=S, inputs=params, grad_outputs=W,
+    create_graph=True, allow_unused=True, retain_graph=False
+)
+non_none = sum(int(gi is not None) for gi in g_list)
+_dbg(f"[VJP] S→params non‑None grads = {non_none}/{len(g_list)}")
+if non_none == 0:
+    raise RuntimeError("α‑trick VJP: S→params produced no grads; check TF using adapters.")
+```
+
+And for the contraction with μ_Y:
+
+```python
+h = torch.zeros((), device=S.device, dtype=S.dtype)
+for p, gi in zip(params, g_list):
+    if gi is None:
+        continue
+    mu = muY_buf.get(id(p))
+    if mu is None:
+        continue  # strict: only contract over known μ_Y entries
+    if mu.device != gi.device or mu.dtype != gi.dtype:
+        mu = mu.to(device=gi.device, dtype=gi.dtype)
+    h = h + (gi * mu).sum()
+
+s = torch.autograd.grad(h, alpha, allow_unused=False, retain_graph=False)[0].detach()  # [k]
+```
+
+C. Minimal gradient-flow tests: use registry
+--------------------------------------------
+
+Where the file performs “minimal” or “diagnostic” gradient flow checks over LoRA
+tensors, replace ad‑hoc enumerations with `self._lora_params`. This ensures the
+checks reflect the same parameter objects the buffers and contraction will use.
+
+================================================================================
+PATCH 3 — offline_entropy_probe.py (notes only)
+================================================================================
+
+No code changes required. Ensure you are constructing `ProbeComponents` and
+`ConditionalVarianceEstimator` with the *same* `model` instance (you already do).
+Both classes now internally normalize to `self._peft` and build registries, so
+parameter identities match across phases.
+
+================================================================================
+POST‑PATCH SANITY CHECKS
+================================================================================
+
+1) **Run Stage‑1 only** (bars_dot path):
+   - Confirm logs show `[X] nonzero param.grads > 0` and `[Y] raw nonzero param.grads > 0`.
+   - Confirm buffer norms are non‑zero:
+     • add: a one‑liner after each accumulation:
+       `self.logger.info(f"[DBG] ||sum_X||={sum(v.pow(2).sum() for v in sum_X_buf.values())**0.5:.3e}")`
+       `self.logger.info(f"[DBG] ||sum_Y||={sum(v.pow(2).sum() for v in sum_Y_buf.values())**0.5:.3e}")`
+   - `bars_dot = μ_X · μ_Y` must be strictly > 0 on typical batches.
+
+2) **Run α‑trick variance block**:
+   - Logs should report non‑None VJP grads and a sensible distribution of `s`.
+   - No keys missing during contraction (we now contract strictly over `id(p)` in μ_Y).
+
+3) **Optional**: Guard preconditioner when state is missing
+   - If your preconditioner occasionally lacks state for a param, it should now
+     fall back to identity rather than zeroing. You’ll see a warning per occurrence.
+
+================================================================================
+RATIONALE (why this solves the observed issues)
+================================================================================
+
+- All gradient and buffer operations are now computed over exactly the same set
+  of parameter objects harvested from the *same module that produces S*.
+- μ‑buffers and VJP contractions agree on `id(p)` keys. No silent misses.
+- Y‑path preconditioning applies to the very same grads that are subsequently
+  accumulated and dotted, with an explicit guard against missing optimizer state.
+- The design mirrors your α‑trick probe (which already worked) while retaining
+  the simpler first‑order bars_dot path.
+
+End.

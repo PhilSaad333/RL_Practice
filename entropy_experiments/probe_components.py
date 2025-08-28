@@ -79,6 +79,26 @@ class ProbeComponents:
         # Initialize conditional variance estimator
         self.variance_estimator = ConditionalVarianceEstimator(model, config, logger, self._tokenizer)
         
+        # --- Canonical Parameter Registry (single source of truth) ---
+        self._peft = self.model.module if hasattr(self.model, "module") else self.model
+
+        # Trainable parameters from the same module that performs forward passes
+        self._trainable_named = [
+            (n, p) for (n, p) in self._peft.named_parameters() if p.requires_grad
+        ]
+        self._trainable_params = [p for _, p in self._trainable_named]
+        self._trainable_ids    = {id(p) for p in self._trainable_params}
+
+        # LoRA-only (plus lm_head if trainable) convenience view
+        self._lora_named = [
+            (n, p) for (n, p) in self._trainable_named
+            if ("lora_a" in n.lower()) or ("lora_b" in n.lower()) or n.endswith("lm_head.weight")
+        ]
+        self._lora_params = [p for _, p in self._lora_named]
+
+        self.logger.debug(f"[REGISTRY] trainable_tensors={len(self._trainable_params)} "
+                          f"lora_tensors={len(self._lora_params)}")
+        
         self.logger.info(f"ProbeComponents initialized: mode={self.mode}, G={self.G}")
         
     def sample_batch(self, B: int, G: int, indices: Optional[List[int]] = None) -> Dict[str, Any]:
@@ -381,64 +401,40 @@ class ProbeComponents:
     
     def zeros_like_params(self, dtype: torch.dtype = torch.float32, device: str = "cpu") -> Dict[int, torch.Tensor]:
         """
-        Create zero buffers matching model parameters.
-        
-        Args:
-            dtype: Data type for buffers (default float32 for stability)
-            device: Device for buffers ("cpu" or "cuda")
-            
-        Returns:
-            Dict mapping param id to zero tensor with same shape as parameter
+        Create zero buffers matching the canonical trainable parameters.
         """
         param_buffers = {}
-        for param in self.model.parameters():
-            if param.requires_grad:
-                param_buffers[id(param)] = torch.zeros_like(param, dtype=dtype, device=device)
+        for p in self._trainable_params:
+            param_buffers[id(p)] = torch.zeros_like(p, dtype=dtype, device=device)
         return param_buffers
     
     def add_into_param_buffer(self, buf: Dict[int, torch.Tensor], scale: float = 1.0) -> None:
-        """
-        Add current param.grad into buffer with optional scaling.
-        
-        Args:
-            buf: Parameter buffer dict from zeros_like_params()
-            scale: Scaling factor for gradients
-        """
-        for param in self.model.parameters():
-            if param.requires_grad and param.grad is not None:
-                param_id = id(param)
-                if param_id in buf:
-                    # Convert gradient to buffer's dtype and device
-                    grad = param.grad.detach()
-                    if buf[param_id].device != grad.device or buf[param_id].dtype != grad.dtype:
-                        grad = grad.to(buf[param_id].device, dtype=buf[param_id].dtype)
-                    buf[param_id].add_(grad, alpha=scale)
+        for p in self._trainable_params:
+            if p.grad is None:
+                continue
+            pid = id(p)
+            if pid not in buf:
+                continue
+            g = p.grad.detach()
+            want = buf[pid]
+            if want.device != g.device or want.dtype != g.dtype:
+                g = g.to(want.device, dtype=want.dtype)
+            want.add_(g, alpha=scale)
     
     def scale_param_gradients(self, scale_factor: float):
-        """Scale all parameter gradients by a factor."""
-        for param in self.model.parameters():
-            if param.grad is not None:
-                param.grad.data *= scale_factor
+        for p in self._trainable_params:
+            if p.grad is not None:
+                p.grad.data.mul_(scale_factor)
     
     def dot_param_buffers(self, buf_a: Dict[int, torch.Tensor], buf_b: Dict[int, torch.Tensor]) -> float:
-        """
-        Compute dot product between two parameter buffers.
-        
-        Args:
-            buf_a: First parameter buffer
-            buf_b: Second parameter buffer
-            
-        Returns:
-            Scalar dot product as float
-        """
-        total_dot = 0.0
-        for param in self.model.parameters():
-            if param.requires_grad:
-                param_id = id(param)
-                if param_id in buf_a and param_id in buf_b:
-                    dot_contrib = (buf_a[param_id] * buf_b[param_id]).sum().item()
-                    total_dot += dot_contrib
-        return total_dot
+        total = 0.0
+        for p in self._trainable_params:
+            pid = id(p)
+            ta = buf_a.get(pid); tb = buf_b.get(pid)
+            if ta is None or tb is None:
+                continue
+            total += (ta * tb).sum().item()
+        return total
     
     # ========================================================================
     # STAGE 1: Mixed E/U Batch Probe - Loss Builders
@@ -593,11 +589,6 @@ class ProbeComponents:
             (sum_X_buf, B_local): Parameter sum buffer and local batch size
         """
         self._assert_grad_context("accumulate_sum_X")
-        # Get trainable LoRA parameters for QLoRA consistency
-        params = [p for n, p in self.model.named_parameters() 
-                  if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
-        
-        # Initialize sum buffer on CPU in fp32
         sum_X_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
         
         # Count prompts processed
@@ -631,7 +622,11 @@ class ProbeComponents:
                 
                 # Backward pass - populates param.grad with raw X gradients  
                 L_X_mb.backward()
-                
+
+                # Optional invariant: count trainable grads present
+                present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in self._trainable_params)
+                self.logger.debug(f"[X] nonzero param.grads = {present}/{len(self._trainable_params)}")
+
                 # Scale gradients by microbatch size to convert from average to sum
                 # build_LX_from_S returns average over prompts, but we need sum
                 self.scale_param_gradients(mb_prompt_count)
@@ -661,11 +656,7 @@ class ProbeComponents:
             (sum_Y_buf, B_local): Parameter sum buffer and local batch size
         """
         self._assert_grad_context("accumulate_sum_Y")
-        # Get trainable LoRA parameters for QLoRA consistency  
-        params = [p for n, p in self.model.named_parameters()
-                  if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
-        
-        # Initialize sum buffer on CPU in fp32
+        params = self._trainable_params   # canonical
         sum_Y_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
         
         # Count prompts processed
@@ -699,16 +690,29 @@ class ProbeComponents:
                 
                 # Backward pass - populates param.grad with raw ∇J
                 L_Y_mb.backward()
-                
+
+                # Optional invariant
+                present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in params)
+                self.logger.debug(f"[Y] raw nonzero param.grads = {present}/{len(params)}")
+
                 # Scale gradients by microbatch size to convert from average to sum
                 # build_LY_from_S returns average over prompts, but we need sum
                 self.scale_param_gradients(mb_prompt_count)
-                
-                # Apply preconditioner in-place: grad ← P(grad) 
-                for param in params:
-                    if param.grad is not None:
-                        preconditioned_grad = adam_preconditioner.apply_preconditioner(param.grad, param)
-                        param.grad.copy_(preconditioned_grad)
+
+                # Adam preconditioning in-place, guarded
+                for p in params:
+                    g = p.grad
+                    if g is None:
+                        continue
+                    try:
+                        gtilde = adam_preconditioner.apply_preconditioner(g, p)
+                    except Exception as e:
+                        self.logger.warning(f"[Y] preconditioner failed on {id(p)}: {e}; using raw grad")
+                        gtilde = g
+                    if gtilde is None:
+                        # identity fallback
+                        gtilde = g
+                    g.copy_(gtilde)
                 
                 # Accumulate preconditioned gradients into sum buffer  
                 self.add_into_param_buffer(sum_Y_buf)
