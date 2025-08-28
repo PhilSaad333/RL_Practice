@@ -1422,7 +1422,11 @@ class ProbeComponents:
                     raise RuntimeError("h tensor in α-trick has no gradients - gradient flow broken")
                 
                 # 7) Second reverse pass: s = ∂h/∂α → [k] (all scalar projections!)
-                s = torch.autograd.grad(h, alpha, allow_unused=False, retain_graph=False)[0].detach()
+                s = torch.autograd.grad(h, alpha, allow_unused=True, retain_graph=False)[0]
+                if s is None:
+                    self.logger.error(f"α-trick: gradient ∂h/∂α is None! This shouldn't happen.")
+                    raise RuntimeError("α-trick: gradient computation failed - ∂h/∂α is None")
+                s = s.detach()
                 
             # 8) Accumulate scalars
             sum_s_local += float(s.sum().item())
