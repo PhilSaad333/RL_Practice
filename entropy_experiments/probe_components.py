@@ -707,21 +707,20 @@ class ProbeComponents:
                 present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in params)
                 self.logger.debug(f"[Y] raw nonzero param.grads = {present}/{len(params)}")
 
-                # Adam preconditioning in-place with fp32 precision
+                # Adam preconditioning in-place, guarded
                 for p in params:
                     g = p.grad
                     if g is None:
                         continue
                     try:
-                        # inside the Y preconditioner loop, right before using g and state tensors
-                        g32 = g.to(torch.float32)
-                        gtilde = adam_preconditioner.apply_preconditioner(g32, p)
-                        if gtilde is None:
-                            gtilde = g32
-                        # copy back (will downcast if p.grad is bf16)
-                        g.copy_(gtilde)
+                        gtilde = adam_preconditioner.apply_preconditioner(g, p)
                     except Exception as e:
                         self.logger.warning(f"[Y] preconditioner failed on {id(p)}: {e}; using raw grad")
+                        gtilde = g
+                    if gtilde is None:
+                        # identity fallback
+                        gtilde = g
+                    g.copy_(gtilde)
                 
                 # Accumulate with fp32 scaling (average -> sum)
                 self.add_into_param_buffer(sum_Y_buf, scale=float(mb_prompt_count))
