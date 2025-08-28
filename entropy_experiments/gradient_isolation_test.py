@@ -201,15 +201,19 @@ class GradientIsolationTest:
         optimizer_state = torch.load(optimizer_path, map_location=self.device)
         
         # Create dummy optimizer to load state into
+        # CRITICAL FIX: Must match RL training setup exactly!
+        # In dr_grpo.py:69, AdamW is initialized with policy.parameters() (ALL params)
+        # Our original test used only trainable params → parameter count mismatch → load fails
         from torch.optim import AdamW
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        dummy_optimizer = AdamW(trainable_params, lr=1e-4)
+        all_params = list(self.model.parameters())  # All params (frozen + trainable)
+        dummy_optimizer = AdamW(all_params, lr=1e-4, weight_decay=0.01)  # Match RL training settings
         
         try:
             dummy_optimizer.load_state_dict(optimizer_state)
             logger.info("✅ Optimizer state loaded successfully")
             
-            # Analyze Adam state for LoRA parameters
+            # Analyze Adam state for LoRA parameters  
+            # Note: optimizer has ALL parameters, but we only care about LoRA ones
             lora_params = [p for n, p in self.model.named_parameters() 
                           if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
             
