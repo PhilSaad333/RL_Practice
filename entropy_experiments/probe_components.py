@@ -820,6 +820,41 @@ class ProbeComponents:
         
         batch_size, G, max_len = sequences.shape
         
+        # 🔧 FIX: Apply same PEFT adapter activation as conditional_variance.py
+        # Resolve the PEFT-wrapped module regardless of DDP
+        peft_model = self.model.module if hasattr(self.model, "module") else self.model
+        
+        # Make sure an adapter is active and trainable
+        if hasattr(peft_model, "set_adapter"):
+            peft_model.set_adapter("default")  # or your adapter name
+        
+        # Sanity: we are not inside a disable_adapter() context
+        active = getattr(peft_model, "active_adapter", None)
+        if active is None:
+            raise RuntimeError("No active adapter on PEFT model in main teacher forcing.")
+            
+        # 🔧 FIX: Add invariant logging for main probe phases
+        self.logger.debug(f"🔧 [MAIN-TF-DEBUG] active_adapter={active} training={peft_model.training}")
+        trainable = [n for n,p in peft_model.named_parameters() if p.requires_grad]
+        self.logger.debug(f"🔧 [MAIN-TF-DEBUG] #trainable={len(trainable)} sample={trainable[:8]}")
+        
+        # 🔧 FIX: Prove LoRA is active at runtime in main phases too
+        if batch_size >= 1:  # Only test on first prompt to avoid overhead
+            seqs_small = sequences[0:1]  # [1, G, max_len]
+            masks_small = attention_masks[0:1] if attention_masks is not None else None
+            
+            with torch.no_grad():
+                logits_on = peft_model(seqs_small.view(-1, max_len), 
+                                     attention_mask=masks_small.view(-1, max_len) if masks_small is not None else None).logits
+                with peft_model.disable_adapter():
+                    logits_off = peft_model(seqs_small.view(-1, max_len),
+                                          attention_mask=masks_small.view(-1, max_len) if masks_small is not None else None).logits
+            
+            delta = (logits_on - logits_off).abs().max().item()
+            self.logger.debug(f"🔧 [MAIN-TF-DEBUG] LoRA on/off delta: {delta:.2e}")
+            if delta < 1e-7:
+                raise RuntimeError("LoRA appears inactive in main TF: on/off logits nearly identical.")
+        
         # Ensure model is in training mode for gradients
         was_training = self.model.training
         self.model.train()
@@ -834,6 +869,10 @@ class ProbeComponents:
                 
             # Stack into tensor with gradients enabled
             S = torch.stack(S_batch, dim=0)  # [batch_size, G]
+            
+            # 🔧 FIX: Assert S has gradient path in main phases
+            assert S.requires_grad and S.grad_fn is not None, "S lost grad path in main TF (inference/no_grad or detach?)"
+            self.logger.debug(f"🔧 [MAIN-TF-DEBUG] S.requires_grad={S.requires_grad} S.grad_fn={S.grad_fn}")
             
         finally:
             # Restore training state
