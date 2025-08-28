@@ -7,10 +7,10 @@ based on the theory from RL_studies.pdf.
 
 Key functionality:
 - Load model checkpoint and optimizer state
-- Sample batch of prompts and responses  
-- Compute first-order entropy change prediction δH₁ via U-statistic
-- Measure actual entropy change ΔH via importance sampling
-- Provide variance estimates and statistical diagnostics
+- Sample batches of prompts and responses - E batch for "evaluation" or "entropy", U batch for "update"  
+- Compute first-order entropy change prediction δH₁ after updating with U batch, using E batch to estimate entropy gradient
+- Compute estimators of the variance of δH₁ (optional, config-driven) to get a sense of uncertainty
+- Measure actual entropy change ΔH via importance sampling (entropy estimated on E batch before/after update with U batch)
 
 Usage:
     probe = OfflineEntropyProbe(config)

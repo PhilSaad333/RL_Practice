@@ -1,3 +1,23 @@
+"""
+In this file we compute an estimate of the variance of our estimator for \delta H_1, conditioned on the update batch U.
+
+We reuse some of the computation from \delta H_1, but we also need to do a bunch of new computation, so we have moved 
+this to a separate file for organization. 
+
+The variance estimator we use (haven't implemented another option, the jackknife), is given by a sum over prompts 
+\hat{V} = \sum_p \hat{V}_p, where \hat{V}_p must be computed using some graidents. Naively we could just compute an
+auxiliary loss for each prompt and backprop through that, but in order to parallelize this efficiently we need to use the
+"alpha trick" (suggested by chat gpt, I don't know who originally came up with this). This ended up being a massive headache,
+and I couldn't get it to work until I turned off gradient checkpointing and used normal LoRA instead of QLoRA. But perhaps
+now that it is working we can try to reintroduce those things later.
+
+"""
+
+
+
+
+
+
 
 
 import torch

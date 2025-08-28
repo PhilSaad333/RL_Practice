@@ -23,6 +23,11 @@ python run_entropy_test.py single \\
 python run_entropy_test.py debug \\
   --checkpoint /path/to/checkpoint \\
   --be-values 16,32 --verbose --save-gradients
+
+# Importance sampling only - skip δH₁ computation (superior measurement)
+python run_entropy_test.py single \\
+  --checkpoint /path/to/checkpoint \\
+  --no-delta-h1
 ```
 
 ## 📁 Directory Structure
@@ -110,6 +115,7 @@ python run_entropy_test.py sanity-check \\
 - Fast execution
 - Focus on conditional variance estimator
 - Perfect for parameter exploration
+- **NEW**: Supports importance sampling only mode (`--no-delta-h1`)
 
 **Example Usage**:
 ```bash
@@ -122,6 +128,11 @@ python run_entropy_test.py single \\
 python run_entropy_test.py single \\
   --checkpoint /path/to/checkpoint \\
   --be 128 --bu 16 --minimal
+
+# Importance sampling only (skip Phase 1-3 δH₁ computation)  
+python run_entropy_test.py single \\
+  --checkpoint /path/to/checkpoint \\
+  --be 256 --bu 32 --no-delta-h1
 ```
 
 ### 4. Debug Mode (`debug`)
@@ -242,8 +253,34 @@ Each run contains complete artifacts:
 - `--be`: B_E value for single test (default: 256)
 - `--bu`: B_U value for single test (default: 32)
 
+### Computation Control
+- `--no-delta-h1`: Skip δH₁ computation (Phase 1-3), run importance sampling only
+
 ### Debug Options
 - `--save-gradients`: Save detailed gradient information
+
+## 🔬 Computation Modes
+
+The entropy probe supports two computation modes:
+
+### Full Mode (Default)
+- **Phase 1-3**: Compute δH₁ via ΣX/ΣY gradients and preconditioned means
+- **Importance Sampling**: Ground-truth entropy change via before/after measurement
+- **Use case**: Complete analysis with both estimator and ground truth
+
+### Importance Sampling Only (`--no-delta-h1`)
+- **Skip Phase 1-3**: No ΣX, ΣY, or δH₁ computation
+- **Focus**: Direct entropy measurement on E batch before/after U batch update
+- **Use case**: Superior direct measurement without estimator interference
+- **Benefits**: Faster execution, cleaner measurement, no estimator bias
+
+```bash
+# Full mode (default) - both δH₁ estimator and importance sampling
+python run_entropy_test.py single --checkpoint /path/to/checkpoint
+
+# Importance sampling only - direct measurement, superior approach
+python run_entropy_test.py single --checkpoint /path/to/checkpoint --no-delta-h1
+```
 
 ## 🎯 Key Features
 

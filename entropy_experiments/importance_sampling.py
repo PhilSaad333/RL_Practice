@@ -1,11 +1,24 @@
 """
-Importance Sampling
+Somewhat poorly named file.
 
-Computes actual entropy change ΔH via self-normalized importance sampling (SNIS).
-Based on Section VI of offline_entropy_probe_strategy.txt.
+The idea is that we want to compute the actual entropy change ΔH via importance sampling, which \delta H_1 is
+supposed to approximate. 
 
-The key insight is that we can measure actual entropy change using the same batch
-of responses by treating the post-update model as the target distribution.
+To do a proper comparison, we need to:
+    1) estimate the entropy of the original model H(π_θ) on the evaluation batch E
+    2) take a real optimizer step on the update batch U
+    3) estimate the entropy of the updated model H(π_{θ+δθ}) on the SAME evaluation batch E
+    4) compute ΔH = H(π_{θ+δθ}) - H(π_θ)
+
+The third step requires using importance sampling if we want to use the same batch E.
+
+I'm not 100% sure if this it theoretically the right approach, but it seems like the most reasonable way to do it.
+If we used a different batch E' for the updated model, then we would be measuring something different - we would get noise
+from the variance of the entropy estimates on different batches, even as the learning rate goes to zero. The quantity we are 
+measuring here should in principle behave linearly in the learning rate for small learning rates.
+
+
+
 """
 
 import torch
