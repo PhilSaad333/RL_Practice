@@ -1,0 +1,3 @@
+[Rank 0] 2025-08-27 16:44:40,074 - entropy_probe_rank_0 - INFO - Starting Stage 1 Mixed E/U Batch Probe Analysis
+[Rank 0] 2025-08-27 16:44:40,074 - entropy_probe_rank_0 - INFO - Loading checkpoint from nul/model
+[Rank 0] 2025-08-27 16:44:40,075 - entropy_probe_rank_0 - ERROR - Error during mixed probe analysis: No module named 'peft'

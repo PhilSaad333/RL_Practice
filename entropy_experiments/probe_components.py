@@ -442,8 +442,7 @@ class ProbeComponents:
         
         return L_vec
     
-    def _batched_teacher_force_logprobs(self, prompt_batches: List[Dict[str, Any]], 
-                                       batch_size: int = 6) -> List[Dict[str, Any]]:
+    def _batched_teacher_force_logprobs(self, prompt_batches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Compute sequence log-probabilities for multiple prompts in batches with proper padding.
         
@@ -453,12 +452,14 @@ class ProbeComponents:
         
         Args:
             prompt_batches: List of single-prompt batch dicts (from _iter_units)
-            batch_size: Number of prompts to process together (default: 6)
             
         Returns:
             List of S_dict results (same as _teacher_force_logprobs output)
         """
         results = []
+        
+        # Get batch size from config
+        batch_size = self.config.get("probe_rework", {}).get("conditional_variance_batch_size", 6)
         
         # Process prompts in groups of batch_size
         for i in range(0, len(prompt_batches), batch_size):
@@ -600,80 +601,84 @@ class ProbeComponents:
         
     def _compute_aligned_batch_logprobs(self, aligned_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Compute log probabilities for aligned batch efficiently.
-        
-        Since all prompts now have the same prompt boundary (max_prompt_len),
-        we can process them together efficiently.
-        
-        Args:
-            aligned_batch: Batch with aligned padding from _align_prompt_batch_with_padding
-            
-        Returns:
-            S_dict with batched results
+        Compute per-response sequence log-probs S for a batch of prompts with aligned shapes.
+        Returns dict with:
+          'S': [num_prompts, G], requires_grad=True (sum over generated tokens per response)
+          'sequences', 'advantages', 'max_lengths' (and optionally 'gen_lengths')
+        Assumes: aligned_batch has fields:
+          sequences: [num_prompts, G, total_len] (left-padded), dtype long
+          attention_masks: [num_prompts, G, total_len], 1=real token, 0=pad
+          max_prompt_len: int
+          advantages: [num_prompts, G] (if present in your pipeline)
+          max_lengths: list[int] or tensor [num_prompts]
         """
-        sequences = aligned_batch['sequences']  # [num_prompts, G, total_aligned_len]
-        attention_masks = aligned_batch['attention_masks'] 
+        sequences = aligned_batch['sequences']
+        attention_masks = aligned_batch['attention_masks']
         max_prompt_len = aligned_batch['max_prompt_len']
-        
         num_prompts, G, total_len = sequences.shape
-        
-        # Ensure model is in training mode for gradients
+
         was_training = self.model.training
-        self.model.train()
-        
+        self.model.train()  # keep modules in train/eval state consistent with caller
+
         try:
-            # Reshape for efficient processing: [num_prompts * G, total_len]
-            flat_sequences = sequences.view(num_prompts * G, total_len)
-            flat_attention_masks = attention_masks.view(num_prompts * G, total_len)
-            
-            # Single forward pass for all sequences
-            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                logits = self.model(flat_sequences, attention_mask=flat_attention_masks).logits
-                
-            # Apply temperature
-            temp = self.config['generation'].get('temperature', 1.0)
-            if temp != 1.0:
-                logits = logits / temp
-                
-            # Convert to log probabilities  
-            log_probs = F.log_softmax(logits.float(), dim=-1)  # [num_prompts * G, total_len, vocab_size]
-            
-            # Extract log probs of actual tokens (causal shift)
-            target_ids = flat_sequences[:, 1:].unsqueeze(-1)  # [num_prompts * G, total_len-1, 1]
-            token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)  # [num_prompts * G, total_len-1]
-            
-            # Reshape back to batch format
-            token_log_probs = token_log_probs.view(num_prompts, G, total_len - 1)  # [num_prompts, G, total_len-1]
-            
-            # Extract generation tokens only (all prompts end at max_prompt_len-1 due to causal shift)
-            gen_start = max_prompt_len - 1
-            gen_token_log_probs = token_log_probs[:, :, gen_start:]  # [num_prompts, G, gen_len]
-            
-            # Create masks for real generation tokens (not padding)
-            gen_sequences = sequences[:, :, max_prompt_len:]  # [num_prompts, G, gen_len]
-            if hasattr(self._tokenizer, 'pad_token_id') and self._tokenizer.pad_token_id is not None:
-                gen_masks = (gen_sequences != self._tokenizer.pad_token_id).float()
-            else:
-                gen_masks = torch.ones_like(gen_sequences).float()
-                
-            # Handle potential shape mismatches
-            if gen_masks.shape != gen_token_log_probs.shape:
-                min_len = min(gen_masks.shape[2], gen_token_log_probs.shape[2])
-                gen_masks = gen_masks[:, :, :min_len]
-                gen_token_log_probs = gen_token_log_probs[:, :, :min_len]
-            
-            # Sum log probs over real generation tokens for each sequence
-            S_batch = (gen_token_log_probs * gen_masks).sum(dim=2)  # [num_prompts, G]
-            
+            # IMPORTANT: ensure graph tracking regardless of outer context
+            with torch.set_grad_enabled(True):
+                flat_sequences = sequences.view(num_prompts * G, total_len)
+                flat_attention_masks = attention_masks.view(num_prompts * G, total_len)
+
+                # Forward with attention_mask; AMP as in training if you use it
+                use_amp = getattr(self, "use_amp", False)
+                amp_dtype = getattr(self, "amp_dtype", torch.float16)
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    outputs = self.model(flat_sequences, attention_mask=flat_attention_masks)
+                    logits = outputs.logits  # [B, T, V]
+
+                # Apply temperature (keeping consistent with existing behavior)
+                temp = self.config['generation'].get('temperature', 1.0)
+                if temp != 1.0:
+                    logits = logits / temp
+
+                # Token-level log-probs for next-token targets, with proper masking
+                log_probs = F.log_softmax(logits.float(), dim=-1)   # [B, T, V]
+                target_ids = flat_sequences[:, 1:].unsqueeze(-1)    # shift left by 1
+                token_log_probs = log_probs[:, :-1].gather(2, target_ids).squeeze(-1)  # [B, T-1]
+
+                # Reshape back to [num_prompts, G, T-1]
+                token_log_probs = token_log_probs.view(num_prompts, G, total_len - 1)
+
+                # Generated-region slice (exclude prompt tokens); index is (max_prompt_len - 1)
+                gen_start = int(max_prompt_len) - 1
+                gen_token_log_probs = token_log_probs[:, :, gen_start:]  # [num_prompts, G, L_gen]
+
+                # Build generation mask from sequences; 1 for non-pad tokens in generated region
+                gen_sequences = sequences[:, :, max_prompt_len:]  # [num_prompts, G, L_gen]
+                if hasattr(self._tokenizer, 'pad_token_id') and self._tokenizer.pad_token_id is not None:
+                    gen_masks = (gen_sequences != self._tokenizer.pad_token_id).float()
+                else:
+                    gen_masks = torch.ones_like(gen_sequences, dtype=torch.float32)
+
+                # Align shapes defensively
+                if gen_masks.shape != gen_token_log_probs.shape:
+                    min_len = min(gen_masks.shape[2], gen_token_log_probs.shape[2])
+                    gen_masks = gen_masks[:, :, :min_len]
+                    gen_token_log_probs = gen_token_log_probs[:, :, :min_len]
+
+                # Sequence log-prob per response (sum over generated tokens)
+                S_batch = (gen_token_log_probs * gen_masks).sum(dim=2)  # [num_prompts, G]
+                # S_batch.requires_grad should be True if logits path is live
+
         finally:
             self.model.train(was_training)
-            
-        return {
-            'S': S_batch,  # [num_prompts, G] 
+
+        out = {
+            'S': S_batch,
             'sequences': sequences,
-            'advantages': aligned_batch['advantages'],
-            'max_lengths': aligned_batch['max_lengths']
+            'advantages': aligned_batch.get('advantages', None),
+            'max_lengths': aligned_batch['max_lengths'],
         }
+        if 'gen_lengths' in aligned_batch:
+            out['gen_lengths'] = aligned_batch['gen_lengths']
+        return out
         
     def _split_batch_results(self, batch_S_dict: Dict[str, Any], 
                            original_batches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -688,6 +693,9 @@ class ProbeComponents:
             List of per-prompt S_dict results (same format as _teacher_force_logprobs)
         """
         S_batch = batch_S_dict['S']  # [num_prompts, G]
+        
+        # Runtime assertion to ensure S has gradients (critical for α-trick)
+        assert S_batch.requires_grad, "S must require grad in TF path for α-trick to work"
         
         results = []
         for i, original_batch in enumerate(original_batches):
@@ -1331,134 +1339,90 @@ class ProbeComponents:
         self.logger.debug(f"Conditional variance over E: B_E_local={B_E_local}, sum_s={sum_s_local:.6f}")
         return sum_s_local, sum_s2_local, B_E_local
     
-    def compute_conditional_variance_over_E_alpha(self, 
-                                                 E_units: List[Dict[str, Any]], 
-                                                 muY_buf: Dict[int, torch.Tensor],
-                                                 weighting_mode: str = "dr_grpo",
-                                                 cv_batch_size: int = 8) -> Tuple[float, float, int]:
+    def compute_conditional_variance_over_E_alpha(
+        self,
+        E_units,
+        muY_buf: dict,
+        weighting_mode: str = "dr_grpo",
+        cv_batch_size: int = 8,
+    ):
         """
-        Fast E-only conditional variance using the α-trick.
-        
-        Computes scalar projections s_n = μ_Y^T X_n for all prompts using just two 
-        backward passes per batch group instead of one backward pass per prompt.
-        
-        Args:
-            E_units: List of prompt unit dictionaries (from _iter_units)
-            muY_buf: Preconditioned mean gradients from U batch {param_id: tensor}
-            weighting_mode: Loss weighting method (dr_grpo, per_token_avg)
-            cv_batch_size: Number of prompts to process per batch group
-            
-        Returns:
-            (sum_s_local, sum_s2_local, B_E_local): Local statistics for global reduction
+        Fast E-only conditional variance via α-trick.
+        Returns (sum_s_local, sum_s2_local, B_E_local) as Python floats/ints.
+        Caller assembles Var_E = η^2 * [ (Σ s^2 − B s̄^2) / (B − 1) ] / B, SE_E = η * sqrt( ... ).
         """
         from contextlib import nullcontext
-        import torch
-        
         device = next(self.model.parameters()).device
         sum_s_local = 0.0
-        sum_s2_local = 0.0  
+        sum_s2_local = 0.0
         B_E_local = 0
-        
-        # DDP: suppress reducer; we are not updating weights
+
+        logger = getattr(self, "logger", None)
+        def _dbg(msg):
+            if logger is not None and hasattr(logger, "debug"):
+                logger.debug(msg)
+
         no_sync_ctx = self.model.no_sync if hasattr(self.model, "no_sync") else nullcontext
-        
-        self.logger.debug(f"α-trick: Processing {len(E_units)} prompts in groups of {cv_batch_size}")
-        
-        # Process prompts in groups
+
         for i in range(0, len(E_units), cv_batch_size):
-            group = E_units[i:i + cv_batch_size]
-            if len(group) == 0:
+            group = E_units[i : i + cv_batch_size]
+            if not group:
                 continue
-                
-            k = len(group)  # Number of prompts in this group
-            self.logger.debug(f"α-trick: Processing group {i//cv_batch_size + 1} with {k} prompts")
-            
-            # 1) One TF forward for this group using existing batched teacher forcing
-            batch_S_list = self._batched_teacher_force_logprobs(group, batch_size=k)
-            
-            # 2) Normalize to a single S_dict with S [k, G] and max_lengths
+
+            # 1) One TF forward for this group; stack into a single S_dict
+            batch_S_list = self._batched_teacher_force_logprobs(group)
             S_cat = torch.cat([d["S"].view(1, -1) for d in batch_S_list], dim=0)  # [k, G]
+
+            if not S_cat.requires_grad:
+                raise RuntimeError("α-trick: S.requires_grad=False — TF path detached from parameters.")
+
             S_dict = {"S": S_cat}
-            
             if "max_lengths" in batch_S_list[0]:
-                # Extract max_lengths from each prompt's dict
-                if isinstance(batch_S_list[0]["max_lengths"], list):
-                    max_lengths = [d["max_lengths"][0] for d in batch_S_list]  # Each is [1] -> scalar
-                else:
-                    max_lengths = [d["max_lengths"] for d in batch_S_list]
-                S_dict["max_lengths"] = max_lengths
-            
+                S_dict["max_lengths"] = [d["max_lengths"] for d in batch_S_list]
             if "gen_lengths" in batch_S_list[0]:
-                gen_lengths_list = [d["gen_lengths"] for d in batch_S_list]
-                S_dict["gen_lengths"] = torch.stack(gen_lengths_list, dim=0)
-                
+                S_dict["gen_lengths"] = torch.stack([d["gen_lengths"] for d in batch_S_list], dim=0)
+
             with no_sync_ctx():
-                # 3) Per-prompt losses L_vec [k] - vectorized X-loss computation
-                L_vec = self.build_LX_vector_from_S(S_dict, weighting_mode=weighting_mode)  # [k]
-                
-                # 4) α-trick setup: α is the "selector"; ∂h/∂α gives s (all s_n at once)
-                alpha = torch.ones_like(L_vec, requires_grad=True)  # [k]
-                L = (alpha * L_vec).sum()  # Scalar combined loss
-                
-                # 5) First reverse pass: g = ∇_θ L (keep graph for second pass)
+                # 2) Per-prompt losses and α selector
+                L_vec = self.build_LX_vector_from_S(S_dict, weighting_mode=weighting_mode)   # [k]
+                alpha = torch.ones_like(L_vec, requires_grad=True)                           # [k]
+                L = (alpha * L_vec).sum()
+                _dbg(f"α-trick: group L={L.item():.6f}, L.requires_grad={L.requires_grad}")
+
+                # 3) First reverse: g = ∇_θ L (keep graph for second pass)
                 params = [p for p in self.model.parameters() if p.requires_grad]
-                self.logger.debug(f"α-trick: L={L.item():.6f}, L.requires_grad={L.requires_grad}, params_count={len(params)}")
-                
-                # Check if model is in training mode
-                if not self.model.training:
-                    self.logger.error("α-trick: Model is not in training mode! This will prevent gradients.")
-                    self.model.train()
-                    
                 g_list = torch.autograd.grad(
                     L, params, create_graph=True, allow_unused=True, retain_graph=False
                 )
-                
-                # Debug gradient computation
-                non_none_grads = sum(1 for g in g_list if g is not None)
-                self.logger.debug(f"α-trick: Got {non_none_grads}/{len(params)} non-None gradients")
-                
-                # 6) Contract with μY: h = Σ_p <g_p, μY_p>  
-                h_terms = []
-                valid_params = 0
+                non_none = sum(int(gi is not None) for gi in g_list)
+                _dbg(f"α-trick: non-None parameter grads in first pass = {non_none}/{len(g_list)}")
+                if non_none == 0:
+                    raise RuntimeError("α-trick: No gradient terms to contract with μY (check TF forward & X-loss).")
+
+                # 4) Contract with μY: h = Σ_p <g_p, μY_p>
+                h = torch.zeros((), device=device, dtype=L.dtype)
                 for p, gi in zip(params, g_list):
                     if gi is None:
                         continue
-                    param_id = id(p)
-                    if param_id in muY_buf:
-                        mu = muY_buf[param_id].to(device=gi.device, dtype=gi.dtype)
-                        dot_term = (gi * mu).sum()
-                        h_terms.append(dot_term)
-                        valid_params += 1
-                
-                if len(h_terms) == 0:
-                    self.logger.error(f"α-trick: No valid parameter gradients found for contraction!")
-                    raise RuntimeError("α-trick: No gradient terms to contract with μY")
-                
-                # Sum all dot products to get h
-                h = torch.stack(h_terms).sum()
-                self.logger.debug(f"α-trick: Contracted {valid_params} parameters, h={h.item():.6f}, h.requires_grad={h.requires_grad}")
-                
-                # Check if h has gradients before second backward pass
-                if not h.requires_grad:
-                    self.logger.error(f"α-trick: h tensor has no gradients! h={h}, h.requires_grad={h.requires_grad}")
-                    raise RuntimeError("h tensor in α-trick has no gradients - gradient flow broken")
-                
-                # 7) Second reverse pass: s = ∂h/∂α → [k] (all scalar projections!)
-                s = torch.autograd.grad(h, alpha, allow_unused=True, retain_graph=False)[0]
-                if s is None:
-                    self.logger.error(f"α-trick: gradient ∂h/∂α is None! This shouldn't happen.")
-                    raise RuntimeError("α-trick: gradient computation failed - ∂h/∂α is None")
-                s = s.detach()
-                
-            # 8) Accumulate scalars
-            sum_s_local += float(s.sum().item())
+                    mu = muY_buf.get(id(p), None)
+                    if mu is None:
+                        # Optional: warn once if IDs don't match; continue
+                        mu = torch.zeros_like(gi)
+                    else:
+                        mu = mu.to(device=gi.device, dtype=gi.dtype)
+                    h = h + (gi * mu).sum()
+
+                # 5) Second reverse: s = ∂h/∂α  → [k]
+                s = torch.autograd.grad(h, alpha, allow_unused=False, retain_graph=False)[0].detach()  # [k]
+
+            # 6) Accumulate scalars
+            sum_s_local  += float(s.sum().item())
             sum_s2_local += float((s * s).sum().item())
-            B_E_local += int(s.numel())
-            
-            # 9) Clear gradients to keep memory bounded
+            B_E_local    += int(s.numel())
+
+            # 7) Clear grads to keep memory bounded
             self.model.zero_grad(set_to_none=True)
-            
-        self.logger.debug(f"α-trick complete: B_E_local={B_E_local}, sum_s={sum_s_local:.6f}")
+
         return sum_s_local, sum_s2_local, B_E_local
     
     def _iter_units(self, batch_dict: Dict[str, Any]):
