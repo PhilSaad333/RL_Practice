@@ -38,7 +38,10 @@ def load_peft_for_probe(
     if mode == "lora_simple":
         # Plain fp16/bf16 base — NO quantization, NO k-bit preparation
         base = AutoModelForCausalLM.from_pretrained(
-            base_id, device_map=device_map, torch_dtype=torch_dtype
+            base_id, 
+            device_map=device_map, 
+            torch_dtype=torch_dtype,
+            attn_implementation="eager"  # Disable flash attention for VJP compatibility
         )
         # Ensure no checkpointing and cache is allowed (deterministic probe)
         if hasattr(base, "gradient_checkpointing_disable"):
@@ -65,7 +68,11 @@ def load_peft_for_probe(
             bnb_4bit_compute_dtype=torch_dtype,
         )
         base = AutoModelForCausalLM.from_pretrained(
-            base_id, device_map=device_map, torch_dtype=torch_dtype, quantization_config=bnb_cfg
+            base_id, 
+            device_map=device_map, 
+            torch_dtype=torch_dtype, 
+            quantization_config=bnb_cfg,
+            attn_implementation="eager"  # Disable flash attention for VJP compatibility
         )
         base = prepare_model_for_kbit_training(base)
         if use_checkpointing and hasattr(base, "gradient_checkpointing_enable"):
