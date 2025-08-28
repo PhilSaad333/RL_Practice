@@ -85,17 +85,13 @@ python rl_training/runners/resume_training.py \
 - **File organization**: New structure with training_state/, logs/, tensorboard/
 
 ## Configuration Files
-- **testconfig.yaml**: 2 steps, save_every=1 (for testing)
-- **overnight_config.yaml**: 100 steps, save_every=10 (for production)
 - **Qwen2.5-1.5B model**: Always use `backbone: qwen2_5_15`
 - **Dataset**: Always use `gsm8k_r1_template` for evaluation
 
 ## Key Parameters & Defaults
-- **batch_size**: 32 (was 8, increased for GPU utilization)
+- **batch_size**: 32
 - **tf_micro_batch**: 32 (was 8, this was the bottleneck!)
 - **num_return_sequences**: 8 (keep at 8, don't increase)
-- **grad_accum_steps**: Auto-calculated as buffer_size/(world_size×microbatch_size)
-- **buffer_size**: 32, **microbatch_size**: 2 (for 2×GPU: grad_accum=8)
 
 ## Troubleshooting Quick Reference
 - **Conda environment**: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate rl`
@@ -110,12 +106,6 @@ python rl_training/runners/resume_training.py \
 - **ESS**: Effective Sample Size computation for weighted losses
 - **DDP**: Multi-GPU distributed training with PyTorch
 
-## Testing Protocol
-1. Run 2-step training test with testconfig.yaml
-2. Test evaluation on all checkpoints (including "final")
-3. Test resume training from latest checkpoint
-4. Verify GPU utilization during eval (~80% memory usage)
-5. Check file organization and symlinks
 
 ## Critical Notes
 - **NEVER** reinstall packages unless explicitly needed
@@ -123,10 +113,3 @@ python rl_training/runners/resume_training.py \
 - **GPU utilization** was solved by fixing BOTH batch_size AND tf_micro_batch
 - **Lambda instances** are ephemeral - always use S3 for persistence
 - **IP address** changes between sessions - always ask Lord Krang
-
-## Success Metrics
-- ✅ Training completes without hanging
-- ✅ Evaluation runs on all checkpoints including "final"
-- ✅ Resume training works perfectly
-- ✅ GPU memory usage >60% during evaluation
-- ✅ File structure follows new training_runs/ organization

@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from typing import Dict, List, Tuple, Optional, Any, Union
 from contextlib import nullcontext
+import os
 import logging
 from collections import defaultdict
 import time
@@ -262,6 +263,21 @@ class ProbeComponents:
                     
                     # Compute advantages following DRGRPO: A = R - mean(R) per prompt
                     advantages = rewards - rewards.mean()  # Center advantages (GRPO style)
+                    
+                    # DEBUG: Option to use random advantages that sum to zero
+                    if os.environ.get('DEBUG_RANDOM_ADVANTAGES', '0') == '1':
+                        G = len(advantages)
+                        if G > 1:
+                            # Generate G-1 random values between -1 and 1
+                            random_advs = torch.FloatTensor(G-1).uniform_(-1, 1).to(advantages.device)
+                            # Last advantage is negative sum to ensure they sum to zero
+                            last_adv = -random_advs.sum()
+                            advantages = torch.cat([random_advs, last_adv.unsqueeze(0)])
+                            self.logger.info(f"[DEBUG] Using random advantages: {advantages.tolist()}, sum={advantages.sum().item():.6f}")
+                        else:
+                            advantages = torch.zeros_like(advantages)
+                            self.logger.info(f"[DEBUG] Single advantage, using zero: {advantages.item():.6f}")
+                    
                     all_advantages.append(advantages)
                     
                     # Track max response length for probe loss normalization
@@ -707,20 +723,63 @@ class ProbeComponents:
                 present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in params)
                 self.logger.debug(f"[Y] raw nonzero param.grads = {present}/{len(params)}")
 
-                # Adam preconditioning in-place, guarded
+                # Adam preconditioning in-place, with detailed debugging
+                self.logger.debug(f"[Y] Starting Adam preconditioning for {len(params)} parameters")
+                zero_exp_avg_sq_count = 0
+                tiny_exp_avg_sq_count = 0
+                zero_output_count = 0
+                
                 for p in params:
                     g = p.grad
                     if g is None:
                         continue
+                        
+                    # Debug statistics before preconditioning
+                    g_norm = g.detach().norm().item()
+                    
                     try:
-                        gtilde = adam_preconditioner.apply_preconditioner(g, p)
+                        # Check Adam state statistics
+                        state = adam_preconditioner.optimizer.state.get(p, {})
+                        exp_avg_sq = state.get('exp_avg_sq', None)
+                        
+                        if exp_avg_sq is not None:
+                            exp_avg_sq_norm = exp_avg_sq.norm().item()
+                            exp_avg_sq_max = exp_avg_sq.max().item()
+                            exp_avg_sq_min = exp_avg_sq.min().item()
+                            
+                            if exp_avg_sq_max == 0.0:
+                                zero_exp_avg_sq_count += 1
+                            elif exp_avg_sq_max < 1e-10:
+                                tiny_exp_avg_sq_count += 1
+                                
+                            self.logger.debug(f"[Y] param {id(p)}: g_norm={g_norm:.2e}, "
+                                            f"exp_avg_sq range=[{exp_avg_sq_min:.2e}, {exp_avg_sq_max:.2e}], "
+                                            f"exp_avg_sq_norm={exp_avg_sq_norm:.2e}")
+                        else:
+                            self.logger.debug(f"[Y] param {id(p)}: g_norm={g_norm:.2e}, no exp_avg_sq state")
+                        
+                        # Apply preconditioning in fp32
+                        g32 = g.to(torch.float32)
+                        gtilde = adam_preconditioner.apply_preconditioner(g32, p)
+                        if gtilde is None:
+                            gtilde = g32
+                            
+                        # Check output statistics
+                        gtilde_norm = gtilde.norm().item()
+                        if gtilde_norm == 0.0:
+                            zero_output_count += 1
+                            
+                        self.logger.debug(f"[Y] param {id(p)}: gtilde_norm={gtilde_norm:.2e} "
+                                        f"(ratio={gtilde_norm/max(g_norm, 1e-20):.2e})")
+                        
+                        # Copy back (will downcast if p.grad is bf16)
+                        g.copy_(gtilde)
+                        
                     except Exception as e:
                         self.logger.warning(f"[Y] preconditioner failed on {id(p)}: {e}; using raw grad")
-                        gtilde = g
-                    if gtilde is None:
-                        # identity fallback
-                        gtilde = g
-                    g.copy_(gtilde)
+                        
+                self.logger.info(f"[Y] Adam preconditioning complete: {zero_exp_avg_sq_count} zero exp_avg_sq, "
+                               f"{tiny_exp_avg_sq_count} tiny exp_avg_sq, {zero_output_count} zero outputs")
                 
                 # Accumulate with fp32 scaling (average -> sum)
                 self.add_into_param_buffer(sum_Y_buf, scale=float(mb_prompt_count))
