@@ -1,0 +1,50 @@
+I can see exactly why your α-trick path is failing in the aligned-batch code: in conditional_variance.py::_compute_aligned_batch_logprobs you compute the logits before you activate the adapter and on self.model rather than the canonical PEFT module. You only call set_adapter("default") later in the “🔧 TF probe” section—so the S_batch you differentiate was produced without LoRA active. That explains the “S does not backprop to LoRA params” error even though your on/off check appears fine (the check is done on a different forward run that does enable the adapter). 
+
+Two concrete actions:
+
+Minimal fix (variance path): move adapter activation before the forward that builds S_batch, and call the same PEFT module for the forward that you used to build the parameter registry, i.e. peft_model = self.model.module if hasattr(self.model,"module") else self.model and then outputs = peft_model(...). This should be done in _compute_aligned_batch_logprobs (and any sibling path that computes S for the α-trick). The rest of your parameter registry patching was fine. 
+
+Run an isolated debugger that reproduces the aligned-batch computation and contrasts “forward via wrapper” vs “forward via PEFT object,” with adapters activated before the forward. I’ve prepared such a script:
+
+file: variance_grad_debug.py
+
+location: /mnt/data/variance_grad_debug.py
+Download the script
+
+Usage:
+
+python variance_grad_debug.py \
+  --base Qwen/Qwen2.5-1.5B \
+  --adapter /path/to/training_state/step_XX/model \
+  --batch 6 --G 4 --prompt-lens 48 --gen-lens 64
+
+
+What it prints:
+
+A sanity “LoRA on/off delta” on a tiny sample.
+
+Variant A: forward via the PEFT module, with set_adapter("default") before the forward. Reports whether S requires grad and how many LoRA tensors get non-None grads.
+
+Variant B: simulates the wrapper call but still activates the adapter before the forward. You should again see non-None gradients for LoRA.
+
+If Variant A works in the debugger while your repo code still fails, it’s a clear signal that your repo’s _compute_aligned_batch_logprobs computes S_batch prior to adapter activation and/or on the wrong module object.
+
+Patch sketch (precise lines to change)
+
+In conditional_variance.py::_compute_aligned_batch_logprobs:
+
+-                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+-                    outputs = self.model(flat_sequences, attention_mask=flat_attention_masks)
+-                    logits = outputs.logits  # [B, T, V]
++                # Resolve PEFT model and ensure adapter is active BEFORE forward
++                peft_model = self.model.module if hasattr(self.model, "module") else self.model
++                if hasattr(peft_model, "set_adapter"):
++                    peft_model.set_adapter("default")
++                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
++                    outputs = peft_model(input_ids=flat_sequences, attention_mask=flat_attention_masks)
++                    logits = outputs.logits  # [B, T, V]
+
+
+Leave the later on/off diagnostic in place if you like, but it is no longer the mechanism that “enables” adapters.
+
+For completeness, make the same “use canonical PEFT module” adjustment anywhere else you compute S for α-trick. In your ProbeComponents forward path for teacher forcing you already resolve peft_model and set adapter, so first-order paths (bars·dot) were fine; it’s this batched/aligned variant that regressed. 
