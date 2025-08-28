@@ -28,14 +28,14 @@ CLI Examples:
   python -m entropy_experiments.other_scripts.entropy_variance.entropy_variance \
       --adapter /path/to/lora/adapter_dir \
       --backbone Qwen/Qwen2.5-1.5B \
-      --dataset gsm8k_latex --split test \
+      --dataset gsm8k_r1_template --split test \
       --B 64 --G 8 --N 20 --method repeats --same-prompts \
       --max-new-tokens 64 --temperature 1.0 --top-p 1.0
 
   # Single-batch with jackknife variance over prompts
   python -m entropy_experiments.other_scripts.entropy_variance.entropy_variance \
       --adapter /path/to/lora/adapter_dir \
-      --dataset gsm8k_latex --split test \
+      --dataset gsm8k_r1_template --split test \
       --B 128 --G 4 --method jackknife
 
 Outputs:
@@ -334,7 +334,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adapter", required=True, type=str, help="Path to LoRA adapter directory")
     p.add_argument("--backbone", default="Qwen/Qwen2.5-1.5B", type=str, help="Base model id or local path")
 
-    p.add_argument("--dataset", default="gsm8k_latex", type=str, help="Dataset registry name")
+    p.add_argument("--dataset", default="gsm8k_r1_template", type=str, help="Dataset registry name")
     p.add_argument("--split", default="test", type=str, help="Dataset split")
 
     p.add_argument("--B", type=int, required=True, help="# of prompts")
