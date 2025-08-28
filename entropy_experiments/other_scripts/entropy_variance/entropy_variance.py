@@ -196,14 +196,18 @@ def jackknife_variance(per_prompt_means: List[float]) -> float:
     return float(var)
 
 
-def one_batch_estimate(
+def batched_generation(
     model,
     tokenizer,
     prompts: List[str],
     G: int,
     gen_cfg: GenConfig,
-) -> Tuple[float, Dict[str, Any]]:
-    """Generate G responses per prompt; return batch mean per-seq entropy and details."""
+) -> Tuple[List[str], List[List[np.ndarray]]]:
+    """Generate G responses per prompt with batched processing, return texts and entropies."""
+    from transformers import GenerationConfig, LogitsProcessorList
+    from evals.utils_io import StopAfterAnswer
+    import torch.nn.functional as F
+    
     # Generation config
     gc = GenerationConfig(
         max_new_tokens=gen_cfg.max_new_tokens,
@@ -215,17 +219,85 @@ def one_batch_estimate(
         return_dict_in_generate=True,
     )
     stop = LogitsProcessorList([StopAfterAnswer(tokenizer)])
+    
+    # Setup for batched generation (similar to probe_components)
+    B = len(prompts)
+    amp_dtype = torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16
+    
+    all_gen_texts = []
+    all_entropies = []
+    
+    # Process in batches (simple approach: all prompts at once for now)
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype):
+        # Tokenize prompts with left padding
+        tokenizer.padding_side = "left" 
+        enc = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
+        prompt_len = enc.input_ids.shape[1]
+        
+        # Generate responses
+        gen_out = model.generate(
+            **enc,
+            generation_config=gc,
+            logits_processor=stop,
+            return_dict_in_generate=True
+        )
+        
+        # Reshape to [B, G, total_len]
+        all_gen_sequences = gen_out.sequences
+        sequences_reshaped = all_gen_sequences.view(B, G, -1)
+        
+        # Process each prompt
+        for b in range(B):
+            sequences = sequences_reshaped[b]  # [G, total_len]
+            prompt_responses = []
+            prompt_entropies = []
+            
+            for g in range(G):
+                # Extract generated portion (skip prompt)
+                gen_ids = sequences[g, prompt_len:]
+                
+                # Decode response text
+                response_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                prompt_responses.append(response_text)
+                
+                # Compute per-token entropies via teacher forcing
+                full_seq = sequences[g:g+1]  # [1, total_len] 
+                with torch.no_grad():
+                    logits = model(full_seq).logits  # [1, total_len, vocab_size]
+                    
+                # Apply temperature and compute log probs
+                temp_logits = logits[0, prompt_len-1:-1] / gen_cfg.temperature  # [gen_len, vocab_size]
+                log_probs = F.log_softmax(temp_logits, dim=-1)
+                
+                # Get actual token log probs
+                actual_tokens = gen_ids[:len(temp_logits)]  # Handle potential length mismatch
+                if len(actual_tokens) > 0:
+                    token_log_probs = log_probs.gather(1, actual_tokens.unsqueeze(1)).squeeze(1)
+                    # Convert to entropy (negative log prob)
+                    entropies = -token_log_probs.float().cpu().numpy()
+                else:
+                    entropies = np.array([])
+                
+                prompt_entropies.append(entropies)
+            
+            all_gen_texts.extend(prompt_responses)
+            all_entropies.append(prompt_entropies)
+    
+    return all_gen_texts, all_entropies
 
-    # Generate and compute per-token entropies (surprisal)
-    gen_text, gen_lps, gen_entropies = generate_with_logprobs(
-        model,
-        tokenizer,
-        prompts,
-        gc,
-        stop,
-        tf_micro_batch=gen_cfg.tf_micro_batch,
-    )
 
+def one_batch_estimate(
+    model,
+    tokenizer,
+    prompts: List[str],
+    G: int,
+    gen_cfg: GenConfig,
+) -> Tuple[float, Dict[str, Any]]:
+    """Generate G responses per prompt; return batch mean per-seq entropy and details."""
+    
+    # Use our custom batched generation
+    gen_text, gen_entropies = batched_generation(model, tokenizer, prompts, G, gen_cfg)
+    
     batch_mean, per_seq_vals, per_prompt_means = compute_per_seq_entropy_stats(gen_entropies, agg="mean")
 
     details = {
