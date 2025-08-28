@@ -91,16 +91,17 @@ def run_training_experiment(config_path: Path, checkpoint_path: str,
         'WORLD_SIZE': '2',
         'MASTER_ADDR': 'localhost',
         'MASTER_PORT': '12345',
+        'PYTHONPATH': str(project_root),  # Set PYTHONPATH to project root
     })
     
     # Prepare output directory for this run
     run_output_dir = output_dir / f"lr_{learning_rate:.0e}_{run_id}"
     run_output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Command to run training
+    # Command to run training with proper PYTHONPATH
     cmd = [
         'torchrun', '--nproc_per_node=2', 
-        str(project_root / 'rl_training/runners/rl_runner.py'),
+        'rl_training/runners/rl_runner.py',
         '--cfg', str(config_path),
         '--ckpt', checkpoint_path
     ]
