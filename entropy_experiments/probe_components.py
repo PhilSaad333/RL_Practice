@@ -1402,9 +1402,20 @@ class ProbeComponents:
                 
                 # 5) First reverse pass: g = ∇_θ L (keep graph for second pass)
                 params = [p for p in self.model.parameters() if p.requires_grad]
+                self.logger.debug(f"α-trick: L={L.item():.6f}, L.requires_grad={L.requires_grad}, params_count={len(params)}")
+                
+                # Check if model is in training mode
+                if not self.model.training:
+                    self.logger.error("α-trick: Model is not in training mode! This will prevent gradients.")
+                    self.model.train()
+                    
                 g_list = torch.autograd.grad(
                     L, params, create_graph=True, allow_unused=True, retain_graph=False
                 )
+                
+                # Debug gradient computation
+                non_none_grads = sum(1 for g in g_list if g is not None)
+                self.logger.debug(f"α-trick: Got {non_none_grads}/{len(params)} non-None gradients")
                 
                 # 6) Contract with μY: h = Σ_p <g_p, μY_p>  
                 h_terms = []
