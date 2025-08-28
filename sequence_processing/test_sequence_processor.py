@@ -81,9 +81,10 @@ def main():
         model = load_peft_for_test(base_model_id, checkpoint_path)
         tokenizer = AutoTokenizer.from_pretrained(base_model_id)
         
-        # Set pad token if not set
+        # Set pad token if not set and fix padding side for decoder-only models
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'  # Important for decoder-only models
         
         print(f"Model loaded successfully!")
         print(f"Model device: {next(model.parameters()).device}")

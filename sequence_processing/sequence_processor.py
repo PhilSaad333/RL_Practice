@@ -206,8 +206,28 @@ class SequenceProcessor:
             
             all_sequences.append(generated)
         
-        # Concatenate all generated sequences
-        sequences = torch.cat(all_sequences, dim=0)  # [B*G, total_len]
+        # Pad and concatenate all generated sequences to handle different lengths
+        if len(all_sequences) == 1:
+            sequences = all_sequences[0]
+        else:
+            # Find max length across all batches
+            max_len = max(seq.size(1) for seq in all_sequences)
+            
+            # Pad sequences to max length
+            padded_sequences = []
+            for seq_batch in all_sequences:
+                if seq_batch.size(1) < max_len:
+                    pad_size = max_len - seq_batch.size(1)
+                    padding = torch.full(
+                        (seq_batch.size(0), pad_size),
+                        self.tokenizer.pad_token_id,
+                        device=seq_batch.device,
+                        dtype=seq_batch.dtype
+                    )
+                    seq_batch = torch.cat([seq_batch, padding], dim=1)
+                padded_sequences.append(seq_batch)
+            
+            sequences = torch.cat(padded_sequences, dim=0)  # [B*G, total_len]
         
         # Reshape to [B, G, total_len]  
         max_len = sequences.size(1)
