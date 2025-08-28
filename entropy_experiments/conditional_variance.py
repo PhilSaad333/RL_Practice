@@ -328,11 +328,16 @@ class ConditionalVarianceEstimator:
                 flat_sequences = sequences.view(num_prompts * G, total_len)
                 flat_attention_masks = attention_masks.view(num_prompts * G, total_len)
 
+                # Resolve PEFT model and ensure adapter is active BEFORE forward
+                peft_model = self.model.module if hasattr(self.model, "module") else self.model
+                if hasattr(peft_model, "set_adapter"):
+                    peft_model.set_adapter("default")
+                
                 # Forward with attention_mask; AMP as in training if you use it
                 use_amp = getattr(self, "use_amp", False)
                 amp_dtype = getattr(self, "amp_dtype", torch.float16)
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                    outputs = self.model(flat_sequences, attention_mask=flat_attention_masks)
+                    outputs = peft_model(input_ids=flat_sequences, attention_mask=flat_attention_masks)
                     logits = outputs.logits  # [B, T, V]
 
                 # Assert logits are connected to autograd graph
@@ -379,18 +384,7 @@ class ConditionalVarianceEstimator:
                 if not S_batch.requires_grad or S_batch.grad_fn is None:
                     raise RuntimeError("S_batch lost its grad_fn; check TF pipeline and masking.")
                 
-                # 🔧 COMPREHENSIVE TF probe for QLoRA/LoRA (from fix.txt)
-                # Apply same PEFT instance consistency as _teacher_force_logprobs
-                peft_model = self.model.module if hasattr(self.model, "module") else self.model
-                
-                # Make sure adapter is active 
-                if hasattr(peft_model, "set_adapter"):
-                    peft_model.set_adapter("default")
-                active = getattr(peft_model, "active_adapter", None)
-                if active is None:
-                    raise RuntimeError("TF probe: No active adapter on PEFT model in aligned batch computation")
-                
-                # Quick on/off adapter check for this batch computation too
+                # 🔧 DIAGNOSTIC: Quick on/off adapter check for this batch computation
                 if num_prompts >= 1:  # Only test if we have data
                     test_seq = flat_sequences[0:1]  # [1, total_len]
                     test_mask = flat_attention_masks[0:1] if flat_attention_masks is not None else None
