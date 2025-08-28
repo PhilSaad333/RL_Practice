@@ -59,15 +59,8 @@ def create_experiment_config(base_config_path: str, learning_rate: float,
     config['buffer_size'] = 64  # Reduced buffer size
     config['microbatch_size'] = 4  # Optimal for 2x H100
     
-    # Enable simple entropy probe for measurements
-    config['simple_entropy_probe'] = {
-        'enabled': True,
-        'debug': True,
-        'preconditioning_mode': 'previous_step',
-        'log_every': 1
-    }
-    
-    # Disable other probes to focus on entropy
+    # Disable ALL probes - we only want the basic entropy from policy logits
+    config.setdefault('simple_entropy_probe', {})['enabled'] = False
     config.setdefault('gns_probe', {})['enabled'] = False
     config.setdefault('entropy_probe', {})['enabled'] = False
     
@@ -112,6 +105,9 @@ def run_training_experiment(config_path: Path, checkpoint_path: str,
     ]
     
     try:
+        # Get training runs before experiment
+        runs_before = get_training_runs()
+        
         # Run the training experiment
         result = subprocess.run(
             cmd, 
@@ -128,8 +124,9 @@ def run_training_experiment(config_path: Path, checkpoint_path: str,
             print(f"STDERR: {result.stderr}")
             return {'success': False, 'error': result.stderr}
         
-        # Parse entropy measurements from logs
-        entropy_measurements = parse_entropy_from_logs(result.stdout)
+        # Get training runs after experiment and parse entropy measurements
+        runs_after = get_training_runs()
+        entropy_measurements = parse_entropy_from_logs(runs_before, runs_after)
         
         if len(entropy_measurements) < 2:
             print(f"⚠️  Insufficient entropy measurements for lr={learning_rate:.0e}, run={run_id}")
@@ -165,27 +162,49 @@ def run_training_experiment(config_path: Path, checkpoint_path: str,
         print(f"💥 Exception for lr={learning_rate:.0e}, run={run_id}: {e}")
         return {'success': False, 'error': str(e)}
 
-def parse_entropy_from_logs(stdout: str) -> List[float]:
+def get_training_runs() -> set:
+    """Get current training runs in the localfs/training_runs directory."""
+    training_runs_dir = Path("/home/ubuntu/localfs/training_runs")
+    if not training_runs_dir.exists():
+        return set()
+    
+    return set(item.name for item in training_runs_dir.iterdir() 
+               if item.is_dir() and item.name.startswith('run_'))
+
+def parse_entropy_from_logs(training_runs_before: set, training_runs_after: set) -> List[float]:
     """Extract entropy measurements from training logs."""
+    import json
+    
+    # Find the new training run created by our experiment
+    new_runs = training_runs_after - training_runs_before
+    if not new_runs:
+        print("⚠️  No new training run detected")
+        return []
+    
+    if len(new_runs) > 1:
+        print(f"⚠️  Multiple new training runs detected: {new_runs}")
+        # Use the most recent one
+        new_run = max(new_runs)
+    else:
+        new_run = next(iter(new_runs))
+    
+    # Path to the train log
+    log_path = Path("/home/ubuntu/localfs/training_runs") / new_run / "logs" / "train_log.jsonl"
+    
     entropy_values = []
-    
-    # Look for simple entropy probe output in logs
-    for line in stdout.split('\\n'):
-        if 'entropy:' in line.lower() or 'simple_entropy' in line.lower():
-            # Try to extract numerical value
-            # This is a simple parser - may need adjustment based on actual log format
-            import re
-            numbers = re.findall(r'[-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?', line)
-            for num_str in numbers:
-                try:
-                    val = float(num_str)
-                    if abs(val) > 0.001:  # Filter out obviously wrong values
-                        entropy_values.append(val)
-                        break
-                except ValueError:
-                    continue
-    
-    return entropy_values
+    try:
+        with open(log_path, 'r') as f:
+            for line in f:
+                data = json.loads(line.strip())
+                if 'entropy' in data:
+                    entropy_values.append(data['entropy'])
+        
+        print(f"✅ Extracted {len(entropy_values)} entropy measurements from {log_path}")
+        return entropy_values
+        
+    except Exception as e:
+        print(f"❌ Failed to read entropy from {log_path}: {e}")
+        return []
 
 def analyze_results(all_results: List[Dict[str, Any]], output_dir: Path):
     """Analyze results and test for linearity."""
