@@ -1449,27 +1449,7 @@ class ProbeComponents:
         """
         self._assert_grad_context("compute_conditional_variance_over_E_alpha")
         
-        # DIAGNOSTIC: Test minimal α-trick on first call to verify gradient flow
-        if not hasattr(self, '_first_alpha_trick_call'):
-            self._first_alpha_trick_call = True
-        
-        if self._first_alpha_trick_call:
-            self.logger.info("Running minimal α-trick test on first call...")
-            
-            # Get first batch for testing (use small batch to avoid memory issues)
-            first_batch = E_units[:min(2, len(E_units))]  # Use 2 prompts max for test
-            batch_data = self._prepare_teacher_forcing_batch(first_batch, max_new_tokens=16)
-            
-            # Import here to avoid circular import
-            try:
-                # Create minimal test inline (simpler than circular import)
-                self._test_minimal_gradient_flow(batch_data['input_ids'], batch_data['attention_mask'])
-                self.logger.info("Minimal α-trick test PASSED - proceeding with full computation")
-            except Exception as e:
-                self.logger.error(f"Minimal α-trick test FAILED: {e}")
-                raise RuntimeError(f"α-trick gradient flow broken: {e}")
-            finally:
-                self._first_alpha_trick_call = False
+        # Note: QLoRA gradient flow diagnostics are now integrated into the main computation paths
                 
         from contextlib import nullcontext
         device = next(self.model.parameters()).device
