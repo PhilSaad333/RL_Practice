@@ -36,8 +36,17 @@ def test_lora_gradient_fixes():
     print(f"Loading checkpoint from: {checkpoint_path}")
     
     try:
+        # Load config and set checkpoint path
+        import yaml
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # Set the checkpoint path in config
+        config['checkpoint']['checkpoint_path'] = checkpoint_path
+        config['checkpoint']['optimizer_path'] = checkpoint_path
+        
         # Initialize probe with comprehensive diagnostics
-        probe = OfflineEntropyProbe(config_path, checkpoint_path)
+        probe = OfflineEntropyProbe(config)
         
         print("✅ Probe initialized successfully")
         
