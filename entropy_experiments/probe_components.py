@@ -1407,14 +1407,25 @@ class ProbeComponents:
                 )
                 
                 # 6) Contract with μY: h = Σ_p <g_p, μY_p>  
-                h = torch.tensor(0.0, device=device, dtype=L.dtype, requires_grad=True)
+                h_terms = []
+                valid_params = 0
                 for p, gi in zip(params, g_list):
                     if gi is None:
                         continue
                     param_id = id(p)
                     if param_id in muY_buf:
                         mu = muY_buf[param_id].to(device=gi.device, dtype=gi.dtype)
-                        h = h + (gi * mu).sum()
+                        dot_term = (gi * mu).sum()
+                        h_terms.append(dot_term)
+                        valid_params += 1
+                
+                if len(h_terms) == 0:
+                    self.logger.error(f"α-trick: No valid parameter gradients found for contraction!")
+                    raise RuntimeError("α-trick: No gradient terms to contract with μY")
+                
+                # Sum all dot products to get h
+                h = torch.stack(h_terms).sum()
+                self.logger.debug(f"α-trick: Contracted {valid_params} parameters, h={h.item():.6f}, h.requires_grad={h.requires_grad}")
                 
                 # Check if h has gradients before second backward pass
                 if not h.requires_grad:
