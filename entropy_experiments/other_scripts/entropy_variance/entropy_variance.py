@@ -95,7 +95,7 @@ def load_model_and_tokenizer(backbone: str, adapter_path: str):
         base_id=backbone,
         adapter_path=adapter_path,
         mode="lora_simple",
-        dtype="fp16",  # Use fp16 to avoid BFloat16 issues
+        dtype="bf16",  # Use bf16 like offline_entropy_probe
         device_map="cuda",
         use_checkpointing=False,
     )
