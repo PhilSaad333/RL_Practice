@@ -692,6 +692,18 @@ class ProbeComponents:
                 # Assert S_batch is connected to autograd graph
                 if not S_batch.requires_grad or S_batch.grad_fn is None:
                     raise RuntimeError("S_batch lost its grad_fn; check TF pipeline and masking.")
+                
+                # --- Debug probe: test TF path really creates graph back to parameters ---
+                try:
+                    emb = self.model.get_input_embeddings().weight  # HF models expose this
+                    # Use a tiny scalar probe to avoid huge graph use: sum over the 1st row only
+                    probe = S_batch[0].sum()
+                    g_emb = torch.autograd.grad(probe, emb, retain_graph=True, allow_unused=True)[0]
+                    if g_emb is None:
+                        raise RuntimeError("TF probe: d(sum S[0]) / d(embedding) is None -> S not linked to parameters")
+                except Exception as e:
+                    raise
+                # --- End debug probe ---
 
         finally:
             self.model.train(was_training)
@@ -1417,29 +1429,67 @@ class ProbeComponents:
                 alpha = torch.ones_like(L_vec, requires_grad=True)                           # [k]
                 L = (alpha * L_vec).sum()
                 _dbg(f"α-trick: group L={L.item():.6f}, L.requires_grad={L.requires_grad}")
+                
+                # --- Diagnostic 1: Check that dL/dS is non-zero ---
+                dL_dS = torch.autograd.grad(L, S_dict["S"], retain_graph=True, allow_unused=False)[0]
+                if (dL_dS.abs().sum() == 0):
+                    raise RuntimeError("α-trick: dL/dS is exactly zero; check L_vec construction / coefficients")
+                _dbg(f"α-trick: dL/dS.abs().sum()={dL_dS.abs().sum().item():.6f} (should be > 0)")
+                
+                # --- Diagnostic 2: Test if any parameter gets gradient from L ---
+                emb = self.model.get_input_embeddings().weight
+                g_test = torch.autograd.grad(L, emb, retain_graph=True, allow_unused=True)[0]
+                if g_test is None:
+                    # If emb fails, try lm_head as well (some models untie weights)
+                    head = getattr(self.model, "lm_head", None)
+                    if head is not None:
+                        g_head = torch.autograd.grad(L, head.weight, retain_graph=True, allow_unused=True)[0]
+                        if g_head is None:
+                            raise RuntimeError("α-trick: L does not backprop to embeddings nor lm_head; parameter list mismatch or graph severed")
+                    else:
+                        raise RuntimeError("α-trick: L does not backprop to embeddings; parameter list mismatch or graph severed")
+                _dbg(f"α-trick: Direct L→embedding test passed")
 
-                # 3) First reverse: g = ∇_θ L (keep graph for second pass)
+                # 3) Robust VJP-based approach via S instead of direct L→params
+                S = S_dict["S"]                     # [k, G], requires_grad=True
+                k, G = S.shape
+
+                # Rebuild the same coefficients used inside L_vec
+                if weighting_mode == "dr_grpo":
+                    Lmax = (torch.tensor(S_dict["max_lengths"], device=S.device, dtype=S.dtype)
+                            if isinstance(S_dict["max_lengths"], list)
+                            else S_dict["max_lengths"].to(device=S.device, dtype=S.dtype))
+                    Lmax = Lmax.view(-1, 1)         # [k, 1]
+                    S_w = S / Lmax                  # [k, G]
+                elif weighting_mode == "per_token_avg":
+                    genL = S_dict["gen_lengths"].to(device=S.device, dtype=S.dtype)
+                    S_w = S / genL.clamp_min(1.0)
+                else:
+                    raise ValueError(f"Unknown weighting_mode: {weighting_mode}")
+
+                sum_Sw = S_w.sum(dim=1, keepdim=True)        # [k, 1]
+                S_w_LOO = (sum_Sw - S_w) / max(G - 1, 1)     # [k, G]
+
+                # dL/dS = -(alpha/G) * (S_w - S_w_LOO)   (alpha is broadcast over g)
+                W = - (alpha.view(-1, 1) / float(G)) * (S_w - S_w_LOO)  # [k, G]
+
+                # One VJP from S back to parameters to obtain g = ∇_θ L
                 params = [p for p in self.model.parameters() if p.requires_grad]
                 g_list = torch.autograd.grad(
-                    L, params, create_graph=True, allow_unused=True, retain_graph=False
+                    outputs=S, inputs=params, grad_outputs=W, create_graph=True, allow_unused=True, retain_graph=False
                 )
                 non_none = sum(int(gi is not None) for gi in g_list)
-                _dbg(f"α-trick: non-None parameter grads in first pass = {non_none}/{len(g_list)}")
+                _dbg(f"α-trick (VJP): non-None parameter grads = {non_none}/{len(g_list)}")
                 if non_none == 0:
-                    raise RuntimeError(
-                        "α-trick: No parameter received a gradient from L. "
-                        "Most likely the model forward happened under inference_mode/no_grad "
-                        "in a higher-level caller (cannot be overridden locally)."
-                    )
+                    raise RuntimeError("α-trick (VJP): S backprop produced no parameter grads; TF path is detached or params mismatch")
 
-                # 4) Contract with μY: h = Σ_p <g_p, μY_p>
-                h = torch.zeros((), device=device, dtype=L.dtype)
+                # 4) Contract with μY as before
+                h = torch.zeros((), device=S.device, dtype=S.dtype)
                 for p, gi in zip(params, g_list):
                     if gi is None:
                         continue
                     mu = muY_buf.get(id(p), None)
                     if mu is None:
-                        # Optional: warn once if IDs don't match; continue
                         mu = torch.zeros_like(gi)
                     else:
                         mu = mu.to(device=gi.device, dtype=gi.dtype)

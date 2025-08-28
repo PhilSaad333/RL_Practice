@@ -1,157 +1,289 @@
-TITLE: Make α-trick grads flow reliably (forbid inference_mode; assert graph; remove TF temperature)
-FILE: probe_components.py only
+A) Instrumented diagnostics (copy–paste patches)
 
-SUMMARY
-- Add a tiny guard to *fail fast* if the probe runs under torch.inference_mode() or torch.no_grad().
-- Assert that TF logits have a grad_fn and that at least one model parameter receives a non-None grad from L.
-- Remove temperature scaling from teacher-forced forwards used by the probe (sampling-only concern).
-- Provide precise places to paste code.
+Goal: prove (1) that logits and 
+𝑆
+S are in the graph, (2) that 
+𝐿
+L carries non-zero sensitivity to 
+𝑆
+S, and (3) that at least one real parameter picks up non-zero gradient from 
+𝐿
+L. Each check isolates a different failure mode.
 
-A) Add a helper to assert a valid grad context
-----------------------------------------------
-Paste near the top (after imports):
+1) Assert the TF path really creates a graph back to parameters
 
-    def _assert_grad_context(self, where: str):
-        # Inference mode cannot be turned back on locally; never enter it for probe passes.
-        if torch.is_inference_mode_enabled():
-            raise RuntimeError(
-                f"{where}: torch.inference_mode() is enabled. "
-                "This disables autograd globally; rerun probe outside inference_mode."
-            )
-        if not torch.is_grad_enabled():
-            raise RuntimeError(
-                f"{where}: torch.no_grad() is active. "
-                "Enable grad (remove no_grad) for probe computations."
-            )
+In _compute_aligned_batch_logprobs (you already added part of this), add one more active gradient probe against a known parameter (the token embeddings). Right after you compute S_batch and before finally:
 
-(Requires torch>=1.11 for torch.is_inference_mode_enabled; present in recent PyTorch.)
+# --- begin debug probe (remove after it passes) ---
+# Try a single VJP from S back to the input embedding weights.
+try:
+    emb = self.model.get_input_embeddings().weight  # HF models expose this
+    # Use a tiny scalar probe to avoid huge graph use: sum over the 1st row only
+    probe = S_batch[0].sum()
+    g_emb = torch.autograd.grad(probe, emb, retain_graph=True, allow_unused=True)[0]
+    if g_emb is None:
+        raise RuntimeError("TF probe: d(sum S[0]) / d(embedding) is None -> S not linked to parameters")
+except Exception as e:
+    raise
+# --- end debug probe ---
 
+If this raises, the break is in the TF path itself (e.g., outer inference_mode, a stray .detach(), or a graph-killing transform). If it passes, the TF path is fine.
 
-B) Guard all probe forwards that must carry gradients
------------------------------------------------------
-At the **very start** of each method below, insert:
+2) Verify 
+𝐿
+L actually depends on 
+𝑆
+S
 
-    self._assert_grad_context("<METHOD NAME>")
+In compute_conditional_variance_over_E_alpha, after you build L_vec and alpha but before the first autograd.grad(L, params, …):
 
-Methods to patch:
-- `_teacher_force_logprobs`
-- `_compute_aligned_batch_logprobs`
-- `accumulate_sum_X`
-- `accumulate_sum_Y`
-- `compute_conditional_variance_over_E_alpha`
+# Check that dL/dS is non-zero (rules out zero coefficients / bad LOO math)
+dL_dS = torch.autograd.grad(L, S_dict["S"], retain_graph=True, allow_unused=False)[0]
+if (dL_dS.abs().sum() == 0):
+    raise RuntimeError("α-trick: dL/dS is exactly zero; check L_vec construction / coefficients")
 
-Example (first line inside `_compute_aligned_batch_logprobs`):
+If this trips, your coefficients are zeroing the signal (e.g., accidental G=1 + LOO, or all weights cancel). If it passes, 
+𝐿
+ ⁣
+→
+ ⁣
+𝑆
+L→S is healthy.
 
-    def _compute_aligned_batch_logprobs(self, aligned_batch: Dict[str, Any]) -> Dict[str, Any]:
-        self._assert_grad_context("_compute_aligned_batch_logprobs")
-        ...
+3) Directly test whether any parameter gets a gradient from 
+𝐿
+L
 
-Do the same for the other four methods listed above.
+Still in the same spot:
 
-
-C) Strengthen TF path: assert logits/S link back to params
-----------------------------------------------------------
-Inside `_compute_aligned_batch_logprobs`, immediately after the model forward:
-
-    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-        outputs = self.model(flat_sequences, attention_mask=flat_attention_masks)
-        logits = outputs.logits
-
-    # REMOVE any temperature scaling here (sampling-only). Keep TF at T=1.0.
-    # temp = self.config['generation'].get('temperature', 1.0)
-    # if temp != 1.0:
-    #     logits = logits / temp
-
-    # New hard assertions (keep during bring-up)
-    if not logits.requires_grad or logits.grad_fn is None:
-        raise RuntimeError(
-            "TF logits are not connected to autograd graph "
-            "(likely due to surrounding inference_mode/no_grad)."
-        )
-
-Later, just before returning, you already compute:
-    S_batch = (gen_token_log_probs * gen_masks).sum(dim=2)
-
-Add:
-
-    if not S_batch.requires_grad or S_batch.grad_fn is None:
-        raise RuntimeError("S_batch lost its grad_fn; check TF pipeline and masking.")
+# Sanity: try a single high-probability leaf param (embedding matrix)
+emb = self.model.get_input_embeddings().weight
+g_test = torch.autograd.grad(L, emb, retain_graph=True, allow_unused=True)[0]
+if g_test is None:
+    # If emb fails, try lm_head as well (some models untie weights)
+    head = getattr(self.model, "lm_head", None)
+    if head is not None:
+        g_head = torch.autograd.grad(L, head.weight, retain_graph=True, allow_unused=True)[0]
+        if g_head is None:
+            raise RuntimeError("α-trick: L does not backprop to embeddings nor lm_head; parameter list mismatch or graph severed")
+    else:
+        raise RuntimeError("α-trick: L does not backprop to embeddings; parameter list mismatch or graph severed")
 
 
-D) α-trick site: prove parameters receive grads from L
-------------------------------------------------------
-In `compute_conditional_variance_over_E_alpha` after you build `L` and before contracting with μY:
+If embeddings (and lm_head if present) both return None, the path 
+𝐿
+ ⁣
+→
+ ⁣
+L→params is dead despite 
+𝐿
+ ⁣
+→
+ ⁣
+𝑆
+L→S being alive—usually meaning the forward used a different parameter object than the one you’re asking grads for (wrapper/flat-param mismatch). That can happen with FSDP/ZeRO or after re-wrapping the model.
 
-    params = [p for p in self.model.parameters() if p.requires_grad]
-    g_list = torch.autograd.grad(
-        L, params, create_graph=True, allow_unused=True, retain_graph=False
-    )
-    non_none = sum(int(gi is not None) for gi in g_list)
-    if non_none == 0:
-        # Extra diagnostics to pinpoint the break
-        # Check a direct grad w.r.t. logits to confirm graph to forward exists:
-        # (Optional: comment out if you don’t keep logits around here.)
-        raise RuntimeError(
-            "α-trick: No parameter received a gradient from L. "
-            "Most likely the model forward happened under inference_mode/no_grad "
-            "in a higher-level caller (cannot be overridden locally)."
-        )
+B) Robust α-trick via VJP on 
+𝑆
+S (drop-in replacement)
 
-**Important:** This message is more precise than the previous generic error. It tells you the *actual cause* (outer inference/no-grad) when it happens.
+Instead of asking autograd for 
+∇
+𝜃
+𝐿
+∇
+θ
+	​
+
+L (which may be brittle when params are wrapped), we can compute the vector-Jacobian product directly through 
+𝑆
+S:
+
+∂
+𝐿
+∂
+𝑆
+𝑏
+,
+𝑔
+=
+−
+ 
+𝛼
+𝑏
+𝐺
+ 
+(
+𝑆
+𝑏
+,
+𝑔
+(
+𝑤
+)
+−
+𝑆
+𝑏
+,
+𝑔
+(
+𝑤
+,
+L
+O
+O
+)
+)
+,
+∂S
+b,g
+	​
+
+∂L
+	​
+
+=−
+G
+α
+b
+	​
+
+	​
+
+(S
+b,g
+(w)
+	​
+
+−S
+b,g
+(w,LOO)
+	​
+
+),
+
+so if we define 
+𝑊
+≡
+∂
+𝐿
+/
+∂
+𝑆
+W≡∂L/∂S with the above entries, then
+
+∇
+𝜃
+𝐿
+  
+=
+  
+(
+∂
+𝑆
+∂
+𝜃
+)
+ ⁣
+⊤
+ ⁣
+:
+𝑊
+∇
+θ
+	​
+
+L=(
+∂θ
+∂S
+	​
+
+)
+⊤
+:W
+
+is exactly what torch.autograd.grad(S, params, grad_outputs=W) computes. Crucially, this avoids the “L-to-params” shortcut that seems to be returning all None in your run.
+
+Replace your first reverse pass in compute_conditional_variance_over_E_alpha with the following:
+
+# 2) Per-prompt losses and α selector (unchanged)
+L_vec = self.build_LX_vector_from_S(S_dict, weighting_mode=weighting_mode)   # [k]
+alpha = torch.ones_like(L_vec, requires_grad=True)                            # [k]
+
+# --- NEW: build W = dL/dS explicitly and use VJP through S ---
+S = S_dict["S"]                     # [k, G], requires_grad=True
+k, G = S.shape
+
+# Rebuild the same coefficients used inside L_vec
+if weighting_mode == "dr_grpo":
+    Lmax = (torch.tensor(S_dict["max_lengths"], device=S.device, dtype=S.dtype)
+            if isinstance(S_dict["max_lengths"], list)
+            else S_dict["max_lengths"].to(device=S.device, dtype=S.dtype))
+    Lmax = Lmax.view(-1, 1)         # [k, 1]
+    S_w = S / Lmax                  # [k, G]
+elif weighting_mode == "per_token_avg":
+    genL = S_dict["gen_lengths"].to(device=S.device, dtype=S.dtype)
+    S_w = S / genL.clamp_min(1.0)
+else:
+    raise ValueError(f"Unknown weighting_mode: {weighting_mode}")
+
+sum_Sw = S_w.sum(dim=1, keepdim=True)        # [k, 1]
+S_w_LOO = (sum_Sw - S_w) / max(G - 1, 1)     # [k, G]
+
+# dL/dS = -(alpha/G) * (S_w - S_w_LOO)   (alpha is broadcast over g)
+W = - (alpha.view(-1, 1) / float(G)) * (S_w - S_w_LOO)  # [k, G]
+
+# One VJP from S back to parameters to obtain g = ∇_θ L
+params = [p for p in self.model.parameters() if p.requires_grad]
+g_list = torch.autograd.grad(
+    outputs=S, inputs=params, grad_outputs=W, create_graph=True, allow_unused=True, retain_graph=False
+)
+non_none = sum(int(gi is not None) for gi in g_list)
+if non_none == 0:
+    raise RuntimeError("α-trick (VJP): S backprop produced no parameter grads; TF path is detached or params mismatch")
+
+# 4) Contract with μY as before
+h = torch.zeros((), device=S.device, dtype=S.dtype)
+for p, gi in zip(params, g_list):
+    if gi is None:
+        continue
+    mu = muY_buf.get(id(p), None)
+    if mu is None:
+        mu = torch.zeros_like(gi)
+    else:
+        mu = mu.to(device=gi.device, dtype=gi.dtype)
+    h = h + (gi * mu).sum()
+
+# 5) Second reverse: s = ∂h/∂α  → [k]
+s = torch.autograd.grad(h, alpha, allow_unused=False, retain_graph=False)[0].detach()  # [k]
 
 
-E) Remove TF temperature scaling everywhere
--------------------------------------------
-Search in this file for divisions like `logits = logits / temp` inside any teacher-forcing path (`_teacher_force_logprobs`, `_compute_aligned_batch_logprobs`, or other probe forwards). **Delete** them. Temperature is part of your *sampling* policy, not the teacher-forcing likelihood; keeping `T=1` avoids damping both signal and gradients.
+Why this helps: we explicitly provide grad_outputs=W at the 
+𝑆
+S boundary, so autograd only needs to follow the standard TF path (log-softmax, gathers, the model) back to the parameters. This path is generally robust even under wrappers; it does not rely on autograd discovering the mapping from 
+𝐿
+L directly to your params list.
+
+C) If the problem persists after B)
+
+Parameter object mismatch. With FSDP / DeepSpeed ZeRO / PEFT adapters, the tensors used in the forward may not be the same objects you collect in params = [p for p in self.model.parameters() …]. In that case:
+
+Build params once right after the model is wrapped (DDP/FSDP), and reuse the same Python objects everywhere in the probe.
+
+For FSDP flat parameters, ensure you call the probe inside the same wrapping and not on an unwrapped reference.
+
+Outer grad-disabling context. Your new _assert_grad_context guards should already catch inference_mode / no_grad. If they never fire, the issue is not a global guard.
+
+Sanity via backward. As a cross-check, on a tiny group run L_vec.sum().backward() (no α-trick), and confirm some param.grad are non-None. If that also yields nothing, the TF path is still effectively detached.
+
+Why “all None” happens (and why allow_unused=True hides it)
+
+When any of the inputs passed to torch.autograd.grad are not part of the computation producing outputs, PyTorch returns None for those inputs if (and only if) you set allow_unused=True—otherwise it raises an error. That’s what you are seeing: the graph that produced 
+𝐿
+L does not reference any of the tensors in your params list, so you get 0/392 non-None. 
+PyTorch Forums
+
+torch.inference_mode() and torch.no_grad() disable autograd bookkeeping; any forward under them will irreversibly sever the graph and lead to “all None” later. (Your guards aim to prevent this; keep them.)
 
 
-F) Where the real bug usually lives (outside this file)
--------------------------------------------------------
-Your probe methods can *enforce* a fail-fast, but they **cannot** override a parent `torch.inference_mode()` scope—the graph is already dead by then (documented behavior). You must ensure the runner doesn’t wrap probe phases in inference. Concretely:
-
-- In your driver (`offline_entropy_probe.py` or calling script), **do not** do:
-  
-      with torch.inference_mode():
-          results = probe.run_mixed_probe()  # WRONG
-
-  or:
-  
-      @torch.inference_mode()
-      def run_mixed_probe(...): ...         # WRONG
-
-- Also avoid a broad:
-  
-      with torch.no_grad():
-          ... probe passes ...
-
-- Restrict `inference_mode` strictly to **response generation** (sampling) only.
-  Your file already uses `with torch.inference_mode():` in *sampling* code—keep that—but **not** around teacher-forcing passes.
-
-Add an early guard at the **top** of the public entry point you call (e.g., `run_mixed_probe`):
-
-    if torch.is_inference_mode_enabled():
-        raise RuntimeError("Probe entrypoint called under torch.inference_mode(); remove that context.")
-
-This forces the calling code to run the probe with autograd enabled.
-
-G) Optional: make autograd.grad stricter during bring-up
---------------------------------------------------------
-Temporarily change:
-
-    g_list = torch.autograd.grad(..., allow_unused=True, ...)
-
-to
-
-    g_list = torch.autograd.grad(..., allow_unused=False, ...)
-
-so PyTorch raises immediately and points at the offending inputs if anything is still unused. Revert to `allow_unused=True` once fixed.
-
-H) Sanity checklist (run in order)
-----------------------------------
-1) Confirm **no** outer `inference_mode` / `no_grad` wraps your probe call.
-2) The new guards should *not* trigger; TF logits should report `requires_grad=True` and a non-None `grad_fn`.
-3) The α-trick debug should report a **non-zero** “non-None parameter grads” count.
-4) Your `s_n` batches (from the α-trick) should now be computed without per-prompt backprops.
-
-If any guard trips, the message tells you exactly what to remove in the outer code.
 
