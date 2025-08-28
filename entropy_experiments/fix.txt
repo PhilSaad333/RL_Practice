@@ -1,289 +1,99 @@
-A) Instrumented diagnostics (copy–paste patches)
+Why this is happening (quick context)
 
-Goal: prove (1) that logits and 
-𝑆
-S are in the graph, (2) that 
-𝐿
-L carries non-zero sensitivity to 
-𝑆
-S, and (3) that at least one real parameter picks up non-zero gradient from 
-𝐿
-L. Each check isolates a different failure mode.
+QLoRA backpropagates through a frozen, 4-bit base into LoRA adapters; only the adapter weights carry gradients (typically lora_A, lora_B, sometimes selected biases). Gradients w.r.t. the base embeddings are supposed to be None. 
+arXiv
+ROCm Blogs
+PyTorch Docs
 
-1) Assert the TF path really creates a graph back to parameters
+PEFT/LoRA exposes adapter parameters on the wrapped PeftModel; you must forward through that same wrapper and differentiate w.r.t. those adapter tensors. 
+Hugging Face
++1
+GitHub
 
-In _compute_aligned_batch_logprobs (you already added part of this), add one more active gradient probe against a known parameter (the token embeddings). Right after you compute S_batch and before finally:
-
-# --- begin debug probe (remove after it passes) ---
-# Try a single VJP from S back to the input embedding weights.
-try:
-    emb = self.model.get_input_embeddings().weight  # HF models expose this
-    # Use a tiny scalar probe to avoid huge graph use: sum over the 1st row only
-    probe = S_batch[0].sum()
-    g_emb = torch.autograd.grad(probe, emb, retain_graph=True, allow_unused=True)[0]
-    if g_emb is None:
-        raise RuntimeError("TF probe: d(sum S[0]) / d(embedding) is None -> S not linked to parameters")
-except Exception as e:
-    raise
-# --- end debug probe ---
-
-If this raises, the break is in the TF path itself (e.g., outer inference_mode, a stray .detach(), or a graph-killing transform). If it passes, the TF path is fine.
-
-2) Verify 
-𝐿
-L actually depends on 
-𝑆
-S
-
-In compute_conditional_variance_over_E_alpha, after you build L_vec and alpha but before the first autograd.grad(L, params, …):
-
-# Check that dL/dS is non-zero (rules out zero coefficients / bad LOO math)
-dL_dS = torch.autograd.grad(L, S_dict["S"], retain_graph=True, allow_unused=False)[0]
-if (dL_dS.abs().sum() == 0):
-    raise RuntimeError("α-trick: dL/dS is exactly zero; check L_vec construction / coefficients")
-
-If this trips, your coefficients are zeroing the signal (e.g., accidental G=1 + LOO, or all weights cancel). If it passes, 
-𝐿
- ⁣
-→
- ⁣
-𝑆
-L→S is healthy.
-
-3) Directly test whether any parameter gets a gradient from 
-𝐿
-L
-
-Still in the same spot:
-
-# Sanity: try a single high-probability leaf param (embedding matrix)
-emb = self.model.get_input_embeddings().weight
-g_test = torch.autograd.grad(L, emb, retain_graph=True, allow_unused=True)[0]
-if g_test is None:
-    # If emb fails, try lm_head as well (some models untie weights)
-    head = getattr(self.model, "lm_head", None)
-    if head is not None:
-        g_head = torch.autograd.grad(L, head.weight, retain_graph=True, allow_unused=True)[0]
-        if g_head is None:
-            raise RuntimeError("α-trick: L does not backprop to embeddings nor lm_head; parameter list mismatch or graph severed")
-    else:
-        raise RuntimeError("α-trick: L does not backprop to embeddings; parameter list mismatch or graph severed")
-
-
-If embeddings (and lm_head if present) both return None, the path 
-𝐿
- ⁣
-→
- ⁣
-L→params is dead despite 
-𝐿
- ⁣
-→
- ⁣
-𝑆
-L→S being alive—usually meaning the forward used a different parameter object than the one you’re asking grads for (wrapper/flat-param mismatch). That can happen with FSDP/ZeRO or after re-wrapping the model.
-
-B) Robust α-trick via VJP on 
-𝑆
-S (drop-in replacement)
-
-Instead of asking autograd for 
-∇
-𝜃
-𝐿
-∇
-θ
-	​
-
-L (which may be brittle when params are wrapped), we can compute the vector-Jacobian product directly through 
-𝑆
-S:
-
-∂
-𝐿
-∂
-𝑆
-𝑏
-,
-𝑔
-=
-−
- 
-𝛼
-𝑏
-𝐺
- 
-(
-𝑆
-𝑏
-,
-𝑔
-(
-𝑤
-)
-−
-𝑆
-𝑏
-,
-𝑔
-(
-𝑤
-,
-L
-O
-O
-)
-)
-,
-∂S
-b,g
-	​
-
-∂L
-	​
-
-=−
-G
-α
-b
-	​
-
-	​
-
-(S
-b,g
-(w)
-	​
-
-−S
-b,g
-(w,LOO)
-	​
-
-),
-
-so if we define 
-𝑊
-≡
-∂
-𝐿
-/
-∂
-𝑆
-W≡∂L/∂S with the above entries, then
-
-∇
-𝜃
-𝐿
-  
-=
-  
-(
-∂
-𝑆
-∂
-𝜃
-)
- ⁣
-⊤
- ⁣
-:
-𝑊
-∇
-θ
-	​
-
-L=(
-∂θ
-∂S
-	​
-
-)
-⊤
-:W
-
-is exactly what torch.autograd.grad(S, params, grad_outputs=W) computes. Crucially, this avoids the “L-to-params” shortcut that seems to be returning all None in your run.
-
-Replace your first reverse pass in compute_conditional_variance_over_E_alpha with the following:
-
-# 2) Per-prompt losses and α selector (unchanged)
-L_vec = self.build_LX_vector_from_S(S_dict, weighting_mode=weighting_mode)   # [k]
-alpha = torch.ones_like(L_vec, requires_grad=True)                            # [k]
-
-# --- NEW: build W = dL/dS explicitly and use VJP through S ---
-S = S_dict["S"]                     # [k, G], requires_grad=True
-k, G = S.shape
-
-# Rebuild the same coefficients used inside L_vec
-if weighting_mode == "dr_grpo":
-    Lmax = (torch.tensor(S_dict["max_lengths"], device=S.device, dtype=S.dtype)
-            if isinstance(S_dict["max_lengths"], list)
-            else S_dict["max_lengths"].to(device=S.device, dtype=S.dtype))
-    Lmax = Lmax.view(-1, 1)         # [k, 1]
-    S_w = S / Lmax                  # [k, G]
-elif weighting_mode == "per_token_avg":
-    genL = S_dict["gen_lengths"].to(device=S.device, dtype=S.dtype)
-    S_w = S / genL.clamp_min(1.0)
-else:
-    raise ValueError(f"Unknown weighting_mode: {weighting_mode}")
-
-sum_Sw = S_w.sum(dim=1, keepdim=True)        # [k, 1]
-S_w_LOO = (sum_Sw - S_w) / max(G - 1, 1)     # [k, G]
-
-# dL/dS = -(alpha/G) * (S_w - S_w_LOO)   (alpha is broadcast over g)
-W = - (alpha.view(-1, 1) / float(G)) * (S_w - S_w_LOO)  # [k, G]
-
-# One VJP from S back to parameters to obtain g = ∇_θ L
-params = [p for p in self.model.parameters() if p.requires_grad]
-g_list = torch.autograd.grad(
-    outputs=S, inputs=params, grad_outputs=W, create_graph=True, allow_unused=True, retain_graph=False
-)
-non_none = sum(int(gi is not None) for gi in g_list)
-if non_none == 0:
-    raise RuntimeError("α-trick (VJP): S backprop produced no parameter grads; TF path is detached or params mismatch")
-
-# 4) Contract with μY as before
-h = torch.zeros((), device=S.device, dtype=S.dtype)
-for p, gi in zip(params, g_list):
-    if gi is None:
-        continue
-    mu = muY_buf.get(id(p), None)
-    if mu is None:
-        mu = torch.zeros_like(gi)
-    else:
-        mu = mu.to(device=gi.device, dtype=gi.dtype)
-    h = h + (gi * mu).sum()
-
-# 5) Second reverse: s = ∂h/∂α  → [k]
-s = torch.autograd.grad(h, alpha, allow_unused=False, retain_graph=False)[0].detach()  # [k]
-
-
-Why this helps: we explicitly provide grad_outputs=W at the 
-𝑆
-S boundary, so autograd only needs to follow the standard TF path (log-softmax, gathers, the model) back to the parameters. This path is generally robust even under wrappers; it does not rely on autograd discovering the mapping from 
-𝐿
-L directly to your params list.
-
-C) If the problem persists after B)
-
-Parameter object mismatch. With FSDP / DeepSpeed ZeRO / PEFT adapters, the tensors used in the forward may not be the same objects you collect in params = [p for p in self.model.parameters() …]. In that case:
-
-Build params once right after the model is wrapped (DDP/FSDP), and reuse the same Python objects everywhere in the probe.
-
-For FSDP flat parameters, ensure you call the probe inside the same wrapping and not on an unwrapped reference.
-
-Outer grad-disabling context. Your new _assert_grad_context guards should already catch inference_mode / no_grad. If they never fire, the issue is not a global guard.
-
-Sanity via backward. As a cross-check, on a tiny group run L_vec.sum().backward() (no α-trick), and confirm some param.grad are non-None. If that also yields nothing, the TF path is still effectively detached.
-
-Why “all None” happens (and why allow_unused=True hides it)
-
-When any of the inputs passed to torch.autograd.grad are not part of the computation producing outputs, PyTorch returns None for those inputs if (and only if) you set allow_unused=True—otherwise it raises an error. That’s what you are seeing: the graph that produced 
-𝐿
-L does not reference any of the tensors in your params list, so you get 0/392 non-None. 
+If you call torch.autograd.grad on a tensor that doesn’t require grad (e.g., frozen embeddings), PyTorch raises or returns None depending on allow_unused; this is the error you see. 
 PyTorch Forums
+PyTorch Docs
+Stack Overflow
 
-torch.inference_mode() and torch.no_grad() disable autograd bookkeeping; any forward under them will irreversibly sever the graph and lead to “all None” later. (Your guards aim to prevent this; keep them.)
+Minimal, targeted edits (single file: probe_components.py)
+
+I refer to your current file; line numbers may shift. Replace the indicated blocks.
+
+1) Replace the embedding diagnostic in _compute_aligned_batch_logprobs
+
+Find the block that probes d(sum S[0]) / d(embedding) (the one that currently trips). Replace it with a LoRA-only probe:
+
+# --- Robust TF probe for QLoRA/LoRA ---
+# Prove S backprops into trainable LoRA params (not the frozen embeddings).
+probe = S_batch[0].sum()  # scalar
+lora_params = [p for n, p in self.model.named_parameters()
+               if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
+if len(lora_params) == 0:
+    raise RuntimeError("TF probe: no trainable LoRA params found (adapters missing/merged/disabled).")
+
+g_lora = torch.autograd.grad(probe, lora_params, retain_graph=True, allow_unused=True)
+if not any(g is not None for g in g_lora):
+    raise RuntimeError("TF probe: S does not backprop to LoRA params. "
+                       "Ensure the TF forward uses the PEFT-wrapped model and adapters are active.")
+# --- end probe ---
 
 
+(Delete the old emb = self.model.get_input_embeddings().weight diagnostic.)
+This makes the probe conform to QLoRA’s gradient topology. 
+arXiv
+Hugging Face
 
+2) In the α-trick path, test LoRA params—not embeddings
+
+In compute_conditional_variance_over_E_alpha, remove the “Direct L→embedding test” and add:
+
+# --- Diagnostic: does L backprop into trainable LoRA params? ---
+lora_params = [p for n, p in self.model.named_parameters()
+               if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
+if len(lora_params) == 0:
+    raise RuntimeError("α-trick: no trainable LoRA params found.")
+
+g_test = torch.autograd.grad(L, lora_params, retain_graph=True, allow_unused=True)
+if not any(g is not None for g in g_test):
+    raise RuntimeError("α-trick: L does not backprop into LoRA params. "
+                       "If μY was built on the PEFT wrapper, make sure TF also uses the same wrapper.")
+# --- end diagnostic ---
+
+
+This prevents an early false failure when embeddings are frozen (QLoRA default). 
+arXiv
+
+3) Ensure the α-trick differentiates w.r.t. the same trainable params
+
+Where you build params for the VJP step, leave the filter as “trainable only” (this picks up LoRA tensors under PEFT/DDP):
+
+params = [p for p in self.model.parameters() if p.requires_grad]
+
+
+If you want to be explicit (and to reduce work), you can restrict to LoRA only:
+
+params = [p for n,p in self.model.named_parameters()
+          if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
+
+
+That’s fully consistent with QLoRA, since the base is frozen. 
+arXiv
+
+Sanity checklist for the calling code (no file changes needed)
+
+Forward through the same PEFT wrapper used to build μY and the optimizer. Do not forward on a base model or a different wrapper instance. (When using DDP, that usually means self.model(... ) where self.model is DistributedDataParallel(PeftModel(...)), not self.model.module.base_model(...).) 
+Hugging Face
++1
+
+Do not run teacher-forced forwards under torch.inference_mode() / no_grad(); that would permanently sever the graph. (It’s fine for sampling, not for the probe.) 
+PyTorch Docs
+Stack Overflow
+
+Adapters active, not merged: don’t merge_and_unload() before the probe; and confirm at runtime that LoRA tensors have requires_grad=True. 
+Hugging Face
+
+Why bars_dot worked but the α-trick failed
+
+Your bars_dot path uses .backward() and inspects param.grad on trainable (LoRA) tensors—so it succeeds.
+
+The failing diagnostic was differentiating w.r.t. embeddings (frozen) and threw exactly the PyTorch error you’d expect when asking for grads from non-grad tensors. Once you change diagnostics and α-trick to target LoRA params, the inconsistency disappears.

@@ -166,6 +166,16 @@ class OfflineEntropyProbe:
                 find_unused_parameters=self.config['distributed']['find_unused_parameters']
             )
             
+            # DIAGNOSTICS: Check if DDP wrapping affected parameter trainability
+            trainable_after_ddp = 0
+            lora_after_ddp = 0
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    trainable_after_ddp += 1
+                    if 'lora_A' in name or 'lora_B' in name:
+                        lora_after_ddp += 1
+            self.logger.info(f"Trainable parameters after DDP wrapping: {trainable_after_ddp} total, {lora_after_ddp} LoRA params")
+            
         # Set to training mode (required for autograd)
         self.model.train()
         
@@ -231,6 +241,27 @@ class OfflineEntropyProbe:
         # Load LoRA adapter (exact copy from rl_runner.py pattern)
         model = PeftModel.from_pretrained(base, lora_path, is_trainable=True)
         model.enable_input_require_grads()
+        
+        # DIAGNOSTICS: Verify LoRA adapters are active and trainable (from fix.txt)
+        self.logger.info(f"Active adapters: {getattr(model, 'active_adapter', None)}")
+        
+        # Count trainable parameters and show LoRA names
+        trainable_params = []
+        lora_params = 0
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                trainable_params.append(name)
+                if 'lora_A' in name or 'lora_B' in name:
+                    lora_params += 1
+                    
+        self.logger.info(f"Trainable parameters after LoRA loading: {len(trainable_params)} total, {lora_params} LoRA params")
+        
+        # Show first few LoRA parameter names for verification
+        lora_names = [name for name in trainable_params if 'lora_A' in name or 'lora_B' in name][:5]
+        if lora_names:
+            self.logger.info(f"Sample LoRA parameters: {lora_names}")
+        else:
+            self.logger.error("ERROR: No LoRA parameters found in trainable params!")
         
         self.logger.info(f"Loaded LoRA model: {backbone} + {lora_path}")
         return model
@@ -961,6 +992,71 @@ class OfflineEntropyProbe:
             with open(results_path, 'w') as f:
                 json.dump(results, f, indent=2, default=str)
             self.logger.info(f"Results saved to {results_path}")
+            
+    def test_minimal_alpha_trick(self, batch_ids: torch.Tensor, batch_mask: torch.Tensor) -> None:
+        """
+        Minimal α-trick probe test from fix.txt to localize gradient flow issues.
+        
+        This implements the diagnostic test from fix.txt section C to verify:
+        1. Model forward produces gradients
+        2. LoRA parameters receive gradients from a simple loss
+        
+        Args:
+            batch_ids: Input token IDs [batch_size, seq_len]
+            batch_mask: Attention mask [batch_size, seq_len]
+        """
+        self.logger.info("Running minimal α-trick probe test...")
+        
+        # Ensure model is in training mode
+        self.model.train()
+        
+        # 1) Tiny TF forward on the PEFT model
+        outs = self.model(input_ids=batch_ids, attention_mask=batch_mask)
+        logits = outs.logits  # must have grad_fn
+        
+        # Assert logits are tracking gradients
+        if not (logits.requires_grad and logits.grad_fn is not None):
+            raise RuntimeError("Minimal probe: logits not tracking grad - model may be frozen or in eval mode")
+        
+        # 2) Build S and a vectorized loss L = <alpha, L_vec(S)>
+        logprobs = torch.log_softmax(logits.float(), dim=-1)
+        token_lp = logprobs[:, :-1].gather(2, batch_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+        S = token_lp.sum(dim=1).view(-1, 1)  # [k, 1] or adapt to your [k,G]
+        S.retain_grad()
+        
+        alpha = torch.ones(S.shape[0], device=S.device, requires_grad=True)
+        L = (-(alpha.view(-1, 1) * S).mean())  # minus sign; simple cross-entropy variant
+        
+        # 3) Try a *known* LoRA param first (more robust than "all params")
+        lora_params = [p for n, p in self.model.named_parameters() if ("lora_A" in n or "lora_B" in n)]
+        
+        if len(lora_params) == 0:
+            raise RuntimeError("Minimal probe: No lora_A/B parameters found (adapters missing/merged?)")
+        
+        self.logger.info(f"Found {len(lora_params)} LoRA parameters for gradient test")
+        
+        g_lora = torch.autograd.grad(L, lora_params, allow_unused=True, retain_graph=True)
+        non_none_lora = sum(int(g is not None) for g in g_lora)
+        
+        self.logger.info(f"Minimal probe results: {non_none_lora}/{len(lora_params)} LoRA params received gradients")
+        
+        if non_none_lora == 0:
+            raise RuntimeError("Minimal probe FAILED: Forward isn't using the same adapter tensors you're differentiating w.r.t. (wrong model object or adapters disabled)")
+        else:
+            self.logger.info("Minimal probe PASSED: LoRA gradient flow is working")
+            
+        # Test all parameters as well
+        all_params = [p for p in self.model.parameters() if p.requires_grad]
+        if len(all_params) == 0:
+            raise RuntimeError("Minimal probe: No trainable parameters found - all parameters frozen!")
+            
+        g_all = torch.autograd.grad(L, all_params, allow_unused=True, retain_graph=True)
+        non_none_all = sum(int(g is not None) for g in g_all)
+        
+        self.logger.info(f"Full gradient test: {non_none_all}/{len(all_params)} total params received gradients")
+        
+        if non_none_all == 0:
+            raise RuntimeError("Minimal probe FAILED: No parameters received gradients from L")
             
     @classmethod
     def from_config_file(cls, config_path: str) -> 'OfflineEntropyProbe':

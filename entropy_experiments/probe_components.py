@@ -45,6 +45,58 @@ class ProbeComponents:
                 f"{where}: torch.no_grad() is active. "
                 "Enable grad (remove no_grad) for probe computations."
             )
+            
+    def _test_minimal_gradient_flow(self, batch_ids: torch.Tensor, batch_mask: torch.Tensor) -> None:
+        """
+        Minimal gradient flow test from fix.txt to diagnose parameter trainability.
+        
+        This implements the diagnostic test from fix.txt section C to verify:
+        1. Model forward produces gradients
+        2. LoRA parameters receive gradients from a simple loss
+        
+        Args:
+            batch_ids: Input token IDs [batch_size, seq_len]
+            batch_mask: Attention mask [batch_size, seq_len]
+        """
+        self.logger.info("Testing minimal gradient flow...")
+        
+        # Ensure model is in training mode
+        self.model.train()
+        
+        # 1) Tiny TF forward on the PEFT model
+        outs = self.model(input_ids=batch_ids, attention_mask=batch_mask)
+        logits = outs.logits  # must have grad_fn
+        
+        # Assert logits are tracking gradients
+        if not (logits.requires_grad and logits.grad_fn is not None):
+            raise RuntimeError("Minimal test: logits not tracking grad - model may be frozen or in eval mode")
+        
+        # 2) Build S and a vectorized loss L = <alpha, L_vec(S)>
+        logprobs = torch.log_softmax(logits.float(), dim=-1)
+        token_lp = logprobs[:, :-1].gather(2, batch_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+        S = token_lp.sum(dim=1).view(-1, 1)  # [k, 1]
+        S.retain_grad()
+        
+        alpha = torch.ones(S.shape[0], device=S.device, requires_grad=True)
+        L = (-(alpha.view(-1, 1) * S).mean())  # minus sign; simple cross-entropy variant
+        
+        # 3) Try a *known* LoRA param first (more robust than "all params")
+        lora_params = [p for n, p in self.model.named_parameters() if ("lora_A" in n or "lora_B" in n)]
+        
+        if len(lora_params) == 0:
+            raise RuntimeError("Minimal test: No lora_A/B parameters found (adapters missing/merged?)")
+        
+        self.logger.info(f"Found {len(lora_params)} LoRA parameters for gradient test")
+        
+        g_lora = torch.autograd.grad(L, lora_params, allow_unused=True, retain_graph=True)
+        non_none_lora = sum(int(g is not None) for g in g_lora)
+        
+        self.logger.info(f"Minimal test results: {non_none_lora}/{len(lora_params)} LoRA params received gradients")
+        
+        if non_none_lora == 0:
+            raise RuntimeError("Minimal test FAILED: Forward isn't using the same adapter tensors you're differentiating w.r.t. (wrong model object or adapters disabled)")
+        
+        self.logger.info("Minimal test PASSED: LoRA gradient flow is working correctly for QLoRA setup")
     
     def __init__(self, model: torch.nn.Module, config: Dict[str, Any], logger: logging.Logger):
         self.model = model
@@ -693,17 +745,19 @@ class ProbeComponents:
                 if not S_batch.requires_grad or S_batch.grad_fn is None:
                     raise RuntimeError("S_batch lost its grad_fn; check TF pipeline and masking.")
                 
-                # --- Debug probe: test TF path really creates graph back to parameters ---
-                try:
-                    emb = self.model.get_input_embeddings().weight  # HF models expose this
-                    # Use a tiny scalar probe to avoid huge graph use: sum over the 1st row only
-                    probe = S_batch[0].sum()
-                    g_emb = torch.autograd.grad(probe, emb, retain_graph=True, allow_unused=True)[0]
-                    if g_emb is None:
-                        raise RuntimeError("TF probe: d(sum S[0]) / d(embedding) is None -> S not linked to parameters")
-                except Exception as e:
-                    raise
-                # --- End debug probe ---
+                # --- Robust TF probe for QLoRA/LoRA ---
+                # Prove S backprops into trainable LoRA params (not the frozen embeddings).
+                probe = S_batch[0].sum()  # scalar
+                lora_params = [p for n, p in self.model.named_parameters()
+                               if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
+                if len(lora_params) == 0:
+                    raise RuntimeError("TF probe: no trainable LoRA params found (adapters missing/merged/disabled).")
+
+                g_lora = torch.autograd.grad(probe, lora_params, retain_graph=True, allow_unused=True)
+                if not any(g is not None for g in g_lora):
+                    raise RuntimeError("TF probe: S does not backprop to LoRA params. "
+                                       "Ensure the TF forward uses the PEFT-wrapped model and adapters are active.")
+                # --- end probe ---
 
         finally:
             self.model.train(was_training)
@@ -1047,8 +1101,9 @@ class ProbeComponents:
             (sum_X_buf, B_local): Parameter sum buffer and local batch size
         """
         self._assert_grad_context("accumulate_sum_X")
-        # Get trainable parameters  
-        params = [p for p in self.model.parameters() if p.requires_grad]
+        # Get trainable LoRA parameters for QLoRA consistency
+        params = [p for n, p in self.model.named_parameters() 
+                  if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
         
         # Initialize sum buffer on CPU in fp32
         sum_X_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
@@ -1114,8 +1169,9 @@ class ProbeComponents:
             (sum_Y_buf, B_local): Parameter sum buffer and local batch size
         """
         self._assert_grad_context("accumulate_sum_Y")
-        # Get trainable parameters
-        params = [p for p in self.model.parameters() if p.requires_grad]
+        # Get trainable LoRA parameters for QLoRA consistency  
+        params = [p for n, p in self.model.named_parameters()
+                  if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
         
         # Initialize sum buffer on CPU in fp32
         sum_Y_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
@@ -1392,6 +1448,29 @@ class ProbeComponents:
         Caller assembles Var_E = η^2 * [ (Σ s^2 − B s̄^2) / (B − 1) ] / B, SE_E = η * sqrt( ... ).
         """
         self._assert_grad_context("compute_conditional_variance_over_E_alpha")
+        
+        # DIAGNOSTIC: Test minimal α-trick on first call to verify gradient flow
+        if not hasattr(self, '_first_alpha_trick_call'):
+            self._first_alpha_trick_call = True
+        
+        if self._first_alpha_trick_call:
+            self.logger.info("Running minimal α-trick test on first call...")
+            
+            # Get first batch for testing (use small batch to avoid memory issues)
+            first_batch = E_units[:min(2, len(E_units))]  # Use 2 prompts max for test
+            batch_data = self._prepare_teacher_forcing_batch(first_batch, max_new_tokens=16)
+            
+            # Import here to avoid circular import
+            try:
+                # Create minimal test inline (simpler than circular import)
+                self._test_minimal_gradient_flow(batch_data['input_ids'], batch_data['attention_mask'])
+                self.logger.info("Minimal α-trick test PASSED - proceeding with full computation")
+            except Exception as e:
+                self.logger.error(f"Minimal α-trick test FAILED: {e}")
+                raise RuntimeError(f"α-trick gradient flow broken: {e}")
+            finally:
+                self._first_alpha_trick_call = False
+                
         from contextlib import nullcontext
         device = next(self.model.parameters()).device
         sum_s_local = 0.0
@@ -1436,18 +1515,17 @@ class ProbeComponents:
                     raise RuntimeError("α-trick: dL/dS is exactly zero; check L_vec construction / coefficients")
                 _dbg(f"α-trick: dL/dS.abs().sum()={dL_dS.abs().sum().item():.6f} (should be > 0)")
                 
-                # --- Diagnostic 2: Test if any parameter gets gradient from L ---
-                emb = self.model.get_input_embeddings().weight
-                g_test = torch.autograd.grad(L, emb, retain_graph=True, allow_unused=True)[0]
-                if g_test is None:
-                    # If emb fails, try lm_head as well (some models untie weights)
-                    head = getattr(self.model, "lm_head", None)
-                    if head is not None:
-                        g_head = torch.autograd.grad(L, head.weight, retain_graph=True, allow_unused=True)[0]
-                        if g_head is None:
-                            raise RuntimeError("α-trick: L does not backprop to embeddings nor lm_head; parameter list mismatch or graph severed")
-                    else:
-                        raise RuntimeError("α-trick: L does not backprop to embeddings; parameter list mismatch or graph severed")
+                # --- Diagnostic: does L backprop into trainable LoRA params? ---
+                lora_params = [p for n, p in self.model.named_parameters()
+                               if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
+                if len(lora_params) == 0:
+                    raise RuntimeError("α-trick: no trainable LoRA params found.")
+
+                g_test = torch.autograd.grad(L, lora_params, retain_graph=True, allow_unused=True)
+                if not any(g is not None for g in g_test):
+                    raise RuntimeError("α-trick: L does not backprop into LoRA params. "
+                                       "If μY was built on the PEFT wrapper, make sure TF also uses the same wrapper.")
+                # --- end diagnostic ---
                 _dbg(f"α-trick: Direct L→embedding test passed")
 
                 # 3) Robust VJP-based approach via S instead of direct L→params
@@ -1474,7 +1552,9 @@ class ProbeComponents:
                 W = - (alpha.view(-1, 1) / float(G)) * (S_w - S_w_LOO)  # [k, G]
 
                 # One VJP from S back to parameters to obtain g = ∇_θ L
-                params = [p for p in self.model.parameters() if p.requires_grad]
+                # Explicit LoRA-only for QLoRA consistency
+                params = [p for n, p in self.model.named_parameters()
+                          if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
                 g_list = torch.autograd.grad(
                     outputs=S, inputs=params, grad_outputs=W, create_graph=True, allow_unused=True, retain_graph=False
                 )
