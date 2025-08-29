@@ -63,7 +63,7 @@ class GenerationConfig:
     """Configuration for sequence generation."""
     temperature: float = 1.0
     top_p: float = 1.0
-    max_new_tokens: int = 512
+    max_new_tokens: int = 200
     do_sample: bool = True
     
     # Batch sizes
@@ -342,8 +342,8 @@ class SequenceProcessor:
                                 log_probs = torch.log_softmax(gen_logits, dim=-1)
                                 token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)
                                 
-                                # Convert to numpy
-                                gen_logprobs_np = token_logprobs.cpu().numpy()
+                                # Convert to numpy (handle BFloat16)
+                                gen_logprobs_np = token_logprobs.float().cpu().numpy()
                                 gen_logprobs_np = np.nan_to_num(gen_logprobs_np, nan=0.0, posinf=0.0, neginf=-100.0)
                                 
                                 # Compute entropies (placeholder)
