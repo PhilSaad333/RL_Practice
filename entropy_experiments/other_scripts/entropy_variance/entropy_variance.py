@@ -255,6 +255,19 @@ def batched_generation(
         all_gen_texts.extend(prompt_responses)
         all_entropies.append(prompt_entropies)
     
+    # Sanity check: print one sample generation per batch
+    if len(all_gen_texts) > 0:
+        sample_idx = min(0, len(all_gen_texts) - 1)
+        print(f"\n--- SAMPLE GENERATION (batch size B={B}) ---")
+        print(f"Generated text: {all_gen_texts[sample_idx][:200]}...")
+        if len(all_entropies) > 0 and len(all_entropies[0]) > 0:
+            entropy_sample = all_entropies[0][0]
+            if len(entropy_sample) > 0:
+                print(f"Entropy stats: mean={entropy_sample.mean():.3f}, std={entropy_sample.std():.3f}, len={len(entropy_sample)}")
+            else:
+                print("Entropy: empty array")
+        print("--- END SAMPLE ---\n")
+    
     return all_gen_texts, all_entropies
 
 
