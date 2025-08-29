@@ -142,12 +142,12 @@ class SequenceProcessor:
         B = len(prompts)
         model = self._unwrap(self.model)
         
-        # Tokenize all prompts
+        # Tokenize all prompts (no truncation to avoid cutting off prompts)
         tokenized_prompts = self.tokenizer(
             prompts, 
             return_tensors="pt", 
             padding=True, 
-            truncation=True
+            truncation=False  # Allow full prompt length
         )
         prompt_input_ids = tokenized_prompts['input_ids'].to(model.device)
         prompt_attention_mask = tokenized_prompts['attention_mask'].to(model.device)
