@@ -20,41 +20,21 @@ from transformers import LogitsProcessor
 
 
 class StopAfterAnswer(LogitsProcessor):
-    """Stop generation after seeing 'The answer is' followed by a number or calculation."""
+    """Stop generation after seeing '</answer>' tag - correct logic from collect_rollouts.py"""
     
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        self.stop_tokens = []
-        
-        # Try different phrasings of "The answer is"
-        variations = [
-            "The answer is ",
-            "The answer is:",
-            "\nThe answer is ",
-            "\nThe answer is:",
-        ]
-        
-        for variation in variations:
-            tokens = tokenizer.encode(variation, add_special_tokens=False)
-            if tokens:
-                self.stop_tokens.extend(tokens)
-        
-        self.stop_tokens = list(set(self.stop_tokens))
+        # Use the correct stop tag from the dataset format
+        TAG_STOP = "</answer>"
+        self.tag_ids = tokenizer(TAG_STOP, add_special_tokens=False).input_ids
+        self.L = len(self.tag_ids)
     
     def __call__(self, input_ids, scores):
-        if len(input_ids[0]) < 10:
-            return scores
-            
-        # Check last few tokens for stop patterns
-        recent_tokens = input_ids[0][-10:].tolist()
-        recent_text = self.tokenizer.decode(recent_tokens, skip_special_tokens=True).lower()
-        
-        if "the answer is" in recent_text:
-            # Force EOS token
-            eos_token_id = self.tokenizer.eos_token_id
-            if eos_token_id is not None:
-                scores[:, eos_token_id] += 10000
-        
+        tag = torch.tensor(self.tag_ids, device=input_ids.device)
+        done = (input_ids[:, -self.L:] == tag).all(-1)
+        if done.any():
+            scores[done] = float("-inf")
+            scores[done, self.tokenizer.pad_token_id] = 0.0
         return scores
 
 
