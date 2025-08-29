@@ -66,9 +66,9 @@ class GenerationConfig:
     max_new_tokens: int = 200
     do_sample: bool = True
     
-    # Batch sizes
-    gen_batch_size: int = 8
-    tf_batch_size: int = 32
+    # Batch sizes (optimized for H100 80GB)
+    gen_batch_size: int = 32  # Conservative default, can go higher
+    tf_batch_size: int = 64   # Teacher forcing can handle larger batches
 
 
 @dataclass
