@@ -212,8 +212,8 @@ def batched_generation(
         top_p=gen_cfg.top_p,
         max_new_tokens=gen_cfg.max_new_tokens,
         do_sample=gen_cfg.do_sample,
-        gen_batch_size=64,  # Much larger for H100 - can handle 64+ sequences at once
-        tf_batch_size=128   # Aggressive teacher forcing batch size for 80GB H100
+        gen_batch_size=128, # Even more aggressive - H100 has 80GB memory
+        tf_batch_size=256   # Double teacher forcing batch size for maximum throughput
     )
     
     # Initialize SequenceProcessor
