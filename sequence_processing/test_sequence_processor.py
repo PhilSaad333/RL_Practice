@@ -131,17 +131,48 @@ def main():
         print(f"Number of prompts: {len(sequences.prompt_lens)}")
         print(f"Prompt lengths: {sequences.prompt_lens}")
         
-        # Show some sample outputs
-        print(f"\nSample generations:")
-        for b in range(min(2, len(sequences.responses_text))):
-            print(f"  Prompt {b}:")
-            for g in range(min(2, len(sequences.responses_text[b]))):
-                response = sequences.responses_text[b][g][:100]  # First 100 chars
-                print(f"    Response {g}: {response}...")
+        # Show detailed sample outputs
+        print(f"\n=== DETAILED SAMPLE OUTPUTS ===")
+        for b in range(len(sequences.responses_text)):
+            print(f"\n--- PROMPT {b} (Length: {sequences.prompt_lens[b]} tokens) ---")
+            
+            # Try to reconstruct the original prompt
+            if len(sequences.sequences[b]) > 0:
+                prompt_tokens = sequences.sequences[b][0][:sequences.prompt_lens[b]]
+                original_prompt = tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+                print(f"ORIGINAL PROMPT: {original_prompt}")
+            
+            for g in range(len(sequences.responses_text[b])):
+                response_text = sequences.responses_text[b][g]
+                gen_len = sequences.gen_lens[b][g] if b < len(sequences.gen_lens) and g < len(sequences.gen_lens[b]) else 0
+                
+                print(f"\n  Response {g} (Generated {gen_len} tokens):")
+                print(f"  TEXT: {response_text}")
+                
+                # Show logprob stats if available
+                if (b < len(logprob_results.logprobs) and 
+                    g < len(logprob_results.logprobs[b]) and 
+                    len(logprob_results.logprobs[b][g]) > 0):
+                    
+                    token_logprobs = logprob_results.logprobs[b][g]
+                    seq_logprob = logprob_results.sequence_logprobs[b][g]
+                    entropies = logprob_results.entropies[b][g]
+                    
+                    print(f"  LOGPROBS: mean={token_logprobs.mean():.3f}, "
+                          f"total_seq={seq_logprob:.3f}, "
+                          f"entropy_mean={entropies.mean():.3f}")
+                else:
+                    print(f"  LOGPROBS: No logprob data available")
+            
+            print(f"--- END PROMPT {b} ---")
         
-        print(f"\nLogprob results:")
-        print(f"Number of batches: {len(logprob_results.logprobs)}")
-        print(f"Sequence logprobs shape: {len(logprob_results.sequence_logprobs)}")
+        print(f"\n=== SUMMARY STATS ===")
+        print(f"Total prompts: {len(sequences.responses_text)}")
+        print(f"Responses per prompt: {len(sequences.responses_text[0]) if sequences.responses_text else 0}")
+        print(f"Sequence tensor shape: {sequences.sequences.shape}")
+        print(f"Attention mask shape: {sequences.attention_masks.shape}")
+        print(f"Prompt lengths: {sequences.prompt_lens}")
+        print(f"Generation lengths: {sequences.gen_lens}")
         
     except Exception as e:
         print(f"ERROR in generation test: {e}")
