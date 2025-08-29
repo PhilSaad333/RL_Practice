@@ -212,8 +212,8 @@ def batched_generation(
         top_p=gen_cfg.top_p,
         max_new_tokens=gen_cfg.max_new_tokens,
         do_sample=gen_cfg.do_sample,
-        gen_batch_size=128, # Even more aggressive - H100 has 80GB memory
-        tf_batch_size=256   # Double teacher forcing batch size for maximum throughput
+        gen_batch_size=128, # Optimized for H100 80GB
+        tf_batch_size=256   # Optimized teacher forcing batch size
     )
     
     # Initialize SequenceProcessor
@@ -255,18 +255,26 @@ def batched_generation(
         all_gen_texts.extend(prompt_responses)
         all_entropies.append(prompt_entropies)
     
-    # Sanity check: print one sample generation per batch
+    # Store sample generation for JSON output (don't print to avoid stdout issues)
+    sample_generation_info = None
     if len(all_gen_texts) > 0:
         sample_idx = min(0, len(all_gen_texts) - 1)
-        print(f"\n--- SAMPLE GENERATION (batch size B={B}) ---")
-        print(f"Generated text: {all_gen_texts[sample_idx][:200]}...")
+        sample_generation_info = {
+            "batch_size": B,
+            "sample_text": all_gen_texts[sample_idx][:200],
+            "full_sample_text": all_gen_texts[sample_idx]  # Include full text
+        }
         if len(all_entropies) > 0 and len(all_entropies[0]) > 0:
             entropy_sample = all_entropies[0][0]
             if len(entropy_sample) > 0:
-                print(f"Entropy stats: mean={entropy_sample.mean():.3f}, std={entropy_sample.std():.3f}, len={len(entropy_sample)}")
-            else:
-                print("Entropy: empty array")
-        print("--- END SAMPLE ---\n")
+                sample_generation_info.update({
+                    "entropy_mean": float(entropy_sample.mean()),
+                    "entropy_std": float(entropy_sample.std()),
+                    "entropy_length": len(entropy_sample)
+                })
+    
+    # Store in global for later access
+    globals()['_sample_generation_info'] = sample_generation_info
     
     return all_gen_texts, all_entropies
 
@@ -467,6 +475,7 @@ def main():
             "seed": args.seed,
             "meta": meta,
             "runtime_sec": time.time() - start,
+            "sample_generation": globals().get('_sample_generation_info', None)
         }
     else:
         batch_mean, var_jk, meta = single_batch_jackknife(
