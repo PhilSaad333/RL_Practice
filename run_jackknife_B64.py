@@ -73,7 +73,6 @@ def generate_with_sequence_processor(model, tokenizer, prompts, G):
         top_p=1.0,
         max_new_tokens=200,  # As requested
         do_sample=True,
-        num_return_sequences=G,  # This was missing!
         gen_batch_size=32,
         tf_batch_size=64
     )
