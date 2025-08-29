@@ -203,85 +203,57 @@ def batched_generation(
     G: int,
     gen_cfg: GenConfig,
 ) -> Tuple[List[str], List[List[np.ndarray]]]:
-    """Generate G responses per prompt with batched processing, return texts and entropies."""
-    from transformers import GenerationConfig, LogitsProcessorList
-    from evals.utils_io import StopAfterAnswer
-    import torch.nn.functional as F
+    """Generate G responses per prompt using SequenceProcessor, return texts and entropies."""
+    from sequence_processing import SequenceProcessor, GenerationConfig as SPGenerationConfig
     
-    # Generation config
-    gc = GenerationConfig(
-        max_new_tokens=gen_cfg.max_new_tokens,
+    # Convert GenConfig to SequenceProcessor's GenerationConfig
+    sp_config = SPGenerationConfig(
         temperature=gen_cfg.temperature,
         top_p=gen_cfg.top_p,
+        max_new_tokens=gen_cfg.max_new_tokens,
         do_sample=gen_cfg.do_sample,
-        num_return_sequences=G,
-        pad_token_id=tokenizer.pad_token_id if gen_cfg.pad_token_id is None else gen_cfg.pad_token_id,
-        return_dict_in_generate=True,
+        gen_batch_size=8,  # Reasonable batch size
+        tf_batch_size=gen_cfg.tf_micro_batch
     )
-    stop = LogitsProcessorList([StopAfterAnswer(tokenizer)])
     
-    # Setup for batched generation (similar to probe_components)
-    B = len(prompts)
-    amp_dtype = torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16
+    # Initialize SequenceProcessor
+    processor = SequenceProcessor(model, tokenizer, sp_config)
     
+    # Generate sequences and compute logprobs (no grad for entropy computation)
+    sequences, logprob_results = processor.generate_with_logprobs(
+        prompts=prompts,
+        G=G,
+        with_grad=False  # No gradients needed for entropy computation
+    )
+    
+    # Extract results
     all_gen_texts = []
     all_entropies = []
     
-    # Process in batches (simple approach: all prompts at once for now)
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype):
-        # Tokenize prompts with left padding
-        tokenizer.padding_side = "left" 
-        enc = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
-        prompt_len = enc.input_ids.shape[1]
+    B = len(sequences.responses_text)
+    for b in range(B):
+        prompt_responses = sequences.responses_text[b]  # [G] responses for this prompt
+        prompt_entropies = []
         
-        # Generate responses
-        gen_out = model.generate(
-            **enc,
-            generation_config=gc,
-            logits_processor=stop,
-            return_dict_in_generate=True
-        )
-        
-        # Reshape to [B, G, total_len]
-        all_gen_sequences = gen_out.sequences
-        sequences_reshaped = all_gen_sequences.view(B, G, -1)
-        
-        # Process each prompt
-        for b in range(B):
-            sequences = sequences_reshaped[b]  # [G, total_len]
-            prompt_responses = []
-            prompt_entropies = []
-            
-            for g in range(G):
-                # Extract generated portion (skip prompt)
-                gen_ids = sequences[g, prompt_len:]
+        for g in range(G):
+            # Get the logprobs for this sequence
+            if (b < len(logprob_results.logprobs) and 
+                g < len(logprob_results.logprobs[b])):
                 
-                # Decode response text
-                response_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-                prompt_responses.append(response_text)
-                
-                # Compute per-token entropies via teacher forcing
-                full_seq = sequences[g:g+1]  # [1, total_len] 
-                with torch.no_grad():
-                    logits = model(full_seq).logits  # [1, total_len, vocab_size]
-                    
-                # Apply temperature and compute log probs
-                temp_logits = logits[0, prompt_len-1:-1] / gen_cfg.temperature  # [gen_len, vocab_size]
-                log_probs = F.log_softmax(temp_logits, dim=-1)
-                
-                # Get actual token log probs
-                actual_tokens = gen_ids[:len(temp_logits)]  # Handle potential length mismatch
-                if len(actual_tokens) > 0:
-                    token_log_probs = log_probs.gather(1, actual_tokens.unsqueeze(1)).squeeze(1)
-                    # Convert to entropy (negative log prob)
-                    entropies = -token_log_probs.float().cpu().numpy()
+                token_logprobs = logprob_results.logprobs[b][g]  # Tensor of logprobs
+                # Convert logprobs to entropies (negative logprobs)
+                if len(token_logprobs) > 0:
+                    entropies = -token_logprobs.detach().cpu().numpy()
                 else:
                     entropies = np.array([])
-                
-                prompt_entropies.append(entropies)
+            else:
+                entropies = np.array([])
             
-            all_gen_texts.extend(prompt_responses)
-            all_entropies.append(prompt_entropies)
+            prompt_entropies.append(entropies)
+        
+        # Add responses to flat list (maintaining original interface)
+        all_gen_texts.extend(prompt_responses)
+        all_entropies.append(prompt_entropies)
     
     return all_gen_texts, all_entropies
 
