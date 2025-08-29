@@ -119,8 +119,8 @@ class SequenceProcessor:
                            
         sampled_examples = random.sample(dataset_list, num_prompts)
         
-        # Extract text prompts (following gsm8k_r1_template pattern)
-        prompts = [example.text for example in sampled_examples]
+        # Extract question prompts (correct field for generation - ends with <think>)
+        prompts = [example.question for example in sampled_examples]
         
         return prompts
     
