@@ -58,7 +58,7 @@ def collect_rollouts_style_generation(model, tokenizer, prompt, num_sequences=2)
             attention_mask=attn,
             do_sample=True,
             num_return_sequences=num_sequences,
-            max_new_tokens=100,
+            max_new_tokens=200,
             temperature=0.8,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
@@ -98,7 +98,7 @@ def sequence_processor_generation(model, tokenizer, prompt, num_sequences=2):
     # Create config (without num_return_sequences for now)
     config = GenerationConfig(
         temperature=0.8,
-        max_new_tokens=100,
+        max_new_tokens=200,
         gen_batch_size=4,
         tf_batch_size=8
     )
