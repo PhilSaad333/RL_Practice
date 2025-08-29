@@ -18,6 +18,15 @@
 4. **Never assume setup** - always inspect Lambda filesystem first
 5. **Git workflow**: Make changes locally → push → pull on Lambda
 
+## Claude's Lambda Execution Responsibility
+**IMPORTANT**: Claude is responsible for executing commands on Lambda instances:
+- **Proactively SSH into Lambda** to run tests, training, and evaluation
+- **Handle debugging and troubleshooting** on Lambda sessions
+- **Test new implementations** before declaring them working
+- **Lord Krang should not need to manually run Lambda commands** unless specifically requesting to do so
+- **Always pull latest code** from git before running anything on Lambda
+- **Current Lambda IP**: 192.222.52.191 (update as needed per session)
+
 ## CLAUDE.md Update Protocol
 **IMPORTANT**: Before updating this CLAUDE.md file with new information:
 1. **Always ask Lord Krang for permission first**
