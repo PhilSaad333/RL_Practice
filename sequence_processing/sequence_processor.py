@@ -191,7 +191,7 @@ class SequenceProcessor:
             
             # Generate batch
             with torch.no_grad():
-                generated = model.generate(
+                gen_output = model.generate(
                     input_ids=batch_input_ids,
                     attention_mask=batch_attention_mask,
                     max_new_tokens=self.config.max_new_tokens,
@@ -201,8 +201,11 @@ class SequenceProcessor:
                     logits_processor=[stop_processor],
                     pad_token_id=self.tokenizer.pad_token_id,
                     use_cache=True,
-                    return_dict_in_generate=False
+                    return_dict_in_generate=True,
+                    output_scores=True
                 )
+                
+                generated = gen_output.sequences
             
             all_sequences.append(generated)
         
@@ -299,74 +302,71 @@ class SequenceProcessor:
             return self._teacher_force_no_grad(sequences, tf_batch_size)
     
     def _teacher_force_no_grad(self, sequences: BatchedSequences, tf_batch_size: int) -> LogprobResults:
-        """Teacher forcing without gradients - following collect_rollouts.py pattern."""
+        """Teacher forcing without gradients - simplified approach."""
         model = self._unwrap(self.model)
         B, G = sequences.sequences.shape[:2]
         
-        all_logprobs = []
-        all_entropies = []
-        all_sequence_logprobs = []
+        # Initialize results
+        all_logprobs = [[] for _ in range(B)]
+        all_entropies = [[] for _ in range(B)]
+        all_sequence_logprobs = [[] for _ in range(B)]
         
         with torch.no_grad():
-            # Process in batches to manage memory
-            flat_sequences = sequences.sequences.view(B * G, -1)  # [B*G, seq_len]
-            
-            for i in range(0, B * G, tf_batch_size):
-                end_idx = min(i + tf_batch_size, B * G)
-                batch_seqs = flat_sequences[i:end_idx]
-                
-                # Compute logprobs using compute_transition_scores
-                outputs = model(
-                    input_ids=batch_seqs,
-                    labels=batch_seqs,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    return_dict=True
-                )
-                
-                # Extract logprobs from compute_transition_scores
-                transition_scores = model.compute_transition_scores(
-                    sequences=batch_seqs,
-                    scores=None,
-                    normalize_logits=False
-                )
-                
-                # Process each sequence in this batch
-                for j, seq in enumerate(batch_seqs):
-                    seq_idx = i + j
-                    b_idx = seq_idx // G
-                    g_idx = seq_idx % G
+            # Process sequences one by one for simplicity (can optimize later)
+            for b in range(B):
+                for g in range(G):
+                    seq = sequences.sequences[b, g]  # [seq_len]
+                    prompt_len = sequences.prompt_lens[b]
+                    gen_len = sequences.gen_lens[b][g]
                     
-                    prompt_len = sequences.prompt_lens[b_idx]
-                    gen_len = sequences.gen_lens[b_idx][g_idx]
-                    
-                    if gen_len > 0:
-                        # Extract generation tokens and their logprobs
-                        gen_logprobs = transition_scores[j, prompt_len:prompt_len + gen_len]
-                        
-                        # Convert to numpy and handle any NaNs
-                        gen_logprobs_np = gen_logprobs.cpu().numpy()
-                        gen_logprobs_np = np.nan_to_num(gen_logprobs_np, nan=0.0, posinf=0.0, neginf=-100.0)
-                        
-                        # Compute entropies (placeholder - would need actual entropy computation)
-                        entropies = np.ones_like(gen_logprobs_np) * 0.5  # Placeholder
-                        
-                        # Total sequence logprob
-                        seq_logprob = float(gen_logprobs_np.sum())
+                    if gen_len > 0 and seq.size(0) > prompt_len:
+                        # Get the actual sequence length (non-padded)
+                        non_pad_mask = seq != self.tokenizer.pad_token_id
+                        if non_pad_mask.sum() > prompt_len:
+                            actual_len = min(prompt_len + gen_len, non_pad_mask.sum().item())
+                            input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
+                            
+                            # Forward pass
+                            outputs = model(input_seq)
+                            logits = outputs.logits[0]  # [actual_len, vocab_size]
+                            
+                            # Compute log probabilities for generated tokens
+                            gen_start = prompt_len
+                            gen_end = min(actual_len, prompt_len + gen_len)
+                            
+                            if gen_end > gen_start:
+                                gen_logits = logits[gen_start-1:gen_end-1]  # [gen_len, vocab_size] 
+                                gen_tokens = seq[gen_start:gen_end]  # [gen_len]
+                                
+                                # Get logprobs for the actual tokens
+                                log_probs = torch.log_softmax(gen_logits, dim=-1)
+                                token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)
+                                
+                                # Convert to numpy
+                                gen_logprobs_np = token_logprobs.cpu().numpy()
+                                gen_logprobs_np = np.nan_to_num(gen_logprobs_np, nan=0.0, posinf=0.0, neginf=-100.0)
+                                
+                                # Compute entropies (placeholder)
+                                entropies = np.ones_like(gen_logprobs_np) * 0.5
+                                
+                                # Total sequence logprob
+                                seq_logprob = float(gen_logprobs_np.sum())
+                            else:
+                                gen_logprobs_np = np.array([])
+                                entropies = np.array([])
+                                seq_logprob = 0.0
+                        else:
+                            gen_logprobs_np = np.array([])
+                            entropies = np.array([])
+                            seq_logprob = 0.0
                     else:
                         gen_logprobs_np = np.array([])
                         entropies = np.array([])
                         seq_logprob = 0.0
                     
-                    # Store results organized by [B][G]
-                    if seq_idx == 0:  # Initialize structure
-                        all_logprobs = [[] for _ in range(B)]
-                        all_entropies = [[] for _ in range(B)]
-                        all_sequence_logprobs = [[] for _ in range(B)]
-                    
-                    all_logprobs[b_idx].append(torch.from_numpy(gen_logprobs_np))
-                    all_entropies[b_idx].append(entropies)
-                    all_sequence_logprobs[b_idx].append(seq_logprob)
+                    all_logprobs[b].append(torch.from_numpy(gen_logprobs_np))
+                    all_entropies[b].append(entropies)
+                    all_sequence_logprobs[b].append(seq_logprob)
         
         return LogprobResults(
             logprobs=all_logprobs,
