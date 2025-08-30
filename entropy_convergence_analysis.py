@@ -33,8 +33,8 @@ def analyze_entropy_convergence(results_file: str = "/content/entropy_study_resu
     print(f"RB entropy range: {np.min(rb_entropies):.3f} - {np.max(rb_entropies):.3f}")
     print()
     
-    # Batch sizes to test
-    batch_sizes = [128, 256, 512, 1024]
+    # Batch sizes to test - avoid using all samples in one batch
+    batch_sizes = [32, 64, 128, 256, 512] if N >= 512 else [16, 32, 64, 128]
     
     # Storage for results
     batch_means_basic = []
@@ -75,7 +75,13 @@ def analyze_entropy_convergence(results_file: str = "/content/entropy_study_resu
         
         print(f"  Basic entropy - Mean: {basic_mean:.4f}, Std: {basic_std:.4f}")
         print(f"  RB entropy    - Mean: {rb_mean:.4f}, Std: {rb_std:.4f}")
-        print(f"  Variance reduction: {(basic_std**2 - rb_std**2) / basic_std**2 * 100:.1f}%")
+        
+        # Handle edge case where std=0 (only 1 batch)
+        if basic_std > 0:
+            var_reduction = (basic_std**2 - rb_std**2) / basic_std**2 * 100
+            print(f"  Variance reduction: {var_reduction:.1f}%")
+        else:
+            print(f"  Variance reduction: N/A (only 1 batch)")
         print()
         
         batch_means_basic.append(basic_mean)
@@ -150,9 +156,13 @@ def analyze_entropy_convergence(results_file: str = "/content/entropy_study_resu
     print("-" * 80)
     
     for i, B in enumerate(batch_sizes):
-        var_reduction = (batch_stds_basic[i]**2 - batch_stds_rb[i]**2) / batch_stds_basic[i]**2 * 100
+        if batch_stds_basic[i] > 0:
+            var_reduction = (batch_stds_basic[i]**2 - batch_stds_rb[i]**2) / batch_stds_basic[i]**2 * 100
+            var_str = f"{var_reduction:.1f}%"
+        else:
+            var_str = "N/A"
         print(f"{B:<12} {batch_means_basic[i]:<12.4f} {batch_stds_basic[i]:<12.4f} "
-              f"{batch_means_rb[i]:<12.4f} {batch_stds_rb[i]:<12.4f} {var_reduction:<15.1f}%")
+              f"{batch_means_rb[i]:<12.4f} {batch_stds_rb[i]:<12.4f} {var_str:<15}")
     
     print("=" * 80)
     print("\nOVERALL STATISTICS:")
