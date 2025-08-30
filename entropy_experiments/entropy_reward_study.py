@@ -130,14 +130,15 @@ def run_entropy_study(
     
     # Setup generation config optimized for A100 with G=1
     # A100 has half the RAM of H100, but G=1 vs G=8 gives us 8x memory savings
-    # Reduced by 4x from initial attempt due to OOM: 128->32, 256->64
+    # Reduced by 8x from initial attempt due to OOM: 128->16, 256->32
+    # Using top_p=0.99 to reduce RB entropy computation cost
     config = GenerationConfig(
         temperature=temperature,
-        top_p=top_p,
+        top_p=0.99,           # Reduced from 1.0 to make RB entropy cheaper
         max_new_tokens=max_new_tokens,
         do_sample=True,
-        gen_batch_size=32,    # Reduced from 64 due to continued OOM
-        tf_batch_size=64      # Reduced from 128 due to continued OOM
+        gen_batch_size=16,    # Reduced from 32 due to continued OOM
+        tf_batch_size=32      # Reduced from 64 due to continued OOM
     )
     
     # Initialize sequence processor
@@ -439,7 +440,7 @@ def main():
         split="train",
         max_new_tokens=200,
         temperature=1.0,
-        top_p=1.0,
+        top_p=0.99,       # Reduced to make RB entropy computation cheaper
         seed=None,  # No seed for natural sampling
         output_dir="/content/entropy_study_results"  # Colab-accessible path
     )
@@ -455,7 +456,7 @@ def run_colab_study(num_prompts: int = 500, max_new_tokens: int = 200):
     
     print(f"🚀 Running entropy study on Google Colab A100")
     print(f"📊 {num_prompts} prompts, {max_new_tokens} max tokens")
-    print(f"🔧 Conservative A100 batch sizes: gen=32, tf=64")
+    print(f"🔧 Ultra-conservative A100: gen=16, tf=32, top_p=0.99")
     
     return run_entropy_study(
         checkpoint_path=checkpoint_path,
