@@ -281,7 +281,9 @@ class SequenceProcessor:
         )
         prompt_input_ids = tokenized_prompts['input_ids'].to(model.device)
         prompt_attention_mask = tokenized_prompts['attention_mask'].to(model.device)
-        prompt_lens = prompt_attention_mask.sum(dim=1).tolist()
+        # Use padded length for extraction, not attention mask sum
+        # This is critical for batch processing with different prompt lengths
+        padded_prompt_len = prompt_input_ids.size(1)  # All prompts padded to same length
         
         # Expand prompts for G generations: [B, seq_len] -> [B*G, seq_len]
         expanded_input_ids = prompt_input_ids.repeat_interleave(G, dim=0)
@@ -358,15 +360,15 @@ class SequenceProcessor:
         responses_text = []
         
         for b in range(B):
-            original_prompt_len = prompt_lens[b]  # Length of original prompt before expansion
+            # Use padded prompt length for ALL prompts in batch (critical fix!)
             batch_gen_lens = []
             batch_responses = []
             
             for g in range(G):
                 full_seq = sequences[b, g]  # Full sequence including prompt
                 
-                # Extract generation-only tokens (same approach as collect_rollouts.py)
-                gen_tokens = full_seq[original_prompt_len:]  # Slice off prompt, keep generation
+                # Extract generation-only tokens using padded length (works for all prompts in batch)
+                gen_tokens = full_seq[padded_prompt_len:]  # Slice off padded prompt, keep generation
                 
                 # Remove padding tokens from generation
                 non_pad_mask = gen_tokens != self.tokenizer.pad_token_id
@@ -394,7 +396,7 @@ class SequenceProcessor:
         
         return BatchedSequences(
             sequences=sequences,
-            prompt_lens=prompt_lens, 
+            prompt_lens=[padded_prompt_len] * B,  # All prompts have same padded length
             gen_lens=gen_lens,
             attention_masks=attention_masks,
             responses_text=responses_text
