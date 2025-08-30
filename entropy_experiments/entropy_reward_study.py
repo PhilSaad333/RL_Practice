@@ -135,7 +135,7 @@ def run_entropy_study(
     # Using top_p=0.99 to reduce RB entropy computation cost
     config = GenerationConfig(
         temperature=temperature,
-        top_p=0.99,           # Reduced from 1.0 to make RB entropy cheaper
+        top_p=0.995,          # Slightly increased from 0.99 for better sampling
         max_new_tokens=max_new_tokens,
         do_sample=True,
         gen_batch_size=64,    # Increased 4x: 16 -> 64 for better A100 utilization
