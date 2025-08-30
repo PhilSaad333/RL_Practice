@@ -655,27 +655,23 @@ class SequenceProcessor:
                                 rb_np = np.array([])
 
                             seq_logprob = float(token_logprobs.detach().sum().item())
+                            
+                            all_logprobs[b].append(token_logprobs)
+                            all_entropies[b].append(entropies_naive)
+                            all_rb_entropies[b].append(rb_np)
+                            all_sequence_logprobs[b].append(seq_logprob)
                         else:
+                            # Size mismatch or zero generation length
                             all_logprobs[b].append(torch.tensor([], requires_grad=True))
                             all_entropies[b].append(np.array([]))
                             all_rb_entropies[b].append(np.array([]))
                             all_sequence_logprobs[b].append(0.0)
-                            continue
                     else:
+                        # No generation found for this (b,g); record empties
                         all_logprobs[b].append(torch.tensor([], requires_grad=True))
                         all_entropies[b].append(np.array([]))
                         all_rb_entropies[b].append(np.array([]))
                         all_sequence_logprobs[b].append(0.0)
-                        continue
-                else:
-                    all_logprobs[b].append(torch.tensor([], requires_grad=True))
-                    all_entropies[b].append(np.array([]))
-                    all_rb_entropies[b].append(np.array([]))
-                    all_sequence_logprobs[b].append(0.0)
-                    continue
-
-                all_rb_entropies[b].append(rb_np)
-                all_sequence_logprobs[b].append(seq_logprob)
 
         logprob_results = LogprobResults(
             logprobs=all_logprobs,
