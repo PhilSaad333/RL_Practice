@@ -118,7 +118,7 @@ def run_entropy_study(
     print(f"Prompts: {num_prompts}")
     print(f"G=1 (one generation per prompt)")
     print(f"Max tokens: {max_new_tokens}")
-    print(f"Temperature: {config.temperature}, Top-p: {config.top_p}")
+    print(f"Temperature: {temperature}, Top-p: 0.99")
     print(f"Seed: {seed}")
     print("=" * 80)
     
