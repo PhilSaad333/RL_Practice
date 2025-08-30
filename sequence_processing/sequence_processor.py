@@ -347,6 +347,8 @@ class SequenceProcessor:
         
         # Reshape to [B, G, total_len]  
         max_len = sequences.size(1)
+        print(f"DEBUG: sequences.shape={sequences.shape}, B={B}, G={G}, max_len={max_len}")
+        print(f"DEBUG: Expected size: {B * G * max_len}, Actual size: {sequences.numel()}")
         sequences = sequences.view(B, G, max_len)
         
         # Create attention masks
