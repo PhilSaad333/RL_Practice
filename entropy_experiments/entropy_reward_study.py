@@ -92,6 +92,8 @@ def run_entropy_study(
     max_new_tokens: int = 200,
     temperature: float = 1.0,
     top_p: float = 1.0,
+    gen_batch_size: int = 64,
+    tf_batch_size: int = 64,
     seed: Optional[int] = None,
     output_dir: str = "entropy_study_results"
 ) -> Dict[str, Any]:
@@ -106,6 +108,8 @@ def run_entropy_study(
         max_new_tokens: Maximum tokens to generate
         temperature: Generation temperature
         top_p: Nucleus sampling parameter
+        gen_batch_size: Generation batch size for memory efficiency
+        tf_batch_size: Teacher forcing batch size for logprob computation
         seed: Random seed for reproducibility
         output_dir: Directory to save results
         
@@ -129,17 +133,15 @@ def run_entropy_study(
     model, tokenizer = load_model_and_tokenizer(checkpoint_path)
     model.eval()
     
-    # Setup generation config optimized for A100 with G=1
-    # A100 has half the RAM of H100, but G=1 vs G=8 gives us 8x memory savings
-    # With padding fix, we can increase batch sizes 4x for better A100 utilization
-    # Using top_p=0.99 to reduce RB entropy computation cost
+    # Setup generation config with configurable parameters
+    # With padding fix, we can use larger batch sizes for better A100 utilization
     config = GenerationConfig(
         temperature=temperature,
-        top_p=0.995,          # Slightly increased from 0.99 for better sampling
+        top_p=top_p,                  # Now configurable
         max_new_tokens=max_new_tokens,
         do_sample=True,
-        gen_batch_size=64,    # Increased 4x: 16 -> 64 for better A100 utilization
-        tf_batch_size=64      # Increased 4x: 16 -> 64 for better A100 utilization
+        gen_batch_size=gen_batch_size,  # Now configurable
+        tf_batch_size=tf_batch_size     # Now configurable
     )
     
     # Initialize sequence processor
@@ -183,7 +185,9 @@ def run_entropy_study(
     
     results = analyze_entropy_results(
         sequences, logprob_results, diagnostics_results,
-        checkpoint_path, num_prompts, generation_duration
+        checkpoint_path, num_prompts, generation_duration,
+        dataset_name, split, temperature, top_p, max_new_tokens, 
+        gen_batch_size, tf_batch_size
     )
     
     analysis_duration = (datetime.now() - analysis_start).total_seconds()
@@ -217,7 +221,9 @@ def run_entropy_study(
 
 def analyze_entropy_results(
     sequences, logprob_results, diagnostics_results,
-    checkpoint_path: str, num_prompts: int, generation_duration: float
+    checkpoint_path: str, num_prompts: int, generation_duration: float,
+    dataset_name: str, split: str, temperature: float, top_p: float, 
+    max_new_tokens: int, gen_batch_size: int, tf_batch_size: int
 ) -> Dict[str, Any]:
     """Analyze and summarize all collected metrics."""
     
@@ -312,8 +318,15 @@ def analyze_entropy_results(
             "checkpoint_path": checkpoint_path,
             "num_prompts": num_prompts,
             "G": G,
-            "dataset": "gsm8k_r1_template",
-            "split": "train"
+            "dataset": dataset_name,
+            "split": split,
+            "generation_params": {
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_new_tokens": max_new_tokens,
+                "gen_batch_size": gen_batch_size,
+                "tf_batch_size": tf_batch_size
+            }
         },
         "per_sequence_data": per_sequence_data,
         "summary_statistics": summary_stats,
@@ -445,7 +458,9 @@ def main():
         split="train",
         max_new_tokens=200,
         temperature=1.0,
-        top_p=0.99,       # Reduced to make RB entropy computation cheaper
+        top_p=1.0,        # Full sampling distribution
+        gen_batch_size=64,  # A100 optimized batch sizes
+        tf_batch_size=64,
         seed=None,  # No seed for natural sampling
         output_dir="/content/entropy_study_results"  # Colab-accessible path
     )
@@ -454,20 +469,28 @@ def main():
     return results
 
 
-def run_colab_study(num_prompts: int = 500, max_new_tokens: int = 200):
-    """Convenience function for Colab execution with common parameters."""
+def run_colab_study(
+    num_prompts: int = 500, 
+    max_new_tokens: int = 200,
+    top_p: float = 1.0,
+    gen_batch_size: int = 64,
+    tf_batch_size: int = 64
+):
+    """Convenience function for Colab execution with configurable parameters."""
     
     checkpoint_path = "/content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_60/model"
     
     print(f"🚀 Running entropy study on Google Colab A100")
     print(f"📊 {num_prompts} prompts, {max_new_tokens} max tokens")
-    print(f"🔧 Ultra-conservative A100: gen=16, tf=16, top_p=0.99")
+    print(f"🔧 Config: gen_batch={gen_batch_size}, tf_batch={tf_batch_size}, top_p={top_p}")
     
     return run_entropy_study(
         checkpoint_path=checkpoint_path,
         num_prompts=num_prompts,
         max_new_tokens=max_new_tokens,
-        top_p=0.99,  # A100 optimization
+        top_p=top_p,
+        gen_batch_size=gen_batch_size,
+        tf_batch_size=tf_batch_size,
         output_dir="/content/entropy_study_results"
     )
 
