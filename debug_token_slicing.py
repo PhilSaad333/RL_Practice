@@ -60,8 +60,9 @@ def debug_token_slicing():
     # Step 3: Generate
     print("Generating...")
     with torch.no_grad():
-        gen_output = model.generate(
+        full_sequences = model.generate(
             input_ids=expanded_input_ids,
+            attention_mask=torch.ones_like(expanded_input_ids),  # Add attention mask
             do_sample=True,
             num_return_sequences=1,  # Fixed value
             max_new_tokens=50,
@@ -70,9 +71,7 @@ def debug_token_slicing():
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
             use_cache=True
-        )
-    
-    full_sequences = gen_output.sequences  # [2, total_len]
+        )  # This returns tensor directly, not dict
     print(f"Generated sequences shape: {full_sequences.shape}")
     print()
     
