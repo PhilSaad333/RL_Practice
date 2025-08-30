@@ -42,15 +42,15 @@ def clear_gpu_memory():
     
     print("🧹 Clearing GPU memory...")
     
-    # Clear Python cache
-    gc.collect()
+    # Aggressive multi-round cleanup for stubborn A100 OOM
+    for i in range(3):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
     
-    # Clear PyTorch cache
+    # Print final memory status
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        
-        # Print memory status
         allocated = torch.cuda.memory_allocated() / 1024**3
         cached = torch.cuda.memory_reserved() / 1024**3
         print(f"   GPU Memory: {allocated:.1f}GB allocated, {cached:.1f}GB cached")
@@ -138,7 +138,7 @@ def run_entropy_study(
         max_new_tokens=max_new_tokens,
         do_sample=True,
         gen_batch_size=16,    # Reduced from 32 due to continued OOM
-        tf_batch_size=32      # Reduced from 64 due to continued OOM
+        tf_batch_size=16      # Halved again for A100 stability
     )
     
     # Initialize sequence processor
@@ -166,6 +166,10 @@ def run_entropy_study(
         with_grad=False,  # No gradients needed
         compute_rb=True   # Compute RB entropies
     )
+    
+    # Aggressive memory cleanup for A100
+    torch.cuda.empty_cache()
+    gc.collect()
     
     generation_duration = (datetime.now() - generation_start).total_seconds()
     print(f"✅ Generation completed in {generation_duration:.1f}s ({generation_duration/60:.1f} min)")
@@ -456,7 +460,7 @@ def run_colab_study(num_prompts: int = 500, max_new_tokens: int = 200):
     
     print(f"🚀 Running entropy study on Google Colab A100")
     print(f"📊 {num_prompts} prompts, {max_new_tokens} max tokens")
-    print(f"🔧 Ultra-conservative A100: gen=16, tf=32, top_p=0.99")
+    print(f"🔧 Ultra-conservative A100: gen=16, tf=16, top_p=0.99")
     
     return run_entropy_study(
         checkpoint_path=checkpoint_path,
