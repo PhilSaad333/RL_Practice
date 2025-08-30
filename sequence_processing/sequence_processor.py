@@ -7,7 +7,7 @@ reusable interface for sequence generation across the RL_Practice project.
 
 import torch
 from dataclasses import dataclass
-from typing import List, Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple, Dict
 import random
 import numpy as np
 
@@ -45,6 +45,7 @@ class GenerationConfig:
     top_p: float = 1.0
     max_new_tokens: int = 200
     do_sample: bool = True
+    num_return_sequences: int = 8  # Match collect_rollouts.py default
     
     # Batch sizes (optimized for H100 80GB)
     gen_batch_size: int = 32  # Conservative default, can go higher
@@ -67,6 +68,73 @@ class LogprobResults:
     logprobs: List[List[torch.Tensor]]     # [B][G] per-token logprobs
     entropies: List[List[np.ndarray]]      # [B][G] per-token entropies  
     sequence_logprobs: List[List[float]]   # [B][G] total sequence logprobs
+    rb_entropies: List[List[np.ndarray]]   # [B][G] per-token RB entropies under top-p (or full-softmax)
+    rewards: List[List[float]]             # [B][G] rewards per sequence using tag_pref reward function
+
+
+@dataclass
+class DiagnosticsResults:
+    """Container for distribution diagnostics results."""
+    diagnostics: List[List[DiagnosticsPack]]  # [B][G] diagnostics per sequence
+
+
+
+
+"""
+Below are dataclasses for various sequence diagnostics, which primarily are going to be used to find potential
+control variates for variance reduction in entropy estimation.
+"""
+
+@dataclass
+class TokenStepDiagnostics:
+    """Per-step token-distribution diagnostics (length T)."""
+    rb_entropy: np.ndarray          # H(q_k)
+    head_mass: np.ndarray           # s_k = mass kept by top-p (or 1.0 if full)
+    tail_mass: np.ndarray           # eps_k = 1 - s_k
+    two_point_entropy: np.ndarray   # H([s_k, eps_k])
+    top1_prob: np.ndarray           # max_j q_{k,j}
+    margin: np.ndarray              # a_{(1)} - a_{(2)}  (after temperature)
+    collision: np.ndarray           # sum_j q_{k,j}^2
+    renyi2: np.ndarray              # -log collision
+    eff_support: np.ndarray         # exp(rb_entropy)
+    logit_mean: np.ndarray          # E_q[a]
+    logit_var: np.ndarray           # Var_q(a)
+    eos_prob: Optional[np.ndarray]  # q_k(EOS) if eos_token_id is provided, else None
+
+@dataclass
+class SequenceDiagnostics:
+    """Sequence-level aggregates computed from TokenStepDiagnostics."""
+    T: int                          # number of generated tokens
+    rb_entropy_sum: float
+    rb_entropy_mean: float
+    rb_entropy_max: float
+    rb_entropy_min: float
+    early_rb_entropy_mean: float    # mean over first K steps (if T>=K)
+    late_rb_entropy_mean: float     # mean over remaining steps (if T>=K)
+    naive_surprisal_sum: float      # sum(-log p(y_k)) for realized tokens
+    naive_surprisal_mean: float
+    margin_mean: float
+    margin_sum: float
+    top1_prob_mean: float
+    collision_mean: float
+    renyi2_mean: float
+    eff_support_mean: float
+    eos_prob_mean: Optional[float]
+
+@dataclass
+class DiagnosticsPack:
+    """Container returned per sequence sample."""
+    step: TokenStepDiagnostics
+    seq: SequenceDiagnostics
+
+
+
+
+
+
+
+
+
 
 
 class SequenceProcessor:
@@ -84,13 +152,75 @@ class SequenceProcessor:
         self.tokenizer = tokenizer
         self.config = config or GenerationConfig()
         self.is_ddp = hasattr(model, 'module')
+        self.diag_results = []
         
     def _unwrap(self, model):
         """Unwrap DDP model if needed."""
         return model.module if self.is_ddp else model
         
+    def _compute_rewards(self, prompts: List[str], sequences: BatchedSequences, examples: Optional[List] = None) -> List[List[float]]:
+        """
+        Compute rewards for generated sequences using the tag_pref reward function.
+        
+        Args:
+            prompts: List of prompts used for generation [B]
+            sequences: Generated sequences from generate_with_logprobs
+            examples: Dataset examples containing gold answers [B] (optional, will try to infer from prompts)
+            
+        Returns:
+            rewards: [B][G] list of rewards for each sequence
+        """
+        from rl_training.rewards.tag_pref import reward_fn, PROMPT2GOLD
+        
+        B, G = sequences.sequences.shape[:2]
+        all_rewards = []
+        
+        # Store original PROMPT2GOLD mapping to restore later
+        original_mapping = PROMPT2GOLD.copy()
+        
+        try:
+            for b in range(B):
+                # Get gold answer
+                gold_answer = None
+                if examples and b < len(examples):
+                    gold_answer = examples[b].answer
+                else:
+                    # Try to infer from dataset if prompts match a known pattern
+                    # This is a fallback - ideally examples should be provided
+                    pass
+                
+                if gold_answer is None:
+                    # No gold answer available, give zero rewards
+                    all_rewards.append([0.0] * G)
+                    continue
+                
+                # Set up temporary PROMPT2GOLD mapping
+                prompt_id = b  # Use batch index as prompt ID
+                PROMPT2GOLD[prompt_id] = gold_answer
+                
+                # Get responses for this prompt
+                responses = sequences.responses_text[b]  # [G] list of response strings
+                
+                # Compute rewards using tag_pref function
+                try:
+                    reward_tensor = reward_fn(prompt_id, responses)  # returns torch.Tensor [G]
+                    rewards = reward_tensor.tolist()  # Convert to list
+                except Exception as e:
+                    # Fallback to zero rewards if computation fails
+                    rewards = [0.0] * G
+                    print(f"Warning: Failed to compute rewards for prompt {b}: {e}")
+                
+                all_rewards.append(rewards)
+                
+        finally:
+            # Restore original PROMPT2GOLD mapping
+            PROMPT2GOLD.clear()
+            PROMPT2GOLD.update(original_mapping)
+        
+        return all_rewards
+        
     def sample_prompts(self, dataset_name: str, split: str, num_prompts: int, 
-                      seed: Optional[int] = None) -> List[str]:
+                      seed: Optional[int] = None) -> Tuple[List[str], List]:
         """Sample prompts from a dataset.
         
         Args:
@@ -100,7 +230,7 @@ class SequenceProcessor:
             seed: Optional random seed for reproducible sampling
             
         Returns:
-            List of prompt strings
+            Tuple of (prompt strings, dataset examples)
         """
         if rlp_datasets is None:
             raise ImportError("rlp_datasets not available. Cannot sample from dataset.")
@@ -122,7 +252,7 @@ class SequenceProcessor:
         # Extract question prompts (correct field for generation - ends with <think>)
         prompts = [example.question for example in sampled_examples]
         
-        return prompts
+        return prompts, sampled_examples
     
     def generate_batched(self, prompts: List[str], G: int, 
                         gen_batch_size: Optional[int] = None) -> BatchedSequences:
@@ -174,15 +304,18 @@ class SequenceProcessor:
                 gen_output = model.generate(
                     input_ids=batch_input_ids,
                     attention_mask=batch_attention_mask,
+                    do_sample=self.config.do_sample,
+                    num_return_sequences=self.config.num_return_sequences,
                     max_new_tokens=self.config.max_new_tokens,
                     temperature=self.config.temperature,
                     top_p=self.config.top_p,
-                    do_sample=self.config.do_sample,
                     logits_processor=[stop_processor],
                     pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,  # Match collect_rollouts.py
                     use_cache=True,
                     return_dict_in_generate=True,
-                    output_scores=True
+                    output_scores=True,
+                    synced_gpus=False  # Match collect_rollouts.py - prevents distributed deadlocks
                 )
                 
                 generated = gen_output.sequences
@@ -262,7 +395,8 @@ class SequenceProcessor:
     
     def teacher_force_logprobs(self, sequences: BatchedSequences, 
                               with_grad: bool = False,
-                              tf_batch_size: Optional[int] = None) -> LogprobResults:
+                              tf_batch_size: Optional[int] = None,
+                              compute_rb: bool = False) -> LogprobResults:
         """Compute logprobs for generated sequences using teacher forcing.
         
         Args:
@@ -277,124 +411,298 @@ class SequenceProcessor:
             tf_batch_size = self.config.tf_batch_size
             
         if with_grad:
-            return self._teacher_force_with_grad(sequences, tf_batch_size)
+            return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb)
         else:
-            return self._teacher_force_no_grad(sequences, tf_batch_size)
+            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb)
     
-    def _teacher_force_no_grad(self, sequences: BatchedSequences, tf_batch_size: int) -> LogprobResults:
-        """Teacher forcing without gradients - simplified approach."""
+    def teacher_force_logprobs_with_diagnostics(self, sequences: BatchedSequences, 
+                                              with_grad: bool = False,
+                                              tf_batch_size: Optional[int] = None,
+                                              compute_rb: bool = False) -> Tuple[LogprobResults, DiagnosticsResults]:
+        """Compute logprobs and diagnostics for generated sequences using teacher forcing.
+        
+        Args:
+            sequences: BatchedSequences from generation
+            with_grad: Whether to compute gradients (True) or not (False)
+            tf_batch_size: Batch size for teacher forcing (uses config default if None)
+            compute_rb: Whether to compute RB entropies
+            
+        Returns:
+            (LogprobResults, DiagnosticsResults)
+        """
+        if tf_batch_size is None:
+            tf_batch_size = self.config.tf_batch_size
+            
+        if with_grad:
+            return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb)
+        else:
+            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb)
+    
+    def _teacher_force_no_grad(
+        self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool
+    ) -> Tuple[LogprobResults, DiagnosticsResults]:
         model = self._unwrap(self.model)
         B, G = sequences.sequences.shape[:2]
-        
-        # Initialize results
+
         all_logprobs = [[] for _ in range(B)]
         all_entropies = [[] for _ in range(B)]
+        all_rb_entropies = [[] for _ in range(B)]
         all_sequence_logprobs = [[] for _ in range(B)]
         
+        # Build diagnostics helper once (outside loops)
+        diag = DistributionDiagnostics(
+            top_p=getattr(self.config, "top_p", 1.0),
+            temperature=getattr(self.config, "temperature", 1.0),
+            eos_token_id=getattr(self.tokenizer, "eos_token_id", None),
+        )
+        
+        # Storage for diagnostics
+        all_diagnostics = [[] for _ in range(B)]
+        
+        # Helper to create empty diagnostics pack
+        def empty_diagnostics_pack():
+            empty_step = TokenStepDiagnostics(
+                rb_entropy=np.array([]),
+                head_mass=np.array([]),
+                tail_mass=np.array([]),
+                two_point_entropy=np.array([]),
+                top1_prob=np.array([]),
+                margin=np.array([]),
+                collision=np.array([]),
+                renyi2=np.array([]),
+                eff_support=np.array([]),
+                logit_mean=np.array([]),
+                logit_var=np.array([]),
+                eos_prob=None
+            )
+            empty_seq = SequenceDiagnostics(
+                T=0,
+                rb_entropy_sum=0.0,
+                rb_entropy_mean=0.0,
+                rb_entropy_max=0.0,
+                rb_entropy_min=0.0,
+                early_rb_entropy_mean=0.0,
+                late_rb_entropy_mean=0.0,
+                naive_surprisal_sum=0.0,
+                naive_surprisal_mean=0.0,
+                margin_mean=0.0,
+                margin_sum=0.0,
+                top1_prob_mean=0.0,
+                collision_mean=0.0,
+                renyi2_mean=0.0,
+                eff_support_mean=0.0,
+                eos_prob_mean=None
+            )
+            return DiagnosticsPack(step=empty_step, seq=empty_seq)
+
         with torch.no_grad():
-            # Process sequences one by one for simplicity (can optimize later)
             for b in range(B):
                 for g in range(G):
-                    seq = sequences.sequences[b, g]  # [seq_len]
+                    seq = sequences.sequences[b, g]          # [seq_len]
                     prompt_len = sequences.prompt_lens[b]
                     gen_len = sequences.gen_lens[b][g]
-                    
+
                     if gen_len > 0 and seq.size(0) > prompt_len:
-                        # Get the actual sequence length (non-padded)
                         non_pad_mask = seq != self.tokenizer.pad_token_id
                         if non_pad_mask.sum() > prompt_len:
                             actual_len = min(prompt_len + gen_len, non_pad_mask.sum().item())
                             input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
-                            
-                            # Forward pass
+
                             outputs = model(input_seq)
-                            logits = outputs.logits[0]  # [actual_len, vocab_size]
-                            
-                            # Compute log probabilities for generated tokens
+                            logits = outputs.logits[0]                 # [actual_len, V]
+
                             gen_start = prompt_len
                             gen_end = min(actual_len, prompt_len + gen_len)
-                            
                             if gen_end > gen_start:
-                                gen_logits = logits[gen_start-1:gen_end-1]  # [gen_len, vocab_size] 
-                                gen_tokens = seq[gen_start:gen_end]  # [gen_len]
+                                gen_logits = logits[gen_start-1:gen_end-1]   # [T=gen_len, V]
+                                gen_tokens = seq[gen_start:gen_end]          # [T]
                                 
-                                # Get logprobs for the actual tokens
-                                log_probs = torch.log_softmax(gen_logits, dim=-1)
-                                token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)
-                                
-                                # Convert to numpy (handle BFloat16)
+                                # Compute diagnostics from logits
+                                pack = diag.compute_from_logits(gen_logits, gen_tokens)
+                                all_diagnostics[b].append(pack)
+
+                                # Naïve per-token logprobs for realized tokens
+                                log_probs = torch.log_softmax(gen_logits, dim=-1)                # [T, V]
+                                token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)  # [T]
+
+                                # Convert to numpy
                                 gen_logprobs_np = token_logprobs.float().cpu().numpy()
                                 gen_logprobs_np = np.nan_to_num(gen_logprobs_np, nan=0.0, posinf=0.0, neginf=-100.0)
-                                
-                                # Compute entropies (placeholder)
-                                entropies = np.ones_like(gen_logprobs_np) * 0.5
-                                
-                                # Total sequence logprob
+
+                                # Naïve per-token "entropies" (surprisal of realized token)
+                                entropies_naive = -gen_logprobs_np                                 # [T]
+
+                                # RB per-step entropies under the SAME top-p/temperature policy
+                                if compute_rb:
+                                    rb_H = self._rb_entropies_top_p(
+                                        gen_logits, self.config.top_p, self.config.temperature
+                                    )                                                               # [T]
+                                    rb_np = rb_H.float().cpu().numpy()
+                                else:
+                                    rb_np = np.array([])
+
                                 seq_logprob = float(gen_logprobs_np.sum())
                             else:
                                 gen_logprobs_np = np.array([])
-                                entropies = np.array([])
+                                entropies_naive = np.array([])
+                                rb_np = np.array([])
                                 seq_logprob = 0.0
+                                all_diagnostics[b].append(empty_diagnostics_pack())
                         else:
                             gen_logprobs_np = np.array([])
-                            entropies = np.array([])
+                            entropies_naive = np.array([])
+                            rb_np = np.array([])
                             seq_logprob = 0.0
+                            all_diagnostics[b].append(empty_diagnostics_pack())
                     else:
                         gen_logprobs_np = np.array([])
-                        entropies = np.array([])
+                        entropies_naive = np.array([])
+                        rb_np = np.array([])
                         seq_logprob = 0.0
-                    
+                        all_diagnostics[b].append(empty_diagnostics_pack())
+
                     all_logprobs[b].append(torch.from_numpy(gen_logprobs_np))
-                    all_entropies[b].append(entropies)
+                    all_entropies[b].append(entropies_naive)
+                    all_rb_entropies[b].append(rb_np)
                     all_sequence_logprobs[b].append(seq_logprob)
-        
-        return LogprobResults(
+
+        logprob_results = LogprobResults(
             logprobs=all_logprobs,
             entropies=all_entropies,
-            sequence_logprobs=all_sequence_logprobs
+            sequence_logprobs=all_sequence_logprobs,
+            rb_entropies=all_rb_entropies,
+            rewards=[],  # Will be filled by generate_with_logprobs
         )
+        
+        diagnostics_results = DiagnosticsResults(
+            diagnostics=all_diagnostics
+        )
+        
+        return logprob_results, diagnostics_results
     
-    def _teacher_force_with_grad(self, sequences: BatchedSequences, tf_batch_size: int) -> LogprobResults:
-        """Teacher forcing with gradients - following dr_grpo.py pattern."""
+    def _teacher_force_with_grad(
+        self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool
+    ) -> Tuple[LogprobResults, DiagnosticsResults]:
+        """
+        Gradient-enabled version. By default we do NOT build a gradient graph for RB entropies,
+        since these are typically diagnostics. If you want grads for RB later, remove .detach().
+        """
         model = self._unwrap(self.model)
         B, G = sequences.sequences.shape[:2]
-        
-        # For now, return a simple implementation
-        # TODO: Implement full gradient-enabled version following dr_grpo.py _policy_logp
+
         all_logprobs = [[] for _ in range(B)]
         all_entropies = [[] for _ in range(B)]
+        all_rb_entropies = [[] for _ in range(B)]
         all_sequence_logprobs = [[] for _ in range(B)]
-        
-        # Placeholder implementation
+
         for b in range(B):
             for g in range(G):
+                seq = sequences.sequences[b, g]
+                prompt_len = sequences.prompt_lens[b]
                 gen_len = sequences.gen_lens[b][g]
-                if gen_len > 0:
-                    # Placeholder tensors that require grad
-                    logprobs = torch.zeros(gen_len, requires_grad=True)
-                    entropies = np.ones(gen_len) * 0.5
-                    seq_logprob = 0.0
+
+                if gen_len > 0 and seq.size(0) > prompt_len:
+                    non_pad_mask = seq != self.tokenizer.pad_token_id
+                    if non_pad_mask.sum() > prompt_len:
+                        actual_len = min(prompt_len + gen_len, non_pad_mask.sum().item())
+                        input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
+
+                        outputs = model(input_seq)                # grads enabled
+                        logits = outputs.logits[0]                # [actual_len, V]
+
+                        gen_start = prompt_len
+                        gen_end = min(actual_len, prompt_len + gen_len)
+                        if gen_end > gen_start:
+                            gen_logits = logits[gen_start-1:gen_end-1]   # [T, V]
+                            gen_tokens = seq[gen_start:gen_end]          # [T]
+
+                            log_probs = torch.log_softmax(gen_logits, dim=-1)
+                            token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)   # [T]
+
+                            # store torch tensors with grad
+                            all_logprobs[b].append(token_logprobs)
+
+                            # naive surprisal as numpy for now (diagnostic); keep torch if you want grads
+                            entropies_naive = (-token_logprobs).detach().float().cpu().numpy()
+                            all_entropies[b].append(entropies_naive)
+
+                            if compute_rb:
+                                with torch.no_grad():  # keep RB as diagnostic
+                                    rb_H = self._rb_entropies_top_p(
+                                        gen_logits, self.config.top_p, self.config.temperature
+                                    )
+                                    rb_np = rb_H.float().cpu().numpy()
+                            else:
+                                rb_np = np.array([])
+
+                            seq_logprob = float(token_logprobs.detach().sum().item())
+                        else:
+                            all_logprobs[b].append(torch.tensor([], requires_grad=True))
+                            all_entropies[b].append(np.array([]))
+                            all_rb_entropies[b].append(np.array([]))
+                            all_sequence_logprobs[b].append(0.0)
+                            continue
+                    else:
+                        all_logprobs[b].append(torch.tensor([], requires_grad=True))
+                        all_entropies[b].append(np.array([]))
+                        all_rb_entropies[b].append(np.array([]))
+                        all_sequence_logprobs[b].append(0.0)
+                        continue
                 else:
-                    logprobs = torch.tensor([], requires_grad=True)
-                    entropies = np.array([])
-                    seq_logprob = 0.0
-                
-                all_logprobs[b].append(logprobs)
-                all_entropies[b].append(entropies)
+                    all_logprobs[b].append(torch.tensor([], requires_grad=True))
+                    all_entropies[b].append(np.array([]))
+                    all_rb_entropies[b].append(np.array([]))
+                    all_sequence_logprobs[b].append(0.0)
+                    continue
+
+                all_rb_entropies[b].append(rb_np)
                 all_sequence_logprobs[b].append(seq_logprob)
-        
-        return LogprobResults(
+
+        logprob_results = LogprobResults(
             logprobs=all_logprobs,
             entropies=all_entropies,
-            sequence_logprobs=all_sequence_logprobs
+            sequence_logprobs=all_sequence_logprobs,
+            rb_entropies=all_rb_entropies,
+            rewards=[],  # Will be filled by generate_with_logprobs
         )
+        
+        # For now, return empty diagnostics for the with_grad version
+        # TODO: Add full diagnostics support if needed
+        B, G = len(all_logprobs), len(all_logprobs[0]) if all_logprobs else 0
+        empty_diagnostics = [[DiagnosticsPack(
+            step=TokenStepDiagnostics(
+                rb_entropy=np.array([]),
+                head_mass=np.array([]),
+                tail_mass=np.array([]),
+                two_point_entropy=np.array([]),
+                top1_prob=np.array([]),
+                margin=np.array([]),
+                collision=np.array([]),
+                renyi2=np.array([]),
+                eff_support=np.array([]),
+                logit_mean=np.array([]),
+                logit_var=np.array([]),
+                eos_prob=None
+            ),
+            seq=SequenceDiagnostics(
+                T=0, rb_entropy_sum=0.0, rb_entropy_mean=0.0, rb_entropy_max=0.0, rb_entropy_min=0.0,
+                early_rb_entropy_mean=0.0, late_rb_entropy_mean=0.0, naive_surprisal_sum=0.0, 
+                naive_surprisal_mean=0.0, margin_mean=0.0, margin_sum=0.0, top1_prob_mean=0.0,
+                collision_mean=0.0, renyi2_mean=0.0, eff_support_mean=0.0, eos_prob_mean=None
+            )
+        ) for g in range(G)] for b in range(B)]
+        
+        diagnostics_results = DiagnosticsResults(diagnostics=empty_diagnostics)
+        
+        return logprob_results, diagnostics_results
     
     def generate_with_logprobs(self, prompts: Optional[List[str]] = None, G: int = 8,
                               dataset_name: Optional[str] = None, split: str = "train",
                               num_prompts: Optional[int] = None, seed: Optional[int] = None,
                               with_grad: bool = False,
                               gen_batch_size: Optional[int] = None,
-                              tf_batch_size: Optional[int] = None) -> Tuple[BatchedSequences, LogprobResults]:
+                              tf_batch_size: Optional[int] = None,
+                              compute_rb: bool = False,) -> Tuple[BatchedSequences, LogprobResults, DiagnosticsResults]:
         """Main interface: Generate sequences and compute logprobs.
         
         Args:
@@ -409,18 +717,224 @@ class SequenceProcessor:
             tf_batch_size: Teacher forcing batch size
             
         Returns:
-            (BatchedSequences, LogprobResults)
+            (BatchedSequences, LogprobResults, DiagnosticsResults)
         """
-        # Get prompts either from parameter or by sampling dataset
+        # Get prompts and examples either from parameter or by sampling dataset
+        examples = None
         if prompts is None:
             if dataset_name is None or num_prompts is None:
                 raise ValueError("Must provide either prompts OR (dataset_name + num_prompts)")
-            prompts = self.sample_prompts(dataset_name, split, num_prompts, seed)
+            prompts, examples = self.sample_prompts(dataset_name, split, num_prompts, seed)
         
         # Generate sequences
         sequences = self.generate_batched(prompts, G, gen_batch_size)
         
-        # Compute logprobs
-        logprob_results = self.teacher_force_logprobs(sequences, with_grad, tf_batch_size)
+        # Compute logprobs and diagnostics
+        logprob_results, diagnostics_results = self.teacher_force_logprobs_with_diagnostics(sequences, with_grad, tf_batch_size, compute_rb)
         
-        return sequences, logprob_results
+        # Compute rewards 
+        rewards = self._compute_rewards(prompts, sequences, examples)
+        
+        # Add rewards to logprob results
+        logprob_results.rewards = rewards
+        
+        return sequences, logprob_results, diagnostics_results
+    
+    # === NEW: helper for RB entropies with top-p (vectorized over timesteps) ===
+    def _rb_entropies_top_p(
+        self,
+        gen_logits: torch.Tensor,   # [T, V] logits aligned to next-token positions
+        top_p: float,
+        temperature: float
+    ) -> torch.Tensor:
+        """
+        Compute per-step RB entropies H(q) with the SAME sampling policy you used:
+          - temperature scaling
+          - top-p truncation (if top_p < 1.0), else full softmax.
+
+        Returns:
+            rb_H: torch.Tensor [T] with per-step entropies (nats).
+        """
+        # Temperature
+        a = gen_logits / max(temperature, 1e-8)  # [T, V]
+
+        if top_p >= 1.0:
+            # Full softmax RB: H = logsumexp(a) - sum softmax(a) * a
+            Z_full = torch.logsumexp(a, dim=-1)                    # [T]
+            p_full = torch.softmax(a, dim=-1)                      # [T, V]
+            H = Z_full - (p_full * a).sum(dim=-1)                  # [T]
+            return H
+
+        # Probabilities for ranking only (no need to keep them for entropy)
+        p = torch.softmax(a, dim=-1)                               # [T, V]
+        # Sort descending
+        p_sorted, idx_sorted = p.sort(dim=-1, descending=True)     # [T, V], [T, V]
+        cumsum = p_sorted.cumsum(dim=-1)                           # [T, V]
+
+        # Keep minimal set whose previous cumulative mass <= top_p
+        # This keeps the "threshold token" that crosses p as well.
+        keep_sorted = (cumsum - p_sorted) <= top_p                 # [T, V]
+        # Safety: ensure at least one token kept
+        keep_sorted[..., 0] = True
+
+        # Scatter keep mask back to vocab order
+        T, V = p.shape
+        keep = torch.zeros_like(p, dtype=torch.bool)               # [T, V]
+        keep.scatter_(dim=-1, index=idx_sorted, src=keep_sorted)
+
+        # Masked logits: outside S -> -inf
+        a_masked = a.masked_fill(~keep, float('-inf'))             # [T, V]
+
+        # Renormalized (truncated) log-partition and probs on S
+        Z_S = torch.logsumexp(a_masked, dim=-1)                    # [T]
+        # Softmax with -inf outside S renormalizes on S
+        q = torch.softmax(a_masked, dim=-1)                        # [T, V]
+
+        # RB entropy on truncated distribution q
+        H = Z_S - (q * a).sum(dim=-1)                              # [T]
+        return H
+
+
+
+
+
+class DistributionDiagnostics:
+    """
+    Compute token-distribution diagnostics under the SAME sampling policy used for generation:
+    temperature + (optionally) top-p (truncated and renormalized).
+
+    Used primarily for finding potential control variates for variance reduction in entropy estimation.
+    """
+    def __init__(self, *, top_p: float = 1.0, temperature: float = 1.0, eos_token_id: Optional[int] = None):
+        self.top_p = float(top_p)
+        self.temperature = float(max(temperature, 1e-8))
+        self.eos_token_id = eos_token_id
+
+    @torch.no_grad()
+    def compute_from_logits(
+        self,
+        gen_logits: torch.Tensor,   # [T, V], logits aligned to next-token positions
+        realized_tokens: torch.Tensor,  # [T], actual sampled token ids (for naive surprisal)
+    ) -> DiagnosticsPack:
+        """
+        Returns per-step diagnostics and sequence aggregates (numpy), computed on the fly.
+        """
+        device = gen_logits.device
+        T, V = gen_logits.shape
+
+        # temperature scaling
+        a = gen_logits / self.temperature  # [T, V]
+
+        # full-softmax objects useful for head/tail accounting even if top_p<1
+        Z_full = torch.logsumexp(a, dim=-1)             # [T]
+        p_full = torch.softmax(a, dim=-1)               # [T, V]
+
+        # nucleus selection
+        if self.top_p < 1.0:
+            p_sorted, idx_sorted = p_full.sort(dim=-1, descending=True)        # [T, V]
+            cumsum = p_sorted.cumsum(dim=-1)
+            keep_sorted = (cumsum - p_sorted) <= self.top_p
+            keep_sorted[..., 0] = True
+            keep = torch.zeros_like(p_full, dtype=torch.bool)
+            keep.scatter_(dim=-1, index=idx_sorted, src=keep_sorted)
+            a_masked = a.masked_fill(~keep, float('-inf'))                     # -inf outside S
+            Z_S = torch.logsumexp(a_masked, dim=-1)                            # [T]
+            q = torch.softmax(a_masked, dim=-1)                                # [T, V] on S
+            s = (p_full * keep).sum(dim=-1)                                    # [T]
+        else:
+            # full vocabulary
+            keep = torch.ones_like(p_full, dtype=torch.bool)
+            a_masked = a
+            Z_S = Z_full
+            q = p_full
+            s = torch.ones_like(Z_full)
+
+        eps = (1.0 - s).clamp_min(0.0)                                         # tail mass
+        # RB entropy H(q) = Z_S - sum q * a  (stable)
+        H = Z_S - (q * a).sum(dim=-1)                                          # [T]
+
+        # two-point entropy of [s, eps]
+        # H_2pt = -s log s - eps log eps, treating 0 log 0 = 0
+        def _safe_log(x): return torch.log(x.clamp_min(1e-38))
+        H_two = -(s * _safe_log(s) + eps * _safe_log(eps))
+
+        # top-1 prob and margin
+        # NOTE: compute top1 from q (the actual sampling distribution)
+        q_sorted, _ = q.sort(dim=-1, descending=True)
+        top1 = q_sorted[..., 0]
+        top2 = torch.where(q_sorted.shape[-1] > 1, q_sorted[..., 1], torch.zeros_like(top1))
+        # margin in logit space: a_{(1)} - a_{(2)} (use masked a)
+        a_sorted, _ = a_masked.sort(dim=-1, descending=True)
+        a1 = a_sorted[..., 0]
+        a2 = torch.where(a_sorted.shape[-1] > 1, a_sorted[..., 1], torch.full_like(a1, -float('inf')))
+        margin = (a1 - a2).masked_fill(~torch.isfinite(a2), 0.0)
+
+        # collision, Rényi-2, effective support
+        collision = (q * q).sum(dim=-1)             # sum q^2
+        renyi2 = -torch.log(collision.clamp_min(1e-38))
+        eff_support = torch.exp(H)                  # exp(H)
+
+        # moments of logits under q
+        Ea = (q * a).sum(dim=-1)
+        Ea2 = (q * (a * a)).sum(dim=-1)
+        var_a = (Ea2 - Ea * Ea).clamp_min(0.0)
+
+        # EOS probability under q (if provided)
+        eos_prob = None
+        if self.eos_token_id is not None and 0 <= self.eos_token_id < V:
+            eos_prob = q[..., self.eos_token_id]
+
+        # naive per-step surprisal for realized tokens (for comparison)
+        log_probs = torch.log_softmax(gen_logits, dim=-1)
+        token_lp = log_probs.gather(1, realized_tokens.view(-1, 1)).squeeze(1)  # [T]
+        naive_surprisal = (-token_lp).float()                                   # [T]
+
+        # convert to numpy
+        to_np = lambda t: t.detach().float().cpu().numpy()
+        step = TokenStepDiagnostics(
+            rb_entropy=to_np(H),
+            head_mass=to_np(s),
+            tail_mass=to_np(eps),
+            two_point_entropy=to_np(H_two),
+            top1_prob=to_np(top1),
+            margin=to_np(margin),
+            collision=to_np(collision),
+            renyi2=to_np(renyi2),
+            eff_support=to_np(eff_support),
+            logit_mean=to_np(Ea),
+            logit_var=to_np(var_a),
+            eos_prob=(to_np(eos_prob) if eos_prob is not None else None),
+        )
+
+        # aggregates
+        T_int = int(T)
+        K = min(16, T_int)  # early-phase window (tunable)
+        rb_sum = float(H.sum().item())
+        rb_mean = float(H.mean().item())
+        rb_max = float(H.max().item())
+        rb_min = float(H.min().item())
+        early_mean = float(H[:K].mean().item()) if T_int >= 1 else 0.0
+        late_mean = float(H[K:].mean().item()) if T_int > K else early_mean
+
+        naive_sum = float(naive_surprisal.sum().item())
+        naive_mean = float(naive_surprisal.mean().item()) if T_int > 0 else 0.0
+
+        seq = SequenceDiagnostics(
+            T=T_int,
+            rb_entropy_sum=rb_sum,
+            rb_entropy_mean=rb_mean,
+            rb_entropy_max=rb_max,
+            rb_entropy_min=rb_min,
+            early_rb_entropy_mean=early_mean,
+            late_rb_entropy_mean=late_mean,
+            naive_surprisal_sum=naive_sum,
+            naive_surprisal_mean=naive_mean,
+            margin_mean=float(margin.mean().item()),
+            margin_sum=float(margin.sum().item()),
+            top1_prob_mean=float(top1.mean().item()),
+            collision_mean=float(collision.mean().item()),
+            renyi2_mean=float(renyi2.mean().item()),
+            eff_support_mean=float(eff_support.mean().item()),
+            eos_prob_mean=(float(eos_prob.mean().item()) if eos_prob is not None and T_int>0 else None),
+        )
+        return DiagnosticsPack(step=step, seq=seq)
