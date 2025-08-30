@@ -35,6 +35,29 @@ from sequence_processing import SequenceProcessor, GenerationConfig
 from entropy_experiments.offline_entropy_probe import load_peft_for_probe
 
 
+def clear_gpu_memory():
+    """Clear GPU memory in Colab - run this if you get OOM errors."""
+    import gc
+    import torch
+    
+    print("🧹 Clearing GPU memory...")
+    
+    # Clear Python cache
+    gc.collect()
+    
+    # Clear PyTorch cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        
+        # Print memory status
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        cached = torch.cuda.memory_reserved() / 1024**3
+        print(f"   GPU Memory: {allocated:.1f}GB allocated, {cached:.1f}GB cached")
+    
+    print("✅ GPU memory cleared!")
+
+
 def load_model_and_tokenizer(checkpoint_path: str, base_model_id: str = "Qwen/Qwen2.5-1.5B"):
     """Load LoRA model and tokenizer for entropy analysis."""
     print(f"Loading model from checkpoint: {checkpoint_path}")
@@ -107,14 +130,14 @@ def run_entropy_study(
     
     # Setup generation config optimized for A100 with G=1
     # A100 has half the RAM of H100, but G=1 vs G=8 gives us 8x memory savings
-    # Reduced by 2x from initial attempt due to OOM: 128->64, 256->128
+    # Reduced by 4x from initial attempt due to OOM: 128->32, 256->64
     config = GenerationConfig(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
         do_sample=True,
-        gen_batch_size=64,    # Reduced from 128 due to OOM
-        tf_batch_size=128     # Reduced from 256 due to OOM
+        gen_batch_size=32,    # Reduced from 64 due to continued OOM
+        tf_batch_size=64      # Reduced from 128 due to continued OOM
     )
     
     # Initialize sequence processor
@@ -432,7 +455,7 @@ def run_colab_study(num_prompts: int = 500, max_new_tokens: int = 200):
     
     print(f"🚀 Running entropy study on Google Colab A100")
     print(f"📊 {num_prompts} prompts, {max_new_tokens} max tokens")
-    print(f"🔧 A100-optimized batch sizes: gen=64, tf=128")
+    print(f"🔧 Conservative A100 batch sizes: gen=32, tf=64")
     
     return run_entropy_study(
         checkpoint_path=checkpoint_path,
