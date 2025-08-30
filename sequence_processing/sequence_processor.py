@@ -352,30 +352,37 @@ class SequenceProcessor:
         # Create attention masks
         attention_masks = (sequences != self.tokenizer.pad_token_id)
         
-        # Calculate generation lengths for each sequence
+        # Extract generation-only tokens following collect_rollouts.py approach
+        # sequences shape: [B, G, total_len] where total_len includes prompt + generation
         gen_lens = []
         responses_text = []
         
         for b in range(B):
-            prompt_len = prompt_lens[b]
+            original_prompt_len = prompt_lens[b]  # Length of original prompt before expansion
             batch_gen_lens = []
             batch_responses = []
             
             for g in range(G):
-                seq = sequences[b, g]
-                # Find actual sequence length (excluding padding)
-                non_pad_mask = seq != self.tokenizer.pad_token_id
+                full_seq = sequences[b, g]  # Full sequence including prompt
+                
+                # Extract generation-only tokens (same approach as collect_rollouts.py)
+                gen_tokens = full_seq[original_prompt_len:]  # Slice off prompt, keep generation
+                
+                # Remove padding tokens from generation
+                non_pad_mask = gen_tokens != self.tokenizer.pad_token_id
                 if non_pad_mask.any():
-                    actual_len = non_pad_mask.sum().item()
-                    gen_len = max(0, actual_len - prompt_len)
+                    # Find last non-pad token
+                    last_valid_idx = non_pad_mask.nonzero()[-1].item() + 1
+                    gen_tokens = gen_tokens[:last_valid_idx]
+                    gen_len = last_valid_idx
                 else:
+                    gen_tokens = torch.tensor([], dtype=gen_tokens.dtype, device=gen_tokens.device)
                     gen_len = 0
                 
                 batch_gen_lens.append(gen_len)
                 
-                # Decode response text (generation part only)
+                # Decode generation-only tokens
                 if gen_len > 0:
-                    gen_tokens = seq[prompt_len:prompt_len + gen_len]
                     response_text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
                 else:
                     response_text = ""
