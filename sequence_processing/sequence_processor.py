@@ -507,24 +507,31 @@ class SequenceProcessor:
         with torch.no_grad():
             for b in range(B):
                 for g in range(G):
-                    seq = sequences.sequences[b, g]          # [seq_len]
-                    prompt_len = sequences.prompt_lens[b]
+                    seq = sequences.sequences[b, g]          # [total_len]
+                    prompt_len_padded = sequences.prompt_lens[b]    # this is the batch's padded prompt length
                     gen_len = sequences.gen_lens[b][g]
+                    seq_len_total = seq.size(0)
 
-                    if gen_len > 0 and seq.size(0) > prompt_len:
-                        non_pad_mask = seq != self.tokenizer.pad_token_id
-                        if non_pad_mask.sum() > prompt_len:
-                            actual_len = min(prompt_len + gen_len, non_pad_mask.sum().item())
-                            input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
+                    if gen_len > 0 and seq_len_total > prompt_len_padded:
+                        # Take prompt + exactly gen_len tokens (prefix used for TF)
+                        actual_len = min(prompt_len_padded + gen_len, seq_len_total)
+                        input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
 
-                            outputs = model(input_seq)
-                            logits = outputs.logits[0]                 # [actual_len, V]
+                        # ATTENTION: use the attention mask so left pads are ignored correctly
+                        attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(input_seq.device)
 
-                            gen_start = prompt_len
-                            gen_end = min(actual_len, prompt_len + gen_len)
-                            if gen_end > gen_start:
-                                gen_logits = logits[gen_start-1:gen_end-1]   # [T=gen_len, V]
-                                gen_tokens = seq[gen_start:gen_end]          # [T]
+                        outputs = model(input_seq, attention_mask=attn)
+                        logits = outputs.logits[0]  # [actual_len, V]
+
+                        gen_start = prompt_len_padded
+                        gen_end   = prompt_len_padded + gen_len
+
+                        # Logits aligned to next-token targets for the generated tokens:
+                        # token t at position i uses logits at i-1
+                        gen_logits = logits[gen_start-1 : gen_end-1]   # [T = gen_len, V]
+                        gen_tokens = seq[gen_start : gen_end]          # [T]
+
+                        if gen_logits.size(0) == gen_tokens.size(0) and gen_logits.size(0) > 0:
                                 
                                 # Compute diagnostics from logits
                                 pack = diag.compute_from_logits(gen_logits, gen_tokens)
@@ -606,24 +613,31 @@ class SequenceProcessor:
 
         for b in range(B):
             for g in range(G):
-                seq = sequences.sequences[b, g]
-                prompt_len = sequences.prompt_lens[b]
+                seq = sequences.sequences[b, g]          # [total_len]
+                prompt_len_padded = sequences.prompt_lens[b]    # this is the batch's padded prompt length
                 gen_len = sequences.gen_lens[b][g]
+                seq_len_total = seq.size(0)
 
-                if gen_len > 0 and seq.size(0) > prompt_len:
-                    non_pad_mask = seq != self.tokenizer.pad_token_id
-                    if non_pad_mask.sum() > prompt_len:
-                        actual_len = min(prompt_len + gen_len, non_pad_mask.sum().item())
-                        input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
+                if gen_len > 0 and seq_len_total > prompt_len_padded:
+                    # Take prompt + exactly gen_len tokens (prefix used for TF)
+                    actual_len = min(prompt_len_padded + gen_len, seq_len_total)
+                    input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
 
-                        outputs = model(input_seq)                # grads enabled
-                        logits = outputs.logits[0]                # [actual_len, V]
+                    # ATTENTION: use the attention mask so left pads are ignored correctly
+                    attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(input_seq.device)
 
-                        gen_start = prompt_len
-                        gen_end = min(actual_len, prompt_len + gen_len)
-                        if gen_end > gen_start:
-                            gen_logits = logits[gen_start-1:gen_end-1]   # [T, V]
-                            gen_tokens = seq[gen_start:gen_end]          # [T]
+                    outputs = model(input_seq, attention_mask=attn)  # grads enabled
+                    logits = outputs.logits[0]                # [actual_len, V]
+
+                    gen_start = prompt_len_padded
+                    gen_end   = prompt_len_padded + gen_len
+
+                    # Logits aligned to next-token targets for the generated tokens:
+                    # token t at position i uses logits at i-1
+                    gen_logits = logits[gen_start-1 : gen_end-1]   # [T = gen_len, V]
+                    gen_tokens = seq[gen_start : gen_end]          # [T]
+
+                    if gen_logits.size(0) == gen_tokens.size(0) and gen_logits.size(0) > 0:
 
                             log_probs = torch.log_softmax(gen_logits, dim=-1)
                             token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)   # [T]
