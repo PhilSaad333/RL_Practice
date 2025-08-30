@@ -634,40 +634,30 @@ class SequenceProcessor:
                     gen_tokens = seq[gen_start : gen_end]          # [T]
 
                     if gen_logits.size(0) == gen_tokens.size(0) and gen_logits.size(0) > 0:
+                        log_probs = torch.log_softmax(gen_logits, dim=-1)
+                        token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)   # [T]
 
-                            log_probs = torch.log_softmax(gen_logits, dim=-1)
-                            token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)   # [T]
+                        # naive surprisal as numpy for now (diagnostic); keep torch if you want grads
+                        entropies_naive = (-token_logprobs).detach().float().cpu().numpy()
 
-                            # store torch tensors with grad
-                            all_logprobs[b].append(token_logprobs)
-
-                            # naive surprisal as numpy for now (diagnostic); keep torch if you want grads
-                            entropies_naive = (-token_logprobs).detach().float().cpu().numpy()
-                            all_entropies[b].append(entropies_naive)
-
-                            if compute_rb:
-                                with torch.no_grad():  # keep RB as diagnostic
-                                    rb_H = self._rb_entropies_top_p(
-                                        gen_logits, self.config.top_p, self.config.temperature
-                                    )
-                                    rb_np = rb_H.float().cpu().numpy()
-                            else:
-                                rb_np = np.array([])
-
-                            seq_logprob = float(token_logprobs.detach().sum().item())
-                            
-                            all_logprobs[b].append(token_logprobs)
-                            all_entropies[b].append(entropies_naive)
-                            all_rb_entropies[b].append(rb_np)
-                            all_sequence_logprobs[b].append(seq_logprob)
+                        if compute_rb:
+                            with torch.no_grad():  # keep RB as diagnostic
+                                rb_H = self._rb_entropies_top_p(
+                                    gen_logits, self.config.top_p, self.config.temperature
+                                )
+                                rb_np = rb_H.float().cpu().numpy()
                         else:
-                            # Size mismatch or zero generation length
-                            all_logprobs[b].append(torch.tensor([], requires_grad=True))
-                            all_entropies[b].append(np.array([]))
-                            all_rb_entropies[b].append(np.array([]))
-                            all_sequence_logprobs[b].append(0.0)
+                            rb_np = np.array([])
+
+                        seq_logprob = float(token_logprobs.detach().sum().item())
+                        
+                        # store torch tensors with grad
+                        all_logprobs[b].append(token_logprobs)
+                        all_entropies[b].append(entropies_naive)
+                        all_rb_entropies[b].append(rb_np)
+                        all_sequence_logprobs[b].append(seq_logprob)
                     else:
-                        # No generation found for this (b,g); record empties
+                        # Size mismatch or zero generation length
                         all_logprobs[b].append(torch.tensor([], requires_grad=True))
                         all_entropies[b].append(np.array([]))
                         all_rb_entropies[b].append(np.array([]))
