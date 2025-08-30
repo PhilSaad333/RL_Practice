@@ -22,6 +22,7 @@ Study Goals:
 import os
 import sys
 import json
+import gc
 import torch
 import numpy as np
 from datetime import datetime
