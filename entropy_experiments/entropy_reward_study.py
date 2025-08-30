@@ -131,15 +131,15 @@ def run_entropy_study(
     
     # Setup generation config optimized for A100 with G=1
     # A100 has half the RAM of H100, but G=1 vs G=8 gives us 8x memory savings
-    # Reduced by 8x from initial attempt due to OOM: 128->16, 256->32
+    # With padding fix, we can increase batch sizes 4x for better A100 utilization
     # Using top_p=0.99 to reduce RB entropy computation cost
     config = GenerationConfig(
         temperature=temperature,
         top_p=0.99,           # Reduced from 1.0 to make RB entropy cheaper
         max_new_tokens=max_new_tokens,
         do_sample=True,
-        gen_batch_size=16,    # Reduced from 32 due to continued OOM
-        tf_batch_size=16      # Halved again for A100 stability
+        gen_batch_size=64,    # Increased 4x: 16 -> 64 for better A100 utilization
+        tf_batch_size=64      # Increased 4x: 16 -> 64 for better A100 utilization
     )
     
     # Initialize sequence processor
