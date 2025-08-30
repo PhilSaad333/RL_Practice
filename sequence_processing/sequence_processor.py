@@ -305,7 +305,7 @@ class SequenceProcessor:
                     input_ids=batch_input_ids,
                     attention_mask=batch_attention_mask,
                     do_sample=self.config.do_sample,
-                    num_return_sequences=self.config.num_return_sequences,
+                    num_return_sequences=G,  # Use G parameter instead of config value
                     max_new_tokens=self.config.max_new_tokens,
                     temperature=self.config.temperature,
                     top_p=self.config.top_p,
@@ -347,8 +347,6 @@ class SequenceProcessor:
         
         # Reshape to [B, G, total_len]  
         max_len = sequences.size(1)
-        print(f"DEBUG: sequences.shape={sequences.shape}, B={B}, G={G}, max_len={max_len}")
-        print(f"DEBUG: Expected size: {B * G * max_len}, Actual size: {sequences.numel()}")
         sequences = sequences.view(B, G, max_len)
         
         # Create attention masks
