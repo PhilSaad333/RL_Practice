@@ -472,6 +472,7 @@ def main():
 def run_colab_study(
     num_prompts: int = 500, 
     max_new_tokens: int = 200,
+    temperature: float = 1.0,
     top_p: float = 1.0,
     gen_batch_size: int = 64,
     tf_batch_size: int = 64
@@ -482,12 +483,13 @@ def run_colab_study(
     
     print(f"🚀 Running entropy study on Google Colab A100")
     print(f"📊 {num_prompts} prompts, {max_new_tokens} max tokens")
-    print(f"🔧 Config: gen_batch={gen_batch_size}, tf_batch={tf_batch_size}, top_p={top_p}")
+    print(f"🔧 Config: temp={temperature}, top_p={top_p}, gen_batch={gen_batch_size}, tf_batch={tf_batch_size}")
     
     return run_entropy_study(
         checkpoint_path=checkpoint_path,
         num_prompts=num_prompts,
         max_new_tokens=max_new_tokens,
+        temperature=temperature,
         top_p=top_p,
         gen_batch_size=gen_batch_size,
         tf_batch_size=tf_batch_size,
