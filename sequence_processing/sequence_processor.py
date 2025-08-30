@@ -75,7 +75,7 @@ class LogprobResults:
 @dataclass
 class DiagnosticsResults:
     """Container for distribution diagnostics results."""
-    diagnostics: List[List[DiagnosticsPack]]  # [B][G] diagnostics per sequence
+    diagnostics: List[List["DiagnosticsPack"]]  # [B][G] diagnostics per sequence
 
 
 
