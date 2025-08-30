@@ -862,11 +862,17 @@ class DistributionDiagnostics:
         # NOTE: compute top1 from q (the actual sampling distribution)
         q_sorted, _ = q.sort(dim=-1, descending=True)
         top1 = q_sorted[..., 0]
-        top2 = torch.where(q_sorted.shape[-1] > 1, q_sorted[..., 1], torch.zeros_like(top1))
+        if q_sorted.shape[-1] > 1:
+            top2 = q_sorted[..., 1]
+        else:
+            top2 = torch.zeros_like(top1)
         # margin in logit space: a_{(1)} - a_{(2)} (use masked a)
         a_sorted, _ = a_masked.sort(dim=-1, descending=True)
         a1 = a_sorted[..., 0]
-        a2 = torch.where(a_sorted.shape[-1] > 1, a_sorted[..., 1], torch.full_like(a1, -float('inf')))
+        if a_sorted.shape[-1] > 1:
+            a2 = a_sorted[..., 1]
+        else:
+            a2 = torch.full_like(a1, -float('inf'))
         margin = (a1 - a2).masked_fill(~torch.isfinite(a2), 0.0)
 
         # collision, Rényi-2, effective support
