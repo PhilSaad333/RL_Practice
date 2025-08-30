@@ -107,14 +107,14 @@ def run_entropy_study(
     
     # Setup generation config optimized for A100 with G=1
     # A100 has half the RAM of H100, but G=1 vs G=8 gives us 8x memory savings
-    # Net result: can use ~4x larger batch sizes than H100 with G=8
+    # Reduced by 2x from initial attempt due to OOM: 128->64, 256->128
     config = GenerationConfig(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
         do_sample=True,
-        gen_batch_size=128,   # 4x larger than H100 w/ G=8 (32->128)
-        tf_batch_size=256     # 4x larger than H100 w/ G=8 (64->256)
+        gen_batch_size=64,    # Reduced from 128 due to OOM
+        tf_batch_size=128     # Reduced from 256 due to OOM
     )
     
     # Initialize sequence processor
@@ -432,7 +432,7 @@ def run_colab_study(num_prompts: int = 500, max_new_tokens: int = 200):
     
     print(f"🚀 Running entropy study on Google Colab A100")
     print(f"📊 {num_prompts} prompts, {max_new_tokens} max tokens")
-    print(f"🔧 Optimized batch sizes: gen=128, tf=256")
+    print(f"🔧 A100-optimized batch sizes: gen=64, tf=128")
     
     return run_entropy_study(
         checkpoint_path=checkpoint_path,
