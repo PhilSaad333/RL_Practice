@@ -118,7 +118,7 @@ def run_entropy_study(
     print(f"Prompts: {num_prompts}")
     print(f"G=1 (one generation per prompt)")
     print(f"Max tokens: {max_new_tokens}")
-    print(f"Temperature: {temperature}, Top-p: {top_p}")
+    print(f"Temperature: {config.temperature}, Top-p: {config.top_p}")
     print(f"Seed: {seed}")
     print("=" * 80)
     
@@ -462,6 +462,7 @@ def run_colab_study(num_prompts: int = 500, max_new_tokens: int = 200):
         checkpoint_path=checkpoint_path,
         num_prompts=num_prompts,
         max_new_tokens=max_new_tokens,
+        top_p=0.99,  # A100 optimization
         output_dir="/content/entropy_study_results"
     )
 
