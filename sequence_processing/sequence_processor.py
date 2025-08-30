@@ -558,19 +558,15 @@ class SequenceProcessor:
                                     rb_np = np.array([])
 
                                 seq_logprob = float(gen_logprobs_np.sum())
-                            else:
-                                gen_logprobs_np = np.array([])
-                                entropies_naive = np.array([])
-                                rb_np = np.array([])
-                                seq_logprob = 0.0
-                                all_diagnostics[b].append(empty_diagnostics_pack())
                         else:
+                            # Size mismatch or zero generation length
                             gen_logprobs_np = np.array([])
                             entropies_naive = np.array([])
                             rb_np = np.array([])
                             seq_logprob = 0.0
                             all_diagnostics[b].append(empty_diagnostics_pack())
                     else:
+                        # No generation found for this (b,g); record empties
                         gen_logprobs_np = np.array([])
                         entropies_naive = np.array([])
                         rb_np = np.array([])
