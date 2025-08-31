@@ -650,6 +650,7 @@ class OfflineEntropyProbe:
                 # Auto-discover optimizer path relative to checkpoint
                 parent_dir = os.path.dirname(checkpoint_path)
                 possible_optimizer_paths = [
+                    os.path.join(checkpoint_path, "optimizer.pt"),  # First: checkpoint-dir/optimizer.pt  
                     os.path.join(parent_dir, "optimizer.pt"),  # Standard: ../optimizer.pt
                     os.path.join(checkpoint_path, "..", "optimizer.pt"),  # Alternative
                 ]
@@ -663,8 +664,8 @@ class OfflineEntropyProbe:
             if not optimizer_path:
                 raise FileNotFoundError(
                     f"Could not find optimizer.pt relative to checkpoint {checkpoint_path}. "
-                    f"Expected to find optimizer.pt in parent directory. "
-                    f"Check checkpoint structure: model/ and optimizer.pt should be siblings."
+                    f"Searched locations: {possible_optimizer_paths}. "
+                    f"Please ensure optimizer.pt exists in one of these locations."
                 )
             
             if not os.path.exists(optimizer_path):
