@@ -65,6 +65,7 @@ def test_rb_autograd_flag(model, tokenizer):
     # Config with RB autograd disabled
     config_no_grad = GenerationConfig(
         temperature=0.7,
+        top_p=0.995,  # Add explicit top_p for RB computation
         max_new_tokens=50,
         rb_requires_grad=False,  # Disabled
         gen_batch_size=4,
@@ -75,11 +76,14 @@ def test_rb_autograd_flag(model, tokenizer):
     
     # Generate and compute teacher forcing
     sequences = processor_no_grad.generate_batched(prompts, G=2)
-    logprob_results, _ = processor_no_grad.teacher_force_logprobs(sequences, with_grad=True)
+    logprob_results, _ = processor_no_grad.teacher_force_logprobs(sequences, with_grad=True, compute_rb=True)
     
     logger.info(f"With rb_requires_grad=False:")
     logger.info(f"  rb_entropies type: {type(logprob_results.rb_entropies[0][0]) if logprob_results.rb_entropies[0] else 'empty'}")
     logger.info(f"  rb_entropies_torch: {logprob_results.rb_entropies_torch}")
+    logger.info(f"  config.rb_requires_grad: {processor_no_grad.config.rb_requires_grad}")
+    logger.info(f"  config.top_p: {processor_no_grad.config.top_p}")
+    logger.info(f"  config.temperature: {processor_no_grad.config.temperature}")
     
     logger.info("=" * 50)
     logger.info("Test 2: rb_requires_grad=True")
@@ -87,6 +91,7 @@ def test_rb_autograd_flag(model, tokenizer):
     # Config with RB autograd enabled
     config_with_grad = GenerationConfig(
         temperature=0.7,
+        top_p=0.995,  # Add explicit top_p for RB computation
         max_new_tokens=50,
         rb_requires_grad=True,  # Enabled
         gen_batch_size=4,
@@ -97,11 +102,14 @@ def test_rb_autograd_flag(model, tokenizer):
     
     # Generate and compute teacher forcing
     sequences = processor_with_grad.generate_batched(prompts, G=2)
-    logprob_results, _ = processor_with_grad.teacher_force_logprobs(sequences, with_grad=True)
+    logprob_results, _ = processor_with_grad.teacher_force_logprobs(sequences, with_grad=True, compute_rb=True)
     
     logger.info(f"With rb_requires_grad=True:")
     logger.info(f"  rb_entropies type: {type(logprob_results.rb_entropies[0][0]) if logprob_results.rb_entropies[0] else 'empty'}")
     logger.info(f"  rb_entropies_torch available: {logprob_results.rb_entropies_torch is not None}")
+    logger.info(f"  config.rb_requires_grad: {processor_with_grad.config.rb_requires_grad}")
+    logger.info(f"  config.top_p: {processor_with_grad.config.top_p}")
+    logger.info(f"  config.temperature: {processor_with_grad.config.temperature}")
     
     if logprob_results.rb_entropies_torch is not None:
         logger.info(f"  rb_entropies_torch[0][0] type: {type(logprob_results.rb_entropies_torch[0][0])}")
