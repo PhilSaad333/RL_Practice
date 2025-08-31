@@ -639,7 +639,7 @@ def run_colab_study(
 
 def run_colab_replacement_study(
     total_sequences: int = 4096,
-    temperature: float = 1.2,
+    temperature: float = 1.0,
     max_new_tokens: int = 200,
     top_p: float = 1.0,
     gen_batch_size: int = 64,
