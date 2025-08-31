@@ -127,7 +127,8 @@ class ProbeComponents:
             temperature=sp_cfg.get('temperature', 1.0),
             top_p=sp_cfg.get('top_p', 1.0),
             gen_batch_size=sp_cfg.get('gen_batch_size', 8),
-            tf_batch_size=sp_cfg.get('tf_batch_size', 64)
+            tf_batch_size=sp_cfg.get('tf_batch_size', 64),
+            rb_requires_grad=sp_cfg.get('rb_requires_grad', False)  # Phase 3: RB autograd
         )
         self._sequence_processor = SequenceProcessor(
             model=self.model,
