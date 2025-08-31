@@ -11,6 +11,7 @@ batch_config:
   split: test
   B_E_values: [8]       # Small E batch for testing
   B_U_values: [4]       # Small U batch for testing
+  B_U: 4                # Required by validation
   G: 3                  # U-batch should use G=3, E-batch overridden to G=1
   rollout_batch_size: 2 # Small for testing
 
