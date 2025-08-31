@@ -9,16 +9,18 @@ model_config:
 batch_config:
   dataset_name: gsm8k_r1_template
   split: test
-  B_E_values: [8]       # Small E batch for testing
-  B_U_values: [4]       # Small U batch for testing
-  B_U: 4                # Required by validation
-  G: 3                  # U-batch should use G=3, E-batch overridden to G=1
-  rollout_batch_size: 2 # Small for testing
+  B_E_values: [16]      # Larger E batch for better signal
+  B_U_values: [8]       # Larger U batch for more data
+  B_U: 8                # Required by validation
+  G: 8                  # More generations to get some correct responses
+  rollout_batch_size: 2 # Keep small for memory
+  
+learning_rate: 1.0e-5   # Proper learning rate for δH₁ = lr × X·Y
 
 generation:
   temperature: 0.7
   top_p: 0.995
-  max_new_tokens: 50    # Small for testing
+  max_new_tokens: 200   # Sufficient tokens for complete math solutions
   gen_batch_size: 4
   tf_batch_size: 8
   do_sample: true       # Required for sampling
