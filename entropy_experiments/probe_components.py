@@ -945,18 +945,25 @@ class ProbeComponents:
     
     def accumulate_sum_X(self, E_batch: Dict[str, Any], mb_size_prompts: int, weighting_mode: str = "dr_grpo") -> tuple:
         """
-        Phase 1: Accumulate ΣX (raw gradients) from evaluation batch E.
+        Phase 3: Accumulate ΣX (entropy gradients) from evaluation batch E.
+        Supports both naive and RB-residual estimators.
         
         Args:
             E_batch: Evaluation batch dictionary
             mb_size_prompts: Microbatch size (number of prompts per microbatch)
-            weighting_mode: Weighting mode for X-loss
+            weighting_mode: Weighting mode for X-loss (used in naive mode)
             
         Returns:
             (sum_X_buf, B_local): Parameter sum buffer and local batch size
         """
         self._assert_grad_context("accumulate_sum_X")
         sum_X_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
+        
+        # Phase 3: Check estimator mode
+        mode = (self.config.get('estimator', {}) or {}).get('x_estimator_mode', 'naive')
+        normalize_by_length = bool(self.config.get('estimator', {}).get('rb_normalize_by_length', True))
+        
+        self.logger.debug(f"X accumulation mode: {mode}, normalize_by_length: {normalize_by_length}")
         
         # Count prompts processed
         B_local = 0
@@ -973,12 +980,6 @@ class ProbeComponents:
                 # Clear gradients
                 self.model.zero_grad(set_to_none=True)
                 
-                # Forward pass with teacher forcing
-                S_dict = self._teacher_force_logprobs(microbatch)
-                
-                # Build X-loss with detached LOO coefficient
-                L_X_mb = self.build_LX_from_S(S_dict, weighting_mode)
-                
                 # Count prompts in this microbatch
                 if 'sequences' in microbatch:
                     mb_prompt_count = len(microbatch['sequences'])
@@ -987,15 +988,43 @@ class ProbeComponents:
                 else:
                     mb_prompt_count = len(microbatch.get('max_lengths', []))
                 
-                # Backward pass - populates param.grad with raw X gradients  
+                # Phase 3: Branch on estimator mode
+                if mode == 'rb_residual':
+                    # New RB-residual path
+                    # 1) Convert microbatch -> BatchedSequences for SP TF with grad
+                    bs = self._to_batched_sequences_from_probe(microbatch)
+                    
+                    # 2) Run TF with grad + RB
+                    logprob_results, _ = self._sequence_processor.teacher_force_logprobs(
+                        sequences=bs, with_grad=True,
+                        tf_batch_size=self._sp_gen_config.tf_batch_size,
+                        compute_rb=True
+                    )
+                    
+                    # 3) Build RB X loss
+                    L_X_mb = self._build_X_loss_rb_residual(
+                        logprob_results=logprob_results,
+                        prompt_lens=bs.prompt_lens,
+                        normalize_by_length=normalize_by_length
+                    )
+                    
+                else:
+                    # Fallback to existing naive path
+                    # Forward pass with teacher forcing
+                    S_dict = self._teacher_force_logprobs(microbatch)
+                    
+                    # Build X-loss with detached LOO coefficient
+                    L_X_mb = self.build_LX_from_S(S_dict, weighting_mode)
+                
+                # Backward pass - populates param.grad with X gradients  
                 L_X_mb.backward()
 
                 # Optional invariant: count trainable grads present
                 present = sum(int(p.grad is not None and p.grad.detach().abs().sum() > 0) for p in self._trainable_params)
-                self.logger.debug(f"[X] nonzero param.grads = {present}/{len(self._trainable_params)}")
+                self.logger.debug(f"[X-{mode}] nonzero param.grads = {present}/{len(self._trainable_params)}")
 
                 # Scale in CPU/fp32 during accumulation to avoid bf16 multiply
-                # build_LX_from_S returns average over prompts, but we need sum
+                # Both paths return average over prompts, but we need sum
                 self.add_into_param_buffer(sum_X_buf, scale=float(mb_prompt_count))
                 
                 B_local += mb_prompt_count
