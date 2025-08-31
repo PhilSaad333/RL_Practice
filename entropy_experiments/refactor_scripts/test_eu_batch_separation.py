@@ -65,6 +65,13 @@ def create_test_config():
         },
         'importance_sampling': {
             'enabled': False,  # Skip importance sampling for this test
+        },
+        'output': {
+            'log_level': 'INFO',
+            'save_path': '/tmp/eu_batch_test',
+        },
+        'checkpoint': {
+            'checkpoint_path': '/home/ubuntu/localfs/rl_training_runs/training_state/step_60/model',
         }
     }
 
