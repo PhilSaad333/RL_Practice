@@ -29,6 +29,7 @@ from collections import defaultdict
 import time
 import math
 from .conditional_variance import ConditionalVarianceEstimator
+from sequence_processing.sequence_processor import SequenceProcessor, GenerationConfig
 
 
 class ProbeComponents:
@@ -77,6 +78,25 @@ class ProbeComponents:
             )
             self._tokenizer.padding_side = "left"
             self._tokenizer.pad_token = self._tokenizer.eos_token
+            
+        # --- SequenceProcessor (Phase 1 sampling only) ---
+        sp_cfg = self.config.get('generation', {})
+        self._sp_gen_config = GenerationConfig(
+            do_sample=True,
+            num_return_sequences=self.G,
+            max_new_tokens=sp_cfg.get('max_new_tokens', 256),
+            temperature=sp_cfg.get('temperature', 1.0),
+            top_p=sp_cfg.get('top_p', 1.0),
+            pad_token_id=self._tokenizer.pad_token_id,
+            eos_token_id=self._tokenizer.eos_token_id,
+            gen_batch_size=sp_cfg.get('gen_batch_size', 8),
+            tf_batch_size=sp_cfg.get('tf_batch_size', 64)
+        )
+        self._sequence_processor = SequenceProcessor(
+            model=self.model,
+            tokenizer=self._tokenizer,
+            config=self._sp_gen_config
+        )
             
         # Initialize conditional variance estimator
         self.variance_estimator = ConditionalVarianceEstimator(model, config, logger, self._tokenizer)
@@ -175,144 +195,86 @@ class ProbeComponents:
             self._tokenizer.padding_side = "left"
             self._tokenizer.pad_token = self._tokenizer.eos_token
             
-        # Generate responses and collect sequences for later teacher forcing
-        # OPTIMIZED: Use batched rollout generation instead of sequential prompts
+        # Generate responses using SequenceProcessor
         all_sequences = []
         all_prompt_lens = []
         all_advantages = []
         max_lengths = []
         all_attention_masks = []
-        
-        # Rollout batch size for parallel generation (optimized for 40GB A100)
-        # With 27% usage = ~11GB used, we have 29GB free for larger batches
+
         rollout_batch_size = self.config.get('batch_config', {}).get('rollout_batch_size', 8)
-        self.logger.info(f"Using rollout_batch_size={rollout_batch_size} for batched generation")
-        
-        # Process prompts in batches for parallel generation
+        self.logger.info(f"Using SequenceProcessor with rollout_batch_size={rollout_batch_size}")
+
         for batch_start in range(0, len(prompts), rollout_batch_size):
             batch_end = min(batch_start + rollout_batch_size, len(prompts))
             batch_prompts = prompts[batch_start:batch_end]
-            batch_examples = sampled_examples[batch_start:batch_end] 
+            batch_examples = sampled_examples[batch_start:batch_end]
             batch_prompt_ids = prompt_ids[batch_start:batch_end]
-            
-            self.logger.debug(f"Generating responses for prompts {batch_start}-{batch_end-1} ({len(batch_prompts)} prompts)")
-            
-            with torch.inference_mode():
-                # ✅ FIX: Use LEFT padding like dr_grpo.py to avoid generating from pad tokens
-                original_padding_side = self._tokenizer.padding_side
-                self._tokenizer.padding_side = "left"
-                
-                # Tokenize all prompts in batch with LEFT padding
-                batch_prompt_enc = self._tokenizer(batch_prompts, padding=True, return_tensors="pt").to(self.device)
-                batch_prompt_lens = (batch_prompt_enc.attention_mask).sum(dim=1).tolist()  # Get actual prompt lengths
-                
-                # Restore original padding side
-                self._tokenizer.padding_side = original_padding_side
-                
-                # Generate G responses for each prompt simultaneously
-                # This generates len(batch_prompts) * G sequences in one call
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                    gen_out = self.model.generate(
-                        **batch_prompt_enc,
-                        generation_config=gen_cfg,
-                        logits_processor=self._get_stop_processor(),
-                        return_dict_in_generate=True
-                    )
-                    
-                # Extract sequences: [batch_size * G, total_len]
-                all_gen_sequences = gen_out.sequences  
-                
-                # Reshape to [batch_size, G, total_len]
-                batch_size = len(batch_prompts)
-                total_len = all_gen_sequences.shape[1]
-                sequences_reshaped = all_gen_sequences.view(batch_size, G, total_len)
-                
-                # With LEFT padding, find where generation actually starts
-                # All sequences have same shape [G, total_len], generation starts at same position
-                max_prompt_len = max(batch_prompt_lens)
-                
-                # Process each prompt in the batch  
-                for local_b, (prompt, example, prompt_id, prompt_len) in enumerate(zip(
-                    batch_prompts, batch_examples, batch_prompt_ids, batch_prompt_lens
-                )):
-                    sequences = sequences_reshaped[local_b]  # [G, total_len]
-                    
-                    # Decode generated text for advantage computation
-                    responses = []
-                    for g in range(G):
-                        # ✅ FIX: With LEFT padding, generation starts at max_prompt_len for ALL sequences
-                        gen_ids = sequences[g, max_prompt_len:]
-                        # Trim at stop tag if present
-                        gen_ids = self._trim_at_stop_tag(gen_ids)
-                        response_text = self._tokenizer.decode(gen_ids, skip_special_tokens=True)
-                        responses.append(response_text)
-                    
-                    # Store sequences and metadata for probe passes
-                    all_sequences.append(sequences)  # [G, total_len]
-                    # ✅ FIX: Store max_prompt_len (where generation starts) not actual prompt_len
-                    all_prompt_lens.append(max_prompt_len)
-                    
-                    # Create attention masks
-                    attention_mask = (sequences != self._tokenizer.pad_token_id).long()
-                    all_attention_masks.append(attention_mask)
-                    
-                    # Compute real rewards using the same reward function as training
-                    rewards = self._compute_rewards(prompt_id, responses, example)
-                    
-                    # Compute advantages following DRGRPO: A = R - mean(R) per prompt
-                    advantages = rewards - rewards.mean()  # Center advantages (GRPO style)
-                    
-                    # DEBUG: Option to use random advantages that sum to zero
-                    if os.environ.get('DEBUG_RANDOM_ADVANTAGES', '0') == '1':
-                        G = len(advantages)
-                        if G > 1:
-                            # Generate G-1 random values between -1 and 1
-                            random_advs = torch.FloatTensor(G-1).uniform_(-1, 1).to(advantages.device)
-                            # Last advantage is negative sum to ensure they sum to zero
-                            last_adv = -random_advs.sum()
-                            advantages = torch.cat([random_advs, last_adv.unsqueeze(0)])
-                            self.logger.info(f"[DEBUG] Using random advantages: {advantages.tolist()}, sum={advantages.sum().item():.6f}")
-                        else:
-                            advantages = torch.zeros_like(advantages)
-                            self.logger.info(f"[DEBUG] Single advantage, using zero: {advantages.item():.6f}")
-                    
-                    all_advantages.append(advantages)
-                    
-                    # Track max response length for probe loss normalization
-                    response_lengths = [len(self._tokenizer.encode(resp, add_special_tokens=False)) for resp in responses]
-                    max_len = max(response_lengths) if response_lengths else 200
-                    max_lengths.append(max_len)
-        
-        # Pad sequences to same length and stack
+
+            # Generate G responses per prompt using SequenceProcessor
+            sequences_pack = self._sequence_processor.generate_batched(
+                prompts=batch_prompts, G=G, gen_batch_size=self._sp_gen_config.gen_batch_size
+            )
+
+            B_b = len(batch_prompts)
+            sequences_b = sequences_pack.sequences            # [B_b, G, T]
+            attn_b      = sequences_pack.attention_masks      # [B_b, G, T]
+            prompt_lens_b = sequences_pack.prompt_lens        # [B_b]
+            gen_lens_b    = sequences_pack.gen_lens           # List[List[int]]
+            responses_b   = sequences_pack.responses_text     # List[List[str]]
+
+            # Compute rewards/advantages for each prompt
+            for local_b in range(B_b):
+                example   = batch_examples[local_b]
+                prompt_id = batch_prompt_ids[local_b]
+                responses = responses_b[local_b]              # List[str], length G
+
+                # Compute advantages: A = R - mean(R) per prompt (DR-GRPO style)
+                rewards = self._compute_rewards(prompt_id, responses, example)
+                advantages = rewards - rewards.mean()
+                all_advantages.append(advantages)
+
+                # Track L_max per prompt for probe loss normalization
+                L_max = max(gen_lens_b[local_b]) if len(gen_lens_b[local_b]) > 0 else 1
+                max_lengths.append(L_max)
+
+            # Store sequences and masks for probe teacher forcing passes
+            all_sequences.extend([sequences_b[i] for i in range(B_b)])
+            all_attention_masks.extend([attn_b[i] for i in range(B_b)])
+            all_prompt_lens.extend(prompt_lens_b)
+
+        # Pad sequences to same max length across all prompts
         max_seq_len = max(seq.shape[1] for seq in all_sequences)
-        padded_sequences = []
-        padded_masks = []
-        
-        for b in range(B):
+        padded_sequences, padded_masks = [], []
+        for b in range(len(all_sequences)):
             seq = all_sequences[b]  # [G, seq_len]
             mask = all_attention_masks[b]  # [G, seq_len]
-            
-            # Pad to max length
             if seq.shape[1] < max_seq_len:
                 pad_len = max_seq_len - seq.shape[1]
-                seq = F.pad(seq, (0, pad_len), value=self._tokenizer.pad_token_id)
+                seq  = F.pad(seq,  (0, pad_len), value=self._tokenizer.pad_token_id)
                 mask = F.pad(mask, (0, pad_len), value=0)
-                
             padded_sequences.append(seq)
             padded_masks.append(mask)
-        
-        # Stack everything
-        sequences = torch.stack(padded_sequences, dim=0)  # [B, G, max_len]
-        attention_masks = torch.stack(padded_masks, dim=0)  # [B, G, max_len]
-        advantages = torch.stack(all_advantages, dim=0)  # [B, G]
-        
+
+        sequences = torch.stack(padded_sequences, dim=0)   # [B, G, max_len]
+        attention_masks = torch.stack(padded_masks, dim=0) # [B, G, max_len]
+        advantages = torch.stack(all_advantages, dim=0)    # [B, G]
+
+        # Sanity checks (temporary; remove once stable)
+        B_chk, G_chk, T_chk = sequences.shape
+        assert B_chk == B and G_chk == G
+        assert len(all_prompt_lens) == B_chk
+        assert len(max_lengths) == B_chk
+        assert attention_masks.shape == (B_chk, G_chk, T_chk)
+        self.logger.info(f"[SP→Probe] batch shapes OK: sequences={tuple(sequences.shape)}")
+
         batch_data = {
-            'sequences': sequences,  # [B, G, max_len] - for teacher forcing with gradients
-            'prompt_lens': all_prompt_lens,  # [B] - prompt lengths
-            'advantages': advantages,  # [B, G] - advantages A_{n,g}
-            'max_lengths': max_lengths,  # [B] - L_max per prompt
-            'attention_masks': attention_masks,  # [B, G, max_len]
-            'prompt_ids': prompt_ids,  # [B] - original dataset indices for each prompt
+            'sequences': sequences,            # [B, G, max_len] - for teacher forcing with gradients
+            'prompt_lens': all_prompt_lens,    # [B] - prompt lengths
+            'advantages': advantages,          # [B, G] - advantages A_{n,g}
+            'max_lengths': max_lengths,        # [B] - L_max per prompt
+            'attention_masks': attention_masks,# [B, G, max_len]
+            'prompt_ids': prompt_ids,          # [B] - original dataset indices for each prompt
             'num_prompts': B,
             'num_responses_per_prompt': G
         }
