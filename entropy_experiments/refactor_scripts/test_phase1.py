@@ -44,9 +44,9 @@ def create_test_config():
             'rollout_batch_size': 2,  # Small batch for testing
         },
         'generation': {
-            'temperature': 1.0,
+            'temperature': 0.7,  # Match training checkpoint temperature for consistent formatting
             'top_p': 1.0,
-            'max_new_tokens': 100,  # Shorter for testing
+            'max_new_tokens': 150,  # Enough for complete mathematical reasoning
             'do_sample': True,
             'pad_token_id': 151643,  # Qwen2.5 EOS token
             'gen_batch_size': 8,
