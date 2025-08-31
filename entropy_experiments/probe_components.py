@@ -196,6 +196,107 @@ class ProbeComponents:
             gen_lens=gen_lens,
             responses_text=None  # not needed for TF
         )
+
+    def _build_X_loss_rb_residual(
+        self,
+        logprob_results,  # LogprobResults from SequenceProcessor
+        prompt_lens: List[int],
+        normalize_by_length: bool = True,
+    ) -> torch.Tensor:
+        """
+        Construct the scalar loss whose gradient equals the RB entropy gradient:
+            sum_j (G_j - b_j) * ∇ log π(Y_j|prefix) + sum_k ∇ H_k(prefix)
+        where b_j = H_j + μ_j (μ_j from BaselineState).
+        Uses:
+          - logprob_results.logprobs[b][g]: torch [T]
+          - logprob_results.rb_entropies_torch[b][g]: torch [T]
+        """
+        assert logprob_results.rb_entropies_torch is not None, "rb_requires_grad=True + compute_rb=True required"
+
+        B = len(logprob_results.logprobs)
+        total_loss = torch.zeros((), device=next(self.model.parameters()).device)
+
+        # Determine max per-seq gen length to pad positionwise residuals for EMA update
+        lengths = []
+        rb_list, lp_list = [], []
+        for b in range(B):
+            for g in range(len(logprob_results.logprobs[b])):
+                lp = logprob_results.logprobs[b][g]              # [T]
+                rb = logprob_results.rb_entropies_torch[b][g]    # [T]
+                if lp is None or rb is None or lp.numel() == 0:
+                    continue
+                L = rb.numel()
+                lengths.append(L)
+                rb_list.append(rb)
+                lp_list.append(lp)
+        if len(lengths) == 0:
+            return total_loss
+        T_max = int(max(lengths))
+
+        # Pad per-sample tensors to T_max for baseline update bookkeeping
+        padded_residuals = []
+        length_tensor = []
+        for rb in rb_list:
+            L = rb.numel()
+            G = torch.cumsum(torch.flip(rb, dims=[0]), dim=0)    # [L], reverse cumsum
+            G = torch.flip(G, dims=[0])
+            resid = G - rb                                       # (G_j - H_j)
+            if L < T_max:
+                pad = torch.zeros(T_max - L, device=rb.device)
+                resid = torch.cat([resid, pad], dim=0)
+            padded_residuals.append(resid.unsqueeze(0))
+            length_tensor.append(L)
+        padded_residuals = torch.cat(padded_residuals, dim=0)    # [N_seq, T_max]
+        length_tensor = torch.tensor(length_tensor, device=padded_residuals.device, dtype=torch.long)  # [N_seq]
+
+        # Update EMA baseline μ_j using current batch residuals
+        self._baseline_state_x.update_from_batch(padded_residuals, length_tensor)
+        mu_vec = self._baseline_state_x.get_mu_vector(T_max)     # [T_max], detached
+
+        # Assemble losses per sequence
+        idx_seq = 0
+        for b in range(B):
+            for g in range(len(logprob_results.logprobs[b])):
+                token_lp = logprob_results.logprobs[b][g]             # [T]
+                Hk = logprob_results.rb_entropies_torch[b][g]         # [T]
+                if token_lp is None or Hk is None or token_lp.numel() == 0:
+                    continue
+                L = Hk.numel()
+
+                # Returns-to-go G_j from RB entropies
+                G = torch.cumsum(torch.flip(Hk, dims=[0]), dim=0)
+                G = torch.flip(G, dims=[0])                           # [L]
+
+                # Baseline b_j = H_j + μ_j (positionwise; slice μ to length L)
+                bl_mode = (self.config.get('estimator', {}).get('baseline', {}) or {}).get('mode', 'residual_mu')
+                if bl_mode == 'residual_mu':
+                    mu = mu_vec[:L]                                   # [L]
+                    b_j = Hk.detach() + mu                            # detach baseline
+                elif bl_mode == 'none':
+                    b_j = Hk.detach()  # μ=0
+                else:
+                    # "constant" or "regression" can be added later; for now treat as residual_mu
+                    mu = mu_vec[:L]
+                    b_j = Hk.detach() + mu
+
+                # Advantages for the score term
+                adv = (G.detach() - b_j).detach()                     # [L]
+
+                # --- Score term with correct sign: grad = Σ adv * ∇ log π ---
+                score_loss = torch.dot(adv, token_lp)                 # scalar
+
+                # --- Pathwise term: Σ H_k (no detach, to get ∂H) ---
+                pathwise_loss = Hk.sum()
+
+                if normalize_by_length and L > 0:
+                    loss = (score_loss + pathwise_loss) / float(L)
+                else:
+                    loss = score_loss + pathwise_loss
+
+                total_loss = total_loss + loss
+                idx_seq += 1
+
+        return total_loss
         
     def sample_batch(self, B: int, G: int, indices: Optional[List[int]] = None) -> Dict[str, Any]:
         """
