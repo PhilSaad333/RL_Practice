@@ -660,13 +660,22 @@ class OfflineEntropyProbe:
                         self.logger.info(f"Auto-discovered optimizer at {optimizer_path}")
                         break
             
-            if optimizer_path and os.path.exists(optimizer_path):
-                self.logger.info(f"Loading optimizer state from {optimizer_path}")
-                optimizer_state = torch.load(optimizer_path, map_location='cpu')
-                self.optimizer = self._initialize_optimizer_from_state(optimizer_state)
-            else:
-                self.logger.warning(f"Optimizer not found (tried: {optimizer_path}), creating fresh optimizer")
-                self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-6)
+            if not optimizer_path:
+                raise FileNotFoundError(
+                    f"Could not find optimizer.pt relative to checkpoint {checkpoint_path}. "
+                    f"Expected to find optimizer.pt in parent directory. "
+                    f"Check checkpoint structure: model/ and optimizer.pt should be siblings."
+                )
+            
+            if not os.path.exists(optimizer_path):
+                raise FileNotFoundError(
+                    f"Optimizer path does not exist: {optimizer_path}. "
+                    f"Check that optimizer.pt was saved alongside the model checkpoint."
+                )
+            
+            self.logger.info(f"Loading optimizer state from {optimizer_path}")
+            optimizer_state = torch.load(optimizer_path, map_location='cpu')
+            self.optimizer = self._initialize_optimizer_from_state(optimizer_state)
             
             # Initialize components
             self._initialize_components()
