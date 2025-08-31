@@ -43,12 +43,20 @@ def load_model_and_tokenizer(checkpoint_path: str):
         trust_remote_code=True
     )
     
+    # Ensure model is in training mode for gradients
+    model.train()
+    
     tokenizer = AutoTokenizer.from_pretrained(
         "Qwen/Qwen2.5-1.5B", 
         trust_remote_code=True
     )
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
+    
+    # Check if model parameters require gradients
+    params_with_grad = sum(1 for p in model.parameters() if p.requires_grad)
+    total_params = sum(1 for p in model.parameters())
+    logger.info(f"Model parameters: {params_with_grad}/{total_params} require gradients")
     
     return model, tokenizer
 
