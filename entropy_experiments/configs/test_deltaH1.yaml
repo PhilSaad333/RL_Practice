@@ -21,6 +21,7 @@ generation:
   max_new_tokens: 50    # Small for testing
   gen_batch_size: 4
   tf_batch_size: 8
+  do_sample: true       # Required for sampling
   rb_requires_grad: true  # Required for Phase 3b regression baseline
 
 memory_config:
