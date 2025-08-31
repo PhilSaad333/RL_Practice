@@ -55,12 +55,43 @@ def create_mock_logprob_results(device, B=2, G=2, max_T=5):
         logprobs.append(b_logprobs)
         rb_entropies_torch.append(b_rb_torch)
     
-    # Create LogprobResults with mock data (minimal - only what we need)
+    # Create mock entropies, sequence_logprobs, rb_entropies, and rewards
+    entropies = []
+    sequence_logprobs = []
+    rb_entropies = []
+    rewards = []
+    
+    for b in range(B):
+        b_entropies = []
+        b_seq_logprobs = []
+        b_rb_entropies = []
+        b_rewards = []
+        
+        for g in range(G):
+            L = max_T - g
+            if L > 0:
+                b_entropies.append(torch.rand(L).numpy())  # mock numpy entropies
+                b_seq_logprobs.append(float(torch.randn(1).item()))  # mock sequence logprob
+                b_rb_entropies.append(torch.rand(L).numpy())  # mock numpy RB entropies
+                b_rewards.append(float(torch.rand(1).item()))  # mock reward
+            else:
+                b_entropies.append(torch.tensor([]).numpy())
+                b_seq_logprobs.append(0.0)
+                b_rb_entropies.append(torch.tensor([]).numpy())
+                b_rewards.append(0.0)
+        
+        entropies.append(b_entropies)
+        sequence_logprobs.append(b_seq_logprobs)
+        rb_entropies.append(b_rb_entropies)
+        rewards.append(b_rewards)
+    
+    # Create LogprobResults with all required fields
     return LogprobResults(
         logprobs=logprobs,
-        entropies=None,  # Not needed for RB loss
-        sequence_logprobs=None,  # Not needed
-        rb_entropies=None,  # Not needed (we use torch version)
+        entropies=entropies,
+        sequence_logprobs=sequence_logprobs,
+        rb_entropies=rb_entropies,
+        rewards=rewards,
         rb_entropies_torch=rb_entropies_torch
     )
 
