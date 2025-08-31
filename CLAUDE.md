@@ -102,6 +102,12 @@ python rl_training/runners/resume_training.py \
 - **tf_micro_batch**: 32 (was 8, this was the bottleneck!)
 - **num_return_sequences**: 8 (keep at 8, don't increase)
 
+## Lambda Instance Monitoring
+- **Lord Krang monitors resources directly**: RAM usage graphs, GPU utilization, and running processes
+- **No need for Claude to check**: ps aux, nvidia-smi, free -h commands unless specifically requested
+- **Resource optimization**: Lord Krang will indicate when instances have capacity for additional workloads
+- **Process management**: Lord Krang tracks experiment progress and will notify when jobs complete
+
 ## Troubleshooting Quick Reference
 - **Conda environment**: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate rl`
 - **Git sync**: Always make changes locally first, then push/pull

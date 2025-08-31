@@ -1,0 +1,258 @@
+PHASE 1 REFACTOR PLAN (TXT)
+
+Goal:
+
+Use SequenceProcessor (SP) for generation and sequence packing (left-pad, attention masks, etc.).
+
+Keep all existing probe math (teacher forcing, losses, ∑X/∑Y accumulation, δH₁ dot-product) unchanged.
+
+No change to RB estimators yet (that’s Phase 3).
+
+0) Config: add one toggle (non-breaking)
+
+Add to your experiment YAML (or set a default in code):
+
+sampling:
+  use_sequence_processor: true   # Phase 1 routes sampling/gen through SP
+generation:
+  # The following should already exist; list here to make intent explicit.
+  top_p: 0.95
+  temperature: 1.0
+  max_new_tokens: 256
+  gen_batch_size: 8              # or your preferred value
+  tf_batch_size: 64
+
+
+Notes
+
+We will read sampling.use_sequence_processor in ProbeComponents.sample_batch(...).
+
+All other sampler knobs (top_p, temperature, etc.) are already in your config; SP will read them via a small GenerationConfig we build from config['generation'].
+
+1) sequence_processor.py — No code changes required for Phase 1
+
+We will use the existing public APIs:
+
+SequenceProcessor(model, tokenizer, GenerationConfig)
+
+generate_batched(prompts, G, gen_batch_size=None) → BatchedSequences
+
+(Phase 1 does not call teacher_force_logprobs; probe math keeps its own TF.)
+
+2) probe_components.py — Minimal wiring to call SP in sample_batch
+2.1 Imports and SP construction
+
+INSERT near top-level imports (keep local import if you prefer):
+
+from .sequence_processor import SequenceProcessor, GenerationConfig
+
+
+EDIT inside ProbeComponents.__init__(...) after _tokenizer is created (we reuse the same tokenizer and keep left padding identical):
+
+# --- SequenceProcessor (Phase 1 sampling only) ---
+sp_cfg = self.config.get('generation', {})
+self._sp_gen_config = GenerationConfig(
+    do_sample=True,
+    num_return_sequences=self.G,
+    max_new_tokens=sp_cfg.get('max_new_tokens', 256),
+    temperature=sp_cfg.get('temperature', 1.0),
+    top_p=sp_cfg.get('top_p', 1.0),
+    pad_token_id=self._tokenizer.pad_token_id,
+    eos_token_id=self._tokenizer.eos_token_id,
+    gen_batch_size=sp_cfg.get('gen_batch_size', 8),
+    tf_batch_size=sp_cfg.get('tf_batch_size', 64)
+)
+self._sequence_processor = SequenceProcessor(
+    model=self.model,
+    tokenizer=self._tokenizer,
+    config=self._sp_gen_config
+)
+
+
+No behavioral change unless sampling.use_sequence_processor is True.
+
+2.2 sample_batch(...): route generation only through SP (keep rewards/advantages as-is)
+
+FIND the method:
+
+def sample_batch(self, B: int, G: int, indices: Optional[List[int]] = None) -> Dict[str, Any]:
+
+
+Within it, you already:
+
+Load the dataset and pick B prompts (+ examples / prompt_ids)
+
+Build a HF tokenizer (we keep it)
+
+Do batched generation and assemble: sequences, prompt_lens, attention_masks, responses, max_lengths, and compute advantages.
+
+We will condition the generation step on sampling.use_sequence_processor:
+
+REPLACE the entire “Generate responses and collect sequences …” block with the following guarded version. The legacy path is preserved in the else: branch (just keep your current code there verbatim).
+
+use_sp = self.config.get('sampling', {}).get('use_sequence_processor', False)
+
+all_sequences = []
+all_prompt_lens = []
+all_advantages = []
+max_lengths = []
+all_attention_masks = []
+prompt_ids = []  # you already fill this above
+
+if use_sp:
+    # ---- Phase 1: generation via SequenceProcessor ----
+    # We still sample prompts/examples HERE (unchanged), because we need:
+    #  - example/gold answer for rewards
+    #  - prompt_ids for bookkeeping
+    #
+    # At this point you already have:
+    #   prompts: List[str]         # size B
+    #   batch_examples: List[...]  # the dataset objects for each prompt
+    #   prompt_ids: List[int]      # dataset indices
+    # We generate in "rollout batches" to control memory, mirroring your block.
+
+    rollout_batch_size = self.config.get('batch_config', {}).get('rollout_batch_size', 8)
+    self.logger.info(f"[SP] Using rollout_batch_size={rollout_batch_size} for SP.batched generation")
+
+    for batch_start in range(0, len(prompts), rollout_batch_size):
+        batch_end = min(batch_start + rollout_batch_size, len(prompts))
+        batch_prompts = prompts[batch_start:batch_end]
+        batch_examples = ds_examples[batch_start:batch_end] if isinstance(ds_examples, list) else [ds_examples[i] for i in range(batch_start, batch_end)]
+        batch_prompt_ids = prompt_ids[batch_start:batch_end]
+
+        # 1) Generate G responses per prompt using SP
+        sequences_pack = self._sequence_processor.generate_batched(
+            prompts=batch_prompts, G=G, gen_batch_size=self._sp_gen_config.gen_batch_size
+        )
+        # sequences_pack: BatchedSequences with fields:
+        #   sequences:        [B_b, G, total_len]
+        #   prompt_lens:      List[int] length B_b
+        #   gen_lens:         List[List[int]] length B_b of length-G lists
+        #   attention_masks:  [B_b, G, total_len]
+        #   responses_text:   List[List[str]] decoded generation-only text (len G per prompt)
+
+        B_b = len(batch_prompts)
+        sequences_b = sequences_pack.sequences            # [B_b, G, T]
+        attn_b      = sequences_pack.attention_masks      # [B_b, G, T]
+        prompt_lens_b = sequences_pack.prompt_lens        # [B_b]
+        gen_lens_b    = sequences_pack.gen_lens           # List[List[int]]
+        responses_b   = sequences_pack.responses_text     # List[List[str]]
+
+        # 2) Compute rewards/advantages for each prompt using EXISTING logic
+        for local_b in range(B_b):
+            example   = batch_examples[local_b]
+            prompt_id = batch_prompt_ids[local_b]
+            responses = responses_b[local_b]              # List[str], length G
+
+            # Rewards -> Advantages (unchanged)
+            rewards = self._compute_rewards(prompt_id, responses, example)
+            advantages = rewards - rewards.mean()         # DR-GRPO style
+
+            all_advantages.append(advantages)
+
+            # 3) Track L_max per prompt for probe loss normalization
+            #    (Use SP gen lengths instead of re-tokenizing strings.)
+            L_max = max(gen_lens_b[local_b]) if len(gen_lens_b[local_b]) > 0 else 1
+            max_lengths.append(L_max)
+
+        # 4) Persist sequences and masks for the probe TF passes
+        all_sequences.extend([sequences_b[i] for i in range(B_b)])    # each: [G, T]
+        all_attention_masks.extend([attn_b[i] for i in range(B_b)])
+        all_prompt_lens.extend(prompt_lens_b)
+
+    # Pad per-prompt sequences to the SAME max length across prompts (unchanged pattern)
+    max_seq_len = max(seq.shape[1] for seq in all_sequences)
+    padded_sequences, padded_masks = [], []
+    for b in range(len(all_sequences)):
+        seq = all_sequences[b]  # [G, seq_len]
+        mask = all_attention_masks[b]  # [G, seq_len]
+        if seq.shape[1] < max_seq_len:
+            pad_len = max_seq_len - seq.shape[1]
+            seq  = F.pad(seq,  (0, pad_len), value=self._tokenizer.pad_token_id)
+            mask = F.pad(mask, (0, pad_len), value=0)
+        padded_sequences.append(seq)
+        padded_masks.append(mask)
+
+    sequences = torch.stack(padded_sequences, dim=0)   # [B, G, max_len]
+    attention_masks = torch.stack(padded_masks, dim=0) # [B, G, max_len]
+
+else:
+    # ---- Legacy generation path (keep your current code here verbatim) ----
+    # (This is your existing "Generate responses and collect sequences..." block.)
+    # Ensure you still fill:
+    #   sequences: [B, G, max_len]
+    #   attention_masks: [B, G, max_len]
+    #   all_prompt_lens: List[B] (use max left-padded prompt length)
+    #   all_advantages:  List[Tensor[G]]
+    #   max_lengths:     List[B]
+    #   prompt_ids:      List[B]
+    ...
+
+
+RETURN shape remains IDENTICAL to the legacy contract:
+
+batch_data = {
+    'sequences': sequences,            # [B, G, max_len]
+    'prompt_lens': all_prompt_lens,    # [B]
+    'advantages': torch.stack(all_advantages, dim=0),  # [B, G]
+    'max_lengths': max_lengths,        # [B]
+    'attention_masks': attention_masks,# [B, G, max_len]
+    'prompt_ids': prompt_ids,          # [B]
+    'num_prompts': B,
+    'num_responses_per_prompt': G
+}
+return batch_data
+
+
+Rationale:
+
+We adopt SP’s left-pad alignment and attention masks to avoid the “zero entropy” pathology you saw.
+
+We keep your reward/advantage computation unchanged (it needs dataset example and prompt_id, which we already have in sample_batch).
+
+We compute max_lengths from SP’s gen_lens for correctness and speed (no re-tokenization).
+
+3) offline_entropy_probe.py — No code changes for Phase 1
+
+It currently calls self.probe_components.sample_batch(...) and then compute_delta_h1(...).
+
+With the sampling.use_sequence_processor flag turned on, the same call path now uses SP under the hood.
+
+4) Invariants & quick checks (add temporarily)
+
+After you build batch_data (before the return), add:
+
+# Sanity checks (temporary; remove once stable)
+B_chk, G_chk, T_chk = batch_data['sequences'].shape
+assert B_chk == batch_data['num_prompts'] and G_chk == batch_data['num_responses_per_prompt']
+assert len(batch_data['prompt_lens']) == B_chk
+assert len(batch_data['max_lengths']) == B_chk
+assert batch_data['attention_masks'].shape == (B_chk, G_chk, T_chk)
+self.logger.info(f"[SP→Probe] batch shapes OK: sequences={tuple(batch_data['sequences'].shape)}")
+
+5) Rollback & risk notes
+
+Toggle sampling.use_sequence_processor: false to restore legacy generation immediately.
+
+Phase 1 does not touch:
+
+accumulate_sum_X / _teacher_force_logprobs / build_LX_from_S
+
+accumulate_sum_Y / build_LY_from_S
+
+compute_delta_h1
+
+Therefore, any bug manifests only as sampling/gen alignment issues; the rollback switch isolates this.
+
+6) Minimal test plan (10 minutes)
+
+Run a tiny probe with B=2, G=2, once with use_sequence_processor=false, once with true.
+Confirm:
+
+No zeros in sequence_logprob for obviously non-empty generations.
+
+prompt_lens equals the batch left-pad prompt length (constant within the batch).
+
+max_lengths[b] == max(gen_lens[b]) if you temporarily log SP’s gen_lens for comparison.
+
+Check GPU memory: SP’s gen_batch_size should match or exceed your legacy throughput; adjust if needed.

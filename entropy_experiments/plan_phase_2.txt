@@ -1,0 +1,349 @@
+PHASE 2 REFACTOR PLAN (TXT)
+
+NOTE: IGNORE REFERENCES TO use_sequence_processor - we always want to when possible, no reason to keep backup code that will bloat things
+
+Goal:
+
+Add E-batch sampling with replacement driven by SequenceProcessor (SP) while keeping U-batch “distinct without replacement”.
+
+Enable RB entropies with autograd in SP (behind a config flag) so Phase 3 can build the RB + residual-baseline gradient.
+
+0) Config — add small knobs (non-breaking)
+
+Append to your experiment YAML (or set default values programmatically):
+
+batch_config:
+  E_sampling_mode: "replacement"    # {"replacement","distinct"}
+  E_total_sequences: 4096           # total eval sequences; prompts sampled with replacement
+  rollout_batch_size: 8             # per-call generation chunking
+
+generation:
+  top_p: 0.95
+  temperature: 1.0
+  max_new_tokens: 256
+  gen_batch_size: 8
+  tf_batch_size: 64
+  rb_requires_grad: true            # new: enable ∂H path in SP when with_grad=True
+
+
+
+Notes:
+
+E_sampling_mode and E_total_sequences control the eval set size and policy.
+
+rb_requires_grad turns on differentiable RB inside SP only for TF-with-grad.
+
+1) sequence_processor.py — enable differentiable RB and expose it in results
+1.1 Extend the generation config
+
+Add the field (wherever your GenerationConfig is defined):
+
+@dataclass
+class GenerationConfig:
+    ...
+    rb_requires_grad: bool = False
+
+1.2 Extend LogprobResults to carry torch RB (backwards compatible)
+
+Modify the dataclass to add an optional torch payload; keep the numpy one intact:
+
+@dataclass
+class LogprobResults:
+    logprobs: List[List[torch.Tensor]]
+    entropies: List[List[np.ndarray]]
+    sequence_logprobs: List[List[float]]
+    rb_entropies: List[List[np.ndarray]]                 # existing: numpy diagnostics
+    rb_entropies_torch: Optional[List[List[torch.Tensor]]] = None  # NEW: torch (for grad path)
+
+1.3 teacher_force_with_grad(...) — compute RB with or without autograd
+
+Find the block that currently computes RB under torch.no_grad() and replace it with a branch on self.config.rb_requires_grad.
+
+Minimal diff inside the (b,g) loop after you have gen_logits and gen_tokens:
+
+log_probs = torch.log_softmax(gen_logits, dim=-1)
+token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)   # [T]
+all_logprobs[b].append(token_logprobs)
+
+# naive surprisal for diagnostics (numpy)
+entropies_naive = (-token_logprobs).detach().float().cpu().numpy()
+all_entropies[b].append(entropies_naive)
+
+# --- RB entropy path (config-gated) ---
+rb_np = np.array([])
+rb_t  = None
+if compute_rb:
+    if self.config.rb_requires_grad:
+        # DIFFERENTIABLE RB: do NOT wrap in torch.no_grad()
+        rb_t = self._rb_entropies_top_p(gen_logits, self.config.top_p, self.config.temperature)  # [T], torch
+        rb_np = rb_t.detach().float().cpu().numpy()
+    else:
+        # Diagnostics-only RB: no grad
+        with torch.no_grad():
+            rb_H = self._rb_entropies_top_p(gen_logits, self.config.top_p, self.config.temperature)
+            rb_np = rb_H.float().cpu().numpy()
+
+# store both
+all_rb_entropies[b].append(rb_np)
+if rb_t is not None:
+    if rb_entropies_torch is None:
+        rb_entropies_torch = [[ ] for _ in range(B)]
+    rb_entropies_torch[b].append(rb_t)
+else:
+    if rb_entropies_torch is not None:
+        rb_entropies_torch[b].append(torch.tensor([], device=gen_logits.device))
+
+
+At the end of the method, return the new field:
+
+return LogprobResults(
+    logprobs=all_logprobs,
+    entropies=all_entropies,
+    sequence_logprobs=all_sequence_logprobs,
+    rb_entropies=all_rb_entropies,
+    rb_entropies_torch=rb_entropies_torch,   # may be None if not requested
+)
+
+
+No changes are needed in teacher_force_no_grad(...) (it should continue returning numpy RB only).
+
+2) probe_components.py — add explicit E/U samplers (replacement vs distinct)
+
+Intent: keep SP dataset-agnostic; ProbeComponents chooses indices and prepares prompt strings, then calls SP’s generate_batched(...) exactly as in Phase 1. We introduce two helpers:
+
+sample_E_batch_with_replacement(E_total_sequences, G)
+Draws prompts with replacement to reach E_total_sequences generations in total (i.e., #prompts = ceil(E_total_sequences / G)), calls SP in chunks, computes rewards/advantages, and packs a probe-compatible batch dict.
+
+sample_U_batch_distinct(B_U, G)
+Draws B_U distinct prompts (without replacement), identical to your current U path but routed through SP.
+
+2.1 Add methods
+
+Insert in ProbeComponents (names/fields match your Phase 1 outputs):
+
+def sample_E_batch_with_replacement(self, E_total_sequences: int, G: int) -> Dict[str, Any]:
+    """
+    Returns a probe-compatible batch dict with ~E_total_sequences total generations,
+    using prompt sampling WITH replacement. Shapes:
+      sequences:       [B_E, G, max_len]
+      attention_masks: [B_E, G, max_len]
+      prompt_lens:     List[B_E]
+      advantages:      [B_E, G]  (centered per prompt)
+      max_lengths:     List[B_E] (max gen_len per prompt)
+      prompt_ids:      List[B_E]
+    """
+    ds = self._get_dataset(split=self.split)     # your existing accessor
+    N = len(ds)
+    G = int(G)
+
+    # how many prompts do we need if each yields G generations?
+    B_E = int(np.ceil(E_total_sequences / G))
+
+    # sample indices WITH replacement
+    rng = np.random.default_rng(self.seed or 0)
+    idx = rng.integers(low=0, high=N, size=B_E, endpoint=False).tolist()
+
+    prompts, examples, prompt_ids = [], [], []
+    for i in idx:
+        ex = ds[i]
+        prompts.append(self._build_prompt_from_example(ex))   # your existing prompt builder
+        examples.append(ex)
+        prompt_ids.append(i)
+
+    # identical to Phase 1 rollouts (reuse rollout_batch_size)
+    rollout_bs = self.config.get('batch_config', {}).get('rollout_batch_size', 8)
+
+    all_sequences, all_masks = [], []
+    all_prompt_lens, all_advantages, max_lengths = [], [], []
+
+    for s in range(0, B_E, rollout_bs):
+        e = min(s + rollout_bs, B_E)
+        pack = self._sequence_processor.generate_batched(
+            prompts=prompts[s:e], G=G, gen_batch_size=self._sp_gen_config.gen_batch_size
+        )
+        B_b = e - s
+        seq_b, mask_b = pack.sequences, pack.attention_masks
+        prompt_lens_b, gen_lens_b, responses_b = pack.prompt_lens, pack.gen_lens, pack.responses_text
+
+        # rewards -> advantages per prompt (unchanged)
+        for b_local in range(B_b):
+            ex = examples[s + b_local]
+            pid = prompt_ids[s + b_local]
+            resp = responses_b[b_local]
+            rewards = self._compute_rewards(pid, resp, ex)
+            adv = rewards - rewards.mean()
+
+            all_advantages.append(adv)
+            L_max = max(gen_lens_b[b_local]) if len(gen_lens_b[b_local]) > 0 else 1
+            max_lengths.append(L_max)
+
+        all_sequences.extend([seq_b[i] for i in range(B_b)])
+        all_masks.extend([mask_b[i] for i in range(B_b)])
+        all_prompt_lens.extend(prompt_lens_b)
+
+    # pad to common T
+    max_T = max(seq.shape[1] for seq in all_sequences)
+    pad_id = self._tokenizer.pad_token_id
+    padded_seq, padded_mask = [], []
+    for b in range(len(all_sequences)):
+        seq = all_sequences[b]
+        msk = all_masks[b]
+        if seq.shape[1] < max_T:
+            pad_len = max_T - seq.shape[1]
+            seq = F.pad(seq, (0, pad_len), value=pad_id)
+            msk = F.pad(msk, (0, pad_len), value=0)
+        padded_seq.append(seq)
+        padded_mask.append(msk)
+
+    sequences       = torch.stack(padded_seq,  dim=0)
+    attention_masks = torch.stack(padded_mask, dim=0)
+    advantages      = torch.stack(all_advantages, dim=0)   # [B_E, G]
+
+    return {
+        'sequences': sequences,
+        'attention_masks': attention_masks,
+        'prompt_lens': all_prompt_lens,
+        'advantages': advantages,
+        'max_lengths': max_lengths,
+        'prompt_ids': prompt_ids,
+        'num_prompts': len(all_prompt_lens),
+        'num_responses_per_prompt': G,
+    }
+
+
+def sample_U_batch_distinct(self, B_U: int, G: int) -> Dict[str, Any]:
+    """
+    Returns a prompt-distinct batch (without replacement), routed through SP.
+    Mirrors your current U path but uses SP’s batched generation.
+    """
+    ds = self._get_dataset(split=self.split)
+    N = len(ds)
+    rng = np.random.default_rng(self.seed or 0)
+    idx = rng.choice(N, size=B_U, replace=False).tolist()
+
+    prompts, examples, prompt_ids = [], [], []
+    for i in idx:
+        ex = ds[i]
+        prompts.append(self._build_prompt_from_example(ex))
+        examples.append(ex)
+        prompt_ids.append(i)
+
+    rollout_bs = self.config.get('batch_config', {}).get('rollout_batch_size', 8)
+    all_sequences, all_masks = [], []
+    all_prompt_lens, all_advantages, max_lengths = [], [], []
+
+    for s in range(0, B_U, rollout_bs):
+        e = min(s + rollout_bs, B_U)
+        pack = self._sequence_processor.generate_batched(
+            prompts=prompts[s:e], G=G, gen_batch_size=self._sp_gen_config.gen_batch_size
+        )
+        B_b = e - s
+        seq_b, mask_b = pack.sequences, pack.attention_masks
+        prompt_lens_b, gen_lens_b, responses_b = pack.prompt_lens, pack.gen_lens, pack.responses_text
+
+        for b_local in range(B_b):
+            ex = examples[s + b_local]
+            pid = prompt_ids[s + b_local]
+            resp = responses_b[b_local]
+            rewards = self._compute_rewards(pid, resp, ex)
+            adv = rewards - rewards.mean()
+
+            all_advantages.append(adv)
+            L_max = max(gen_lens_b[b_local]) if len(gen_lens_b[b_local]) > 0 else 1
+            max_lengths.append(L_max)
+
+        all_sequences.extend([seq_b[i] for i in range(B_b)])
+        all_masks.extend([mask_b[i] for i in range(B_b)])
+        all_prompt_lens.extend(prompt_lens_b)
+
+    max_T = max(seq.shape[1] for seq in all_sequences)
+    pad_id = self._tokenizer.pad_token_id
+    padded_seq, padded_mask = [], []
+    for b in range(len(all_sequences)):
+        seq = all_sequences[b]
+        msk = all_masks[b]
+        if seq.shape[1] < max_T:
+            pad_len = max_T - seq.shape[1]
+            seq = F.pad(seq, (0, pad_len), value=pad_id)
+            msk = F.pad(msk, (0, pad_len), value=0)
+        padded_seq.append(seq)
+        padded_mask.append(msk)
+
+    sequences       = torch.stack(padded_seq,  dim=0)
+    attention_masks = torch.stack(padded_mask, dim=0)
+    advantages      = torch.stack(all_advantages, dim=0)
+
+    return {
+        'sequences': sequences,
+        'attention_masks': attention_masks,
+        'prompt_lens': all_prompt_lens,
+        'advantages': advantages,
+        'max_lengths': max_lengths,
+        'prompt_ids': prompt_ids,
+        'num_prompts': len(all_prompt_lens),
+        'num_responses_per_prompt': G,
+    }
+
+3) offline_entropy_probe.py — switch call sites in run_mixed_probe
+
+Inside run_mixed_probe(...), replace the E-batch and U-batch sampling calls with:
+
+E_mode = self.config.get('batch_config', {}).get('E_sampling_mode', 'replacement')
+E_total = int(self.config.get('batch_config', {}).get('E_total_sequences', 4096))
+G = int(self.config.get('num_generations_per_prompt', 1))  # or wherever G is configured
+
+if E_mode == 'replacement':
+    batch_E = self.probe_components.sample_E_batch_with_replacement(E_total_sequences=E_total, G=G)
+else:
+    # fallback: distinct prompts with count = E_total_sequences // G
+    B_E = max(1, E_total // G)
+    batch_E = self.probe_components.sample_U_batch_distinct(B_U=B_E, G=G)
+
+# U-batch (unchanged policy, but routed through SP)
+B_U = int(self.config.get('batch_config', {}).get('B_U', 64))
+batch_U = self.probe_components.sample_U_batch_distinct(B_U=B_U, G=G)
+
+
+All downstream code (teacher-forcing passes to compute X and Y, dot-product for δH₁) remains unchanged in Phase 2.
+
+4) Invariants & quick checks (add temporarily)
+
+Add after each sampler returns:
+
+def _assert_probe_batch(batch):
+    B, G, T = batch['sequences'].shape
+    assert batch['attention_masks'].shape == (B, G, T)
+    assert len(batch['prompt_lens']) == B
+    assert len(batch['max_lengths']) == B
+    assert batch['advantages'].shape == (B, G)
+    assert batch['num_prompts'] == B and batch['num_responses_per_prompt'] == G
+
+_assert_probe_batch(batch_E)
+_assert_probe_batch(batch_U)
+self.logger.info(f"[Phase2] E-batch {tuple(batch_E['sequences'].shape)}; U-batch {tuple(batch_U['sequences'].shape)}")
+
+5) Rollback & risk
+
+Set generation.rb_requires_grad: false to disable the RB autograd path (without touching any call sites).
+
+Set batch_config.E_sampling_mode: "distinct" to revert to distinct-prompt eval.
+
+Set sampling.use_sequence_processor: false to restore the legacy sampler entirely (Phase 1 toggle).
+
+6) Minimal test plan (10–15 minutes)
+
+Shape smoke test.
+Run with small settings: E_total_sequences=16, B_U=8, G=2. Confirm both samplers produce identical tensor shapes to before and _assert_probe_batch passes.
+
+Replacement behavior.
+Log prompt_ids for E-batch and count duplicates; you should see repeats when E_total_sequences // G > #dataset.
+
+RB grad path toggle.
+Run a single teacher-forcing microbatch with with_grad=True, compute_rb=True, and:
+
+rb_requires_grad=false: after backward(), inspect grad norms → zero contribution from the RB pathwise term.
+
+rb_requires_grad=true: same check → non-zero contribution (you will see param grads even if the score-term loss is disabled).
+
+Perf sanity.
+Ensure rollout_batch_size and gen_batch_size do not increase peak memory beyond your Phase-1 run; adjust if needed.

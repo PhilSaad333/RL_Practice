@@ -75,6 +75,8 @@ class LogprobResults:
     rewards: List[List[float]]             # [B][G] rewards per sequence using tag_pref reward function
     # Phase 2: Optional torch tensors for differentiable RB entropies
     rb_entropies_torch: Optional[List[List[torch.Tensor]]] = None  # [B][G] torch RB entropies (for grad path)
+    # Phase 3b: Optional per-step feature matrix φ_j for regression baseline
+    baseline_feats_torch: Optional[List[List[torch.Tensor]]] = None  # [B][G] features [T, d] (detached)
 
 
 @dataclass
@@ -416,7 +418,8 @@ class SequenceProcessor:
     def teacher_force_logprobs(self, sequences: BatchedSequences, 
                               with_grad: bool = False,
                               tf_batch_size: Optional[int] = None,
-                              compute_rb: bool = False) -> LogprobResults:
+                              compute_rb: bool = False,
+                              return_baseline_features: bool = False) -> LogprobResults:
         """Compute logprobs for generated sequences using teacher forcing.
         
         Args:
@@ -431,14 +434,15 @@ class SequenceProcessor:
             tf_batch_size = self.config.tf_batch_size
             
         if with_grad:
-            return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb)
+            return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
         else:
-            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb)
+            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
     
     def teacher_force_logprobs_with_diagnostics(self, sequences: BatchedSequences, 
                                               with_grad: bool = False,
                                               tf_batch_size: Optional[int] = None,
-                                              compute_rb: bool = False) -> Tuple[LogprobResults, DiagnosticsResults]:
+                                              compute_rb: bool = False,
+                                              return_baseline_features: bool = False) -> Tuple[LogprobResults, DiagnosticsResults]:
         """Compute logprobs and diagnostics for generated sequences using teacher forcing.
         
         Args:
@@ -454,12 +458,12 @@ class SequenceProcessor:
             tf_batch_size = self.config.tf_batch_size
             
         if with_grad:
-            return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb)
+            return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
         else:
-            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb)
+            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
     
     def _teacher_force_no_grad(
-        self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool
+        self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool, return_baseline_features: bool = False
     ) -> Tuple[LogprobResults, DiagnosticsResults]:
         model = self._unwrap(self.model)
         B, G = sequences.sequences.shape[:2]
@@ -595,6 +599,8 @@ class SequenceProcessor:
             sequence_logprobs=all_sequence_logprobs,
             rb_entropies=all_rb_entropies,
             rewards=[],  # Will be filled by generate_with_logprobs
+            rb_entropies_torch=None,  # no grad path doesn't compute torch tensors
+            baseline_feats_torch=None,  # no grad path doesn't compute baseline features
         )
         
         diagnostics_results = DiagnosticsResults(
@@ -604,7 +610,7 @@ class SequenceProcessor:
         return logprob_results, diagnostics_results
     
     def _teacher_force_with_grad(
-        self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool
+        self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool, return_baseline_features: bool = False
     ) -> Tuple[LogprobResults, DiagnosticsResults]:
         """
         Gradient-enabled version. By default we do NOT build a gradient graph for RB entropies,
@@ -618,6 +624,7 @@ class SequenceProcessor:
         all_rb_entropies = [[] for _ in range(B)]
         all_sequence_logprobs = [[] for _ in range(B)]
         rb_entropies_torch = [[] for _ in range(B)] if compute_rb and self.config.rb_requires_grad else None
+        baseline_feats_torch = [[] for _ in range(B)] if return_baseline_features else None
 
         for b in range(B):
             for g in range(G):
@@ -668,6 +675,61 @@ class SequenceProcessor:
 
                         seq_logprob = float(token_logprobs.detach().sum().item())
                         
+                        # --- Baseline features (Phase 3b) ---
+                        phi = None
+                        if return_baseline_features:
+                            with torch.no_grad():
+                                # Derive masked logits a_masked and q exactly as in RB computation
+                                a = gen_logits / self.config.temperature  # [T, V]
+                                if self.config.top_p < 1.0:
+                                    p_full = torch.softmax(a, dim=-1)  # [T,V]
+                                    p_sorted, idx_sorted = p_full.sort(dim=-1, descending=True)
+                                    cumsum = p_sorted.cumsum(dim=-1)
+                                    keep_sorted = (cumsum - p_sorted) <= self.config.top_p
+                                    keep_sorted[..., 0] = True
+                                    keep = torch.zeros_like(p_full, dtype=torch.bool)
+                                    keep.scatter_(dim=-1, index=idx_sorted, src=keep_sorted)
+                                    a_masked = a.masked_fill(~keep, float('-inf'))
+                                    q = torch.softmax(a_masked, dim=-1)  # [T,V]
+                                    s = (p_full * keep).sum(dim=-1)  # [T] head mass
+                                    eps = (1.0 - s).clamp_min(0.0)
+                                    Z_S = torch.logsumexp(a_masked, dim=-1)  # [T]
+                                else:
+                                    a_masked = a
+                                    q = torch.softmax(a_masked, dim=-1)
+                                    s = torch.ones(a.size(0), device=a.device)
+                                    eps = torch.zeros_like(s)
+                                    Z_S = torch.logsumexp(a_masked, dim=-1)
+                                
+                                # H (RB entropy) on q
+                                H = Z_S - (q * a).sum(dim=-1)  # [T]
+                                
+                                # top1 prob and margin
+                                q_sorted, _ = q.sort(dim=-1, descending=True)
+                                top1 = q_sorted[..., 0]  # [T]
+                                a_sorted, _ = a_masked.sort(dim=-1, descending=True)
+                                a1 = a_sorted[..., 0]
+                                a2 = torch.where(a_sorted.shape[-1] > 1, a_sorted[..., 1], torch.full_like(a1, -float('inf')))
+                                margin = (a1 - a2).masked_fill(~torch.isfinite(a2), 0.0)  # [T]
+                                
+                                # two-point entropy H([s,eps])
+                                def _slog(x): 
+                                    return torch.log(x.clamp_min(1e-38))
+                                H2pt = -(s * _slog(s) + eps * _slog(eps))  # [T]
+                                
+                                # logit moments under q
+                                Ea = (q * a).sum(dim=-1)
+                                Ea2 = (q * (a * a)).sum(dim=-1)
+                                var_a = (Ea2 - Ea * Ea).clamp_min(0.0)  # [T]
+                                
+                                # position fraction j/L
+                                T = a.size(0)
+                                pos_frac = torch.arange(T, device=a.device, dtype=torch.float32) / max(T, 1)
+                                
+                                # Stack features in order: ["H", "top1", "margin", "head_mass", "two_point_entropy", "logit_var", "pos_frac"]
+                                feats = [H, top1, margin, s, H2pt, var_a, pos_frac]  # list of [T]
+                                phi = torch.stack(feats, dim=-1).detach()  # [T, d]
+                        
                         # store torch tensors with grad
                         all_logprobs[b].append(token_logprobs)
                         all_entropies[b].append(entropies_naive)
@@ -680,6 +742,13 @@ class SequenceProcessor:
                                 rb_entropies_torch[b].append(rb_t)
                             else:
                                 rb_entropies_torch[b].append(torch.tensor([], device=gen_logits.device))
+                        
+                        # Store baseline features if available
+                        if baseline_feats_torch is not None:
+                            if phi is not None:
+                                baseline_feats_torch[b].append(phi)
+                            else:
+                                baseline_feats_torch[b].append(torch.tensor([]).view(0, 7))  # empty [0, 7] tensor
                     else:
                         # Size mismatch or zero generation length
                         all_logprobs[b].append(torch.tensor([], requires_grad=True))
@@ -690,6 +759,10 @@ class SequenceProcessor:
                         # Store empty torch RB if needed
                         if rb_entropies_torch is not None:
                             rb_entropies_torch[b].append(torch.tensor([], device=next(model.parameters()).device))
+                        
+                        # Store empty baseline features if needed
+                        if baseline_feats_torch is not None:
+                            baseline_feats_torch[b].append(torch.tensor([]).view(0, 7))
 
         logprob_results = LogprobResults(
             logprobs=all_logprobs,
@@ -698,6 +771,7 @@ class SequenceProcessor:
             rb_entropies=all_rb_entropies,
             rewards=[],  # Will be filled by generate_with_logprobs
             rb_entropies_torch=rb_entropies_torch,  # Phase 2: torch RB tensors
+            baseline_feats_torch=baseline_feats_torch,  # Phase 3b: baseline features
         )
         
         # For now, return empty diagnostics for the with_grad version

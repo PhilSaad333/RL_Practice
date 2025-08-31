@@ -1,0 +1,350 @@
+PHASE 3b: REGRESSION BASELINE (TXT)
+
+Goal:
+
+Add baseline.mode: "regression" that fits a light ridge regression to predict the residual 
+𝐺
+𝑗
+−
+𝐻
+𝑗
+G
+j
+	​
+
+−H
+j
+	​
+
+ from per-step features 
+𝜙
+(
+𝑠
+𝑗
+)
+ϕ(s
+j
+	​
+
+) that depend only on the prefix 
+𝑠
+𝑗
+=
+(
+𝑥
+,
+𝑌
+<
+𝑗
+)
+s
+j
+	​
+
+=(x,Y
+<j
+	​
+
+).
+
+Use the same sampling policy as generation (temperature + top-p), i.e., policy parity for features.
+
+Keep all gradients flowing only through the score and pathwise terms; detach the baseline prediction.
+
+0) Config additions (non-breaking)
+
+Append to your YAML (or set sensible defaults):
+
+estimator:
+  x_estimator_mode: "rb_residual"      # already set in Phase 3
+  baseline:
+    mode: "regression"                 # {"none","constant","residual_mu","regression"}
+    ridge_lambda: 1.0e-3               # L2 regularization
+    features: ["H", "top1", "margin", "head_mass", "two_point_entropy", "logit_var", "pos_frac"]
+    ema_decay: 0.9                     # kept for "residual_mu" mode
+
+generation:
+  rb_requires_grad: true               # keep on
+
+
+Notes:
+
+features controls which predictors to include (see §1.2).
+
+pos_frac is the normalized step index 
+𝑗
+/
+𝐿
+j/L; it helps absorb position effects.
+
+1) sequence_processor.py — expose prefix features for the baseline
+1.1 Extend LogprobResults to carry detached per-step feature tensors
+
+Add a new optional field:
+
+@dataclass
+class LogprobResults:
+    logprobs: List[List[torch.Tensor]]
+    entropies: List[List[np.ndarray]]
+    sequence_logprobs: List[List[float]]
+    rb_entropies: List[List[np.ndarray]]
+    rb_entropies_torch: Optional[List[List[torch.Tensor]]] = None
+    # NEW: per-step feature matrix φ_j (detached torch), shape [T, d] for each (b,g)
+    baseline_feats_torch: Optional[List[List[torch.Tensor]]] = None
+
+1.2 teacher_force_with_grad(...): add return_baseline_features: bool
+
+Signature change:
+
+def teacher_force_logprobs(
+    self,
+    sequences: BatchedSequences,
+    with_grad: bool = False,
+    tf_batch_size: Optional[int] = None,
+    compute_rb: bool = False,
+    return_baseline_features: bool = False,    # NEW
+) -> LogprobResults:
+
+
+Inside the (b,g) loop, after you’ve computed gen_logits (shape [T,V]), and after you’ve created a = gen_logits / temperature for RB:
+
+Compute a small set of prefix-only features from the truncated distribution 
+𝑞
+q (top-p or full):
+
+# --- Baseline features (DETACHED) ---
+phi = None
+if return_baseline_features:
+    with torch.no_grad():
+        # Derive masked logits a_masked and q exactly as in your RB computation
+        if self.config.top_p < 1.0:
+            p_full = torch.softmax(a, dim=-1)                           # [T,V]
+            p_sorted, idx_sorted = p_full.sort(dim=-1, descending=True)
+            cumsum = p_sorted.cumsum(dim=-1)
+            keep_sorted = (cumsum - p_sorted) <= self.config.top_p
+            keep_sorted[..., 0] = True
+            keep = torch.zeros_like(p_full, dtype=torch.bool)
+            keep.scatter_(dim=-1, index=idx_sorted, src=keep_sorted)
+            a_masked = a.masked_fill(~keep, float('-inf'))
+            q = torch.softmax(a_masked, dim=-1)                         # [T,V]
+            s = (p_full * keep).sum(dim=-1)                             # [T] head mass
+            eps = (1.0 - s).clamp_min(0.0)
+            Z_S = torch.logsumexp(a_masked, dim=-1)                     # [T]
+        else:
+            a_masked = a
+            q = torch.softmax(a_masked, dim=-1)
+            s = torch.ones(a.size(0), device=a.device)
+            eps = torch.zeros_like(s)
+            Z_S = torch.logsumexp(a_masked, dim=-1)
+
+        # H (RB entropy) on q (same as rb_t if enabled)
+        H = Z_S - (q * a).sum(dim=-1)                                   # [T]
+
+        # top1 prob and margin (logit space, masked)
+        q_sorted, _ = q.sort(dim=-1, descending=True)
+        top1 = q_sorted[..., 0]                                         # [T]
+        a_sorted, _ = a_masked.sort(dim=-1, descending=True)
+        a1 = a_sorted[..., 0]
+        a2 = torch.where(a_sorted.shape[-1] > 1, a_sorted[..., 1], torch.full_like(a1, -float('inf')))
+        margin = (a1 - a2).masked_fill(~torch.isfinite(a2), 0.0)        # [T]
+
+        # two-point entropy H([s,eps])
+        def _slog(x): return torch.log(x.clamp_min(1e-38))
+        H2pt = -(s * _slog(s) + eps * _slog(eps))                       # [T]
+
+        # logit moments under q
+        Ea  = (q * a).sum(dim=-1)
+        Ea2 = (q * (a * a)).sum(dim=-1)
+        var_a = (Ea2 - Ea * Ea).clamp_min(0.0)                          # [T]
+
+        # position fraction j/L
+        T = a.size(0)
+        pos_frac = torch.arange(T, device=a.device, dtype=torch.float32) / max(T, 1)
+
+        # Stack selected features in ORDER matching config default
+        feats = [H, top1, margin, s, H2pt, var_a, pos_frac]             # list of [T]
+        phi = torch.stack(feats, dim=-1).detach()                       # [T, d]
+
+
+Store it alongside existing outputs:
+
+if return_baseline_features:
+    if baseline_feats_torch is None:
+        baseline_feats_torch = [[ ] for _ in range(B)]
+    baseline_feats_torch[b].append(phi)
+...
+return LogprobResults(..., baseline_feats_torch=baseline_feats_torch)
+
+
+All features are prefix-only and do not depend on the action 
+𝑌
+𝑗
+Y
+j
+	​
+
+.
+They are detached; they never carry gradients.
+
+2) probe_components.py — fit ridge on 
+(
+Φ
+,
+𝑟
+)
+(Φ,r) and build 
+𝑏
+𝑗
+b
+j
+	​
+
+2.1 Read features from SP and select columns per config
+
+In _build_X_loss_rb_residual(...) (Phase 3), before assembling per-sequence losses, gather a global design matrix and target residuals:
+
+bl_cfg = self.config.get('estimator', {}).get('baseline', {}) or {}
+bl_mode = bl_cfg.get('mode', 'residual_mu')
+use_reg = (bl_mode == 'regression')
+feat_names = bl_cfg.get('features', ["H","top1","margin","head_mass","two_point_entropy","logit_var","pos_frac"])
+ridge_lambda = float(bl_cfg.get('ridge_lambda', 1e-3))
+
+# Map feature names to column indices in phi (must match SP stacking order)
+feat_index = {
+    "H": 0, "top1": 1, "margin": 2, "head_mass": 3,
+    "two_point_entropy": 4, "logit_var": 5, "pos_frac": 6
+}
+
+# 1) Build global Φ and r targets (concatenate over all sequences)
+Phi_list, r_list, seg_lengths = [], [], []
+if use_reg:
+    assert logprob_results.baseline_feats_torch is not None, \
+        "baseline.mode=regression requires return_baseline_features=True in SP TF call."
+
+for b in range(B):
+    for g in range(len(logprob_results.logprobs[b])):
+        token_lp = logprob_results.logprobs[b][g]
+        Hk = logprob_results.rb_entropies_torch[b][g] if logprob_results.rb_entropies_torch else None
+        phi_bg = (logprob_results.baseline_feats_torch[b][g]
+                  if use_reg and logprob_results.baseline_feats_torch else None)
+        if token_lp is None or Hk is None or token_lp.numel() == 0:
+            continue
+        L = Hk.numel()
+        # returns-to-go G_j
+        G = torch.cumsum(torch.flip(Hk, dims=[0]), dim=0)
+        G = torch.flip(G, dims=[0])                                  # [L]
+        resid = (G - Hk).detach()                                    # [L]
+
+        if use_reg:
+            # select requested feature columns
+            cols = [feat_index[n] for n in feat_names]
+            Phi = phi_bg[:, cols]                                    # [L, d], detached
+            Phi_list.append(Phi)
+            r_list.append(resid)
+            seg_lengths.append(L)
+
+# 2) Fit ridge: β = (ΦᵀΦ + λI)^{-1} Φᵀ r  (computed on CPU for stability)
+beta = None
+if use_reg and len(Phi_list) > 0:
+    Phi_cat = torch.cat(Phi_list, dim=0).float().cpu()              # [N, d]
+    r_cat   = torch.cat(r_list,  dim=0).float().cpu()               # [N]
+    N, d = Phi_cat.shape
+    I = torch.eye(d, dtype=Phi_cat.dtype)
+    XtX = Phi_cat.T @ Phi_cat
+    XtX = XtX + ridge_lambda * I
+    Xtr = Phi_cat.T @ r_cat
+    beta = torch.linalg.solve(XtX, Xtr)                             # [d]
+    beta = beta.to(next(self.model.parameters()).device).detach()
+
+2.2 Use the fitted baseline when assembling the loss
+
+Replace the baseline branch inside the per-sequence loop:
+
+if bl_mode == 'residual_mu':
+    mu = mu_vec[:L]
+    b_j = Hk.detach() + mu
+elif bl_mode == 'regression' and (beta is not None):
+    # Predict μ̂_j = Φ_j β, then b_j = H_j + μ̂_j
+    cols = [feat_index[n] for n in feat_names]
+    Phi = logprob_results.baseline_feats_torch[b][g][:, cols].to(beta.device)  # [L,d]
+    mu_hat = (Phi @ beta).detach()                                             # [L]
+    b_j = Hk.detach() + mu_hat
+elif bl_mode == 'none':
+    b_j = Hk.detach()
+else:
+    # fallback
+    mu = mu_vec[:L]
+    b_j = Hk.detach() + mu
+
+
+Important: b_j must be detached (as above). The rest of the loss assembly (score + pathwise) remains exactly as in Phase 3.
+
+2.3 Call SP with return_baseline_features=True when needed
+
+In accumulate_sum_X(...), when you invoke SP TF:
+
+return_feats = (self.config.get('estimator', {}).get('baseline', {}).get('mode', 'residual_mu') == 'regression')
+
+logprob_results = self._sequence_processor.teacher_force_logprobs(
+    sequences=bs, with_grad=True,
+    tf_batch_size=self._sp_gen_config.tf_batch_size,
+    compute_rb=(mode == 'rb_residual'),
+    return_baseline_features=return_feats,    # NEW
+)
+
+3) offline_entropy_probe.py — no change required
+
+Optionally log at run start:
+
+x_estimator_mode
+
+baseline.mode
+
+selected features
+
+ridge_lambda
+
+4) Invariants & guardrails
+
+Action independence: all features must depend only on the prefix/logits 
+𝑎
+𝑗
+a
+j
+	​
+
+ and 
+𝑞
+𝑗
+q
+j
+	​
+
+. Do not include realized action 
+𝑌
+𝑗
+Y
+j
+	​
+
+ or realized token logprob as a feature.
+
+Detachment: ensure phi, beta, and b_j are detached; the baseline carries no gradients.
+
+Fallback: if beta cannot be fit (empty batch), fall back to residual_mu.
+
+Add a quick runtime check (temporary):
+
+if use_reg:
+    # sanity: b_j should have zero grad
+    assert not b_j.requires_grad, "baseline must be detached"
+
+5) Minimal test plan (10–15 minutes)
+
+Shapes/flow: run a tiny job (B=2,G=2) with baseline.mode: regression. Confirm no errors and that baseline_feats_torch is populated (d matches selected features).
+
+Unbiasedness smoke: temporarily compute the mean of (G_j - b_j) over all j; it should be near the mean of (G_j - H_j) centered by the regression fit (not necessarily zero, but typically smaller variance).
+
+Variance reduction: compare the empirical variance of the score advantages adv_j = G_j - b_j under residual_mu vs regression. It should drop further with regression (print scalar variances per batch).
+
+No gradient through baseline: check total grad norm of parameters with and without return_baseline_features; should be similar (differences only from numerical changes, not extra paths).

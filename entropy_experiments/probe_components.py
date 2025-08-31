@@ -253,6 +253,60 @@ class ProbeComponents:
         # Update EMA baseline μ_j using current batch residuals
         self._baseline_state_x.update_from_batch(padded_residuals, length_tensor)
         mu_vec = self._baseline_state_x.get_mu_vector(T_max)     # [T_max], detached
+        
+        # Phase 3b: Ridge regression baseline setup
+        bl_cfg = self.config.get('estimator', {}).get('baseline', {}) or {}
+        bl_mode = bl_cfg.get('mode', 'residual_mu')
+        use_reg = (bl_mode == 'regression')
+        feat_names = bl_cfg.get('features', ["H","top1","margin","head_mass","two_point_entropy","logit_var","pos_frac"])
+        ridge_lambda = float(bl_cfg.get('ridge_lambda', 1e-3))
+        
+        # Map feature names to column indices in phi (must match SP stacking order)
+        feat_index = {
+            "H": 0, "top1": 1, "margin": 2, "head_mass": 3,
+            "two_point_entropy": 4, "logit_var": 5, "pos_frac": 6
+        }
+        
+        # 1) Build global Φ and r targets (concatenate over all sequences)
+        Phi_list, r_list, seg_lengths = [], [], []
+        if use_reg:
+            assert logprob_results.baseline_feats_torch is not None, \
+                "baseline.mode=regression requires return_baseline_features=True in SP TF call."
+            
+            for b in range(B):
+                for g in range(len(logprob_results.logprobs[b])):
+                    token_lp = logprob_results.logprobs[b][g]
+                    Hk = logprob_results.rb_entropies_torch[b][g] if logprob_results.rb_entropies_torch else None
+                    phi_bg = (logprob_results.baseline_feats_torch[b][g]
+                              if use_reg and logprob_results.baseline_feats_torch else None)
+                    if token_lp is None or Hk is None or token_lp.numel() == 0:
+                        continue
+                    L = Hk.numel()
+                    # returns-to-go G_j
+                    G = torch.cumsum(torch.flip(Hk, dims=[0]), dim=0)
+                    G = torch.flip(G, dims=[0])                                  # [L]
+                    resid = (G - Hk).detach()                                    # [L]
+                    
+                    if phi_bg is not None and phi_bg.numel() > 0:
+                        # select requested feature columns
+                        cols = [feat_index[n] for n in feat_names]
+                        Phi = phi_bg[:L, cols]                                    # [L, d], detached
+                        Phi_list.append(Phi)
+                        r_list.append(resid)
+                        seg_lengths.append(L)
+        
+        # 2) Fit ridge: β = (ΦᵀΦ + λI)^{-1} Φᵀ r  (computed on CPU for stability)
+        beta = None
+        if use_reg and len(Phi_list) > 0:
+            Phi_cat = torch.cat(Phi_list, dim=0).float().cpu()              # [N, d]
+            r_cat   = torch.cat(r_list,  dim=0).float().cpu()               # [N]
+            N, d = Phi_cat.shape
+            I = torch.eye(d, dtype=Phi_cat.dtype)
+            XtX = Phi_cat.T @ Phi_cat
+            XtX = XtX + ridge_lambda * I
+            Xtr = Phi_cat.T @ r_cat
+            beta = torch.linalg.solve(XtX, Xtr)                             # [d]
+            beta = beta.to(next(self.model.parameters()).device).detach()
 
         # Assemble losses per sequence
         idx_seq = 0
@@ -268,15 +322,22 @@ class ProbeComponents:
                 G = torch.cumsum(torch.flip(Hk, dims=[0]), dim=0)
                 G = torch.flip(G, dims=[0])                           # [L]
 
-                # Baseline b_j = H_j + μ_j (positionwise; slice μ to length L)
-                bl_mode = (self.config.get('estimator', {}).get('baseline', {}) or {}).get('mode', 'residual_mu')
+                # Baseline b_j = H_j + μ_j (different modes)
                 if bl_mode == 'residual_mu':
-                    mu = mu_vec[:L]                                   # [L]
-                    b_j = Hk.detach() + mu                            # detach baseline
+                    mu = mu_vec[:L]
+                    b_j = Hk.detach() + mu
+                elif bl_mode == 'regression' and (beta is not None):
+                    # Predict μ̂_j = Φ_j β, then b_j = H_j + μ̂_j
+                    cols = [feat_index[n] for n in feat_names]
+                    phi_feat = logprob_results.baseline_feats_torch[b][g][:L, cols].to(beta.device)  # [L,d]
+                    mu_hat = (phi_feat @ beta).detach()                                             # [L]
+                    b_j = Hk.detach() + mu_hat
+                    # Add runtime check (temporary)
+                    assert not b_j.requires_grad, "baseline must be detached"
                 elif bl_mode == 'none':
                     b_j = Hk.detach()  # μ=0
                 else:
-                    # "constant" or "regression" can be added later; for now treat as residual_mu
+                    # fallback
                     mu = mu_vec[:L]
                     b_j = Hk.detach() + mu
 
@@ -997,11 +1058,13 @@ class ProbeComponents:
                     # 1) Convert microbatch -> BatchedSequences for SP TF with grad
                     bs = self._to_batched_sequences_from_probe(microbatch)
                     
-                    # 2) Run TF with grad + RB
+                    # 2) Run TF with grad + RB + baseline features if needed
+                    return_feats = (self.config.get('estimator', {}).get('baseline', {}).get('mode', 'residual_mu') == 'regression')
                     logprob_results, _ = self._sequence_processor.teacher_force_logprobs(
                         sequences=bs, with_grad=True,
                         tf_batch_size=self._sp_gen_config.tf_batch_size,
-                        compute_rb=True
+                        compute_rb=True,
+                        return_baseline_features=return_feats
                     )
                     
                     # 3) Build RB X loss
