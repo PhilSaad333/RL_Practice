@@ -34,17 +34,27 @@ def load_model_and_tokenizer(checkpoint_path: str):
     """Load the model and tokenizer from checkpoint."""
     logger = logging.getLogger('rb_autograd_test')
     
-    logger.info(f"Loading model from checkpoint: {checkpoint_path}")
+    logger.info(f"Loading LoRA model from checkpoint: {checkpoint_path}")
     
-    model = AutoModelForCausalLM.from_pretrained(
-        checkpoint_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True
+    # Import the proper LoRA loader
+    from entropy_experiments.offline_entropy_probe import load_peft_for_probe
+    
+    # Load base model + LoRA adapter (same approach as offline_entropy_probe)
+    model = load_peft_for_probe(
+        base_id="Qwen/Qwen2.5-1.5B",
+        adapter_path=checkpoint_path,
+        mode="lora_simple",
+        dtype="bf16",
+        device_map="cuda",
+        use_checkpointing=False
     )
     
-    # Ensure model is in training mode for gradients
+    # Set model to training mode for gradients
     model.train()
+    
+    # Ensure adapter is active
+    if hasattr(model, "set_adapter"):
+        model.set_adapter("default")
     
     tokenizer = AutoTokenizer.from_pretrained(
         "Qwen/Qwen2.5-1.5B", 
@@ -53,10 +63,20 @@ def load_model_and_tokenizer(checkpoint_path: str):
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Check if model parameters require gradients
-    params_with_grad = sum(1 for p in model.parameters() if p.requires_grad)
-    total_params = sum(1 for p in model.parameters())
-    logger.info(f"Model parameters: {params_with_grad}/{total_params} require gradients")
+    # DIAGNOSTICS: Count trainable parameters (same as offline_entropy_probe)
+    peft_model = model.module if hasattr(model, "module") else model
+    trainable_named = [(n, p) for (n, p) in peft_model.named_parameters() if p.requires_grad]
+    lora_named = [(n, p) for (n, p) in trainable_named 
+                  if ("lora_a" in n.lower()) or ("lora_b" in n.lower()) or n.endswith("lm_head.weight")]
+    
+    logger.info(f"Trainable parameters after LoRA loading: {len(trainable_named)} total, {len(lora_named)} LoRA params")
+    
+    # Show first few LoRA parameter names for verification
+    lora_names = [name for name, _ in lora_named[:5]]
+    if lora_names:
+        logger.info(f"Sample LoRA parameters: {lora_names}")
+    else:
+        logger.error("ERROR: No LoRA parameters found in trainable params!")
     
     return model, tokenizer
 
