@@ -119,7 +119,7 @@ class ProbeComponents:
         self.logger.debug(f"[REGISTRY] trainable_tensors={len(self._trainable_params)} "
                           f"lora_tensors={len(self._lora_params)}")
         
-        self.logger.info(f"ProbeComponents initialized: mode={self.mode}, G={self.G}")
+        self.logger.info(f"ProbeComponents initialized with SequenceProcessor: G={self.G}")
         
     def sample_batch(self, B: int, G: int, indices: Optional[List[int]] = None) -> Dict[str, Any]:
         """
