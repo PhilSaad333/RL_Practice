@@ -284,6 +284,8 @@ class ProbeComponents:
                 adv = (G.detach() - b_j).detach()                     # [L]
 
                 # --- Score term with correct sign: grad = Σ adv * ∇ log π ---
+                # Ensure dtype compatibility for dot product
+                adv = adv.to(dtype=token_lp.dtype)
                 score_loss = torch.dot(adv, token_lp)                 # scalar
 
                 # --- Pathwise term: Σ H_k (no detach, to get ∂H) ---
