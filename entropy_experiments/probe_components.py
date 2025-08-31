@@ -32,6 +32,45 @@ from .conditional_variance import ConditionalVarianceEstimator
 from sequence_processing.sequence_processor import SequenceProcessor, GenerationConfig
 
 
+class BaselineState:
+    """
+    Maintains per-position residual means μ_j for the baseline b_j = H_j + μ_j.
+    G_j - H_j is the target; we track an EMA per absolute step index j (0-based).
+    """
+    def __init__(self, ema_decay: float = 0.9, device: torch.device = torch.device("cpu")):
+        self.ema_decay = float(ema_decay)
+        self.mu = torch.zeros(0, device=device)  # shape [J_max]; grows as needed
+
+    def ensure_len(self, J_needed: int):
+        if self.mu.numel() < J_needed:
+            pad = torch.zeros(J_needed - self.mu.numel(), device=self.mu.device)
+            self.mu = torch.cat([self.mu, pad], dim=0)
+
+    @torch.no_grad()
+    def update_from_batch(self, residuals: torch.Tensor, lengths: torch.Tensor):
+        """
+        residuals: (B_total, T_max) padded with 0 where j >= length
+        lengths:   (B_total,) number of valid steps per row
+        """
+        J_max = residuals.size(1)
+        self.ensure_len(J_max)
+
+        # Compute per-position batch means of residuals over valid rows
+        # mask: 1 for j < length
+        idx = torch.arange(J_max, device=lengths.device).unsqueeze(0)  # [1, J_max]
+        mask = (idx < lengths.unsqueeze(1)).float()                    # [B, J_max]
+        denom = mask.sum(dim=0).clamp_min(1.0)                         # [J_max]
+        mean_resid = (residuals * mask).sum(dim=0) / denom             # [J_max]
+
+        # EMA update μ_j ← (1-α) μ_j + α mean_resid_j
+        α = self.ema_decay
+        self.mu[:J_max].mul_(1.0 - α).add_(α * mean_resid)
+
+    def get_mu_vector(self, J: int) -> torch.Tensor:
+        self.ensure_len(J)
+        return self.mu[:J].detach()  # [J], no grad
+
+
 class ProbeComponents:
     """
     Core computational components for entropy probe analysis.
@@ -119,7 +158,19 @@ class ProbeComponents:
         self.logger.debug(f"[REGISTRY] trainable_tensors={len(self._trainable_params)} "
                           f"lora_tensors={len(self._lora_params)}")
         
+        # --- Phase 3: Initialize BaselineState for RB-residual estimator ---
+        bl_cfg = self.config.get('estimator', {}).get('baseline', {})
+        self._baseline_state_x = BaselineState(
+            ema_decay=bl_cfg.get('ema_decay', 0.9),
+            device=self.device
+        )
+        
         self.logger.info(f"ProbeComponents initialized with SequenceProcessor: G={self.G}")
+        
+        # Log Phase 3 configuration
+        x_estimator_mode = self.config.get('estimator', {}).get('x_estimator_mode', 'naive')
+        baseline_mode = bl_cfg.get('mode', 'residual_mu')
+        self.logger.info(f"Phase 3 config: x_estimator_mode={x_estimator_mode}, baseline_mode={baseline_mode}")
         
     def sample_batch(self, B: int, G: int, indices: Optional[List[int]] = None) -> Dict[str, Any]:
         """
