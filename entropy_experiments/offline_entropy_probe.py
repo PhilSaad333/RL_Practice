@@ -104,7 +104,6 @@ import json
 from .probe_components import ProbeComponents
 from .adam_preconditioner import AdamPreconditioner  
 from .importance_sampling import ImportanceSampler
-from .u_statistics import UStatisticsCalculator
 from . import distributed_helpers
 from .distributed_helpers import DistributedHelpers
 
@@ -521,11 +520,7 @@ class OfflineEntropyProbe:
         else:
             self.importance_sampler = None
             self.logger.info("ImportanceSampler disabled (importance.enabled: false)")
-        
-        self.u_statistics = UStatisticsCalculator(
-            config=self.config,
-            logger=self.logger
-        )
+    
         
         if self.distributed:
             self.distributed_helpers = DistributedHelpers(
@@ -746,19 +741,36 @@ class OfflineEntropyProbe:
             self.logger.info("Phase 0: Sampling E and U batches")
             phase0_start = time.time()
             
-            E_batch = self.probe_components.sample_batch(
-                B=B_E_local if is_dist else B_E, 
-                G=self.config['batch_config']['G'],
-                indices=E_indices_local
-            )
+            # E-batch: Use replacement sampling with G=1
+            # For distributed: each rank samples independently (statistically equivalent)
+            G_U = self.config['batch_config']['G']  # U-batch uses configured G
+            
+            if is_dist:
+                # Distributed: E-batch samples independently per rank
+                E_total_sequences = B_E_local * 1  # G=1 for E-batch
+                E_batch = self.probe_components.sample_E_batch_with_replacement(
+                    E_total_sequences=E_total_sequences, 
+                    G=1
+                )
+            else:
+                # Single GPU: E-batch samples with replacement
+                E_total_sequences = B_E * 1  # G=1 for E-batch
+                E_batch = self.probe_components.sample_E_batch_with_replacement(
+                    E_total_sequences=E_total_sequences, 
+                    G=1
+                )
+            
+            # U-batch: Keep existing distinct sampling with configured G
             U_batch = self.probe_components.sample_batch(
                 B=B_U_local if is_dist else B_U, 
-                G=self.config['batch_config']['G'],
+                G=G_U,
                 indices=U_indices_local
             )
             
             phase0_time = time.time() - phase0_start
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
+            self.logger.info(f"E-batch: G=1 (replacement), {E_batch['sequences'].shape[0]} prompts, {E_batch['sequences'].shape[1]} responses/prompt")
+            self.logger.info(f"U-batch: G={G_U} (distinct), {U_batch['sequences'].shape[0]} prompts, {U_batch['sequences'].shape[1]} responses/prompt")
             
             # Check if δH₁ computation should be performed
             probe_config = self.config.get('probe_rework', {})
