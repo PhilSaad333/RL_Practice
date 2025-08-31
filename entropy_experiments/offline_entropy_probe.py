@@ -1054,15 +1054,7 @@ class OfflineEntropyProbe:
                 }
             }
             
-            # Add Stage 2 variance results if computed
-            if compute_vx_vy_variance:
-                results.update({
-                    "V_X": V_X,
-                    "V_Y": V_Y, 
-                    "SE_deltaH1": SE_deltaH1,
-                    "compute_vx_vy_variance": True
-                })
-                results["timing"]["phase4_variance"] = phase4_time
+            # Stage 2 variance computation removed (old vx_vy_variance functionality)
             
             # Add conditional variance results if computed
             if compute_conditional_variance:
@@ -1081,7 +1073,7 @@ class OfflineEntropyProbe:
                 })
                 results["timing"]["phase5_importance"] = phase5_time
             
-            stage = "Stage 1+2" if (compute_vx_vy_variance or compute_conditional_variance or importance_enabled) else "Stage 1"
+            stage = "Stage 1+2" if (compute_conditional_variance or importance_enabled) else "Stage 1"
             self.logger.info(f"{stage} Mixed probe analysis completed in {total_time:.2f}s")
             return results
             
