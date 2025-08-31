@@ -10,7 +10,6 @@ Main components:
 - ProbeComponents: Core gradient computation and microbatching
 - AdamPreconditioner: Extract and apply P from Adam optimizer state
 - ImportanceSampler: Self-normalized importance sampling for actual ΔH
-- UStatisticsCalculator: U-statistic computation and variance estimation
 - DistributedHelpers: Multi-GPU scalar communication helpers
 """
 
@@ -18,7 +17,6 @@ from .offline_entropy_probe import OfflineEntropyProbe
 from .probe_components import ProbeComponents
 from .adam_preconditioner import AdamPreconditioner
 from .importance_sampling import ImportanceSampler
-from .u_statistics import UStatisticsCalculator
 from .distributed_helpers import DistributedHelpers
 
 __all__ = [
@@ -26,6 +24,5 @@ __all__ = [
     'ProbeComponents', 
     'AdamPreconditioner',
     'ImportanceSampler',
-    'UStatisticsCalculator',
     'DistributedHelpers'
 ]
