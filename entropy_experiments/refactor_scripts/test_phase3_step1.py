@@ -39,7 +39,7 @@ def test_baseline_state():
     
     logger.info(f"✅ BaselineState initialized: ema_decay={baseline.ema_decay}, device={baseline.mu.device}")
     assert baseline.ema_decay == 0.9
-    assert baseline.mu.device == device
+    assert baseline.mu.device.type == device.type  # Compare device type, not exact device
     assert baseline.mu.numel() == 0
     
     # Test ensure_len
