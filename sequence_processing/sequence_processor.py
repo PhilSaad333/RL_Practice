@@ -709,7 +709,10 @@ class SequenceProcessor:
                                 top1 = q_sorted[..., 0]  # [T]
                                 a_sorted, _ = a_masked.sort(dim=-1, descending=True)
                                 a1 = a_sorted[..., 0]
-                                a2 = torch.where(a_sorted.shape[-1] > 1, a_sorted[..., 1], torch.full_like(a1, -float('inf')))
+                                if a_sorted.shape[-1] > 1:
+                                    a2 = a_sorted[..., 1]
+                                else:
+                                    a2 = torch.full_like(a1, -float('inf'))
                                 margin = (a1 - a2).masked_fill(~torch.isfinite(a2), 0.0)  # [T]
                                 
                                 # two-point entropy H([s,eps])
