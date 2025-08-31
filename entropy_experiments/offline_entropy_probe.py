@@ -643,14 +643,29 @@ class OfflineEntropyProbe:
                 # LoRA checkpoint directory
                 self.model = self._load_lora_model(checkpoint_path)
             
-            # Load optimizer state
-            optimizer_path = self.config['checkpoint']['optimizer_path']
-            if os.path.exists(optimizer_path):
+            # Load optimizer state - use fallback logic like load_checkpoint()
+            optimizer_path = self.config['checkpoint'].get('optimizer_path')
+            
+            if not optimizer_path:
+                # Auto-discover optimizer path relative to checkpoint
+                parent_dir = os.path.dirname(checkpoint_path)
+                possible_optimizer_paths = [
+                    os.path.join(parent_dir, "optimizer.pt"),  # Standard: ../optimizer.pt
+                    os.path.join(checkpoint_path, "..", "optimizer.pt"),  # Alternative
+                ]
+                
+                for opt_path in possible_optimizer_paths:
+                    if os.path.exists(opt_path):
+                        optimizer_path = opt_path
+                        self.logger.info(f"Auto-discovered optimizer at {optimizer_path}")
+                        break
+            
+            if optimizer_path and os.path.exists(optimizer_path):
                 self.logger.info(f"Loading optimizer state from {optimizer_path}")
                 optimizer_state = torch.load(optimizer_path, map_location='cpu')
                 self.optimizer = self._initialize_optimizer_from_state(optimizer_state)
             else:
-                self.logger.warning(f"Optimizer path not found: {optimizer_path}, creating fresh optimizer")
+                self.logger.warning(f"Optimizer not found (tried: {optimizer_path}), creating fresh optimizer")
                 self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-6)
             
             # Initialize components
