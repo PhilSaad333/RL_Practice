@@ -219,14 +219,14 @@ class SequenceProcessor:
         
         return all_rewards
         
-    def sample_prompts(self, dataset_name: str, split: str, num_prompts: int, 
+    def sample_prompts(self, dataset_name: str, split: str, num_prompts: Optional[int], 
                       seed: Optional[int] = None) -> Tuple[List[str], List]:
         """Sample prompts from a dataset.
         
         Args:
             dataset_name: Name of dataset (e.g., 'gsm8k_r1_template')
             split: Dataset split (e.g., 'train', 'test')  
-            num_prompts: Number of prompts to sample
+            num_prompts: Number of prompts to sample (None = return all prompts)
             seed: Optional random seed for reproducible sampling
             
         Returns:
@@ -241,13 +241,19 @@ class SequenceProcessor:
         # Load dataset following the pattern from schedulers/mix_passrate.py
         dataset = rlp_datasets.DATASET_REGISTRY[dataset_name](split=split)
         
-        # Convert to list and sample
+        # Convert to list
         dataset_list = list(dataset)
-        if len(dataset_list) < num_prompts:
-            raise ValueError(f"Dataset {dataset_name}:{split} has only {len(dataset_list)} examples, "
-                           f"but {num_prompts} prompts were requested.")
-                           
-        sampled_examples = random.sample(dataset_list, num_prompts)
+        
+        # Sample or return all
+        if num_prompts is None:
+            # Return all prompts (no sampling)
+            sampled_examples = dataset_list
+        else:
+            # Sample specified number
+            if len(dataset_list) < num_prompts:
+                raise ValueError(f"Dataset {dataset_name}:{split} has only {len(dataset_list)} examples, "
+                               f"but {num_prompts} prompts were requested.")
+            sampled_examples = random.sample(dataset_list, num_prompts)
         
         # Extract question prompts (correct field for generation - ends with <think>)
         prompts = [example.question for example in sampled_examples]
@@ -744,6 +750,122 @@ class SequenceProcessor:
         logprob_results.rewards = rewards
         
         return sequences, logprob_results, diagnostics_results
+    
+    
+    def generate_with_replacement_sampling(
+        self,
+        total_sequences: int,
+        dataset_name: str,
+        split: str = "train",
+        max_prompts_pool: Optional[int] = None,
+        seed: Optional[int] = None,
+        **kwargs
+    ) -> Tuple[BatchedSequences, LogprobResults, DiagnosticsResults]:
+        """
+        Generate sequences by sampling prompts WITH REPLACEMENT from dataset.
+        
+        This achieves true independent sampling from D(p)π(t|p) where:
+        - D(p): Uniform distribution over prompts (with replacement)  
+        - π(t|p): Model's conditional distribution over responses given prompt
+        
+        This is useful for generating large numbers of sequences (e.g., 32K) from a 
+        smaller pool of prompts (e.g., 4K), where each sequence represents an 
+        independent draw from the joint distribution.
+        
+        Args:
+            total_sequences: Number of sequences to generate (e.g., 32768)
+            dataset_name: Dataset to sample prompts from (e.g., 'gsm8k_r1_template')
+            split: Dataset split ('train', 'test', etc.)
+            max_prompts_pool: Limit prompt pool size (None = use all available)
+            seed: Random seed for prompt sampling reproducibility
+            **kwargs: Additional arguments passed to generate_with_logprobs()
+                     (G, gen_batch_size, tf_batch_size, with_grad, compute_rb, etc.)
+        
+        Returns:
+            Same as generate_with_logprobs(): (BatchedSequences, LogprobResults, DiagnosticsResults)
+            
+        Example:
+            # Generate 32K sequences from GSM8K prompts with replacement
+            sequences, logprobs, diagnostics = processor.generate_with_replacement_sampling(
+                total_sequences=32768,
+                dataset_name="gsm8k_r1_template",
+                split="train", 
+                G=1,  # One generation per sampled prompt
+                seed=42,
+                compute_rb=True
+            )
+        """
+        import numpy as np
+        from collections import Counter
+        
+        print(f"🎲 Loading prompt pool from {dataset_name}:{split}")
+        
+        # 1. Load full prompt pool from dataset
+        prompts, examples = self.sample_prompts(dataset_name, split, num_prompts=None, seed=None)
+        
+        if max_prompts_pool and len(prompts) > max_prompts_pool:
+            prompts = prompts[:max_prompts_pool]
+            if examples:
+                examples = examples[:max_prompts_pool]
+        
+        pool_size = len(prompts)
+        print(f"✅ Loaded {pool_size:,} prompts from dataset")
+        
+        # 2. Sample prompt indices with replacement
+        print(f"🎯 Sampling {total_sequences:,} prompt indices with replacement")
+        
+        if seed is not None:
+            np.random.seed(seed)
+        
+        sampled_indices = np.random.choice(pool_size, size=total_sequences, replace=True)
+        unique_prompts_used = len(set(sampled_indices))
+        
+        print(f"✅ Sampled indices: {total_sequences:,} total, {unique_prompts_used:,} unique ({unique_prompts_used/pool_size:.1%} of pool)")
+        
+        # Show sampling statistics
+        index_counts = Counter(sampled_indices)
+        max_reuse = max(index_counts.values())
+        print(f"📈 Max reuse of single prompt: {max_reuse}x")
+        
+        # 3. Create explicit prompt list
+        sampled_prompts = [prompts[idx] for idx in sampled_indices]
+        sampled_examples = [examples[idx] for idx in sampled_indices] if examples else None
+        
+        print(f"📝 Created {len(sampled_prompts):,} explicit prompts")
+        
+        # 4. Use existing generate_with_logprobs with explicit prompts
+        # Force G=1 for true independence (one generation per sampled prompt)
+        kwargs_copy = kwargs.copy()
+        kwargs_copy['G'] = 1
+        
+        print("🔄 Generating sequences using explicit sampled prompts...")
+        
+        # Temporarily store examples for reward computation
+        if sampled_examples:
+            original_examples = getattr(self, '_temp_examples', None)
+            self._temp_examples = sampled_examples
+        
+        try:
+            sequences, logprob_results, diagnostics_results = self.generate_with_logprobs(
+                prompts=sampled_prompts,
+                dataset_name=None,  # Don't sample from dataset
+                split=None,
+                num_prompts=None,   # Ignored when prompts provided
+                seed=None,          # Don't reseed in processor  
+                **kwargs_copy
+            )
+        finally:
+            # Restore original examples if they existed
+            if sampled_examples:
+                if original_examples is not None:
+                    self._temp_examples = original_examples
+                elif hasattr(self, '_temp_examples'):
+                    delattr(self, '_temp_examples')
+        
+        print(f"✅ Generated {total_sequences:,} sequences with replacement sampling")
+        
+        return sequences, logprob_results, diagnostics_results
+    
     
     # === NEW: helper for RB entropies with top-p (vectorized over timesteps) ===
     def _rb_entropies_top_p(
