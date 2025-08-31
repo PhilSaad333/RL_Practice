@@ -130,14 +130,33 @@ def test_batch_sampling(probe_components, B=2, G=2):
     else:
         logger.warning(f"⚠️  Multiple prompt lengths found: {unique_prompt_lens}")
     
-    # Check no sequences are all padding tokens
+    # Check no sequences are all padding tokens and decode some examples
     pad_token_id = 151643  # Qwen2.5 EOS/PAD token
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B", trust_remote_code=True)
+    
     for b in range(B):
         for g in range(G):
             seq = sequences[b, g]
             non_pad_tokens = (seq != pad_token_id).sum()
             logger.info(f"Sequence [{b},{g}]: {non_pad_tokens} non-pad tokens")
             assert non_pad_tokens > 0, f"Sequence [{b},{g}] is all padding tokens!"
+            
+            # Decode and show the full sequence for the first few examples
+            if b < 2:  # Only show first 2 prompts to avoid spam
+                # Find where the prompt ends and generation begins
+                prompt_len = prompt_lens[b]
+                prompt_tokens = seq[:prompt_len]
+                gen_tokens = seq[prompt_len:]
+                
+                # Decode prompt and generation separately
+                prompt_text = tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+                gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                
+                logger.info(f"\n--- Sequence [{b},{g}] ---")
+                logger.info(f"PROMPT: {prompt_text}")
+                logger.info(f"GENERATION: {gen_text}")
+                logger.info("=" * 50)
     
     logger.info("✅ All sanity checks passed!")
     return batch_data
