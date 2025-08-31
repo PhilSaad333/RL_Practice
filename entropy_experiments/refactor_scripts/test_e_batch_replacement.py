@@ -122,6 +122,44 @@ def test_e_batch_replacement(probe_components, E_total_sequences=16, G=2):
     
     return batch_data
 
+def test_u_batch_distinct(probe_components, B_U=6, G=2):
+    """Test the U-batch distinct sampling."""
+    logger = logging.getLogger('e_batch_test')
+    
+    logger.info(f"Testing U-batch distinct: {B_U} distinct prompts, G={G}")
+    
+    # Sample U-batch with distinct prompts
+    batch_data = probe_components.sample_U_batch_distinct(B_U, G)
+    
+    # Validate the structure
+    sequences = batch_data['sequences']
+    prompt_ids = batch_data['prompt_ids']
+    advantages = batch_data['advantages']
+    
+    logger.info(f"U-batch results:")
+    logger.info(f"  sequences shape: {sequences.shape}")
+    logger.info(f"  prompt_ids: {prompt_ids}")
+    logger.info(f"  advantages shape: {advantages.shape}")
+    logger.info(f"  unique prompt_ids: {len(set(prompt_ids))} out of {len(prompt_ids)} total")
+    
+    # Check for NO duplicates (this is the key test - distinct sampling should have no duplicates)
+    duplicates = len(prompt_ids) - len(set(prompt_ids))
+    if duplicates == 0:
+        logger.info(f"✅ SUCCESS: No duplicate prompt_ids (distinct sampling working)")
+    else:
+        logger.error(f"❌ ERROR: Found {duplicates} duplicate prompt_ids - distinct sampling failed!")
+    
+    # Validate shapes
+    assert sequences.shape[0] == B_U, f"Expected {B_U} prompts, got {sequences.shape[0]}"
+    assert sequences.shape[1] == G, f"Expected G={G}, got {sequences.shape[1]}"
+    assert len(prompt_ids) == B_U, f"prompt_ids length mismatch"
+    assert advantages.shape == (B_U, G), f"advantages shape mismatch"
+    assert len(set(prompt_ids)) == B_U, f"Expected {B_U} unique prompt_ids, got {len(set(prompt_ids))}"
+    
+    logger.info("✅ All shape validations passed!")
+    
+    return batch_data
+
 def main():
     """Main test function."""
     logger = setup_logging()
@@ -149,12 +187,13 @@ def main():
         logger.info("Initializing ProbeComponents...")
         probe_components = ProbeComponents(model, config, logger)
         
-        # Test E-batch replacement sampling with different sizes
-        logger.info("\n--- Test 1: Small batch (16 sequences, G=2) ---")
+        # Test E-batch replacement sampling 
+        logger.info("\n--- Test 1: E-batch replacement (16 sequences, G=2) ---")
         test_e_batch_replacement(probe_components, E_total_sequences=16, G=2)
         
-        logger.info("\n--- Test 2: Larger batch (24 sequences, G=3) ---")
-        test_e_batch_replacement(probe_components, E_total_sequences=24, G=3)
+        # Test U-batch distinct sampling
+        logger.info("\n--- Test 2: U-batch distinct (6 prompts, G=2) ---")
+        test_u_batch_distinct(probe_components, B_U=6, G=2)
         
         logger.info("=" * 60)
         logger.info("🎉 E-batch replacement test completed successfully!")

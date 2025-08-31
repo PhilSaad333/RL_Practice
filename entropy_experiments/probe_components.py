@@ -388,6 +388,101 @@ class ProbeComponents:
 
         self.logger.info(f"E-batch replacement complete: {len(prompt_ids)} prompts, duplicates: {len(prompt_ids) - len(set(prompt_ids))}")
         return batch_data
+
+    def sample_U_batch_distinct(self, B_U: int, G: int) -> Dict[str, Any]:
+        """
+        Sample U batch with distinct sampling (without replacement) for gradient updates.
+        
+        Returns a probe-compatible batch dict with B_U distinct prompts, each with G responses.
+        Mirrors the current U batch approach but routed through SequenceProcessor.
+        """
+        import numpy as np
+        
+        ds = self._get_dataset(split=self.config['batch_config']['split'])
+        N = len(ds)
+        G = int(G)
+        B_U = int(B_U)
+        
+        self.logger.info(f"U-batch distinct sampling: {B_U} distinct prompts × {G} responses")
+        
+        # Sample indices WITHOUT replacement  
+        rng = np.random.default_rng(42)  # Fixed seed for reproducibility during testing
+        if B_U > N:
+            self.logger.warning(f"Requested {B_U} distinct prompts but dataset only has {N} examples. Using all available.")
+            B_U = N
+        
+        idx = rng.choice(N, size=B_U, replace=False).tolist()
+
+        prompts, examples, prompt_ids = [], [], []
+        for i in idx:
+            ex = ds[i]
+            prompts.append(self._build_prompt_from_example(ex))
+            examples.append(ex)
+            prompt_ids.append(i)
+
+        # Use rollout batching like Phase 1
+        rollout_bs = self.config.get('batch_config', {}).get('rollout_batch_size', 8)
+        self.logger.info(f"U-batch using rollout_batch_size={rollout_bs}")
+
+        all_sequences, all_masks = [], []
+        all_prompt_lens, all_advantages, max_lengths = [], [], []
+
+        for s in range(0, B_U, rollout_bs):
+            e = min(s + rollout_bs, B_U)
+            pack = self._sequence_processor.generate_batched(
+                prompts=prompts[s:e], G=G, gen_batch_size=self._sp_gen_config.gen_batch_size
+            )
+            B_b = e - s
+            seq_b, mask_b = pack.sequences, pack.attention_masks
+            prompt_lens_b, gen_lens_b, responses_b = pack.prompt_lens, pack.gen_lens, pack.responses_text
+
+            # Compute rewards -> advantages per prompt (unchanged from Phase 1)
+            for b_local in range(B_b):
+                ex = examples[s + b_local]
+                pid = prompt_ids[s + b_local]
+                resp = responses_b[b_local]
+                rewards = self._compute_rewards(pid, resp, ex)
+                adv = rewards - rewards.mean()
+
+                all_advantages.append(adv)
+                L_max = max(gen_lens_b[b_local]) if len(gen_lens_b[b_local]) > 0 else 1
+                max_lengths.append(L_max)
+
+            all_sequences.extend([seq_b[i] for i in range(B_b)])
+            all_masks.extend([mask_b[i] for i in range(B_b)])
+            all_prompt_lens.extend(prompt_lens_b)
+
+        # Pad to common max length
+        max_T = max(seq.shape[1] for seq in all_sequences)
+        pad_id = self._tokenizer.pad_token_id
+        padded_seq, padded_mask = [], []
+        for b in range(len(all_sequences)):
+            seq = all_sequences[b]
+            msk = all_masks[b]
+            if seq.shape[1] < max_T:
+                pad_len = max_T - seq.shape[1]
+                seq = F.pad(seq, (0, pad_len), value=pad_id)
+                msk = F.pad(msk, (0, pad_len), value=0)
+            padded_seq.append(seq)
+            padded_mask.append(msk)
+
+        sequences = torch.stack(padded_seq, dim=0)
+        attention_masks = torch.stack(padded_mask, dim=0)
+        advantages = torch.stack(all_advantages, dim=0)   # [B_U, G]
+
+        batch_data = {
+            'sequences': sequences,
+            'attention_masks': attention_masks,
+            'prompt_lens': all_prompt_lens,
+            'advantages': advantages,
+            'max_lengths': max_lengths,
+            'prompt_ids': prompt_ids,
+            'num_prompts': len(all_prompt_lens),
+            'num_responses_per_prompt': G,
+        }
+
+        self.logger.info(f"U-batch distinct complete: {len(prompt_ids)} unique prompts (no duplicates)")
+        return batch_data
         
     def _get_stop_processor(self):
         """Get stopping processor for generation."""
