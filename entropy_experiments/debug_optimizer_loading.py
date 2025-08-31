@@ -60,6 +60,14 @@ def debug_optimizer_loading():
     print(f"   Saved parameter groups: {len(saved_groups)}")
     print(f"   Saved parameters total: {saved_param_count}")
     print(f"   Saved state entries: {len(saved_state)}")
+    
+    # Analyze parameter group structure
+    print(f"   Parameter group details:")
+    for i, group in enumerate(saved_groups):
+        params_in_group = len(group.get('params', []))
+        lr = group.get('lr', 'unknown')
+        wd = group.get('weight_decay', 'unknown') 
+        print(f"     Group {i}: {params_in_group} params, lr={lr}, weight_decay={wd}")
     print()
     
     # Current probe code BUG: Uses model.parameters() (includes frozen)
@@ -81,6 +89,15 @@ def debug_optimizer_loading():
     fixed_param_count = sum(len(group['params']) for group in fixed_optimizer.param_groups)
     print(f"   Fixed optimizer sees: {fixed_param_count} parameters (trainable only)")
     print(f"   Perfect match: {saved_param_count} saved = {fixed_param_count} current")
+    
+    # Compare parameter group structures
+    print(f"   Current parameter group details:")
+    for i, group in enumerate(fixed_optimizer.param_groups):
+        params_in_group = len(group['params'])
+        lr = group.get('lr', 'unknown')
+        wd = group.get('weight_decay', 'unknown')
+        print(f"     Group {i}: {params_in_group} params, lr={lr}, weight_decay={wd}")
+    print(f"   Group structure mismatch: {len(saved_groups)} saved vs {len(fixed_optimizer.param_groups)} current")
     print()
     
     # Test remapping with fixed optimizer
