@@ -29,7 +29,7 @@ from collections import defaultdict
 import time
 import math
 from .conditional_variance import ConditionalVarianceEstimator
-from sequence_processing.sequence_processor import SequenceProcessor, GenerationConfig
+from sequence_processing.sequence_processor import SequenceProcessor, GenerationConfig, BatchedSequences
 
 
 class BaselineState:
@@ -171,6 +171,31 @@ class ProbeComponents:
         x_estimator_mode = self.config.get('estimator', {}).get('x_estimator_mode', 'naive')
         baseline_mode = bl_cfg.get('mode', 'residual_mu')
         self.logger.info(f"Phase 3 config: x_estimator_mode={x_estimator_mode}, baseline_mode={baseline_mode}")
+        
+    def _to_batched_sequences_from_probe(self, batch: Dict[str, Any]) -> BatchedSequences:
+        """
+        Convert probe batch dict -> BatchedSequences required by SequenceProcessor.teacher_force_logprobs.
+        """
+        sequences = batch['sequences']            # [B, G, T]
+        attention_masks = batch['attention_masks']# [B, G, T]
+        prompt_lens = batch['prompt_lens']        # List[B], left-padded prompt length
+        B, G, T = sequences.shape
+
+        # gen_len[b][g] = sum(attn_mask[b,g]) - prompt_len[b]
+        sums = attention_masks.long().sum(dim=-1)              # [B, G]
+        gen_lens: List[List[int]] = []
+        for b in range(B):
+            gl = (sums[b].cpu().tolist())
+            pl = int(prompt_lens[b])
+            gen_lens.append([max(0, int(x) - pl) for x in gl])
+
+        return BatchedSequences(
+            sequences=sequences,
+            attention_masks=attention_masks,
+            prompt_lens=prompt_lens,
+            gen_lens=gen_lens,
+            responses_text=None  # not needed for TF
+        )
         
     def sample_batch(self, B: int, G: int, indices: Optional[List[int]] = None) -> Dict[str, Any]:
         """

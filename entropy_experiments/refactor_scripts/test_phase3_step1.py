@@ -129,12 +129,70 @@ def test_probe_components_initialization():
     
     return probe_components
 
+def test_batch_conversion_utility(probe_components):
+    """Test the _to_batched_sequences_from_probe utility function."""
+    logger = logging.getLogger('phase3_step1_test')
+    logger.info("Testing batch conversion utility...")
+    
+    # Create a mock probe batch (similar to what sample_E_batch_with_replacement returns)
+    device = probe_components.device
+    B, G, T = 2, 2, 10
+    
+    # Create mock data
+    sequences = torch.randint(0, 1000, (B, G, T), device=device)
+    attention_masks = torch.ones((B, G, T), device=device)
+    # Mask out some positions to simulate variable lengths
+    attention_masks[0, 0, 8:] = 0  # first seq has 8 tokens
+    attention_masks[0, 1, 6:] = 0  # second seq has 6 tokens  
+    attention_masks[1, 0, 9:] = 0  # third seq has 9 tokens
+    attention_masks[1, 1, 7:] = 0  # fourth seq has 7 tokens
+    
+    prompt_lens = [3, 4]  # prompt lengths for each of the B prompts
+    
+    batch = {
+        'sequences': sequences,
+        'attention_masks': attention_masks, 
+        'prompt_lens': prompt_lens,
+        'advantages': torch.randn(B, G, device=device),  # not used in conversion
+        'max_lengths': [5, 3],  # not used in conversion
+        'prompt_ids': [0, 1],   # not used in conversion
+    }
+    
+    # Test the conversion
+    batched_sequences = probe_components._to_batched_sequences_from_probe(batch)
+    
+    # Verify the conversion
+    assert batched_sequences.sequences.shape == (B, G, T)
+    assert batched_sequences.attention_masks.shape == (B, G, T)
+    assert len(batched_sequences.prompt_lens) == B
+    assert len(batched_sequences.gen_lens) == B
+    assert len(batched_sequences.gen_lens[0]) == G
+    assert len(batched_sequences.gen_lens[1]) == G
+    
+    # Check gen_lens calculation: gen_len = total_len - prompt_len
+    expected_gen_lens = [
+        [8 - 3, 6 - 3],  # first prompt: [5, 3]
+        [9 - 4, 7 - 4]   # second prompt: [5, 3]
+    ]
+    
+    logger.info(f"✅ BatchedSequences conversion successful")
+    logger.info(f"   sequences shape: {batched_sequences.sequences.shape}")
+    logger.info(f"   attention_masks shape: {batched_sequences.attention_masks.shape}")
+    logger.info(f"   prompt_lens: {batched_sequences.prompt_lens}")
+    logger.info(f"   gen_lens: {batched_sequences.gen_lens}")
+    logger.info(f"   expected gen_lens: {expected_gen_lens}")
+    
+    assert batched_sequences.gen_lens == expected_gen_lens
+    assert batched_sequences.responses_text is None
+    
+    return batched_sequences
+
 def main():
     """Main test function."""
     logger = setup_logging()
     
     logger.info("=" * 60)
-    logger.info("Phase 3 Step 1 Test: BaselineState & Config")
+    logger.info("Phase 3 Steps 1-2 Test: BaselineState & Batch Conversion")
     logger.info("=" * 60)
     
     try:
@@ -146,8 +204,12 @@ def main():
         logger.info("\n--- Test 2: ProbeComponents Phase 3 initialization ---")
         probe_components = test_probe_components_initialization()
         
+        # Test 3: Batch conversion utility (Step 2)
+        logger.info("\n--- Test 3: Batch conversion utility (Step 2) ---")
+        batched_sequences = test_batch_conversion_utility(probe_components)
+        
         logger.info("=" * 60)
-        logger.info("🎉 Phase 3 Step 1 tests completed successfully!")
+        logger.info("🎉 Phase 3 Steps 1-2 tests completed successfully!")
         logger.info(f"GPU memory usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         logger.info("=" * 60)
         
