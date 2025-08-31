@@ -374,8 +374,11 @@ class OfflineEntropyProbe:
         self.logger.info(f"Creating AdamW optimizer with lr={lr}, weight_decay={weight_decay}")
         
         # Create optimizer with same configuration as DRGRPO (matches dr_grpo.py)
+        # CRITICAL: Only include trainable parameters, not all parameters!
+        # The saved optimizer state only contains trainable parameters.
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         optimizer = optim.AdamW(
-            self.model.parameters(),
+            trainable_params,
             lr=lr,
             weight_decay=weight_decay,
         )
@@ -476,18 +479,53 @@ class OfflineEntropyProbe:
                 self.logger.debug(f"Skipping unmappable parameter ID: {old_id}")
                 
         # Update param_groups with new IDs
+        # Handle parameter group structure mismatch by consolidating into current structure
         remapped_param_groups = []
-        for i, group in enumerate(saved_param_groups):
-            new_group = group.copy()
-            if 'params' in group:
-                # Map old param IDs to new param IDs
-                old_param_ids = group['params']
-                new_param_ids = []
-                for old_id in old_param_ids:
-                    if old_id in id_mapping:
-                        new_param_ids.append(id_mapping[old_id])
-                new_group['params'] = new_param_ids
-            remapped_param_groups.append(new_group)
+        
+        if len(saved_param_groups) != len(current_optimizer.param_groups):
+            self.logger.warning(f"Parameter group count mismatch: saved={len(saved_param_groups)}, current={len(current_optimizer.param_groups)}")
+            self.logger.info("Consolidating saved parameter groups to match current structure")
+            
+            # Consolidate all saved parameters into current group structure
+            all_new_param_ids = []
+            merged_group_config = {}
+            
+            # Collect all successfully remapped parameter IDs
+            for group in saved_param_groups:
+                if 'params' in group and len(group['params']) > 0:
+                    # Use configuration from the non-empty group
+                    if not merged_group_config:
+                        merged_group_config = {k: v for k, v in group.items() if k != 'params'}
+                    
+                    # Add remapped parameter IDs
+                    for old_id in group['params']:
+                        if old_id in id_mapping:
+                            all_new_param_ids.append(id_mapping[old_id])
+            
+            # Create remapped groups to match current structure
+            for i, current_group in enumerate(current_optimizer.param_groups):
+                if i == 0:
+                    # First group gets all the parameters
+                    new_group = merged_group_config.copy()
+                    new_group['params'] = all_new_param_ids
+                else:
+                    # Additional groups (if any) get current group config but no params
+                    new_group = {k: v for k, v in current_group.items() if k != 'params'}
+                    new_group['params'] = []
+                remapped_param_groups.append(new_group)
+        else:
+            # Standard case: same number of parameter groups
+            for i, group in enumerate(saved_param_groups):
+                new_group = group.copy()
+                if 'params' in group:
+                    # Map old param IDs to new param IDs
+                    old_param_ids = group['params']
+                    new_param_ids = []
+                    for old_id in old_param_ids:
+                        if old_id in id_mapping:
+                            new_param_ids.append(id_mapping[old_id])
+                    new_group['params'] = new_param_ids
+                remapped_param_groups.append(new_group)
         
         self.logger.info(f"Successfully remapped {successful_remaps}/{len(saved_state)} parameter states")
         
