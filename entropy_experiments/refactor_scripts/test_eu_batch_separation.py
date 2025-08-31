@@ -119,7 +119,7 @@ def main():
         
         # Initialize probe
         logger.info("Initializing OfflineEntropyProbe...")
-        probe = OfflineEntropyProbe(config, logger)
+        probe = OfflineEntropyProbe(config)
         
         # Test E/U batch separation
         logger.info("\\n--- Testing E/U batch separation ---")
