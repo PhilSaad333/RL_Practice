@@ -50,6 +50,9 @@ class GenerationConfig:
     # Batch sizes (optimized for H100 80GB)
     gen_batch_size: int = 32  # Conservative default, can go higher
     tf_batch_size: int = 64   # Teacher forcing can handle larger batches
+    
+    # Phase 2: Enable differentiable RB entropies for gradient computation
+    rb_requires_grad: bool = False
 
 
 @dataclass
@@ -70,6 +73,8 @@ class LogprobResults:
     sequence_logprobs: List[List[float]]   # [B][G] total sequence logprobs
     rb_entropies: List[List[np.ndarray]]   # [B][G] per-token RB entropies under top-p (or full-softmax)
     rewards: List[List[float]]             # [B][G] rewards per sequence using tag_pref reward function
+    # Phase 2: Optional torch tensors for differentiable RB entropies
+    rb_entropies_torch: Optional[List[List[torch.Tensor]]] = None  # [B][G] torch RB entropies (for grad path)
 
 
 @dataclass
@@ -646,14 +651,19 @@ class SequenceProcessor:
                         # naive surprisal as numpy for now (diagnostic); keep torch if you want grads
                         entropies_naive = (-token_logprobs).detach().float().cpu().numpy()
 
+                        # --- RB entropy path (config-gated) ---
+                        rb_np = np.array([])
+                        rb_t = None
                         if compute_rb:
-                            with torch.no_grad():  # keep RB as diagnostic
-                                rb_H = self._rb_entropies_top_p(
-                                    gen_logits, self.config.top_p, self.config.temperature
-                                )
-                                rb_np = rb_H.float().cpu().numpy()
-                        else:
-                            rb_np = np.array([])
+                            if self.config.rb_requires_grad:
+                                # DIFFERENTIABLE RB: do NOT wrap in torch.no_grad()
+                                rb_t = self._rb_entropies_top_p(gen_logits, self.config.top_p, self.config.temperature)  # [T], torch
+                                rb_np = rb_t.detach().float().cpu().numpy()
+                            else:
+                                # Diagnostics-only RB: no grad
+                                with torch.no_grad():
+                                    rb_H = self._rb_entropies_top_p(gen_logits, self.config.top_p, self.config.temperature)
+                                    rb_np = rb_H.float().cpu().numpy()
 
                         seq_logprob = float(token_logprobs.detach().sum().item())
                         
@@ -662,12 +672,23 @@ class SequenceProcessor:
                         all_entropies[b].append(entropies_naive)
                         all_rb_entropies[b].append(rb_np)
                         all_sequence_logprobs[b].append(seq_logprob)
+                        
+                        # Store torch RB if available
+                        if rb_entropies_torch is not None:
+                            if rb_t is not None:
+                                rb_entropies_torch[b].append(rb_t)
+                            else:
+                                rb_entropies_torch[b].append(torch.tensor([], device=gen_logits.device))
                     else:
                         # Size mismatch or zero generation length
                         all_logprobs[b].append(torch.tensor([], requires_grad=True))
                         all_entropies[b].append(np.array([]))
                         all_rb_entropies[b].append(np.array([]))
                         all_sequence_logprobs[b].append(0.0)
+                        
+                        # Store empty torch RB if needed
+                        if rb_entropies_torch is not None:
+                            rb_entropies_torch[b].append(torch.tensor([], device=next(model.parameters()).device))
 
         logprob_results = LogprobResults(
             logprobs=all_logprobs,
@@ -675,6 +696,7 @@ class SequenceProcessor:
             sequence_logprobs=all_sequence_logprobs,
             rb_entropies=all_rb_entropies,
             rewards=[],  # Will be filled by generate_with_logprobs
+            rb_entropies_torch=rb_entropies_torch,  # Phase 2: torch RB tensors
         )
         
         # For now, return empty diagnostics for the with_grad version
