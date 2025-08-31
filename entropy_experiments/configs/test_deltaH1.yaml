@@ -22,6 +22,7 @@ generation:
   gen_batch_size: 4
   tf_batch_size: 8
   do_sample: true       # Required for sampling
+  pad_token_id: 151643  # Qwen2.5 pad token ID
   rb_requires_grad: true  # Required for Phase 3b regression baseline
 
 memory_config:
