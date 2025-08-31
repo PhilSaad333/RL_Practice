@@ -87,8 +87,6 @@ class ProbeComponents:
             max_new_tokens=sp_cfg.get('max_new_tokens', 256),
             temperature=sp_cfg.get('temperature', 1.0),
             top_p=sp_cfg.get('top_p', 1.0),
-            pad_token_id=self._tokenizer.pad_token_id,
-            eos_token_id=self._tokenizer.eos_token_id,
             gen_batch_size=sp_cfg.get('gen_batch_size', 8),
             tf_batch_size=sp_cfg.get('tf_batch_size', 64)
         )
