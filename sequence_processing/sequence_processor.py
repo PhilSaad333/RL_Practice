@@ -617,6 +617,7 @@ class SequenceProcessor:
         all_entropies = [[] for _ in range(B)]
         all_rb_entropies = [[] for _ in range(B)]
         all_sequence_logprobs = [[] for _ in range(B)]
+        rb_entropies_torch = [[] for _ in range(B)] if compute_rb and self.config.rb_requires_grad else None
 
         for b in range(B):
             for g in range(G):
