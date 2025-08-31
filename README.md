@@ -8,7 +8,7 @@ Sort of inspired by https://arxiv.org/abs/2505.22617. Their derivations are done
 
 We can roughly split what I'm doing into:
 
-- **1/3 Theoretical Investigation**: Understanding entropy dynamics during gradient steps in policy optimization (see [`docs/RL_studies.pdf`](docs/RL_studies%20.pdf))
+- **1/3 Theoretical Investigation**: Understanding entropy dynamics during gradient steps in policy optimization (see [`docs/RL_studies.pdf`](docs/RL_studies.pdf))
 - **1/3 Infrastructure & Tooling**: Setting up training and experimentation code in the distributed setting, as well as various analysis tools
 - **1/3 Empirical Exploration**: Taking lots of detours to get more familiar with interesting and useful things I'm learning about along the way (grdient noise scale for getting a sense of what is a good batch size, experimenting with various variance reduction techniques like Rao-Blackwellization and control variates, basically anything that seems worthwhile for doing better science)
 
