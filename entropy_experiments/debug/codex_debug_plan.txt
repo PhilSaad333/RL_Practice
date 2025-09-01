@@ -1,0 +1,112 @@
+Title: Gradient crash at L_X_mb.backward() — diagnosis and fixes
+
+Summary
+- Symptom: RuntimeError “element 0 of tensors does not require grad and does not have a grad_fn” at L_X_mb.backward() inside ProbeComponents.accumulate_sum_X.
+- Context: Stage 3 cleanup made ProbeComponents pure compute and routed sampling via SequenceProcessor. Crash occurs during X accumulation (E batch) with x_estimator_mode likely set to 'rb_residual' while SequenceProcessor GenerationConfig.rb_requires_grad is False, so RB tensors are non-differentiable.
+- Impact: Stage 1–3 deltaH1 computation halts; E/U sampling is fine.
+
+Root Cause Hypothesis
+- RB residual X path computes L_X_mb from per-token objects that must carry gradients (token logprobs and RB entropies if used). If compute_rb=True but rb_requires_grad=False, _build_X_loss_rb_residual sees no usable tensors and returns a constant 0.0 (no grad), causing backward to fail.
+- A secondary cause is an E microbatch with all gen_len == 0 (e.g., immediate stop), which also yields an empty set of per-token tensors and a constant loss.
+
+Plan of Record (PoR)
+1) Config alignment: If estimator.x_estimator_mode == 'rb_residual', ensure generation.rb_requires_grad=True in OfflineEntropyProbe._ensure_sequence_processor().
+2) Safer X accumulation:
+   - In _build_X_loss_rb_residual, return a scalar with requires_grad=True when empty, to avoid hard crash.
+   - In accumulate_sum_X, if L_X_mb has no grad_fn (or !requires_grad), fallback to the naive X loss for that microbatch.
+3) Logging and assertions: Keep strong invariants to fail early with clear message in dev runs.
+
+Minimal Diffs (copy-pastable)
+
+1) Force rb_requires_grad when using RB residual X
+File: entropy_experiments/offline_entropy_probe.py
+Location: OfflineEntropyProbe._ensure_sequence_processor()
+
+Patch:
+```
+# before
+sp_cfg = GenerationConfig(
+    temperature=gen_cfg.get('temperature', 1.0),
+    top_p=gen_cfg.get('top_p', 1.0),
+    max_new_tokens=gen_cfg.get('max_new_tokens', 256),
+    do_sample=True,
+    num_return_sequences=self.config['batch_config']['G'],
+    gen_batch_size=gen_cfg.get('gen_batch_size', 8),
+    tf_batch_size=gen_cfg.get('tf_batch_size', 64),
+    rb_requires_grad=gen_cfg.get('rb_requires_grad', False),
+)
+
+# after (force True when x_estimator_mode is rb_residual)
+est_mode = (self.config.get('estimator', {}) or {}).get('x_estimator_mode', 'naive')
+rb_rg_cfg = gen_cfg.get('rb_requires_grad', False)
+rb_rg_final = True if est_mode == 'rb_residual' else rb_rg_cfg
+sp_cfg = GenerationConfig(
+    temperature=gen_cfg.get('temperature', 1.0),
+    top_p=gen_cfg.get('top_p', 1.0),
+    max_new_tokens=gen_cfg.get('max_new_tokens', 256),
+    do_sample=True,
+    num_return_sequences=self.config['batch_config']['G'],
+    gen_batch_size=gen_cfg.get('gen_batch_size', 8),
+    tf_batch_size=gen_cfg.get('tf_batch_size', 64),
+    rb_requires_grad=rb_rg_final,
+)
+```
+
+2) Make empty RB loss grad-safe and add fallback
+File: entropy_experiments/probe_components.py
+Locations: _build_X_loss_rb_residual() and accumulate_sum_X()
+
+Patch A (grad-enabled zero):
+```
+# before
+total_loss = torch.zeros((), device=next(self.model.parameters()).device)
+...
+if len(lengths) == 0:
+    return total_loss
+
+# after
+total_loss = torch.zeros((), device=next(self.model.parameters()).device, requires_grad=True)
+...
+if len(lengths) == 0:
+    # Return a grad-enabled scalar to avoid hard crash; caller may fallback
+    return total_loss
+```
+
+Patch B (fallback to naive when loss has no grad_fn):
+```
+# inside accumulate_sum_X(), right after L_X_mb = ...
+if (not L_X_mb.requires_grad) or (L_X_mb.grad_fn is None):
+    self.logger.warning(
+        f"X loss has no grad (mode={mode}); falling back to naive estimator for this microbatch."
+    )
+    S_dict = self._teacher_force_logprobs(microbatch)
+    L_X_mb = self.build_LX_from_S(S_dict, weighting_mode)
+```
+
+Optional Hard Assertion (dev only):
+```
+# immediately after computing S in _teacher_force_logprobs
+assert S.requires_grad and S.grad_fn is not None, "S lost grad path (inference/no_grad or detach?)"
+```
+
+3) Guard against degenerate E batches
+Operational note: If you observe many degenerate microbatches (all gen_len==0), reduce stop criteria or adjust max_new_tokens/temperature/top_p to ensure at least 1 token generation for E. The fallback ensures liveness but may bias X toward naive for those microbatches.
+
+Validation
+- Config sanity: Print once at start of Phase 1 — “X mode: {mode}, rb_requires_grad={rb_rg_final}”.
+- Smoke test (single GPU):
+  1) estimator.x_estimator_mode=naive, generation.rb_requires_grad=false → should run and match previous baseline.
+  2) estimator.x_estimator_mode=rb_residual, generation.rb_requires_grad=true → should run without crash; verify nonzero X grads.
+  3) estimator.x_estimator_mode=rb_residual, generation.rb_requires_grad=false → should log fallback to naive for some microbatches but not crash.
+
+Acceptance Criteria
+- No RuntimeError from L_X_mb.backward() under the three scenarios above.
+- For case (2), present (nonzero param.grads count in X accumulation) is consistently > 0, and bars_dot/deltaH1 are finite.
+- For case (3), logs show fallback messages and run completes; results are reasonable (potentially different from full RB-residual).
+
+Rollback
+- Remove the fallback block in accumulate_sum_X() and revert the rb_requires_grad forcing if you want stricter behavior.
+- Set estimator.x_estimator_mode back to 'naive' to avoid any RB dependency.
+
+Next Steps (optional simplification)
+- Route Y accumulation through SequenceProcessor.teacher_force_logprobs to remove ProbeComponents._teacher_force_logprobs/_compute_sequence_logprobs. I can provide a focused patch when desired.

@@ -280,6 +280,20 @@ class OfflineEntropyProbe:
         tok.pad_token = tok.eos_token
 
         gen_cfg = self.config.get('generation', {})
+        
+        # CRITICAL FIX: Force rb_requires_grad=True when using rb_residual estimator
+        # Without gradients on RB tensors, rb_residual X computation will crash
+        est_mode = (self.config.get('estimator', {}) or {}).get('x_estimator_mode', 'naive')
+        rb_rg_cfg = gen_cfg.get('rb_requires_grad', False)
+        rb_rg_final = True if est_mode == 'rb_residual' else rb_rg_cfg
+        
+        if est_mode == 'rb_residual' and not rb_rg_cfg:
+            self.logger.warning(
+                f"OVERRIDING rb_requires_grad: {rb_rg_cfg} → True (required for x_estimator_mode=rb_residual)"
+            )
+        
+        self.logger.info(f"SequenceProcessor config: x_estimator_mode={est_mode}, rb_requires_grad={rb_rg_final}")
+        
         sp_cfg = GenerationConfig(
             temperature=gen_cfg.get('temperature', 1.0),
             top_p=gen_cfg.get('top_p', 1.0),
@@ -288,7 +302,7 @@ class OfflineEntropyProbe:
             num_return_sequences=self.config['batch_config']['G'],
             gen_batch_size=gen_cfg.get('gen_batch_size', 8),
             tf_batch_size=gen_cfg.get('tf_batch_size', 64),
-            rb_requires_grad=gen_cfg.get('rb_requires_grad', False),
+            rb_requires_grad=rb_rg_final,
         )
         self._sequence_processor = SequenceProcessor(self.model, tok, sp_cfg)
 

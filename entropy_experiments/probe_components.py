@@ -227,7 +227,13 @@ class ProbeComponents:
                 rb_list.append(rb)
                 lp_list.append(lp)
         if len(lengths) == 0:
-            return total_loss
+            raise RuntimeError(
+                f"RB residual X loss computation failed: all sequences in microbatch had gen_len=0. "
+                f"This indicates all sequences immediately hit stop tokens. "
+                f"Consider: reducing stop criteria, increasing max_new_tokens, adjusting temperature/top_p, "
+                f"or checking if prompts are malformed. "
+                f"Microbatch size: {B}, prompt_lens: {prompt_lens}"
+            )
         T_max = int(max(lengths))
 
         # Pad per-sample tensors to T_max for baseline update bookkeeping
@@ -641,6 +647,23 @@ class ProbeComponents:
                     
                     # Build X-loss with detached LOO coefficient
                     L_X_mb = self.build_LX_from_S(S_dict, weighting_mode)
+                
+                # CRITICAL: Validate gradient flow before backward pass
+                if not L_X_mb.requires_grad:
+                    raise RuntimeError(
+                        f"X loss tensor does not require gradients! "
+                        f"Mode: {mode}, L_X_mb.requires_grad: {L_X_mb.requires_grad}, "
+                        f"L_X_mb.grad_fn: {L_X_mb.grad_fn}. "
+                        f"This indicates a configuration issue - check that rb_requires_grad=True "
+                        f"when using x_estimator_mode=rb_residual, or all sequences had gen_len=0."
+                    )
+                
+                if L_X_mb.grad_fn is None:
+                    raise RuntimeError(
+                        f"X loss tensor has no gradient function! "
+                        f"Mode: {mode}, L_X_mb: {L_X_mb}, grad_fn: {L_X_mb.grad_fn}. "
+                        f"This suggests the tensor was detached or computed under no_grad context."
+                    )
                 
                 # Backward pass - populates param.grad with X gradients  
                 L_X_mb.backward()
