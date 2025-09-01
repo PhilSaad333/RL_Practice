@@ -836,6 +836,10 @@ class SequenceProcessor:
             if dataset_name is None or num_prompts is None:
                 raise ValueError("Must provide either prompts OR (dataset_name + num_prompts)")
             prompts, examples = self.sample_prompts(dataset_name, split, num_prompts, seed)
+        else:
+            # Check if examples were provided by generate_with_replacement_sampling
+            if hasattr(self, '_temp_examples') and self._temp_examples is not None:
+                examples = self._temp_examples
         
         # Generate sequences
         sequences = self.generate_batched(prompts, G, gen_batch_size)
