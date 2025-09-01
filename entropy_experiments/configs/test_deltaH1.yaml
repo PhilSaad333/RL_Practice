@@ -9,11 +9,11 @@ model_config:
 batch_config:
   dataset_name: gsm8k_r1_template
   split: test
-  B_E_values: [64]       # Reduce E batch to debug (E: 64×1=64 sequences)
-  B_U_values: [16]       # Reduce U batch to debug (U: 16×8=128 sequences)  
+  B_E_values: [128]      # Target batch size (E: 128×1=128 sequences)
+  B_U_values: [16]       # Target batch size (U: 16×8=128 sequences)  
   B_U: 16                # Required by validation
   G: 8                  # Keep same G for U batch
-  # Total: 64 + 128 = 192 sequences (much more manageable)
+  # Total: 128 + 128 = 256 sequences for deltaH1 computation
   
 learning_rate: 1.0e-5   # Proper learning rate for δH₁ = lr × X·Y
 
