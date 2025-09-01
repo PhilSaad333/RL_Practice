@@ -6,7 +6,7 @@ Implements the strategy outlined in offline_entropy_probe_strategy.txt
 based on the theory from RL_studies.pdf.
 
 Key functionality:
-- Load model checkpoint and optimizer state
+- Load LoRA/QLoRA adapter and Adam optimizer state
 - Sample batches of prompts and responses - E batch for "evaluation" or "entropy", U batch for "update"  
 - Compute first-order entropy change prediction δH₁ after updating with U batch, using E batch to estimate entropy gradient
 - Compute estimators of the variance of δH₁ (optional, config-driven) to get a sense of uncertainty
@@ -49,6 +49,8 @@ class OfflineEntropyProbe:
     
     This implements the complete pipeline for measuring δH₁ (predicted entropy change)
     and ΔH (actual entropy change) given a training checkpoint.
+
+    Main method is run_mixed_probe.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -125,49 +127,30 @@ class OfflineEntropyProbe:
         if optimizer_path:
             self.config['checkpoint']['optimizer_path'] = optimizer_path
         
-        # Initialize model using the updated config
-        # Pass empty dict since we're using config paths instead
-        self.model = self._initialize_model_from_checkpoint({})
+        # Initialize model using LoRA/QLoRA adapter via model_loader
+        adapter_path = self.config['checkpoint']['checkpoint_path']
+        # Prefer the existing helper which wraps load_peft_for_probe and sets adapter
+        self.model = self._load_lora_model(adapter_path)
         
-        # Load optimizer state
-        if optimizer_path:
-            self.logger.info(f"Loading optimizer state from {optimizer_path}")
-            optimizer_state = torch.load(optimizer_path, map_location='cpu')
-        else:
-            # Try to load optimizer from a companion file or embedded in checkpoint
-            # For LoRA adapters, optimizer is typically in parent directory
+        # Resolve optimizer path (required for Adam preconditioning state)
+        if not optimizer_path:
             parent_dir = os.path.dirname(checkpoint_path)
             possible_optimizer_paths = [
-                os.path.join(parent_dir, "optimizer.pt"),  # Most common: ../optimizer.pt
-                checkpoint_path + "/optimizer.pt",         # Inside model dir (unlikely)
-                checkpoint_path.replace('.pt', '_optimizer.pt'),
-                checkpoint_path.replace('.pth', '_optimizer.pth'),
+                os.path.join(parent_dir, "optimizer.pt"),
+                os.path.join(adapter_path, "optimizer.pt"),
+                os.path.join(checkpoint_path, "optimizer.pt"),
             ]
-            
-            optimizer_state = None
             for opt_path in possible_optimizer_paths:
                 if os.path.exists(opt_path):
+                    optimizer_path = opt_path
                     self.logger.info(f"Found optimizer state at {opt_path}")
-                    optimizer_state = torch.load(opt_path, map_location='cpu')
                     break
-            
-            # Try loading as a full checkpoint with optimizer embedded
-            if optimizer_state is None:
-                try:
-                    if os.path.isfile(checkpoint_path):
-                        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-                        if 'optimizer' in checkpoint:
-                            optimizer_state = checkpoint['optimizer']
-                            self.logger.info("Found optimizer state embedded in checkpoint")
-                except Exception as e:
-                    self.logger.debug(f"Could not load checkpoint as dict: {e}")
-            
-            if optimizer_state is None:
-                self.logger.warning("No optimizer state found - creating fresh optimizer")
-                # Create a minimal state dict to initialize fresh optimizer
-                optimizer_state = {'param_groups': [{'lr': 1e-6, 'weight_decay': 0.01}]}
-            
-        self.optimizer = self._initialize_optimizer_from_state(optimizer_state)
+        if not optimizer_path or not os.path.exists(optimizer_path):
+            raise FileNotFoundError(
+                f"Optimizer state not found. Provide checkpoint.optimizer_path or place optimizer.pt near {adapter_path}"
+            )
+        # Load AdamW with state (ID remap handled inside)
+        self.optimizer = load_adam_optimizer_from_path(self.model, optimizer_path)
         
         # Move to GPU and setup DDP if distributed
         device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
@@ -199,32 +182,6 @@ class OfflineEntropyProbe:
         self.checkpoint_loaded = True
         self.logger.info("Checkpoint loaded successfully")
         
-    def _initialize_model_from_checkpoint(self, checkpoint: Dict[str, Any]) -> torch.nn.Module:
-        """
-        Initialize model from checkpoint.
-        
-        This follows the same pattern as rl_runner.py for loading LoRA models.
-        """
-        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-        from peft import PeftModel, prepare_model_for_kbit_training
-        import os
-        
-        self.logger.info("Initializing model from checkpoint...")
-        
-        # Extract checkpoint path - handle both full checkpoints and directory paths
-        checkpoint_path = self.config['checkpoint']['checkpoint_path']
-        if not checkpoint_path:
-            raise ValueError("checkpoint_path not specified in config")
-            
-        # Determine if this is a direct model checkpoint or LoRA adapter
-        if os.path.isdir(checkpoint_path) and any(f.endswith('.safetensors') for f in os.listdir(checkpoint_path) if 'adapter' in f):
-            # This is a LoRA adapter directory
-            self.logger.info(f"Loading LoRA adapter from: {checkpoint_path}")
-            return self._load_lora_model(checkpoint_path)
-        else:
-            # This is a full model checkpoint
-            self.logger.info(f"Loading full model checkpoint from: {checkpoint_path}")
-            return self._load_full_model_checkpoint(checkpoint_path)
             
     def _load_lora_model(self, lora_path: str) -> torch.nn.Module:
         """Load LoRA/QLoRA model based on config toggle."""
@@ -268,204 +225,7 @@ class OfflineEntropyProbe:
         self.logger.info(f"Loaded LoRA model: {backbone} + {lora_path}")
         return model
         
-    def _load_full_model_checkpoint(self, checkpoint_path: str) -> torch.nn.Module:
-        """Load full model checkpoint."""
-        from transformers import AutoModelForCausalLM
-        
-        # Load full model from checkpoint
-        model = AutoModelForCausalLM.from_pretrained(
-            checkpoint_path,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            local_files_only=True
-        )
-        
-        # Enable training mode and gradients  
-        model.train()
-        # Disable gradient checkpointing for entropy probe - needed for clean autograd graphs
-        # model.gradient_checkpointing_enable()
-        model.config.use_cache = False
-        
-        self.logger.info(f"Loaded full model from: {checkpoint_path}")
-        return model
-        
-    def _initialize_optimizer_from_state(self, optimizer_state: Dict[str, Any]) -> torch.optim.Optimizer:
-        """
-        Initialize optimizer from saved state.
-        
-        This follows the same pattern as rl_runner.py -> DRGRPO for creating AdamW optimizers.
-        """
-        import torch.optim as optim
-        
-        self.logger.info("Initializing optimizer from saved state...")
-        
-        # Extract optimizer configuration from saved state or use defaults from RL training
-        # These defaults match DRGRPO.__init__ in dr_grpo.py
-        lr = optimizer_state.get('param_groups', [{}])[0].get('lr', 1e-6)  # Extract from state
-        weight_decay = optimizer_state.get('param_groups', [{}])[0].get('weight_decay', 0.01)
-        
-        self.logger.info(f"Creating AdamW optimizer with lr={lr}, weight_decay={weight_decay}")
-        
-        # Create optimizer with same configuration as DRGRPO (matches dr_grpo.py)
-        # CRITICAL: Only include trainable parameters, not all parameters!
-        # The saved optimizer state only contains trainable parameters.
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = optim.AdamW(
-            trainable_params,
-            lr=lr,
-            weight_decay=weight_decay,
-        )
-        
-        # Load the saved state with custom parameter ID mapping
-        try:
-            # Handle different state formats and extract the actual optimizer state dict
-            if isinstance(optimizer_state, dict):
-                if 'state_dict' in optimizer_state:
-                    state_dict = optimizer_state['state_dict']
-                elif 'param_groups' in optimizer_state:
-                    state_dict = optimizer_state
-                else:
-                    state_dict = optimizer_state
-            else:
-                raise ValueError(f"Unexpected optimizer_state type: {type(optimizer_state)}")
-            
-            # Custom parameter ID remapping to handle model reconstruction
-            remapped_state_dict = self._remap_optimizer_state_ids(state_dict, optimizer)
-            optimizer.load_state_dict(remapped_state_dict)
-            
-            self.logger.info("Successfully loaded optimizer state with ID remapping")
-            
-            # Validate that optimizer has state (exp_avg_sq for Adam preconditioning)
-            param_count = len(list(self.model.parameters()))
-            state_count = len(optimizer.state)
-            self.logger.info(f"Optimizer state: {state_count} parameters have state out of {param_count} total")
-            
-            if state_count == 0:
-                self.logger.warning("No optimizer state found - this may cause issues with Adam preconditioning")
-            
-            return optimizer
-            
-        except Exception as e:
-            self.logger.error(f"Failed to load optimizer state: {e}")
-            self.logger.info("Creating fresh optimizer without state")
-            
-            # Return fresh optimizer if loading fails
-            fresh_optimizer = optim.AdamW(
-                self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-            )
-            return fresh_optimizer
     
-    def _remap_optimizer_state_ids(self, saved_state_dict: dict, current_optimizer: torch.optim.Optimizer) -> dict:
-        """
-        Remap parameter IDs in saved optimizer state to match current model parameters.
-        
-        This handles the common issue where model reconstruction creates new parameter IDs
-        that don't match the saved optimizer state keys.
-        
-        Args:
-            saved_state_dict: Original optimizer state dict with old parameter IDs
-            current_optimizer: Current optimizer with new parameter IDs
-            
-        Returns:
-            Remapped state dict with current parameter IDs as keys
-        """
-        # Extract current parameter list (in order)
-        current_params = []
-        for group in current_optimizer.param_groups:
-            current_params.extend(group['params'])
-            
-        # Extract saved parameter IDs and states (in order)
-        saved_state = saved_state_dict.get('state', {})
-        saved_param_groups = saved_state_dict.get('param_groups', [])
-        
-        # Get saved parameter IDs in the same order they were saved
-        saved_param_ids = []
-        for group in saved_param_groups:
-            if 'params' in group:
-                saved_param_ids.extend(group['params'])
-        
-        self.logger.info(f"Remapping optimizer IDs: {len(saved_param_ids)} saved → {len(current_params)} current")
-        
-        if len(saved_param_ids) != len(current_params):
-            self.logger.warning(f"Parameter count mismatch: saved={len(saved_param_ids)}, current={len(current_params)}")
-            self.logger.warning("This might indicate model architecture changes - some optimizer state may be lost")
-        
-        # Create ID mapping: old_id → new_id based on position
-        id_mapping = {}
-        min_count = min(len(saved_param_ids), len(current_params))
-        for i in range(min_count):
-            old_id = saved_param_ids[i]
-            new_id = id(current_params[i])
-            id_mapping[old_id] = new_id
-            
-        # Remap the state dict
-        remapped_state = {}
-        successful_remaps = 0
-        for old_id, param_state in saved_state.items():
-            if old_id in id_mapping:
-                new_id = id_mapping[old_id]
-                remapped_state[new_id] = param_state
-                successful_remaps += 1
-            else:
-                self.logger.debug(f"Skipping unmappable parameter ID: {old_id}")
-                
-        # Update param_groups with new IDs
-        # Handle parameter group structure mismatch by consolidating into current structure
-        remapped_param_groups = []
-        
-        if len(saved_param_groups) != len(current_optimizer.param_groups):
-            self.logger.warning(f"Parameter group count mismatch: saved={len(saved_param_groups)}, current={len(current_optimizer.param_groups)}")
-            self.logger.info("Consolidating saved parameter groups to match current structure")
-            
-            # Consolidate all saved parameters into current group structure
-            all_new_param_ids = []
-            merged_group_config = {}
-            
-            # Collect all successfully remapped parameter IDs
-            for group in saved_param_groups:
-                if 'params' in group and len(group['params']) > 0:
-                    # Use configuration from the non-empty group
-                    if not merged_group_config:
-                        merged_group_config = {k: v for k, v in group.items() if k != 'params'}
-                    
-                    # Add remapped parameter IDs
-                    for old_id in group['params']:
-                        if old_id in id_mapping:
-                            all_new_param_ids.append(id_mapping[old_id])
-            
-            # Create remapped groups to match current structure
-            for i, current_group in enumerate(current_optimizer.param_groups):
-                if i == 0:
-                    # First group gets all the parameters
-                    new_group = merged_group_config.copy()
-                    new_group['params'] = all_new_param_ids
-                else:
-                    # Additional groups (if any) get current group config but no params
-                    new_group = {k: v for k, v in current_group.items() if k != 'params'}
-                    new_group['params'] = []
-                remapped_param_groups.append(new_group)
-        else:
-            # Standard case: same number of parameter groups
-            for i, group in enumerate(saved_param_groups):
-                new_group = group.copy()
-                if 'params' in group:
-                    # Map old param IDs to new param IDs
-                    old_param_ids = group['params']
-                    new_param_ids = []
-                    for old_id in old_param_ids:
-                        if old_id in id_mapping:
-                            new_param_ids.append(id_mapping[old_id])
-                    new_group['params'] = new_param_ids
-                remapped_param_groups.append(new_group)
-        
-        self.logger.info(f"Successfully remapped {successful_remaps}/{len(saved_state)} parameter states")
-        
-        return {
-            'state': remapped_state,
-            'param_groups': remapped_param_groups
-        }
         
     def _initialize_components(self) -> None:
         """Initialize all probe components after model/optimizer are loaded."""
@@ -505,6 +265,14 @@ class OfflineEntropyProbe:
     def _ensure_sequence_processor(self):
         if hasattr(self, "_sequence_processor") and self._sequence_processor is not None:
             return
+        
+        # BUG FIX: Ensure model is loaded before creating SequenceProcessor
+        if not hasattr(self, 'model') or self.model is None:
+            raise RuntimeError(
+                "Model must be loaded before SequenceProcessor can be created. "
+                "Call load_checkpoint() or run_mixed_probe() first."
+            )
+            
         from transformers import AutoTokenizer
         backbone = self.config['checkpoint'].get('model_config_path', 'Qwen/Qwen2.5-1.5B')
         tok = AutoTokenizer.from_pretrained(backbone, trust_remote_code=True)
@@ -599,69 +367,16 @@ class OfflineEntropyProbe:
             # Get optimizer path from config if available
             optimizer_path = self.config['checkpoint'].get('optimizer_path')
             self.load_checkpoint(checkpoint_path, optimizer_path)
-            
-        start_time = time.time()
-        
+                    
         try:
-            # Step 1: Sample batch of prompts and responses
-            self.logger.info("Sampling batch of prompts and responses")
-            batch_data = self._sample_batch()
-            
-            # Step 2: Compute U-statistic for δH₁
-            self.logger.info("Computing first-order entropy change prediction δH₁") 
-            delta_h1_results = self._compute_delta_h1(batch_data)
-            
-            # Step 3: Compute actual entropy change ΔH via importance sampling
-            self.logger.info("Computing actual entropy change ΔH via importance sampling")
-            actual_entropy_results = self._compute_actual_entropy_change(batch_data)
-            
-            # Step 4: Compile results
-            results = self._compile_results(delta_h1_results, actual_entropy_results)
-            results['timing']['total_time'] = time.time() - start_time
-            
-            # Step 5: Save results if requested
-            if self.config['output']['save_results']:
-                self._save_results(results)
-                
-            self.results = results
-            self.logger.info(f"Offline analysis completed in {results['timing']['total_time']:.2f}s")
-            
-            return results
+            # Delegate to the cleaner run_mixed_probe implementation
+            self.logger.info("Delegating to run_mixed_probe for unified analysis")
+            return self.run_mixed_probe()
             
         except Exception as e:
             self.logger.error(f"Error during offline analysis: {e}")
             raise
-            
-    def _sample_batch(self) -> Dict[str, Any]:
-        # Legacy shim for older codepaths: use SP to sample B distinct prompts with G responses
-        B = int(self.config['batch_config']['B_E_values'][0]) if isinstance(self.config['batch_config']['B_E_values'], list) else int(self.config['batch_config']['B_E_values'])
-        G = int(self.config['batch_config']['G'])
-        self._ensure_sequence_processor()
-        ds_name = self.config['batch_config']['dataset_name']
-        split = self.config['batch_config']['split']
-        seqs, lp, _ = self._sequence_processor.generate_with_logprobs(
-            prompts=None, G=G, dataset_name=ds_name, split=split, num_prompts=B, compute_rb=False, with_grad=False,
-        )
-        rewards = lp.rewards
-        return self._pack_U_from_sequences(seqs, rewards)
-        
-    def _compute_delta_h1(self, batch_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Compute first-order entropy change prediction."""
-        # This coordinates the main computation pipeline
-        return self.probe_components.compute_delta_h1(
-            batch_data=batch_data,
-            adam_preconditioner=self.adam_preconditioner,
-            u_statistics=self.u_statistics,
-            distributed_helpers=self.distributed_helpers,
-            optimizer=self.optimizer  # 🔍 Pass optimizer for correct learning rate extraction
-        )
-        
-    def _compute_actual_entropy_change(self, batch_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Compute actual entropy change via importance sampling."""
-        if self.importance_sampler is None:
-            self.logger.warning("Importance sampling disabled - cannot compute actual entropy change")
-            return {"error": "ImportanceSampler not initialized (importance sampling disabled)"}
-        return self.importance_sampler.compute_entropy_change(batch_data, self.optimizer)
+                
     
     def run_mixed_probe(self, checkpoint_path: str = None) -> Dict[str, Any]:
         """
@@ -691,13 +406,8 @@ class OfflineEntropyProbe:
             # Load model and optimizer (following run_offline_analysis pattern)
             self.logger.info(f"Loading checkpoint from {checkpoint_path}")
             
-            # Load checkpoint
-            if checkpoint_path.endswith('.pt') or checkpoint_path.endswith('.pth'):
-                checkpoint = torch.load(checkpoint_path, map_location='cpu')
-                self.model = self._initialize_model_from_checkpoint(checkpoint)
-            else:
-                # LoRA checkpoint directory
-                self.model = self._load_lora_model(checkpoint_path)
+            # Load LoRA/QLoRA adapter using model_loader helper
+            self.model = self._load_lora_model(checkpoint_path)
             
             # Load optimizer state - use fallback logic like load_checkpoint()
             optimizer_path = self.config['checkpoint'].get('optimizer_path')
@@ -731,8 +441,7 @@ class OfflineEntropyProbe:
                 )
             
             self.logger.info(f"Loading optimizer state from {optimizer_path}")
-            optimizer_state = torch.load(optimizer_path, map_location='cpu')
-            self.optimizer = self._initialize_optimizer_from_state(optimizer_state)
+            self.optimizer = load_adam_optimizer_from_path(self.model, optimizer_path)
             
             # Initialize components
             self._initialize_components()
@@ -869,57 +578,6 @@ class OfflineEntropyProbe:
                     B_E_global = B_E_local
                     B_U_global = B_U_local
             
-            # ================================================================
-            # STAGE 2: Variance Components - Optional (configurable)
-            # ================================================================
-            compute_conditional_variance = probe_config.get('compute_conditional_variance', False)
-            
-            SE_deltaH1 = 0.0
-            SE_conditional = 0.0
-            phase4_time, phase5_time = 0.0, 0.0
-            
-            
-            # ================================================================
-            # STAGE 2: Conditional Variance Var_E(δH₁ | U) - Optional
-            # ================================================================
-            if compute_conditional_variance:
-                self.logger.info("Phase 4b: Computing conditional variance Var_E(δH₁ | U)")
-                phase4b_start = time.time()
-                
-                # Compute conditional variance using scalar projections
-                sum_s_local, sum_s2_local, B_E_local = self.probe_components.compute_conditional_variance_over_E(
-                    E_batch, mu_Y, mb_size_prompts, weighting_mode
-                )
-                
-                # All-reduce scalar statistics
-                if is_dist:
-                    S1 = distributed_helpers.all_reduce_scalar_sum(
-                        torch.tensor(sum_s_local, dtype=torch.float64, device='cpu')
-                    )
-                    S2 = distributed_helpers.all_reduce_scalar_sum(
-                        torch.tensor(sum_s2_local, dtype=torch.float64, device='cpu')
-                    )
-                    B_E_cond = distributed_helpers.all_reduce_scalar_sum(
-                        torch.tensor(B_E_local, dtype=torch.float64, device='cpu')  
-                    )
-                    self.logger.info(f"All-reduced conditional stats: S1={S1:.10f}, S2={S2:.10f}, B_E={B_E_cond:.0f}")
-                else:
-                    S1, S2, B_E_cond = sum_s_local, sum_s2_local, B_E_local
-                
-                # Compute conditional variance and standard error
-                if B_E_cond >= 2:
-                    s_bar = S1 / B_E_cond
-                    sample_var_s = (S2 - B_E_cond * s_bar * s_bar) / (B_E_cond - 1)
-                    var_cond_E = (learning_rate * learning_rate) * sample_var_s / B_E_cond
-                    SE_conditional = learning_rate * math.sqrt(max(sample_var_s / B_E_cond, 0.0))
-                else:
-                    sample_var_s, var_cond_E, SE_conditional = 0.0, 0.0, 0.0
-                    self.logger.warning("B_E < 2, cannot compute conditional variance")
-                
-                phase4b_time = time.time() - phase4b_start
-                self.logger.info(f"🔍 [CONDITIONAL VARIANCE] Var_E(δH₁|U)={var_cond_E:.10f}")
-                self.logger.info(f"🔍 [CONDITIONAL VARIANCE] SE_E(δH₁|U)={SE_conditional:.10f}")
-                self.logger.info(f"Phase 4b complete: {phase4b_time:.2f}s")
             
             # ================================================================
             # STAGE 2c: Two-Batch Ground-Truth Entropy Change - Optional
@@ -1011,38 +669,6 @@ class OfflineEntropyProbe:
             self.logger.error(f"Error during mixed probe analysis: {e}")
             raise
         
-    def _compile_results(self, delta_h1_results: Dict[str, Any], 
-                        actual_entropy_results: Dict[str, Any]) -> Dict[str, Any]:
-        """Compile final results dictionary."""
-        return {
-            # Core results
-            "U_cross": delta_h1_results["U_cross"],
-            "deltaH1": delta_h1_results["deltaH1"], 
-            
-            # Standard error estimates
-            "se_plugin": delta_h1_results["se_plugin"],
-            "zeta1_plugin": delta_h1_results["zeta1_plugin"],
-            "se_jack": delta_h1_results["se_jack"],
-            "zeta1_jack": delta_h1_results["zeta1_jack"],
-            
-            # Actual entropy change
-            "deltaH_snis": actual_entropy_results["deltaH_snis"],
-            "ESS": actual_entropy_results["ESS"],
-            "psis_k": actual_entropy_results.get("psis_k", None),
-            
-            # Timing and diagnostics
-            "timing": {
-                **delta_h1_results.get("timing", {}),
-                **actual_entropy_results.get("timing", {})
-            },
-            "config": self.config,
-            
-            # Additional diagnostics
-            "diagnostics": {
-                **delta_h1_results.get("diagnostics", {}),
-                **actual_entropy_results.get("diagnostics", {})
-            }
-        }
         
     def _save_results(self, results: Dict[str, Any]) -> None:
         """Save results to file."""
@@ -1059,70 +685,6 @@ class OfflineEntropyProbe:
                 json.dump(results, f, indent=2, default=str)
             self.logger.info(f"Results saved to {results_path}")
             
-    def test_minimal_alpha_trick(self, batch_ids: torch.Tensor, batch_mask: torch.Tensor) -> None:
-        """
-        Minimal α-trick probe test from fix.txt to localize gradient flow issues.
-        
-        This implements the diagnostic test from fix.txt section C to verify:
-        1. Model forward produces gradients
-        2. LoRA parameters receive gradients from a simple loss
-        
-        Args:
-            batch_ids: Input token IDs [batch_size, seq_len]
-            batch_mask: Attention mask [batch_size, seq_len]
-        """
-        self.logger.info("Running minimal α-trick probe test...")
-        
-        # Ensure model is in training mode
-        self.model.train()
-        
-        # 1) Tiny TF forward on the PEFT model
-        outs = self.model(input_ids=batch_ids, attention_mask=batch_mask)
-        logits = outs.logits  # must have grad_fn
-        
-        # Assert logits are tracking gradients
-        if not (logits.requires_grad and logits.grad_fn is not None):
-            raise RuntimeError("Minimal probe: logits not tracking grad - model may be frozen or in eval mode")
-        
-        # 2) Build S and a vectorized loss L = <alpha, L_vec(S)>
-        logprobs = torch.log_softmax(logits.float(), dim=-1)
-        token_lp = logprobs[:, :-1].gather(2, batch_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
-        S = token_lp.sum(dim=1).view(-1, 1)  # [k, 1] or adapt to your [k,G]
-        S.retain_grad()
-        
-        alpha = torch.ones(S.shape[0], device=S.device, requires_grad=True)
-        L = (-(alpha.view(-1, 1) * S).mean())  # minus sign; simple cross-entropy variant
-        
-        # 3) Try a *known* LoRA param first (more robust than "all params")
-        lora_params = [p for n, p in self.model.named_parameters() if ("lora_A" in n or "lora_B" in n)]
-        
-        if len(lora_params) == 0:
-            raise RuntimeError("Minimal probe: No lora_A/B parameters found (adapters missing/merged?)")
-        
-        self.logger.info(f"Found {len(lora_params)} LoRA parameters for gradient test")
-        
-        g_lora = torch.autograd.grad(L, lora_params, allow_unused=True, retain_graph=True)
-        non_none_lora = sum(int(g is not None) for g in g_lora)
-        
-        self.logger.info(f"Minimal probe results: {non_none_lora}/{len(lora_params)} LoRA params received gradients")
-        
-        if non_none_lora == 0:
-            raise RuntimeError("Minimal probe FAILED: Forward isn't using the same adapter tensors you're differentiating w.r.t. (wrong model object or adapters disabled)")
-        else:
-            self.logger.info("Minimal probe PASSED: LoRA gradient flow is working")
-            
-        # Test all parameters as well
-        all_params = [p for p in self.model.parameters() if p.requires_grad]
-        if len(all_params) == 0:
-            raise RuntimeError("Minimal probe: No trainable parameters found - all parameters frozen!")
-            
-        g_all = torch.autograd.grad(L, all_params, allow_unused=True, retain_graph=True)
-        non_none_all = sum(int(g is not None) for g in g_all)
-        
-        self.logger.info(f"Full gradient test: {non_none_all}/{len(all_params)} total params received gradients")
-        
-        if non_none_all == 0:
-            raise RuntimeError("Minimal probe FAILED: No parameters received gradients from L")
             
     @classmethod
     def from_config_file(cls, config_path: str) -> 'OfflineEntropyProbe':
