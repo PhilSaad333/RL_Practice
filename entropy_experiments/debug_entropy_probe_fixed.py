@@ -71,7 +71,7 @@ def debug_entropy_probe_fixed():
         print(f"\n📈 ACTUAL BATCH ANALYSIS:")
         print(f"   E_batch sequences shape: {E_batch['sequences'].shape if 'sequences' in E_batch else 'N/A'}")
         print(f"   E_batch num_prompts: {E_batch.get('num_prompts', 'N/A')}")
-        print(f"   U_batch sequences shape: {U_batch['sequences'].shape if 'sequences' in U_batch else 'N/A')}")
+        print(f"   U_batch sequences shape: {U_batch['sequences'].shape if 'sequences' in U_batch else 'N/A'}")
         print(f"   U_batch num_prompts: {U_batch.get('num_prompts', 'N/A')}")
         
         # Verify totals
