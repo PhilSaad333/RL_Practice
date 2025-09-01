@@ -656,16 +656,6 @@ class OfflineEntropyProbe:
                 }
             }
             
-            # Stage 2 variance computation removed (old vx_vy_variance functionality)
-            
-            # Add conditional variance results if computed
-            if compute_conditional_variance:
-                results.update({
-                    "SE_conditional": SE_conditional,
-                    "compute_conditional_variance": True
-                })
-                if "phase4b_time" in locals():
-                    results["timing"]["phase4b_conditional"] = phase4b_time
             
             # Add Stage 2 ground-truth results if computed
             if importance_enabled:
@@ -675,7 +665,7 @@ class OfflineEntropyProbe:
                 })
                 results["timing"]["phase5_importance"] = phase5_time
             
-            stage = "Stage 1+2" if (compute_conditional_variance or importance_enabled) else "Stage 1"
+            stage = "Stage 1+2" if importance_enabled else "Stage 1"
             self.logger.info(f"{stage} Mixed probe analysis completed in {total_time:.2f}s")
             return results
             
