@@ -22,6 +22,9 @@ from .model_loader import load_peft_for_probe, load_adam_optimizer_from_path
 
 import torch
 import torch.distributed as dist
+from sequence_processing.sequence_processor import (
+    SequenceProcessor, GenerationConfig, BatchedSequences,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
 import logging
 import time
@@ -497,6 +500,89 @@ class OfflineEntropyProbe:
                 config=self.config,
                 logger=self.logger
             )
+    
+    # --- SequenceProcessor setup and sampling helpers ---
+    def _ensure_sequence_processor(self):
+        if hasattr(self, "_sequence_processor") and self._sequence_processor is not None:
+            return
+        from transformers import AutoTokenizer
+        backbone = self.config['checkpoint'].get('model_config_path', 'Qwen/Qwen2.5-1.5B')
+        tok = AutoTokenizer.from_pretrained(backbone, trust_remote_code=True)
+        tok.padding_side = "left"
+        tok.pad_token = tok.eos_token
+
+        gen_cfg = self.config.get('generation', {})
+        sp_cfg = GenerationConfig(
+            temperature=gen_cfg.get('temperature', 1.0),
+            top_p=gen_cfg.get('top_p', 1.0),
+            max_new_tokens=gen_cfg.get('max_new_tokens', 256),
+            do_sample=True,
+            num_return_sequences=self.config['batch_config']['G'],
+            gen_batch_size=gen_cfg.get('gen_batch_size', 8),
+            tf_batch_size=gen_cfg.get('tf_batch_size', 64),
+            rb_requires_grad=gen_cfg.get('rb_requires_grad', False),
+        )
+        self._sequence_processor = SequenceProcessor(self.model, tok, sp_cfg)
+
+    def _pack_E_from_sequences(self, seqs: BatchedSequences) -> dict:
+        import torch as _torch
+        B, G = seqs.sequences.shape[:2]
+        assert G == 1, f"E-batch expected G=1, got G={G}"
+        max_lengths = [max(lens) if len(lens) > 0 else 1 for lens in seqs.gen_lens]
+        advantages = _torch.zeros((B, G), dtype=_torch.float32, device=seqs.sequences.device)
+        return {
+            'sequences': seqs.sequences,
+            'attention_masks': seqs.attention_masks,
+            'prompt_lens': seqs.prompt_lens,
+            'advantages': advantages,
+            'max_lengths': max_lengths,
+            'num_prompts': B,
+            'num_responses_per_prompt': 1,
+        }
+
+    def _pack_U_from_sequences(self, seqs: BatchedSequences, rewards: list[list[float]]) -> dict:
+        import torch as _torch
+        B, G = seqs.sequences.shape[:2]
+        advantages = _torch.tensor(rewards, dtype=_torch.float32, device=seqs.sequences.device)
+        advantages = advantages - advantages.mean(dim=1, keepdim=True)
+        max_lengths = [max(lens) if len(lens) > 0 else 1 for lens in seqs.gen_lens]
+        return {
+            'sequences': seqs.sequences,
+            'attention_masks': seqs.attention_masks,
+            'prompt_lens': seqs.prompt_lens,
+            'advantages': advantages,
+            'max_lengths': max_lengths,
+            'num_prompts': B,
+            'num_responses_per_prompt': G,
+        }
+
+    def _sample_EU_via_sequence_processor(self, *, B_E: int, B_U: int, G_U: int) -> tuple[dict, dict]:
+        self._ensure_sequence_processor()
+        ds_name = self.config['batch_config']['dataset_name']
+        split = self.config['batch_config']['split']
+
+        # E: with replacement, G=1, compute RB for X if needed later
+        E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
+            total_sequences=B_E,
+            dataset_name=ds_name,
+            split=split,
+            G=1,
+            compute_rb=True,
+        )
+        E_batch = self._pack_E_from_sequences(E_sequences)
+
+        # U: distinct prompts, G responses each (SequenceProcessor handles reward computation)
+        U_sequences, U_lp, _U_diag = self._sequence_processor.generate_with_logprobs(
+            prompts=None,
+            G=G_U,
+            dataset_name=ds_name,
+            split=split,
+            num_prompts=B_U,
+            compute_rb=False,
+            with_grad=False,
+        )
+        U_batch = self._pack_U_from_sequences(U_sequences, U_lp.rewards)
+        return E_batch, U_batch
             
     def run_offline_analysis(self, checkpoint_path: str) -> Dict[str, Any]:
         """
@@ -734,31 +820,28 @@ class OfflineEntropyProbe:
             self.logger.info("Phase 0: Sampling E and U batches")
             phase0_start = time.time()
             
-            # E-batch: Use replacement sampling with G=1
-            # For distributed: each rank samples independently (statistically equivalent)
-            G_U = self.config['batch_config']['G']  # U-batch uses configured G
-            
-            if is_dist:
-                # Distributed: E-batch samples independently per rank
-                E_total_sequences = B_E_local * 1  # G=1 for E-batch
-                E_batch = self.probe_components.sample_E_batch_with_replacement(
-                    E_total_sequences=E_total_sequences, 
-                    G=1
+            G_U = self.config['batch_config']['G']
+            if self.config.get('probe_rework', {}).get('use_sequence_processor_sampling', True):
+                E_batch, U_batch = self._sample_EU_via_sequence_processor(
+                    B_E=B_E, B_U=B_U, G_U=G_U
                 )
             else:
-                # Single GPU: E-batch samples with replacement
-                E_total_sequences = B_E * 1  # G=1 for E-batch
-                E_batch = self.probe_components.sample_E_batch_with_replacement(
-                    E_total_sequences=E_total_sequences, 
-                    G=1
-                )
-            
-            # U-batch: Keep existing distinct sampling with configured G
-            U_batch = self.probe_components.sample_batch(
-                B=B_U_local if is_dist else B_U, 
-                G=G_U,
-                indices=U_indices_local
-            )
+                # Legacy fallback
+                if is_dist:
+                    E_total_sequences = B_E_local * 1
+                    E_batch = self.probe_components.sample_E_batch_with_replacement(
+                        E_total_sequences=E_total_sequences, G=1
+                    )
+                    U_batch = self.probe_components.sample_batch(
+                        B=B_U_local, G=G_U, indices=U_indices_local
+                    )
+                else:
+                    E_batch = self.probe_components.sample_E_batch_with_replacement(
+                        E_total_sequences=B_E * 1, G=1
+                    )
+                    U_batch = self.probe_components.sample_batch(
+                        B=B_U, G=G_U, indices=None
+                    )
             
             phase0_time = time.time() - phase0_start
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
