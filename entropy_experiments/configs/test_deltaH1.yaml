@@ -13,7 +13,7 @@ batch_config:
   B_U_values: [64]       # Larger U batch for more data
   B_U: 64                # Required by validation
   G: 8                  # More generations to get some correct responses
-  rollout_batch_size: 16 # Keep small for memory
+  #rollout_batch_size: 16 # Keep small for memory
   
 learning_rate: 1.0e-5   # Proper learning rate for δH₁ = lr × X·Y
 
@@ -21,7 +21,7 @@ generation:
   temperature: 0.7
   top_p: 1.0
   max_new_tokens: 150   # Sufficient tokens for complete math solutions
-  gen_batch_size: 32
+  gen_batch_size: 64
   tf_batch_size: 8
   do_sample: true       # Required for sampling
   pad_token_id: 151643  # Qwen2.5 pad token ID
