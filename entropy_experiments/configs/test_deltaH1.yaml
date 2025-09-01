@@ -9,20 +9,20 @@ model_config:
 batch_config:
   dataset_name: gsm8k_r1_template
   split: test
-  B_E_values: [1024]      # Larger E batch for better signal
-  B_U_values: [64]       # Larger U batch for more data
-  B_U: 64                # Required by validation
-  G: 8                  # More generations to get some correct responses
-  #rollout_batch_size: 16 # Keep small for memory
+  B_E_values: [64]       # Reduce E batch to debug (E: 64×1=64 sequences)
+  B_U_values: [16]       # Reduce U batch to debug (U: 16×8=128 sequences)  
+  B_U: 16                # Required by validation
+  G: 8                  # Keep same G for U batch
+  # Total: 64 + 128 = 192 sequences (much more manageable)
   
 learning_rate: 1.0e-5   # Proper learning rate for δH₁ = lr × X·Y
 
 generation:
   temperature: 0.7
   top_p: 1.0
-  max_new_tokens: 150   # Sufficient tokens for complete math solutions
-  gen_batch_size: 64
-  tf_batch_size: 8
+  max_new_tokens: 150   # Keep same
+  gen_batch_size: 16    # Reduce from 64->16 for safety
+  tf_batch_size: 8      # Keep same
   do_sample: true       # Required for sampling
   pad_token_id: 151643  # Qwen2.5 pad token ID
   rb_requires_grad: true  # Required for Phase 3b regression baseline
@@ -30,7 +30,7 @@ generation:
 memory_config:
   amp: true
   dtype: bfloat16
-  microbatch_size: 2    # Small for testing
+  microbatch_size: 1    # Reduce to 1 for maximum safety
 
 # Phase 3b: RB-residual estimator with regression baseline
 estimator:
