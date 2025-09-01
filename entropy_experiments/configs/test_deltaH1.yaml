@@ -9,19 +9,19 @@ model_config:
 batch_config:
   dataset_name: gsm8k_r1_template
   split: test
-  B_E_values: [16]      # Larger E batch for better signal
-  B_U_values: [8]       # Larger U batch for more data
-  B_U: 8                # Required by validation
+  B_E_values: [1024]      # Larger E batch for better signal
+  B_U_values: [64]       # Larger U batch for more data
+  B_U: 64                # Required by validation
   G: 8                  # More generations to get some correct responses
-  rollout_batch_size: 2 # Keep small for memory
+  rollout_batch_size: 4 # Keep small for memory
   
 learning_rate: 1.0e-5   # Proper learning rate for δH₁ = lr × X·Y
 
 generation:
   temperature: 0.7
-  top_p: 0.995
-  max_new_tokens: 200   # Sufficient tokens for complete math solutions
-  gen_batch_size: 4
+  top_p: 1.0
+  max_new_tokens: 150   # Sufficient tokens for complete math solutions
+  gen_batch_size: 8
   tf_batch_size: 8
   do_sample: true       # Required for sampling
   pad_token_id: 151643  # Qwen2.5 pad token ID
@@ -30,14 +30,14 @@ generation:
 memory_config:
   amp: true
   dtype: bfloat16
-  microbatch_size: 1    # Small for testing
+  microbatch_size: 2    # Small for testing
 
 # Phase 3b: RB-residual estimator with regression baseline
 estimator:
   x_estimator_mode: rb_residual
   rb_normalize_by_length: true
   baseline:
-    mode: regression    # Use new regression baseline
+    mode: basic    # Use new regression baseline or basic
     ridge_lambda: 1e-3
     features:
       - "H"
@@ -50,7 +50,6 @@ estimator:
 
 probe_rework:
   compute_delta_h1: true
-  compute_conditional_variance: false  # Skip to save time in test
   mb_size_prompts: 2    # Small microbatch
   weighting_mode: dr_grpo
   prompt_sampling_seed: null  # null = random prompts each run, int = fixed for reproducibility
@@ -63,4 +62,8 @@ output:
   save_path: /home/ubuntu/localfs/entropy_test
 
 checkpoint:
-  checkpoint_path: /home/ubuntu/localfs/checkpoints/qwen2_5_15_finetuned/qwen2_5_15_gsm8k_lora/checkpoint-156
+  checkpoint_path: /home/ubuntu/localfs/rl_training_runs/training_state/step_60/model
+  optimizer_path: /home/ubuntu/localfs/rl_training_runs/training_state/step_60/optimizer.pt
+  use_qlora: false
+  dtype: bf16
+  device_map: cuda
