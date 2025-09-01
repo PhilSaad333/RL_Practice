@@ -9,11 +9,11 @@ model_config:
 batch_config:
   dataset_name: gsm8k_r1_template
   split: test
-  B_E_values: [128]      # Target batch size (E: 128×1=128 sequences)
-  B_U_values: [16]       # Target batch size (U: 16×8=128 sequences)  
-  B_U: 16                # Required by validation
+  B_E_values: [1024]     # Target batch size (E: 1024×1=1024 sequences)
+  B_U_values: [64]       # Target batch size (U: 64×8=512 sequences)  
+  B_U: 64                # Required by validation
   G: 8                  # Keep same G for U batch
-  # Total: 128 + 128 = 256 sequences for deltaH1 computation
+  # Total: 1024 + 512 = 1536 sequences for deltaH1 computation
   
 learning_rate: 1.0e-5   # Proper learning rate for δH₁ = lr × X·Y
 
@@ -21,8 +21,8 @@ generation:
   temperature: 0.7
   top_p: 0.995
   max_new_tokens: 150   # Keep same
-  gen_batch_size: 16    # Reduce from 64->16 for safety
-  tf_batch_size: 8      # Keep same
+  gen_batch_size: 32    # Double from 16->32 for larger batches
+  tf_batch_size: 16     # Double from 8->16 for larger batches
   do_sample: true       # Required for sampling
   pad_token_id: 151643  # Qwen2.5 pad token ID
   rb_requires_grad: true  # Required for Phase 3b regression baseline
