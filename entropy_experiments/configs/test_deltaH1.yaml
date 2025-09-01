@@ -53,6 +53,7 @@ probe_rework:
   compute_conditional_variance: false  # Skip to save time in test
   mb_size_prompts: 2    # Small microbatch
   weighting_mode: dr_grpo
+  prompt_sampling_seed: null  # null = random prompts each run, int = fixed for reproducibility
 
 importance:
   enabled: false        # Skip for test

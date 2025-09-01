@@ -556,8 +556,11 @@ class ProbeComponents:
         self.logger.info(f"E-batch replacement sampling: {E_total_sequences} total sequences, {B_E} prompts × {G} responses")
 
         # Sample indices WITH replacement
-        rng = np.random.default_rng(42)  # Fixed seed for reproducibility during testing
+        prompt_seed = self.config.get('probe_rework', {}).get('prompt_sampling_seed', None)
+        rng = np.random.default_rng(prompt_seed)  # None = random each run, int = reproducible
         idx = rng.integers(low=0, high=N, size=B_E, endpoint=False).tolist()
+        
+        self.logger.info(f"E-batch prompt sampling seed: {prompt_seed} ({'random' if prompt_seed is None else 'fixed'})")
 
         prompts, examples, prompt_ids = [], [], []
         for i in idx:
