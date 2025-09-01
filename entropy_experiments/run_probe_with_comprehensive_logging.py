@@ -14,7 +14,12 @@ import yaml
 def setup_comprehensive_logging():
     """Set up comprehensive logging to capture everything."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = f"entropy_probe_comprehensive_{timestamp}.log"
+    
+    # Create logs directory if it doesn't exist
+    logs_dir = Path("entropy_experiments/logs")
+    logs_dir.mkdir(exist_ok=True)
+    
+    log_file = logs_dir / f"entropy_probe_comprehensive_{timestamp}.log"
     
     # Set up root logger to capture everything
     logging.basicConfig(
