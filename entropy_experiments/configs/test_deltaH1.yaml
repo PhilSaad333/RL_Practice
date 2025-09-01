@@ -19,7 +19,7 @@ learning_rate: 1.0e-5   # Proper learning rate for δH₁ = lr × X·Y
 
 generation:
   temperature: 0.7
-  top_p: 1.0
+  top_p: 0.995
   max_new_tokens: 150   # Keep same
   gen_batch_size: 16    # Reduce from 64->16 for safety
   tf_batch_size: 8      # Keep same
