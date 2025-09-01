@@ -362,7 +362,7 @@ class ProbeComponents:
 
         return total_loss
         
-    def sample_batch(self, B: int, G: int, indices: Optional[List[int]] = None) -> Dict[str, Any]:
+    # Removed sample_batch method - sampling now handled by SequenceProcessor
         """
         Sample batch of B prompts, each with G responses.
         
@@ -1225,6 +1225,63 @@ class ProbeComponents:
         
         self.logger.info(f"Y accumulation complete: {B_local} prompts processed")
         return sum_Y_buf, B_local
+
+    def compute_delta_h1_from_batches(
+        self,
+        *,
+        E_batch: Dict[str, Any],
+        U_batch: Dict[str, Any],
+        mb_size_prompts: int,
+        weighting_mode: str,
+        adam_preconditioner,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+    ) -> Dict[str, Any]:
+        """Compute delta H1 given packed E and U batches.
+
+        Returns:
+            {
+              'deltaH1': float,
+              'bars_dot': float,
+              'B_E': int,
+              'B_U': int,
+              'learning_rate': float,
+              'timing': {'phase1_time': float, 'phase2_time': float, 'phase3_time': float}
+            }
+        """
+        import time
+        self._assert_grad_context("compute_delta_h1_from_batches")
+
+        t1 = time.time()
+        sum_X_buf, B_E_local = self.accumulate_sum_X(E_batch, mb_size_prompts, weighting_mode)
+        phase1_time = time.time() - t1
+
+        t2 = time.time()
+        sum_Y_buf, B_U_local = self.accumulate_sum_Y(U_batch, mb_size_prompts, adam_preconditioner)
+        phase2_time = time.time() - t2
+
+        # Averages
+        mu_X = {pid: buf / max(B_E_local, 1) for pid, buf in sum_X_buf.items()}
+        mu_Y = {pid: buf / max(B_U_local, 1) for pid, buf in sum_Y_buf.items()}
+
+        # Dot product and deltaH1
+        t3 = time.time()
+        bars_dot = self.dot_param_buffers(mu_X, mu_Y)
+        lr = self._get_learning_rate(optimizer)
+        delta_h1 = lr * bars_dot
+        phase3_time = time.time() - t3
+
+        return {
+            'deltaH1': float(delta_h1),
+            'bars_dot': float(bars_dot),
+            'B_E': int(B_E_local),
+            'B_U': int(B_U_local),
+            'learning_rate': float(lr),
+            'timing': {
+                'phase1_time': float(phase1_time),
+                'phase2_time': float(phase2_time),
+                'phase3_time': float(phase3_time),
+            },
+        }
     
     # ========================================================================
     # STAGE 2: Variance Computation - Helper Methods

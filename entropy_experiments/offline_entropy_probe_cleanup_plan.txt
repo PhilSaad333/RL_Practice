@@ -1,0 +1,370 @@
+Summary
+Goal: Reduce bloat in offline entropy probe by centralizing sampling in SequenceProcessor, extracting a reusable LoRA/QLoRA model + Adam optimizer loader, and slimming ProbeComponents to focus on compute. Preserve QLoRA behind a config toggle and keep the path DDP‑ready (single‑GPU first, clean hooks for later DDP index plans).
+
+Scope (initial pass = Stage 1–2)
+- Stage 1: Add model_loader.py and switch offline_entropy_probe.py to import loader; keep optimizer loading logic for now or adopt a minimal loader wrapper with state remap.
+- Stage 2: Route E/U sampling through SequenceProcessor from offline_entropy_probe.py (behind a config toggle); adapt outputs to ProbeComponents batch format; no functional change to ProbeComponents compute.
+- Stage 3 (planned next): Remove sampling methods from ProbeComponents; add a pure compute entrypoint. Not implemented in this diff, described below.
+
+Rationale
+- Remove duplicated sampling/generation code scattered in offline_entropy_probe.py and probe_components.py. SequenceProcessor already unifies batch generation, TF logprob computation, RB entropies, and reward computation.
+- Extract reusable loader utilities (LoRA/QLoRA + Adam) to keep offline orchestrator lean and future‑proof.
+- Keep QLoRA optional to re‑enable once the conditional variance path is removed or refactored.
+
+Config Changes (backward‑compatible)
+- checkpoint:
+  - use_qlora: bool (default: false)
+  - dtype: 'bf16' | 'fp16' (default: 'bf16')
+  - device_map: e.g., 'cuda' (default: 'cuda')
+- generation:
+  - temperature, top_p, max_new_tokens, gen_batch_size, tf_batch_size, rb_requires_grad (defaults align with SequenceProcessor)
+- probe_rework:
+  - use_sequence_processor_sampling: bool (default: true)
+
+Minimal Diffs (copy‑pastable)
+
+1) Add entropy_experiments/model_loader.py
+---
+Create file: entropy_experiments/model_loader.py
+
+```
+"""
+Model and optimizer loaders for offline probes.
+
+Supports LoRA and QLoRA via a single entrypoint and loads Adam optimizer
+state with parameter‑ID remapping to current model parameter IDs.
+"""
+
+from typing import Optional, Dict, Any
+from pathlib import Path
+import torch
+
+
+def load_peft_for_probe(
+    base_id: str,
+    adapter_path: str,
+    *,
+    use_qlora: bool = False,
+    dtype: str = "bf16",         # "bf16" or "fp16"
+    device_map: str = "cuda",
+    use_checkpointing: bool = False,
+):
+    """Load a PEFT (LoRA/QLoRA) model ready for probe computations.
+
+    Sets attn_implementation="eager" for VJP compatibility and disables
+    gradient checkpointing unless explicitly requested.
+    """
+    from transformers import AutoModelForCausalLM
+    from peft import PeftModel
+
+    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
+
+    if not use_qlora:
+        # LoRA‑simple (no quantization)
+        base = AutoModelForCausalLM.from_pretrained(
+            base_id,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            attn_implementation="eager",
+            trust_remote_code=True,
+        )
+        if hasattr(base, "gradient_checkpointing_disable"):
+            base.gradient_checkpointing_disable()
+        if hasattr(base.config, "use_cache"):
+            base.config.use_cache = True
+
+        peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
+        if hasattr(peft, "enable_input_require_grads"):
+            peft.enable_input_require_grads()
+        return peft
+
+    # QLoRA path
+    from transformers import BitsAndBytesConfig
+    from peft import prepare_model_for_kbit_training
+
+    bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch_dtype,
+    )
+    base = AutoModelForCausalLM.from_pretrained(
+        base_id,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+        quantization_config=bnb_cfg,
+        attn_implementation="eager",
+        trust_remote_code=True,
+    )
+    base = prepare_model_for_kbit_training(base)
+    if use_checkpointing and hasattr(base, "gradient_checkpointing_enable"):
+        base.gradient_checkpointing_enable()
+        if hasattr(base.config, "use_cache"):
+            base.config.use_cache = False
+    peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
+    if hasattr(peft, "enable_input_require_grads"):
+        peft.enable_input_require_grads()
+    return peft
+
+
+def _remap_optimizer_state_ids(saved_state_dict: Dict[str, Any], optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
+    """Map saved param IDs to current model param IDs by position.
+
+    Handles the common case where parameter object IDs differ across runs.
+    """
+    # Current params in order
+    current_params = []
+    for group in optimizer.param_groups:
+        current_params.extend(group["params"])  # list[Tensor]
+
+    saved_state = saved_state_dict.get("state", {})
+    saved_param_groups = saved_state_dict.get("param_groups", [])
+
+    # Flatten saved param IDs in group order
+    saved_param_ids = []
+    for group in saved_param_groups:
+        saved_param_ids.extend(group.get("params", []))
+
+    # Build position mapping
+    id_mapping = {}
+    count = min(len(saved_param_ids), len(current_params))
+    for i in range(count):
+        id_mapping[saved_param_ids[i]] = id(current_params[i])
+
+    # Remap state
+    remapped_state = {}
+    for old_id, st in saved_state.items():
+        if old_id in id_mapping:
+            remapped_state[id_mapping[old_id]] = st
+
+    # Remap param_groups structure to current shape: put all params into first group
+    # and keep hyperparams from the first non‑empty saved group
+    merged_cfg = {}
+    for group in saved_param_groups:
+        if group.get("params"):
+            merged_cfg = {k: v for k, v in group.items() if k != "params"}
+            break
+
+    all_new_ids = [id(p) for p in current_params]
+    remapped_param_groups = []
+    for i, cur in enumerate(optimizer.param_groups):
+        if i == 0:
+            g = merged_cfg.copy()
+            g["params"] = all_new_ids
+            remapped_param_groups.append(g)
+        else:
+            g = {k: v for k, v in cur.items() if k != "params"}
+            g["params"] = []
+            remapped_param_groups.append(g)
+
+    return {"state": remapped_state, "param_groups": remapped_param_groups}
+
+
+def load_adam_optimizer_from_path(
+    model: torch.nn.Module,
+    optimizer_path: str | Path,
+    *,
+    lr: Optional[float] = None,
+    weight_decay: float = 0.0,
+    betas: tuple[float, float] = (0.9, 0.999),
+    eps: float = 1e-8,
+) -> torch.optim.Optimizer:
+    """Create AdamW and load state from optimizer.pt, remapping param IDs.
+
+    If state cannot be loaded, returns a fresh AdamW with provided hparams.
+    """
+    from torch.optim import AdamW
+
+    optimizer_path = Path(optimizer_path)
+    if not optimizer_path.exists():
+        raise FileNotFoundError(f"Optimizer state not found: {optimizer_path}")
+
+    # Instantiate AdamW with provided hparams (lr may be overridden later)
+    opt = AdamW(model.parameters(), lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)
+
+    try:
+        state_dict = torch.load(str(optimizer_path), map_location="cpu")
+        remapped = _remap_optimizer_state_ids(state_dict, opt)
+        opt.load_state_dict(remapped)
+        return opt
+    except Exception:
+        return opt  # Fall back to fresh optimizer
+```
+
+2) Update entropy_experiments/offline_entropy_probe.py
+---
+Keep QLoRA via new config key `checkpoint.use_qlora` and pass through to loader.
+Add SequenceProcessor sampling path under `probe_rework.use_sequence_processor_sampling` (default true).
+Provide adapter to pack SequenceProcessor outputs into ProbeComponents batch format.
+
+2a. Replace in‑file loader with imports; add SP imports
+Search for the top‑of‑file inlined loader function `def load_peft_for_probe(...):` and delete it.
+Then add imports near the top:
+
+```
+from .model_loader import load_peft_for_probe, load_adam_optimizer_from_path
+from sequence_processing.sequence_processor import (
+    SequenceProcessor, GenerationConfig, BatchedSequences,
+)
+```
+
+2b. Use QLoRA toggle in `_load_lora_model`
+Replace the body to read config and call the loader:
+
+```
+def _load_lora_model(self, lora_path: str) -> torch.nn.Module:
+    """Load LoRA/QLoRA model based on config toggle."""
+    backbone = self.config['checkpoint'].get('model_config_path', 'Qwen/Qwen2.5-1.5B')
+    use_qlora = bool(self.config['checkpoint'].get('use_qlora', False))
+    dtype = self.config['checkpoint'].get('dtype', 'bf16')
+    device_map = self.config['checkpoint'].get('device_map', 'cuda')
+
+    model = load_peft_for_probe(
+        base_id=backbone,
+        adapter_path=lora_path,
+        use_qlora=use_qlora,
+        dtype=dtype,
+        device_map=device_map,
+        use_checkpointing=False,
+    )
+    model.to("cuda")
+    model.eval()
+    if hasattr(model, "set_adapter"):
+        model.set_adapter("default")
+    return model
+```
+
+2c. Add SP setup and E/U sampling helpers in OfflineEntropyProbe
+Insert these methods in the class (e.g., after `_initialize_components`):
+
+```
+def _ensure_sequence_processor(self):
+    if hasattr(self, "_sequence_processor") and self._sequence_processor is not None:
+        return
+    from transformers import AutoTokenizer
+    backbone = self.config['checkpoint'].get('model_config_path', 'Qwen/Qwen2.5-1.5B')
+    tok = AutoTokenizer.from_pretrained(backbone, trust_remote_code=True)
+    tok.padding_side = "left"
+    tok.pad_token = tok.eos_token
+
+    gen_cfg = self.config.get('generation', {})
+    sp_cfg = GenerationConfig(
+        temperature=gen_cfg.get('temperature', 1.0),
+        top_p=gen_cfg.get('top_p', 1.0),
+        max_new_tokens=gen_cfg.get('max_new_tokens', 256),
+        do_sample=True,
+        num_return_sequences=self.config['batch_config']['G'],
+        gen_batch_size=gen_cfg.get('gen_batch_size', 8),
+        tf_batch_size=gen_cfg.get('tf_batch_size', 64),
+        rb_requires_grad=gen_cfg.get('rb_requires_grad', False),
+    )
+    self._sequence_processor = SequenceProcessor(self.model, tok, sp_cfg)
+
+def _pack_E_from_sequences(self, seqs: BatchedSequences) -> dict:
+    import torch as _torch
+    B, G = seqs.sequences.shape[:2]
+    assert G == 1, f"E-batch expected G=1, got G={G}"
+    max_lengths = [max(lens) if len(lens) > 0 else 1 for lens in seqs.gen_lens]
+    advantages = _torch.zeros((B, G), dtype=_torch.float32, device=seqs.sequences.device)
+    return {
+        'sequences': seqs.sequences,
+        'attention_masks': seqs.attention_masks,
+        'prompt_lens': seqs.prompt_lens,
+        'advantages': advantages,
+        'max_lengths': max_lengths,
+        'num_prompts': B,
+        'num_responses_per_prompt': 1,
+    }
+
+def _pack_U_from_sequences(self, seqs: BatchedSequences, rewards: list[list[float]]) -> dict:
+    import torch as _torch
+    B, G = seqs.sequences.shape[:2]
+    advantages = _torch.tensor(rewards, dtype=_torch.float32, device=seqs.sequences.device)
+    advantages = advantages - advantages.mean(dim=1, keepdim=True)
+    max_lengths = [max(lens) if len(lens) > 0 else 1 for lens in seqs.gen_lens]
+    return {
+        'sequences': seqs.sequences,
+        'attention_masks': seqs.attention_masks,
+        'prompt_lens': seqs.prompt_lens,
+        'advantages': advantages,
+        'max_lengths': max_lengths,
+        'num_prompts': B,
+        'num_responses_per_prompt': G,
+    }
+
+def _sample_EU_via_sequence_processor(self, *, B_E: int, B_U: int, G_U: int) -> tuple[dict, dict]:
+    self._ensure_sequence_processor()
+    ds_name = self.config['batch_config']['dataset_name']
+    split = self.config['batch_config']['split']
+
+    E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
+        total_sequences=B_E, dataset_name=ds_name, split=split, G=1, compute_rb=True,
+    )
+    E_batch = self._pack_E_from_sequences(E_sequences)
+
+    U_sequences, U_lp, _U_diag = self._sequence_processor.generate_with_logprobs(
+        prompts=None, G=G_U, dataset_name=ds_name, split=split, num_prompts=B_U,
+        compute_rb=False, with_grad=False,
+    )
+    U_batch = self._pack_U_from_sequences(U_sequences, U_lp.rewards)
+    return E_batch, U_batch
+```
+
+2d. Use SP path in run_mixed_probe Phase 0
+Replace the existing Phase 0 sampling block with:
+
+```
+# Phase 0: Sampling E and U batches
+self.logger.info("Phase 0: Sampling E and U batches")
+phase0_start = time.time()
+G_U = self.config['batch_config']['G']
+
+if self.config.get('probe_rework', {}).get('use_sequence_processor_sampling', True):
+    E_batch, U_batch = self._sample_EU_via_sequence_processor(B_E=B_E, B_U=B_U, G_U=G_U)
+else:
+    # previous logic (unchanged)
+    ...
+```
+
+3) (Planned next, not applied here) Refactor ProbeComponents to pure compute
+---
+Outline only; to be implemented after Stage 1–2 validation:
+- Remove: sample_E_batch_with_replacement(), sample_U_batch_distinct(), any StopAfterAnswer/stop‑tag logic.
+- Add: compute_delta_h1_from_batches(E_batch: dict, U_batch: dict, optimizer) -> dict with {delta_h1, bars_dot, Xbar, Ybar, timings} and reuse accumulate_sum_X/Y + dot utilities.
+- Ensure teacher forcing uses the same slicing conventions as SequenceProcessor (prompt_len padded, gen_len from per‑sequence lengths).
+
+Implementation Steps
+1. Add model_loader.py (Section 1).
+2. Update offline_entropy_probe.py (Sections 2a–2d).
+3. Ensure config contains the new keys (defaults are safe if absent):
+   - checkpoint.use_qlora=false, checkpoint.dtype='bf16', checkpoint.device_map='cuda'
+   - probe_rework.use_sequence_processor_sampling=true
+   - generation.{temperature, top_p, max_new_tokens, gen_batch_size, tf_batch_size, rb_requires_grad}
+4. Run a local smoke test on single GPU with a small LoRA adapter; confirm delta H1 parity with existing path by toggling use_sequence_processor_sampling.
+
+Validation
+- Single GPU sanity (no DDP):
+  1) With SP sampling enabled
+     python -m entropy_experiments.offline_entropy_probe --config path/to/config.yaml --dryrun
+  2) With SP sampling disabled (fallback to legacy)
+     set probe_rework.use_sequence_processor_sampling=false
+     python -m entropy_experiments.offline_entropy_probe --config path/to/config.yaml --dryrun
+  Compare logs for Phase 1/2 timings and deltaH1 within tolerance on same seed.
+
+- Loader toggles:
+  - set checkpoint.use_qlora=false -> loads LoRA‑simple
+  - set checkpoint.use_qlora=true  -> loads QLoRA
+
+Acceptance Criteria
+- delta H1 matches current implementation within tolerance on 3 seeds for a fixed checkpoint.
+- E sampling uses with‑replacement, G=1; U sampling uses distinct prompts, G per prompt, verified by counts in logs.
+- offline_entropy_probe.py shrinks at call sites: model load via model_loader.load_peft_for_probe; sampling via SequenceProcessor path; no behavior regression.
+- Config remains backward compatible; new keys optional with sensible defaults.
+
+Rollback
+- Set probe_rework.use_sequence_processor_sampling=false to use previous sampling path immediately.
+- Revert import changes in offline_entropy_probe.py to restore in‑file loader implementation.
+
+DDP Forward Plan (not in this diff)
+- Generate an “index plan” on rank 0 (E and U prompt indices), broadcast, and pass explicit prompts to SequenceProcessor to ensure identical sampling across ranks.
+- Slice E/U plans per rank and keep accumulation/reduction identical to today.

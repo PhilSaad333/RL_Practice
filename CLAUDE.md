@@ -122,6 +122,44 @@ python rl_training/runners/resume_training.py \
 - **DDP**: Multi-GPU distributed training with PyTorch
 
 
+## RL-Trained Checkpoint for Entropy Experiments
+**Primary checkpoint**: `localfs/rl_training_runs/training_state/step_60/`
+This checkpoint has been trained with RL and contains optimizer states for entropy probe experiments.
+
+**Structure**:
+```
+step_60/
+├── model/                           # LoRA adapter weights
+│   ├── adapter_config.json         
+│   ├── adapter_model.safetensors   # 295MB LoRA weights
+│   └── README.md
+├── optimizer.pt                    # 591MB optimizer state with 392 parameters
+├── scheduler.pt                    # Learning rate scheduler state
+└── training_info.json             # Training metadata
+```
+
+**Usage**: This checkpoint is ideal for entropy experiments because:
+- Has RL-trained LoRA weights (step 60 of training)
+- Contains nonzero optimizer states (exp_avg, exp_avg_sq all 100% nonzero)
+- Compatible with new model_loader.py utilities
+- Ready for δH₁ computation and entropy probes
+
+**Model loading**:
+```python
+from entropy_experiments.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
+
+model = load_peft_for_probe(
+    base_id="Qwen/Qwen2.5-1.5B",
+    adapter_path="localfs/rl_training_runs/training_state/step_60/model",
+    use_qlora=False, dtype="bf16", device_map="cuda"
+)
+optimizer = load_adam_optimizer_from_path(
+    model=model,
+    optimizer_path="localfs/rl_training_runs/training_state/step_60/optimizer.pt",
+    lr=1e-5
+)
+```
+
 ## Critical Notes
 - **NEVER** reinstall packages unless explicitly needed
 - **ALWAYS** inspect filesystem before assuming what's available

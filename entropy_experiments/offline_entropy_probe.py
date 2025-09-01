@@ -633,15 +633,17 @@ class OfflineEntropyProbe:
             raise
             
     def _sample_batch(self) -> Dict[str, Any]:
-        """Sample batch of prompts and responses."""
-        # Use first B_E value from the unified config format
-        B_E_values = self.config['batch_config']['B_E_values']
-        B_E = B_E_values[0] if isinstance(B_E_values, list) else B_E_values
-        
-        return self.probe_components.sample_batch(
-            B=B_E,
-            G=self.config['batch_config']['G']
+        # Legacy shim for older codepaths: use SP to sample B distinct prompts with G responses
+        B = int(self.config['batch_config']['B_E_values'][0]) if isinstance(self.config['batch_config']['B_E_values'], list) else int(self.config['batch_config']['B_E_values'])
+        G = int(self.config['batch_config']['G'])
+        self._ensure_sequence_processor()
+        ds_name = self.config['batch_config']['dataset_name']
+        split = self.config['batch_config']['split']
+        seqs, lp, _ = self._sequence_processor.generate_with_logprobs(
+            prompts=None, G=G, dataset_name=ds_name, split=split, num_prompts=B, compute_rb=False, with_grad=False,
         )
+        rewards = lp.rewards
+        return self._pack_U_from_sequences(seqs, rewards)
         
     def _compute_delta_h1(self, batch_data: Dict[str, Any]) -> Dict[str, Any]:
         """Compute first-order entropy change prediction."""
@@ -816,33 +818,11 @@ class OfflineEntropyProbe:
                 
                 self.logger.info(f"Single GPU: using random sampling")
             
-            # Phase 0: Sample two batches using deterministic indices (if available)
+            # Phase 0: Sampling E and U batches
             self.logger.info("Phase 0: Sampling E and U batches")
             phase0_start = time.time()
-            
             G_U = self.config['batch_config']['G']
-            if self.config.get('probe_rework', {}).get('use_sequence_processor_sampling', True):
-                E_batch, U_batch = self._sample_EU_via_sequence_processor(
-                    B_E=B_E, B_U=B_U, G_U=G_U
-                )
-            else:
-                # Legacy fallback
-                if is_dist:
-                    E_total_sequences = B_E_local * 1
-                    E_batch = self.probe_components.sample_E_batch_with_replacement(
-                        E_total_sequences=E_total_sequences, G=1
-                    )
-                    U_batch = self.probe_components.sample_batch(
-                        B=B_U_local, G=G_U, indices=U_indices_local
-                    )
-                else:
-                    E_batch = self.probe_components.sample_E_batch_with_replacement(
-                        E_total_sequences=B_E * 1, G=1
-                    )
-                    U_batch = self.probe_components.sample_batch(
-                        B=B_U, G=G_U, indices=None
-                    )
-            
+            E_batch, U_batch = self._sample_EU_via_sequence_processor(B_E=B_E, B_U=B_U, G_U=G_U)
             phase0_time = time.time() - phase0_start
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
             self.logger.info(f"E-batch: G=1 (replacement), {E_batch['sequences'].shape[0]} prompts, {E_batch['sequences'].shape[1]} responses/prompt")
@@ -861,87 +841,24 @@ class OfflineEntropyProbe:
             B_U_global = B_U_local if not is_dist else None
             
             if compute_delta_h1:
-                # Phase 1: Accumulate ΣX (raw gradients from E batch)
-                self.logger.info("Phase 1: Accumulating ΣX from E batch")
-                phase1_start = time.time()
-                
-                sum_X_buf, B_E_local = self.probe_components.accumulate_sum_X(
-                    E_batch, mb_size_prompts, weighting_mode
+                self.logger.info("Phase 1–3: Computing delta H1 from E/U batches")
+                compute = self.probe_components.compute_delta_h1_from_batches(
+                    E_batch=E_batch,
+                    U_batch=U_batch,
+                    mb_size_prompts=mb_size_prompts,
+                    weighting_mode=weighting_mode,
+                    adam_preconditioner=self.adam_preconditioner,
+                    optimizer=self.optimizer,
                 )
-            
-                phase1_time = time.time() - phase1_start
-                self.logger.info(f"Phase 1 complete: {phase1_time:.2f}s, B_E_local={B_E_local}")
-                
-                # Phase 2: Accumulate ΣY (preconditioned gradients from U batch)
-                self.logger.info("Phase 2: Accumulating ΣY from U batch")
-                phase2_start = time.time()
-                
-                sum_Y_buf, B_U_local = self.probe_components.accumulate_sum_Y(
-                    U_batch, mb_size_prompts, self.adam_preconditioner
-                )
-                
-                phase2_time = time.time() - phase2_start
-                self.logger.info(f"Phase 2 complete: {phase2_time:.2f}s, B_U_local={B_U_local}")
-                
-                # Phase 3: All-reduce and compute means and δH₁  
-                self.logger.info("Phase 3: All-reduce and computing means and δH₁")
-                phase3_start = time.time()
-                
-                # Stage 3: All-reduce counts and parameter buffers
-                if is_dist:
-                    self.logger.info("Multi-GPU: All-reducing counts and parameter buffers")
-                    
-                    # All-reduce counts
-                    B_E_global = distributed_helpers.count_global(B_E_local)
-                    B_U_global = distributed_helpers.count_global(B_U_local)
-                    
-                    # All-reduce parameter buffers (in-place)
-                    distributed_helpers.all_reduce_param_buffer_(sum_X_buf)
-                    distributed_helpers.all_reduce_param_buffer_(sum_Y_buf)
-                    
-                    self.logger.info(f"All-reduced: B_E_global={B_E_global}, B_U_global={B_U_global}")
-                else:
-                    # Single GPU: use local counts
-                    B_E_global = B_E_local
-                    B_U_global = B_U_local
-                    self.logger.info(f"Single GPU: B_E={B_E_global}, B_U={B_U_global}")
-                
-                # Compute means: μ_X = ΣX / B_E_global, μ_Y = ΣY / B_U_global
-                mu_X = {param_id: buf_tensor / max(B_E_global, 1) 
-                       for param_id, buf_tensor in sum_X_buf.items()}
-                mu_Y = {param_id: buf_tensor / max(B_U_global, 1) 
-                       for param_id, buf_tensor in sum_Y_buf.items()}
-                
-                # Instrumentation to confirm numerical stability (from fix.txt)
-                nz_X = sum(int(t.abs().sum().item() > 0) for t in mu_X.values())
-                nz_Y = sum(int(t.abs().sum().item() > 0) for t in mu_Y.values())
-                self.logger.info(f"[CHECK] nonzero μ_X entries: {nz_X}, nonzero μ_Y entries: {nz_Y}")
-                norm_X = sum(float((t.double().pow(2)).sum().item()) for t in mu_X.values())**0.5
-                norm_Y = sum(float((t.double().pow(2)).sum().item()) for t in mu_Y.values())**0.5
-                self.logger.info(f"[CHECK] ||μ_X||₂={norm_X:.6e}, ||μ_Y||₂={norm_Y:.6e}")
-                
-                # Compute dot product: bars_dot = μ_X · μ_Y (now uses fp64 accumulation)
-                bars_dot = self.probe_components.dot_param_buffers(mu_X, mu_Y)
-                
-                # Get learning rate and compute δH₁
-                learning_rate = self.probe_components._get_learning_rate(self.optimizer)
-                delta_h1 = learning_rate * bars_dot
-                
-                phase3_time = time.time() - phase3_start
-                
-                # Log results with high precision
-                self.logger.info(f"🔍 [RESULTS] bars_dot={bars_dot:.10f}")
-                self.logger.info(f"🔍 [RESULTS] learning_rate={learning_rate:.2e}")
-                self.logger.info(f"🔍 [RESULTS] deltaH1={delta_h1:.10f}")
-                self.logger.info(f"Phase 3 complete: {phase3_time:.2f}s")
-                
-                # Update globals for distributed case
-                if is_dist:
-                    # B_E_global and B_U_global already set above
-                    pass
-                else:
-                    B_E_global = B_E_local
-                    B_U_global = B_U_local
+                delta_h1 = compute['deltaH1']
+                bars_dot = compute['bars_dot']
+                learning_rate = compute['learning_rate']
+                phase1_time = compute['timing']['phase1_time']
+                phase2_time = compute['timing']['phase2_time']
+                phase3_time = compute['timing']['phase3_time']
+                B_E_global = B_E
+                B_U_global = B_U
+                self.logger.info(f"[RESULTS] bars_dot={bars_dot:.10f}, lr={learning_rate:.2e}, deltaH1={delta_h1:.10f}")
             else:
                 self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
                 # Set global batch sizes for downstream use
