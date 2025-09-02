@@ -154,13 +154,36 @@ def load_adam_optimizer_from_path(
     if not optimizer_path.exists():
         raise FileNotFoundError(f"Optimizer state not found: {optimizer_path}")
 
-    # Instantiate AdamW with provided hparams (lr may be overridden later)
-    opt = AdamW(model.parameters(), lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)
+    # Instantiate AdamW over LoRA trainables only (stable order via named_parameters)
+    peft_mod = model.module if hasattr(model, "module") else model
+    trainable_params = [p for _, p in peft_mod.named_parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable (LoRA) parameters found; cannot build optimizer for probe.")
+
+    opt = AdamW(trainable_params, lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)
 
     try:
         state_dict = torch.load(str(optimizer_path), map_location="cpu")
         remapped = _remap_optimizer_state_ids(state_dict, opt)
         opt.load_state_dict(remapped)
+
+        # Coverage summary: fraction of params with exp_avg_sq and step present
+        have_v = 0
+        have_step = 0
+        total = 0
+        for group in opt.param_groups:
+            for p in group["params"]:
+                total += 1
+                st = opt.state.get(p, {})
+                if isinstance(st.get("exp_avg_sq", None), torch.Tensor):
+                    have_v += 1
+                s = st.get("step", None)
+                if isinstance(s, int) or isinstance(s, torch.Tensor):
+                    have_step += 1
+        coverage_v = have_v / max(total, 1)
+        coverage_step = have_step / max(total, 1)
+        print(f"[optimizer-state] coverage: v(exp_avg_sq) {have_v}/{total} = {coverage_v:.1%}, step {have_step}/{total} = {coverage_step:.1%}")
+
         return opt
     except Exception:
         return opt  # Fall back to fresh optimizer
