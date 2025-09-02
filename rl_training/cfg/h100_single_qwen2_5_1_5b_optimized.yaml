@@ -67,7 +67,7 @@ scheduler:
 # ------------------ GRPO Trainer Configuration ---------------- #
 
 # Learning rate and optimization
-lr: 1.0e-6                    # Learning rate
+lr: 2.0e-6                    # Learning rate
 clip_eps: 0.2                 # PPO clipping epsilon
 clip_+: 0.2                   # Asymmetric clipping
 cfg["kl_beta"]: 0.0           # KL penalty (0 = compute for logging only)
@@ -87,7 +87,7 @@ total_steps: 64               # 64 steps for comprehensive GNS testing
 
 # Gradient Noise Scale probe (optional - enable for GNS analysis)
 gns_probe:
-  enabled: true               # Enable for GNS data collection
+  enabled: false               # Enable for GNS data collection
   window_size: 16             # Window for GNS computation
   ema_alpha: 0.1              # EMA smoothing factor
   debug: false                # Set true for debug output
