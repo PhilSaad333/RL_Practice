@@ -210,7 +210,7 @@ class DeltaEntropyIS:
             RB = torch.zeros_like(S)
             return S, RB
         bs = self._to_batched_sequences_from_probe(E_batch)
-        logprob_results, _diag = self.sequence_processor.teacher_force_logprobs_with_diagnostics(
+        logprob_results, diagnostics_results = self.sequence_processor.teacher_force_logprobs_with_diagnostics(
             sequences=bs,
             with_grad=False,
             tf_batch_size=getattr(self.sequence_processor.config, 'tf_batch_size', None),
@@ -222,20 +222,36 @@ class DeltaEntropyIS:
             seq_lp_list.append([float(x) for x in b_list])
         S = torch.tensor(seq_lp_list, device=device, dtype=torch.float32)
         RB_vals: list[list[float]] = []
-        if getattr(logprob_results, 'rb_entropies_torch', None):
+        have_torch_rb = bool(getattr(logprob_results, 'rb_entropies_torch', None))
+        have_np_rb = bool(getattr(logprob_results, 'rb_entropies', None))
+        if have_torch_rb:
             for b in range(len(logprob_results.rb_entropies_torch)):
                 row = []
                 for g in range(len(logprob_results.rb_entropies_torch[b])):
                     rb_t = logprob_results.rb_entropies_torch[b][g]
                     row.append(float(rb_t.detach().sum().item()) if rb_t is not None and rb_t.numel() > 0 else 0.0)
                 RB_vals.append(row)
-        else:
+        elif have_np_rb:
             for b in range(len(logprob_results.rb_entropies)):
                 row = []
                 for g in range(len(logprob_results.rb_entropies[b])):
                     rb_np = logprob_results.rb_entropies[b][g]
                     row.append(float(rb_np.sum()) if rb_np is not None else 0.0)
                 RB_vals.append(row)
+        else:
+            # Fallback to diagnostics packs (SequenceDiagnostics.rb_entropy_sum)
+            diag = getattr(diagnostics_results, 'diagnostics', None)
+            if diag is not None:
+                for b in range(len(diag)):
+                    row = []
+                    for g in range(len(diag[b])):
+                        seq_diag = getattr(diag[b][g], 'seq', None)
+                        rb_sum = float(getattr(seq_diag, 'rb_entropy_sum', 0.0)) if seq_diag is not None else 0.0
+                        row.append(rb_sum)
+                    RB_vals.append(row)
+            else:
+                # As a last resort, zero RB (should not happen if compute_rb=True)
+                RB_vals = [[0.0 for _ in range(S.shape[1])] for _ in range(S.shape[0])]
         RB = torch.tensor(RB_vals, device=device, dtype=torch.float32)
         return S, RB
 
@@ -429,4 +445,3 @@ class DeltaEntropyIS:
                 'deltaH_true_tok': deltaH_true_tok,
             })
         return results
-
