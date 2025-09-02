@@ -29,7 +29,7 @@ computation_options:
 # === GROUND TRUTH ENTROPY CHANGE ===  
 # Renamed from 'importance' to be more descriptive
 true_delta_h:
-  enabled: true                    # Enable ground truth ΔH computation (Phase 5)
+  enabled: false                   # Disable ground truth ΔH computation (Phase 5) for now
   training_loss: "rl"             # Use RL-aligned loss for updates
   microbatch_size: 4              # IS microbatch size
   clip_c: 10.0                    # Importance weight clipping
@@ -38,11 +38,11 @@ true_delta_h:
 # === GENERATION SETTINGS ===  
 # Streamlined - removed rb_requires_grad (now hardcoded to true)
 generation:
-  temperature: 1.0
+  temperature: 0.7
   top_p: 0.995  
   max_new_tokens: 150
-  gen_batch_size: 64
-  tf_batch_size: 16
+  gen_batch_size: 256
+  tf_batch_size: 8
 
 # === MEMORY CONFIGURATION ===
 # Simplified - removed amp (hardcoded true), kept essentials
