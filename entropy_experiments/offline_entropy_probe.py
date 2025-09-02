@@ -249,7 +249,7 @@ class OfflineEntropyProbe:
         )
         
         # Only initialize DeltaEntropyIS if importance sampling is enabled
-        if self.config['importance']['enabled']:
+        if self.config['true_delta_h']['enabled']:
             self.delta_entropy_is = DeltaEntropyIS(
                 model=self.model,
                 config=self.config,
@@ -258,7 +258,7 @@ class OfflineEntropyProbe:
             )
         else:
             self.delta_entropy_is = None
-            self.logger.info("Importance sampling disabled (importance.enabled: false)")
+            self.logger.info("Importance sampling disabled (true_delta_h.enabled: false)")
     
         
         if self.distributed:
@@ -578,8 +578,8 @@ class OfflineEntropyProbe:
                 B_U = batch_config['B_U']  
             else:
                 raise KeyError("Config must contain 'B_U' in batch_config")
-            mb_size_prompts = self.config.get('probe_rework', {}).get('mb_size_prompts', 2)
-            weighting_mode = self.config.get('probe_rework', {}).get('weighting_mode', 'dr_grpo')
+            mb_size_prompts = self.config.get('computation_options', {}).get('mb_size_prompts', 2)
+            weighting_mode = self.config.get('computation_options', {}).get('weighting_mode', 'dr_grpo')
             
             self.logger.info(f"Mixed probe config: B_E={B_E}, B_U={B_U}, mb_size={mb_size_prompts}, weighting={weighting_mode}")
             
@@ -594,7 +594,7 @@ class OfflineEntropyProbe:
             dataset_size = len(ds_examples)
             
             # Get master seed for deterministic sampling
-            master_seed = self.config.get('probe_rework', {}).get('master_seed', 42)
+            master_seed = self.config.get('computation_options', {}).get('master_seed', 42)
             
             if is_dist:
                 # Deterministic sampling: rank 0 generates global indices, broadcasts to all ranks
@@ -664,7 +664,7 @@ class OfflineEntropyProbe:
                 self.detailed_logger.log_batch_data("U_batch", U_batch)
             
             # Check if δH₁ computation should be performed
-            probe_config = self.config.get('probe_rework', {})
+            probe_config = self.config.get('computation_options', {})
             compute_delta_h1 = probe_config.get('compute_delta_h1', True)
             
             # Initialize variables for potential use in later stages
@@ -701,14 +701,14 @@ class OfflineEntropyProbe:
                     base_bars_dot = bars_dot
                     deltaH1_list = [float(float(lr_i) * base_bars_dot) for lr_i in lr_sweep]
                     gt_list = []
-                    if self.config.get('importance', {}).get('enabled', False):
+                    if self.config.get('true_delta_h', {}).get('enabled', False):
                         cfg_importance = {
-                            'training_loss': self.config.get('importance', {}).get('training_loss', 'nll'),
-                            'importance_microbatch_size': self.config.get('importance', {}).get('importance_microbatch_size', 1),
-                            'is_mode': self.config.get('importance', {}).get('is_mode', 'snis'),
-                            'clip_c': self.config.get('importance', {}).get('clip_c', 10.0),
-                            'report_per_token': self.config.get('importance', {}).get('report_per_token', False),
-                            'snapshot_device': self.config.get('importance', {}).get('snapshot_device', 'cpu')
+                            'training_loss': self.config.get('true_delta_h', {}).get('training_loss', 'nll'),
+                            'importance_microbatch_size': self.config.get('true_delta_h', {}).get('microbatch_size', 1),
+                            'is_mode': self.config.get('true_delta_h', {}).get('is_mode', 'snis'),
+                            'clip_c': self.config.get('true_delta_h', {}).get('clip_c', 10.0),
+                            'report_per_token': self.config.get('true_delta_h', {}).get('report_per_token', False),
+                            'snapshot_device': self.config.get('true_delta_h', {}).get('snapshot_device', 'cpu')
                         }
                         saved_lr = self.optimizer.param_groups[0]['lr']
                         try:
@@ -740,7 +740,7 @@ class OfflineEntropyProbe:
             # STAGE 2: Two-Batch Ground-Truth Entropy Change - Optional
             # ================================================================
             compute_importance_sampling = probe_config.get('compute_importance_sampling', False)
-            importance_enabled = self.config.get('importance', {}).get('enabled', False) or compute_importance_sampling
+            importance_enabled = self.config.get('true_delta_h', {}).get('enabled', False) or compute_importance_sampling
             ground_truth_results = {}
             
             if importance_enabled:
@@ -762,12 +762,12 @@ class OfflineEntropyProbe:
                 
                 # Extract importance sampling configuration
                 cfg_importance = {
-                    'training_loss': self.config.get('importance', {}).get('training_loss', 'nll'),
-                    'importance_microbatch_size': self.config.get('importance', {}).get('importance_microbatch_size', 1),
-                    'is_mode': self.config.get('importance', {}).get('is_mode', 'snis'),
-                    'clip_c': self.config.get('importance', {}).get('clip_c', 10.0),
-                    'report_per_token': self.config.get('importance', {}).get('report_per_token', False),
-                    'snapshot_device': self.config.get('importance', {}).get('snapshot_device', 'cpu')
+                    'training_loss': self.config.get('true_delta_h', {}).get('training_loss', 'nll'),
+                    'importance_microbatch_size': self.config.get('true_delta_h', {}).get('microbatch_size', 1),
+                    'is_mode': self.config.get('true_delta_h', {}).get('is_mode', 'snis'),
+                    'clip_c': self.config.get('true_delta_h', {}).get('clip_c', 10.0),
+                    'report_per_token': self.config.get('true_delta_h', {}).get('report_per_token', False),
+                    'snapshot_device': self.config.get('true_delta_h', {}).get('snapshot_device', 'cpu')
                 }
                 
                 # Compute ground-truth entropy change
