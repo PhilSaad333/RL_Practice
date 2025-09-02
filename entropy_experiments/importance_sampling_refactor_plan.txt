@@ -1,0 +1,322 @@
+Title: Refactor plan — Replace naive entropy with RB + SequenceProcessor; rename ImportanceSampler → DeltaEntropyIS
+
+Author: (your name)
+Date: (today)
+Scope: This note instructs an implementer to (1) rename the “importance sampling” module/class and (2) refactor it to consume SequenceProcessor outputs and use Rao–Blackwellized (RB) entropies for the IS estimate of H(θ⁺), while preserving DDP correctness and existing two-batch (E/U) workflow.
+
+----------------------------------------------------------------------
+0) Executive summary
+----------------------------------------------------------------------
+Goal: In the “true delta entropy” path (the component that actually takes a real optimizer step on U and then re-estimates H on E), switch the estimator from realized surprisal to RB entropies already produced by SequenceProcessor. Keep the same SNIS weighting by π_{θ⁺}(Y)/π_θ(Y). Rename file & class to reflect purpose.
+
+Key invariants:
+- Use the SAME E batch before and after the update (common-random-numbers).
+- Sequence-level IS weights: logw = log π_{θ⁺}(Y) − log π_θ(Y), computed at the sequence level by teacher forcing.
+- H_orig: plain mean over E of per-sequence RB sums under θ.
+- H_upd: SNIS mean over E of per-sequence RB sums under θ⁺, with weights w = exp(logw − max(logw)).
+- DDP correctness: global reductions for sums and counts.
+
+Deliverables:
+- New file: rl_training/…/delta_entropy_is.py
+- Class rename: ImportanceSampler → DeltaEntropyIS
+- Offline orchestrator import/call-site updates
+- Internals refactored to call SequenceProcessor.teacher_force_logprobs(..., with_grad=False, compute_rb=True)
+
+----------------------------------------------------------------------
+1) File/class rename
+----------------------------------------------------------------------
+A. Move/rename:
+- FROM: rl_training/…/importance_sampling.py
+- TO:   rl_training/…/delta_entropy_is.py
+
+B. Edit class header:
+- FROM: class ImportanceSampler:
+- TO:   class DeltaEntropyIS:
+
+C. Update offline orchestrator (offline_entropy_probe.py):
+- Replace import:
+    from .importance_sampling import ImportanceSampler
+  with:
+    from .delta_entropy_is import DeltaEntropyIS
+- Replace attribute/instantiation:
+    self.importance_sampler = ImportanceSampler(model=self.model, config=self.config, logger=self.logger)
+  with (and prefer passing an existing SequenceProcessor):
+    self.delta_entropy_is = DeltaEntropyIS(
+        model=self.model,
+        config=self.config,
+        logger=self.logger,
+        sequence_processor=self._sequence_processor  # reuse the one probe already built
+    )
+- Replace method call sites:
+    self.importance_sampler.entropy_change_two_batch(...)
+  → self.delta_entropy_is.entropy_change_two_batch(...)
+
+Notes:
+- If you prefer to keep the attribute name self.importance_sampler for minimal edits, you may instantiate DeltaEntropyIS into that attribute. The name change here is simply for clarity.
+
+----------------------------------------------------------------------
+2) Public API and config surface (unchanged unless noted)
+----------------------------------------------------------------------
+Keep the existing public method signature so the orchestrator remains compatible:
+
+def entropy_change_two_batch(
+    self,
+    model: torch.nn.Module,
+    E_batch: Dict[str, Any],
+    U_batch: Dict[str, Any],
+    optimizer: torch.optim.Optimizer,
+    cfg_importance: Dict[str, Any],
+) -> Dict[str, Any]:
+
+Add a config switch (default “rb”):
+- config['importance']['entropy_mode'] ∈ {'rb','naive'}, default 'rb'
+  • 'rb': use per-sequence sums of RB entropies
+  • 'naive' (legacy): realized surprisal paths remain available for ablation
+
+----------------------------------------------------------------------
+3) Integrate SequenceProcessor in DeltaEntropyIS
+----------------------------------------------------------------------
+Constructor:
+
+class DeltaEntropyIS:
+    def __init__(..., sequence_processor: Optional[SequenceProcessor] = None, ...):
+        self.sequence_processor = sequence_processor  # prefer non-None
+        # if None: lazily build from tokenizer/model using same GenerationConfig as the probe
+
+Reason: We want a single canonical tokenizer/config and to avoid duplicate TF config drift.
+
+----------------------------------------------------------------------
+4) Adapter: probe batch → BatchedSequences
+----------------------------------------------------------------------
+Add (or import) a small helper in delta_entropy_is.py:
+
+def _to_batched_sequences_from_probe(self, batch: Dict[str, Any]) -> BatchedSequences:
+    """
+    Convert probe batch dict -> BatchedSequences (as required by SequenceProcessor.teacher_force_logprobs).
+    Inputs required in batch: 'sequences' [B,G,T], 'attention_masks' [B,G,T], 'prompt_lens' List[B].
+    gen_lens[b][g] = sum(attn_mask[b,g]) - prompt_len[b], clamped at >=0.
+    responses_text can be None.
+    """
+    # Implementation mirrors probe_components._to_batched_sequences_from_probe
+
+----------------------------------------------------------------------
+5) Replace bespoke teacher-forcing passes
+----------------------------------------------------------------------
+Delete/retire code paths that compute sequence logprobs manually:
+- _compute_logprobs_for_sequences(...)
+- _compute_logprobs_microbatched(...)
+
+Replace with two SequenceProcessor calls on the SAME E batch:
+
+# Before update (θ), no grad; we need sequence_logprobs and RB entropies
+seqs = _to_batched_sequences_from_probe(E_batch)
+lp_orig, _diag = self.sequence_processor.teacher_force_logprobs(
+    seqs, with_grad=False, compute_rb=True
+)
+# After update (θ⁺), call the same on the SAME seqs:
+lp_upd, _diag2 = self.sequence_processor.teacher_force_logprobs(
+    seqs, with_grad=False, compute_rb=True
+)
+
+Where lp_*.sequence_logprobs is List[List[float]] and lp_*.rb_entropies is List[List[np.ndarray]].
+
+Helper extractors (put as private methods):
+
+def _tensor_from_sequence_logprobs(self, lp) -> torch.Tensor:
+    # returns [B,G] on current device
+    vals = [[float(x) for x in row] for row in lp.sequence_logprobs]
+    return torch.tensor(vals, device=self.device, dtype=torch.float32)
+
+def _tensor_from_rb_sums(self, lp) -> torch.Tensor:
+    # returns [B,G] of sum over per-step RB entropies for each sequence
+    import numpy as _np
+    vals = [[float(_np.sum(arr)) if (arr is not None and getattr(arr, "size", 0) > 0) else 0.0
+             for arr in row] for row in lp.rb_entropies]
+    return torch.tensor(vals, device=self.device, dtype=torch.float32)
+
+----------------------------------------------------------------------
+6) Weights and estimators (RB mode)
+----------------------------------------------------------------------
+Weights (sequence-level IS):
+- S_orig = _tensor_from_sequence_logprobs(lp_orig)  # [B,G], under θ
+- S_upd  = _tensor_from_sequence_logprobs(lp_upd)   # [B,G], under θ⁺
+- logw = S_upd − S_orig
+- For numerical stability: logw_shift = logw − logw.max(); w = exp(logw_shift)
+
+Estimands:
+- RB_orig_per_seq = _tensor_from_rb_sums(lp_orig)   # [B,G] under θ
+- RB_upd_per_seq  = _tensor_from_rb_sums(lp_upd)    # [B,G] under θ⁺
+
+Global reductions (DDP-safe):
+- H_orig_rb = mean over all sequences of RB_orig_per_seq
+    * Implement as: sum_local = RB_orig_per_seq.sum(); cnt_local = torch.tensor(numel)
+      If dist.is_initialized(): all_reduce both sums and counts; H_orig_rb = sum_global / cnt_global
+
+- H_upd_rb via SNIS:
+    * Numerator: (w * RB_upd_per_seq).sum()
+    * Denominator: w.sum()
+    * If DDP: reduce numerator and denominator separately across ranks; then divide.
+    * Also compute ESS = (sum w)^2 / (sum w^2) with DDP reductions.
+
+Per-token variant (optional): if existing code logs “per-token entropy,” replace the legacy -w*S term by w * RB_upd_per_seq on the numerator, and divide by weighted sum of token counts. (If lengths are needed, reuse existing _get_generation_lengths(E_batch) to compute per-sequence lengths L; then the per-token SNIS numerator is w * RB_upd_per_seq and denominator is w * L.)
+
+Keep legacy code paths behind entropy_mode == 'naive' for A/B.
+
+----------------------------------------------------------------------
+7) Two-batch workflow (entropy_change_two_batch)
+----------------------------------------------------------------------
+Leave the overall structure identical:
+
+A) Snapshot model + optimizer (existing code is fine)
+B) Compute H_orig_rb from lp_orig (SequenceProcessor, with_grad=False, compute_rb=True)
+C) Take one optimizer step on U (existing streaming microbatch logic)
+D) Compute H_upd_rb from lp_upd and SNIS weights w (SequenceProcessor again)
+E) Restore model + optimizer (existing code)
+F) Report:
+   - deltaH_true = H_upd_rb − H_orig_rb
+   - If per-token was requested, deltaH_true_tok similarly.
+
+Switch on config['importance']['entropy_mode']:
+- if 'rb': use RB paths above
+- if 'naive': fall back to legacy S-based estimators
+
+----------------------------------------------------------------------
+8) DDP helpers (recommended small utilities)
+----------------------------------------------------------------------
+Add private helpers and reuse them in both RB and legacy paths:
+
+def _ddp_sum_scalar(self, x: torch.Tensor) -> float:
+    if dist.is_initialized():
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+    return float(x.item())
+
+def _ddp_sum2_scalar(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[float,float]:
+    if dist.is_initialized():
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+    return float(x.item()), float(y.item())
+
+Usage examples:
+- For H_orig_rb: sum_local = RB_orig_per_seq.sum(); cnt_local = torch.tensor(RB_orig_per_seq.numel(), device=…)
+- For H_upd_rb SNIS: num_local = (w*RB_upd_per_seq).sum(); den_local = w.sum()
+- For ESS: s1_local = w.sum(); s2_local = (w*w).sum(); reduce both → ESS = s1^2 / s2
+
+----------------------------------------------------------------------
+9) Remove/retire redundant functions
+----------------------------------------------------------------------
+- Remove or mark unused:
+  • _compute_logprobs_for_sequences
+  • _compute_logprobs_microbatched
+  • Any token-loop TF code duplicating SequenceProcessor behavior
+- Keep existing “clip IS”, “PSIS” utilities only if you still want to experiment. If kept, refactor them to accept a generic “values” tensor (either -S or RB sums) plus log-weights so they are agnostic to estimator choice.
+
+----------------------------------------------------------------------
+10) Logging & diagnostics
+----------------------------------------------------------------------
+Maintain the existing logging structure but rename strings to reflect RB:
+- “Original entropy (RB): H(θ;E) = …”
+- “Updated entropy (RB, SNIS): H(θ⁺;E) = …”
+- Report ESS, max logw, sum weights, etc., as before.
+- If “report_per_token” is enabled, compute the per-token variant with RB payload and consistent denominators (weighted sum of lengths).
+
+----------------------------------------------------------------------
+11) Orchestrator changes (offline_entropy_probe.py)
+----------------------------------------------------------------------
+- Import rename (see §1).
+- Construction rename (see §1). Prefer passing sequence_processor=self._sequence_processor.
+- Call-site rename (see §1).
+- Optional: Add config toggle in your YAML:
+    importance:
+      enabled: true
+      entropy_mode: rb           # default is rb
+      is_mode: snis              # existing option
+      importance_microbatch_size: 1 or 2 (unused once we delegate to SP TF batching)
+
+No other orchestrator changes required.
+
+----------------------------------------------------------------------
+12) Sanity checks / acceptance tests
+----------------------------------------------------------------------
+A. Tiny E batch (B=2, G=2) with small learning rate:
+   - Run once with entropy_mode='naive', then with 'rb'.
+   - Confirm magnitudes of H_orig are similar; RB variance should be noticeably smaller across repeats.
+   - Confirm deltaH_true ≈ deltaH_linear (your first-order estimate) and that the gap shrinks ~O(lr^2).
+
+B. Weight stability:
+   - Log max(logw), min(logw), ESS; ensure ESS does not collapse. If it does, lower lr for this validation step.
+
+C. EOS and lengths:
+   - Ensure S_orig/S_upd include EOS consistently and RB sums iterate over the same generation region. Mismatches here are a common source of bias.
+
+D. DDP:
+   - Run 1-GPU vs 2-GPU and verify identical scalars (within floating error).
+
+----------------------------------------------------------------------
+13) Known limitations / future improvements
+----------------------------------------------------------------------
+- Sequence-level vs prefix-level IS: current approach is correct and adequate for small steps. If later steps are larger, consider a prefix-wise IS variant to reduce bias.
+- SNIS bias is O(1/n); acceptable for E sizes you are using. Keep “naive” path for occasional cross-checks.
+- If needed, expose a flag to compute both RB and naive during the same run for controlled comparisons.
+
+----------------------------------------------------------------------
+14) Minimal code sketch (indicative only)
+----------------------------------------------------------------------
+# inside DeltaEntropyIS.entropy_change_two_batch(...), RB mode
+seqs = self._to_batched_sequences_from_probe(E_batch)
+lp_orig, _ = self.sequence_processor.teacher_force_logprobs(seqs, with_grad=False, compute_rb=True)
+
+# H_orig_rb (DDP-mean over sequences)
+RB_orig = self._tensor_from_rb_sums(lp_orig)          # [B,G]
+sum_local = RB_orig.sum()
+cnt_local = torch.tensor(RB_orig.numel(), device=sum_local.device, dtype=sum_local.dtype)
+if dist.is_initialized():
+    dist.all_reduce(sum_local, op=dist.ReduceOp.SUM)
+    dist.all_reduce(cnt_local, op=dist.ReduceOp.SUM)
+H_orig_rb = (sum_local / cnt_local).item()
+
+# Take optimizer step on U (existing code)
+# ...
+
+# After step: recompute on SAME seqs
+lp_upd, _ = self.sequence_processor.teacher_force_logprobs(seqs, with_grad=False, compute_rb=True)
+
+# Weights
+S_orig = self._tensor_from_sequence_logprobs(lp_orig)
+S_upd  = self._tensor_from_sequence_logprobs(lp_upd)
+logw   = S_upd - S_orig
+logw_shift = logw - logw.max()
+w = torch.exp(logw_shift)
+
+# H_upd_rb via SNIS with DDP
+RB_upd = self._tensor_from_rb_sums(lp_upd)
+num_local = (w * RB_upd).sum()
+den_local = w.sum()
+if dist.is_initialized():
+    dist.all_reduce(num_local, op=dist.ReduceOp.SUM)
+    dist.all_reduce(den_local, op=dist.ReduceOp.SUM)
+H_upd_rb = (num_local / den_local).item()
+
+deltaH_true = H_upd_rb - H_orig_rb
+
+# ESS
+s1_local = w.sum()
+s2_local = (w*w).sum()
+if dist.is_initialized():
+    dist.all_reduce(s1_local, op=dist.ReduceOp.SUM)
+    dist.all_reduce(s2_local, op=dist.ReduceOp.SUM)
+ESS = (s1_local * s1_local / s2_local).item()
+
+----------------------------------------------------------------------
+15) Checklist
+----------------------------------------------------------------------
+[ ] File/class rename done; imports/attributes updated in orchestrator
+[ ] DeltaEntropyIS accepts a SequenceProcessor or builds one lazily
+[ ] Adapter function added for E-batch → BatchedSequences
+[ ] Legacy TF code removed/replaced by SequenceProcessor.teacher_force_logprobs(..., compute_rb=True)
+[ ] RB extraction helpers implemented
+[ ] H_orig_rb and H_upd_rb (SNIS) computed with DDP reductions
+[ ] Logging updated (RB nomenclature, ESS, weighting diagnostics)
+[ ] Config toggle entropy_mode with default 'rb'
+[ ] Basic tests pass on 1-GPU and 2-GPU with small lr; results consistent
+
+End of document.

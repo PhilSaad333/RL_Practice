@@ -38,7 +38,7 @@ import json
 
 from .probe_components import ProbeComponents
 from .adam_preconditioner import AdamPreconditioner  
-from .importance_sampling import ImportanceSampler
+from .delta_entropy_is import DeltaEntropyIS
 from . import distributed_helpers
 from .distributed_helpers import DistributedHelpers
 
@@ -80,7 +80,7 @@ class OfflineEntropyProbe:
         # Initialize components
         self.probe_components = None
         self.adam_preconditioner = None  
-        self.importance_sampler = None
+        self.delta_entropy_is = None
         self.u_statistics = None
         self.distributed_helpers = None
         
@@ -241,16 +241,17 @@ class OfflineEntropyProbe:
             logger=self.logger
         )
         
-        # Only initialize ImportanceSampler if importance sampling is enabled
+        # Only initialize DeltaEntropyIS if importance sampling is enabled
         if self.config['importance']['enabled']:
-            self.importance_sampler = ImportanceSampler(
+            self.delta_entropy_is = DeltaEntropyIS(
                 model=self.model,
                 config=self.config,
-                logger=self.logger
+                logger=self.logger,
+                sequence_processor=getattr(self, '_sequence_processor', None),
             )
         else:
-            self.importance_sampler = None
-            self.logger.info("ImportanceSampler disabled (importance.enabled: false)")
+            self.delta_entropy_is = None
+            self.logger.info("Importance sampling disabled (importance.enabled: false)")
     
         
         if self.distributed:
@@ -281,8 +282,6 @@ class OfflineEntropyProbe:
 
         gen_cfg = self.config.get('generation', {})
         
-        # CRITICAL FIX: Force rb_requires_grad=True when using rb_residual estimator
-        # Without gradients on RB tensors, rb_residual X computation will crash
         est_mode = (self.config.get('estimator', {}) or {}).get('x_estimator_mode', 'naive')
         rb_rg_cfg = gen_cfg.get('rb_requires_grad', False)
         rb_rg_final = True if est_mode == 'rb_residual' else rb_rg_cfg
@@ -365,6 +364,88 @@ class OfflineEntropyProbe:
         )
         U_batch = self._pack_U_from_sequences(U_sequences, U_lp.rewards)
         return E_batch, U_batch
+
+    # --- Batch cache I/O helpers ---
+    def _save_batch(self, batch: Dict[str, Any], path: str) -> None:
+        import torch as _torch
+        from pathlib import Path as _Path
+        def _to_cpu(obj):
+            if isinstance(obj, _torch.Tensor):
+                return obj.detach().to('cpu')
+            if isinstance(obj, list):
+                return [_to_cpu(x) for x in obj]
+            if isinstance(obj, dict):
+                return {k: _to_cpu(v) for k, v in obj.items()}
+            return obj
+        cpu_batch = _to_cpu(batch)
+        meta = {
+            'dataset_name': self.config['batch_config']['dataset_name'],
+            'split': self.config['batch_config']['split'],
+            'B': int(cpu_batch.get('num_prompts', len(cpu_batch.get('prompt_lens', [])))) ,
+            'G': int(cpu_batch.get('num_responses_per_prompt', 1)),
+        }
+        _Path(path).parent.mkdir(parents=True, exist_ok=True)
+        _torch.save({'meta': meta, 'data': cpu_batch}, path)
+
+    def _load_batch(self, path: str, device: torch.device) -> Dict[str, Any]:
+        import torch as _torch
+        blob = _torch.load(path, map_location='cpu')
+        data = blob['data']
+        def _to_device(obj):
+            if isinstance(obj, _torch.Tensor):
+                return obj.to(device)
+            if isinstance(obj, list):
+                return [_to_device(x) for x in obj]
+            if isinstance(obj, dict):
+                return {k: _to_device(v) for k, v in obj.items()}
+            return obj
+        return _to_device(data)
+
+    def _get_or_sample_E(self, B_E: int) -> Dict[str, Any]:
+        reuse = self.config.get('probe_reuse', {}).get('reuse_E', False)
+        cache_path = self.config.get('probe_reuse', {}).get('e_batch_cache_path', None)
+        device = next(self.model.parameters()).device
+        if reuse and cache_path and os.path.exists(cache_path):
+            self.logger.info(f"Loading cached E-batch from {cache_path}")
+            E_batch = self._load_batch(cache_path, device)
+            # Sanity: E must have G=1
+            assert int(E_batch.get('num_responses_per_prompt', 1)) == 1, "Cached E-batch must have G=1"
+            return E_batch
+        E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
+            total_sequences=B_E,
+            dataset_name=self.config['batch_config']['dataset_name'],
+            split=self.config['batch_config']['split'],
+            G=1,
+            compute_rb=True,
+        )
+        E_batch = self._pack_E_from_sequences(E_sequences)
+        if reuse and cache_path:
+            self.logger.info(f"Saving E-batch to {cache_path}")
+            self._save_batch(E_batch, cache_path)
+        return E_batch
+
+    def _get_or_sample_U(self, B_U: int, G_U: int) -> Dict[str, Any]:
+        reuse = self.config.get('probe_reuse', {}).get('reuse_U', False)
+        cache_path = self.config.get('probe_reuse', {}).get('u_batch_cache_path', None)
+        device = next(self.model.parameters()).device
+        if reuse and cache_path and os.path.exists(cache_path):
+            self.logger.info(f"Loading cached U-batch from {cache_path}")
+            U_batch = self._load_batch(cache_path, device)
+            return U_batch
+        U_sequences, U_lp, _U_diag = self._sequence_processor.generate_with_logprobs(
+            prompts=None,
+            G=G_U,
+            dataset_name=self.config['batch_config']['dataset_name'],
+            split=self.config['batch_config']['split'],
+            num_prompts=B_U,
+            compute_rb=False,
+            with_grad=False,
+        )
+        U_batch = self._pack_U_from_sequences(U_sequences, U_lp.rewards)
+        if reuse and cache_path:
+            self.logger.info(f"Saving U-batch to {cache_path}")
+            self._save_batch(U_batch, cache_path)
+        return U_batch
             
     def run_offline_analysis(self, checkpoint_path: str) -> Dict[str, Any]:
         """
@@ -541,11 +622,14 @@ class OfflineEntropyProbe:
                 
                 self.logger.info(f"Single GPU: using random sampling")
             
-            # Phase 0: Sampling E and U batches
+            # Phase 0: Sampling E and U batches (with optional cache reuse)
             self.logger.info("Phase 0: Sampling E and U batches")
             phase0_start = time.time()
             G_U = self.config['batch_config']['G']
-            E_batch, U_batch = self._sample_EU_via_sequence_processor(B_E=B_E, B_U=B_U, G_U=G_U)
+            # Ensure SP is ready before sampling
+            self._ensure_sequence_processor()
+            E_batch = self._get_or_sample_E(B_E)
+            U_batch = self._get_or_sample_U(B_U, G_U)
             phase0_time = time.time() - phase0_start
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
             self.logger.info(f"E-batch: G=1 (replacement), {E_batch['sequences'].shape[0]} prompts, {E_batch['sequences'].shape[1]} responses/prompt")
@@ -582,6 +666,37 @@ class OfflineEntropyProbe:
                 B_E_global = B_E
                 B_U_global = B_U
                 self.logger.info(f"[RESULTS] bars_dot={bars_dot:.10f}, lr={learning_rate:.2e}, deltaH1={delta_h1:.10f}")
+                # Optional LR sweep
+                lr_sweep = (self.config.get('probe_reuse', {}) or {}).get('lr_sweep', None)
+                sweep_results = None
+                if lr_sweep:
+                    base_bars_dot = bars_dot
+                    deltaH1_list = [float(float(lr_i) * base_bars_dot) for lr_i in lr_sweep]
+                    gt_list = []
+                    if self.config.get('importance', {}).get('enabled', False):
+                        cfg_importance = {
+                            'training_loss': self.config.get('importance', {}).get('training_loss', 'nll'),
+                            'importance_microbatch_size': self.config.get('importance', {}).get('importance_microbatch_size', 1),
+                            'is_mode': self.config.get('importance', {}).get('is_mode', 'snis'),
+                            'clip_c': self.config.get('importance', {}).get('clip_c', 10.0),
+                            'report_per_token': self.config.get('importance', {}).get('report_per_token', False),
+                            'snapshot_device': self.config.get('importance', {}).get('snapshot_device', 'cpu')
+                        }
+                        saved_lr = self.optimizer.param_groups[0]['lr']
+                        try:
+                            for lr_i in lr_sweep:
+                                self.optimizer.param_groups[0]['lr'] = float(lr_i)
+                                gt = self.delta_entropy_is.entropy_change_two_batch(
+                                    self.model, E_batch, U_batch, self.optimizer, cfg_importance
+                                )
+                                gt_list.append(gt)
+                        finally:
+                            self.optimizer.param_groups[0]['lr'] = saved_lr
+                    sweep_results = {
+                        'lrs': [float(x) for x in lr_sweep],
+                        'deltaH1': deltaH1_list,
+                        'ground_truth': gt_list,
+                    }
             else:
                 self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
                 # Set global batch sizes for downstream use
@@ -594,7 +709,7 @@ class OfflineEntropyProbe:
             
             
             # ================================================================
-            # STAGE 2c: Two-Batch Ground-Truth Entropy Change - Optional
+            # STAGE 2: Two-Batch Ground-Truth Entropy Change - Optional
             # ================================================================
             compute_importance_sampling = probe_config.get('compute_importance_sampling', False)
             importance_enabled = self.config.get('importance', {}).get('enabled', False) or compute_importance_sampling
@@ -604,10 +719,12 @@ class OfflineEntropyProbe:
                 self.logger.info("Phase 5: Computing two-batch ground-truth entropy change")
                 phase5_start = time.time()
                 
-                # Initialize importance sampler if not already done
-                if not hasattr(self, 'importance_sampler') or self.importance_sampler is None:
-                    from .importance_sampling import ImportanceSampler
-                    self.importance_sampler = ImportanceSampler(self.model, self.config, self.logger)
+                # Initialize DeltaEntropyIS if not already done
+                if not hasattr(self, 'delta_entropy_is') or self.delta_entropy_is is None:
+                    self.delta_entropy_is = DeltaEntropyIS(
+                        model=self.model, config=self.config, logger=self.logger,
+                        sequence_processor=getattr(self, '_sequence_processor', None)
+                    )
                 
                 # Extract importance sampling configuration
                 cfg_importance = {
@@ -620,7 +737,7 @@ class OfflineEntropyProbe:
                 }
                 
                 # Compute ground-truth entropy change
-                ground_truth_results = self.importance_sampler.entropy_change_two_batch(
+                ground_truth_results = self.delta_entropy_is.entropy_change_two_batch(
                     self.model, E_batch, U_batch, self.optimizer, cfg_importance
                 )
                 
@@ -655,6 +772,10 @@ class OfflineEntropyProbe:
                     "phase3_delta_h1": phase3_time,
                 }
             }
+
+            # Attach LR sweep if present
+            if 'sweep_results' in locals() and sweep_results is not None:
+                results['sweep'] = sweep_results
             
             
             # Add Stage 2 ground-truth results if computed
