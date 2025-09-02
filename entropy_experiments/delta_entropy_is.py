@@ -253,6 +253,16 @@ class DeltaEntropyIS:
                 # As a last resort, zero RB (should not happen if compute_rb=True)
                 RB_vals = [[0.0 for _ in range(S.shape[1])] for _ in range(S.shape[0])]
         RB = torch.tensor(RB_vals, device=device, dtype=torch.float32)
+        # Debug summary to ensure payloads are non-zero
+        try:
+            lengths = self._get_generation_lengths(E_batch).to(device)
+            self.logger.info(
+                f"[RB-DEBUG] S_sum={S.sum().item():.4f}, S_mean={S.mean().item():.4f}, "
+                f"RB_sum={RB.sum().item():.4f}, RB_mean={RB.mean().item():.4f}, "
+                f"len_mean={lengths.float().mean().item():.2f}"
+            )
+        except Exception:
+            pass
         return S, RB
 
     # ----------------------------

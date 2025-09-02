@@ -82,7 +82,7 @@ def build_config(
         },
         'generation': {
             'temperature': 1.0,
-            'top_p': 1.0,
+            'top_p': 0.995,
             'max_new_tokens': int(max_new_tokens),
             'gen_batch_size': 8,
             'tf_batch_size': 16,
