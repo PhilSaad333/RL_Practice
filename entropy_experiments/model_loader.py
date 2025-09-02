@@ -27,7 +27,12 @@ def load_peft_for_probe(
     from transformers import AutoModelForCausalLM
     from peft import PeftModel
 
-    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
+    torch_dtype = {
+        "bf16": torch.bfloat16, 
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16, 
+        "float16": torch.float16
+    }[dtype]
 
     if not use_qlora:
         # LoRA-simple (no quantization)
