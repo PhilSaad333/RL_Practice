@@ -304,6 +304,13 @@ class OfflineEntropyProbe:
             rb_requires_grad=rb_rg_final,
         )
         self._sequence_processor = SequenceProcessor(self.model, tok, sp_cfg)
+        # Ensure DeltaEntropyIS uses the same SequenceProcessor (if already constructed)
+        if hasattr(self, 'delta_entropy_is') and self.delta_entropy_is is not None:
+            try:
+                self.delta_entropy_is.sequence_processor = self._sequence_processor
+                self.logger.info("DeltaEntropyIS bound to SequenceProcessor for RB evaluation")
+            except Exception:
+                pass
 
     def _pack_E_from_sequences(self, seqs: BatchedSequences) -> dict:
         import torch as _torch
