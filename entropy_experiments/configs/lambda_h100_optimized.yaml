@@ -4,8 +4,8 @@
 
 # === MODEL AND CHECKPOINT ===
 checkpoint:
-  checkpoint_path: "localfs/stage3_checkpoints/step_40/model"  # Use the RL-trained checkpoint 
-  optimizer_path: "localfs/stage3_checkpoints/step_40/optimizer.pt"   # Explicit optimizer path  
+  checkpoint_path: "/home/ubuntu/localfs/stage3_checkpoints/step_40/model"  # Use the RL-trained checkpoint 
+  optimizer_path: "/home/ubuntu/localfs/stage3_checkpoints/step_40/optimizer.pt"   # Explicit optimizer path  
   backbone: "qwen2_5_15"
   dtype: "bfloat16"
   device_map: "cuda"
@@ -31,7 +31,7 @@ computation_options:
 true_delta_h:
   enabled: true                    # Enable ground truth ΔH computation (Phase 5)
   training_loss: "rl"             # Use RL-aligned loss for updates
-  microbatch_size: 1              # IS microbatch size
+  microbatch_size: 4              # IS microbatch size
   clip_c: 10.0                    # Importance weight clipping
   report_per_token: true          # Include per-token entropy analysis
 
@@ -41,7 +41,7 @@ generation:
   temperature: 1.0
   top_p: 0.995  
   max_new_tokens: 150
-  gen_batch_size: 16
+  gen_batch_size: 64
   tf_batch_size: 16
 
 # === MEMORY CONFIGURATION ===
