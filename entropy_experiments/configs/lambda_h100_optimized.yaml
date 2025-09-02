@@ -1,0 +1,83 @@
+# 🚀 Lambda H100 Optimized Entropy Probe Config
+# Streamlined configuration with hardcoded sensible defaults
+# and renamed sections for clarity
+
+# === MODEL AND CHECKPOINT ===
+checkpoint:
+  checkpoint_path: "localfs/rl_training_runs/training_state/step_60/model"  # Use the RL-trained checkpoint from CLAUDE.md
+  optimizer_path: "localfs/rl_training_runs/training_state/step_60/optimizer.pt"   # Explicit optimizer path  
+  backbone: "qwen2_5_15"
+  dtype: "bfloat16"
+  device_map: "cuda"
+
+# === BATCH CONFIGURATION ===
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  split: "test"
+  B_E: 32        # E batch size - reduced for H100 testing
+  B_U: 16        # U batch size - balanced with B_E  
+  G: 8           # Number of responses per prompt (U batch)
+
+# === COMPUTATION OPTIONS ===
+# Renamed from 'probe_rework' for clarity
+computation_options:
+  compute_delta_h1: true           # Enable δH₁ prediction (Phase 1-3)
+  master_seed: 42                  # Deterministic sampling
+  mb_size_prompts: 2              # Microbatch size for gradient computation
+  weighting_mode: "dr_grpo"       # RL-style weighting
+
+# === GROUND TRUTH ENTROPY CHANGE ===  
+# Renamed from 'importance' to be more descriptive
+true_delta_h:
+  enabled: true                    # Enable ground truth ΔH computation (Phase 5)
+  training_loss: "rl"             # Use RL-aligned loss for updates
+  microbatch_size: 1              # IS microbatch size
+  clip_c: 10.0                    # Importance weight clipping
+  report_per_token: true          # Include per-token entropy analysis
+
+# === GENERATION SETTINGS ===  
+# Streamlined - removed rb_requires_grad (now hardcoded to true)
+generation:
+  temperature: 1.0
+  top_p: 0.995  
+  max_new_tokens: 256
+  gen_batch_size: 8
+  tf_batch_size: 16
+
+# === MEMORY CONFIGURATION ===
+# Simplified - removed amp (hardcoded true), kept essentials
+memory_config:
+  dtype: "bfloat16" 
+  microbatch_size: 2
+
+# === DETAILED LOGGING ===
+detailed_logging:
+  enabled: true
+  level: "standard"               # Good balance: core metrics + diagnostics (~5-10KB)
+  log_sequences: true             # Include sequence data for debugging
+  log_tokens: false               # Disable token-level logging for performance
+  log_raw_tensors: false          # Disable raw tensor dumps for performance
+  output_directory: "entropy_experiments/logs"
+  compress: true                  # Gzip compression for log files
+  max_files: 50                   # Auto-cleanup old logs
+
+# === OUTPUT CONFIGURATION ===
+output:
+  log_level: "INFO"
+  results_path: ""                # Auto-generate path
+
+# === HARDCODED OPTIMIZATIONS APPLIED ===
+# The following parameters have been hardcoded in the implementation for simplicity:
+# - rb_requires_grad: true (always required for proper gradient computation)
+# - x_estimator_mode: 'rb_residual' (preferred over 'naive' mode)
+# - entropy_mode: 'rb' (standard RB-based entropy computation)
+# - use_qlora: false (standard LoRA setup)  
+# - amp: true (automatic mixed precision enabled)
+# - is_mode: 'snis' (self-normalized importance sampling)
+# - snapshot_device: 'cpu' (memory management)
+# - do_sample: true (required for generation)
+
+# === REMOVED REDUNDANCIES ===
+# - compute_importance_sampling: redundant with true_delta_h.enabled
+# - Multiple device_map specifications: consolidated
+# - Duplicate dtype specifications: unified

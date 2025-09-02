@@ -40,9 +40,11 @@ Probably it would be good to have a more quantitative understanding of the Fishe
 
 ### Key Components
 
+entropy_experiments - At least for now this is where have our offline experiments, where we load checkpoints and do some tests on them. Currently implemented is the a measurement of the predicted value of $\delta\mathcal{H}$ and the true value. As part of that we also measure an estimator of the variance of the estimator of $\delta\mathcal{H}$ so we can get a sense of what batch sizes we need to make a good comparison (this is forcing me to become familiar with more sophisticated stats stuff). Next we will add some measurments of the Fisher Kernel itself. See the README.md in this folder for a hopefully up-to-date explanation of the various components.
+
 rl_training - Some training code so we can do online measurements during training, or save checkpoints and do offline measurements on them. Online experiments will be put in this folder, including measuring the gradient noise scale during training, and measuring the predicted entropy step change.
 
-entropy_experiments - At least for now this is where have our offline experiments, where we load checkpoints and do some tests on them. Currently implemented is the a measurement of the predicted value of $\delta\mathcal{H}$ and the true value. As part of that we also measure an estimator of the variance of the estimator of $\delta\mathcal{H}$ so we can get a sense of what batch sizes we need to make a good comparison (this is forcing me to become familiar with more sophisticated stats stuff). Next we will add some measurments of the Fisher Kernel itself.
+
 
 
 ### Models & Datasets
