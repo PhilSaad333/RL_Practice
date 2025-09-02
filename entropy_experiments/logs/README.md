@@ -45,3 +45,87 @@ A successful run should show:
 - ✅ X/Y accumulation completion without gradient errors
 - ✅ Final deltaH1 computation with finite result
 - ✅ "Stage 1 Mixed probe analysis completed" success message
+
+---
+
+## New Detailed Logging System (2025-01)
+
+### Overview
+A comprehensive structured logging system has been added to `OfflineEntropyProbe` that captures detailed debugging information in JSON format.
+
+### Configuration
+Enable detailed logging in your config:
+```yaml
+detailed_logging:
+  enabled: true
+  level: "standard"              # minimal, standard, detailed, debug
+  log_sequences: true            # Include sequence text and individual scores
+  output_directory: "entropy_experiments/logs"
+  compress: true                 # Gzip large files
+```
+
+### Log File Structure
+Each run generates three files organized by date:
+```
+logs/YYYY-MM-DD/
+├── entropy_probe_HH-MM-SS_checkpoint.json.gz    # Main detailed log
+├── entropy_probe_HH-MM-SS_checkpoint_summary.json # Quick summary
+└── entropy_probe_HH-MM-SS_checkpoint_config.yaml  # Exact config used
+```
+
+### Logging Levels
+
+#### 1. Minimal (~1KB)
+Core metrics only:
+- bars_dot, deltaH1, deltaH_true
+- Phase timings, batch sizes
+
+#### 2. Standard (~5-10KB) 
+Minimal + diagnostics:
+- Batch statistics (generation lengths, rewards)
+- Ground truth diagnostics (ESS, importance weights)
+
+#### 3. Detailed (~50-500KB)
+Standard + sequence data:
+- Individual prompts and responses
+- Per-sequence logprobs and RB entropies
+- Importance sampling intermediate results
+
+#### 4. Debug (~1-10MB)
+Everything + raw data:
+- Token-level data
+- Raw tensor dumps
+- Complete intermediate computations
+
+### Usage Examples
+
+```python
+# Enable detailed logging
+from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
+
+probe = OfflineEntropyProbe.from_config_file('configs/detailed_logging_example.yaml')
+results = probe.run_mixed_probe('/path/to/checkpoint')
+
+# Log files automatically saved to entropy_experiments/logs/
+```
+
+### Log Analysis
+```bash
+# Quick results check
+cat logs/2025-01-15/entropy_probe_14-30-25_step_60_summary.json | jq '.core_results'
+
+# Detailed sequence analysis  
+zcat logs/2025-01-15/entropy_probe_14-30-25_step_60.json.gz | jq '.sequences.E_batch[0:3]'
+
+# Compare runs
+for f in logs/2025-01-15/*_summary.json; do
+  echo "=== $f ==="
+  jq '.core_results | {deltaH1, deltaH_true, bars_dot}' "$f"
+done
+```
+
+### Benefits
+- **Complete debugging visibility**: All intermediate computations captured
+- **Reproducibility**: Exact configs saved with results
+- **Performance analysis**: Detailed timing breakdown
+- **Research analysis**: Rich data for post-hoc analysis and plotting

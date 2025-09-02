@@ -41,6 +41,7 @@ from .adam_preconditioner import AdamPreconditioner
 from .delta_entropy_is import DeltaEntropyIS
 from . import distributed_helpers
 from .distributed_helpers import DistributedHelpers
+from .detailed_logger import DetailedLogger
 
 
 class OfflineEntropyProbe:
@@ -93,6 +94,12 @@ class OfflineEntropyProbe:
         # Probe state
         self.checkpoint_loaded = False
         self.results = {}
+        
+        # Initialize detailed logger if enabled
+        if self.config.get('detailed_logging', {}).get('enabled', False):
+            self.detailed_logger = DetailedLogger(self.config, self.logger)
+        else:
+            self.detailed_logger = None
         
         self.logger.info(f"Initialized OfflineEntropyProbe on rank {self.rank}/{self.world_size}")
         
@@ -498,6 +505,12 @@ class OfflineEntropyProbe:
         
         start_time = time.time()
         
+        # Initialize detailed logging if enabled
+        if self.detailed_logger:
+            log_file = self.detailed_logger.log_run_start(checkpoint_path or 
+                                                        self.config['checkpoint']['checkpoint_path'], 
+                                                        self.config)
+        
         try:
             self.logger.info("Starting Stage 1 Mixed E/U Batch Probe Analysis")
             
@@ -631,6 +644,8 @@ class OfflineEntropyProbe:
             
             # Phase 0: Sampling E and U batches (with optional cache reuse)
             self.logger.info("Phase 0: Sampling E and U batches")
+            if self.detailed_logger:
+                self.detailed_logger.log_phase_start("phase0_sampling")
             phase0_start = time.time()
             G_U = self.config['batch_config']['G']
             # Ensure SP is ready before sampling
@@ -641,6 +656,12 @@ class OfflineEntropyProbe:
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
             self.logger.info(f"E-batch: G=1 (replacement), {E_batch['sequences'].shape[0]} prompts, {E_batch['sequences'].shape[1]} responses/prompt")
             self.logger.info(f"U-batch: G={G_U} (distinct), {U_batch['sequences'].shape[0]} prompts, {U_batch['sequences'].shape[1]} responses/prompt")
+            
+            # Log batch data for detailed logging
+            if self.detailed_logger:
+                self.detailed_logger.log_phase_end("phase0_sampling")
+                self.detailed_logger.log_batch_data("E_batch", E_batch)
+                self.detailed_logger.log_batch_data("U_batch", U_batch)
             
             # Check if δH₁ computation should be performed
             probe_config = self.config.get('probe_rework', {})
@@ -724,6 +745,8 @@ class OfflineEntropyProbe:
             
             if importance_enabled:
                 self.logger.info("Phase 5: Computing two-batch ground-truth entropy change")
+                if self.detailed_logger:
+                    self.detailed_logger.log_phase_start("phase5_importance")
                 phase5_start = time.time()
                 
                 # Initialize DeltaEntropyIS if not already done
@@ -732,6 +755,10 @@ class OfflineEntropyProbe:
                         model=self.model, config=self.config, logger=self.logger,
                         sequence_processor=getattr(self, '_sequence_processor', None)
                     )
+                
+                # Enable detailed importance sampling logging if detailed logger is active
+                if self.detailed_logger and self.detailed_logger.level in ['detailed', 'debug']:
+                    self.delta_entropy_is._store_importance_details = True
                 
                 # Extract importance sampling configuration
                 cfg_importance = {
@@ -751,6 +778,19 @@ class OfflineEntropyProbe:
                 phase5_time = time.time() - phase5_start
                 self.logger.info(f"🔍 [GROUND-TRUTH] deltaH_true={ground_truth_results['deltaH_true']:.10f}")
                 self.logger.info(f"Phase 5 complete: {phase5_time:.2f}s")
+                
+                # Log ground truth results for detailed logging
+                if self.detailed_logger:
+                    self.detailed_logger.log_phase_end("phase5_importance")
+                    self.detailed_logger.log_ground_truth_results(ground_truth_results)
+                    
+                    # Log detailed importance sampling data if available
+                    if hasattr(self.delta_entropy_is, '_importance_details'):
+                        details = self.delta_entropy_is._importance_details
+                        self.detailed_logger.log_importance_sampling_details(
+                            details['S_orig'], details['S_upd'],
+                            details['RB_orig'], details['RB_upd']
+                        )
             
             # ================================================================
             # Compile Final Results  
@@ -795,6 +835,13 @@ class OfflineEntropyProbe:
             
             stage = "Stage 1+2" if importance_enabled else "Stage 1"
             self.logger.info(f"{stage} Mixed probe analysis completed in {total_time:.2f}s")
+            
+            # Finalize detailed logging
+            if self.detailed_logger:
+                log_file = self.detailed_logger.finalize_log(results)
+                if log_file:
+                    self.logger.info(f"Detailed log saved: {log_file}")
+            
             return results
             
         except Exception as e:

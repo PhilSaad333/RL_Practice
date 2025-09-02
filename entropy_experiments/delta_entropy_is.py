@@ -424,6 +424,16 @@ class DeltaEntropyIS:
         H_upd = is_results['H_upd']
         H_upd_tok = is_results.get('H_upd_tok')
         self.logger.info(f"Updated entropy (RB, SNIS): H(I_updated;E) = {H_upd:.6f}")
+        
+        # Store intermediate results for detailed logging if needed
+        if hasattr(self, '_store_importance_details') and self._store_importance_details:
+            self._importance_details = {
+                'S_orig': S_orig,
+                'S_upd': S_upd, 
+                'RB_orig': RB_orig,
+                'RB_upd': RB_upd,
+                'logw': logw
+            }
 
         # E) Restore
         self._restore_model_optimizer(model, optimizer, cpu_snaps, opt_state_snapshot)

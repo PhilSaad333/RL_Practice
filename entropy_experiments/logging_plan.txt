@@ -1,0 +1,335 @@
+# Comprehensive Logging Plan for Offline Entropy Probe
+# ====================================================
+
+## Overview
+This document outlines a comprehensive logging system for offline_entropy_probe.py that captures
+detailed information about entropy probe runs for debugging and analysis purposes.
+
+## Current System Analysis
+
+### OfflineEntropyProbe Main Flow (run_mixed_probe):
+1. **Phase 0**: Sample E and U batches via SequenceProcessor
+2. **Phase 1-3**: Compute δH₁ (delta H1) - first-order entropy change prediction (optional)
+3. **Phase 5**: Compute ground-truth entropy change via DeltaEntropyIS (optional)
+
+### Key Data Structures:
+- **E_batch**: Evaluation batch (G=1, replacement sampling)
+- **U_batch**: Update batch (G=multiple responses per prompt) 
+- **DeltaEntropyIS results**: Ground truth entropy measurements
+- **ProbeComponents results**: δH₁ gradient-based predictions
+
+## Loggable Quantities
+
+### 1. Run Metadata
+```json
+{
+  "run_metadata": {
+    "timestamp": "2025-01-15T10:30:00Z",
+    "probe_version": "v2.0",
+    "git_commit": "abc123def",
+    "checkpoint_path": "/path/to/checkpoint",
+    "config_hash": "sha256_of_config",
+    "environment": {
+      "python_version": "3.11.0",
+      "torch_version": "2.0.0",
+      "cuda_version": "12.1",
+      "gpu_name": "H100",
+      "memory_gb": 80
+    }
+  }
+}
+```
+
+### 2. Core Results (Always Logged)
+```json
+{
+  "core_results": {
+    "bars_dot": 0.00012345,          # Gradient dot product (key quantity)
+    "deltaH1": 0.000067890,          # First-order entropy prediction
+    "deltaH_true": 0.000071234,      # Ground truth entropy change (if available)
+    "learning_rate": 1e-5,           # Learning rate used
+    "B_E": 256,                      # E batch size (global)
+    "B_U": 64,                       # U batch size (global)
+    "G": 8,                          # Responses per prompt (U batch)
+    "mb_size_prompts": 4,            # Microbatch size
+    "weighting_mode": "uniform"      # Batch weighting mode
+  }
+}
+```
+
+### 3. Timing Information (Always Logged)
+```json
+{
+  "timing": {
+    "total_time": 45.67,
+    "phase0_sampling": 12.34,        # E/U batch sampling
+    "phase1_sum_X": 8.92,           # E batch gradient computation
+    "phase2_sum_Y": 7.45,           # U batch gradient computation  
+    "phase3_delta_h1": 1.23,        # δH₁ computation
+    "phase5_importance": 15.73       # Ground truth computation (if enabled)
+  }
+}
+```
+
+### 4. Ground Truth Results (If Importance Sampling Enabled)
+```json
+{
+  "ground_truth": {
+    "H_orig": 2.34567,              # Original entropy (before update)
+    "H_upd": 2.34638,               # Updated entropy (after update)
+    "deltaH_true": 0.000071,        # H_upd - H_orig
+    "H_orig_tok": 0.0456,           # Per-token versions (if enabled)
+    "H_upd_tok": 0.0457,
+    "deltaH_true_tok": 0.0001,
+    "diagnostics": {
+      "ESS": 234.56,                # Effective Sample Size
+      "w_max": 1.234,               # Max importance weight
+      "w_min": 0.456,               # Min importance weight
+      "w_sum_global": 512.0,        # Sum of all weights
+      "is_mode": "snis_rb",         # Importance sampling mode
+      "rl_grad_accum": 1            # RL gradient accumulation steps
+    }
+  }
+}
+```
+
+### 5. Batch Statistics (Standard Level)
+```json
+{
+  "batch_statistics": {
+    "E_batch": {
+      "num_prompts": 256,
+      "num_sequences": 256,           # num_prompts * G (G=1 for E)
+      "avg_prompt_length": 45.6,
+      "avg_generation_length": 128.3,
+      "max_sequence_length": 512,
+      "avg_advantages": 0.0,          # Should be 0 for E batch
+      "sequence_length_distribution": [10, 50, 100, 200, 400]  # Percentiles
+    },
+    "U_batch": {
+      "num_prompts": 64,
+      "num_sequences": 512,           # num_prompts * G  
+      "G": 8,
+      "avg_prompt_length": 46.2,
+      "avg_generation_length": 132.1,
+      "avg_reward": 0.234,
+      "reward_std": 0.456,
+      "avg_advantages": 0.0,          # Mean-centered
+      "advantages_std": 0.312
+    }
+  }
+}
+```
+
+### 6. Sequence-Level Data (Detailed Level)
+```json
+{
+  "sequences": {
+    "E_batch": [
+      {
+        "prompt_id": 0,
+        "prompt_text": "Solve: 2x + 3 = 11",
+        "response_text": "To solve 2x + 3 = 11, I subtract 3...",
+        "prompt_length": 45,
+        "generation_length": 128,
+        "sequence_logprob": -45.67,     # S value (log-prob sum)
+        "rb_entropy": 2.345,           # RB entropy sum
+        "importance_weight": 1.023,     # logw = S_upd - S_orig (if available)
+        "reward": null,                 # Not applicable for E batch
+        "advantage": 0.0
+      }
+      // ... more sequences
+    ],
+    "U_batch": [
+      {
+        "prompt_id": 0,
+        "responses": [
+          {
+            "response_id": 0,
+            "response_text": "2x + 3 = 11 means 2x = 8...",
+            "sequence_logprob": -42.13,
+            "reward": 0.85,
+            "advantage": 0.123
+          },
+          {
+            "response_id": 1, 
+            "response_text": "Let me solve this step by step...",
+            "sequence_logprob": -48.92,
+            "reward": 0.72,
+            "advantage": -0.109
+          }
+          // ... G responses total
+        ]
+      }
+      // ... more prompts
+    ]
+  }
+}
+```
+
+### 7. Token-Level Data (Debug Level)
+```json
+{
+  "token_data": {
+    "E_batch": [
+      {
+        "sequence_id": 0,
+        "tokens": [123, 456, 789],
+        "token_texts": ["To", " solve", " 2x"],
+        "token_logprobs": [-2.31, -1.45, -3.67],
+        "rb_entropies": [0.234, 0.456, 0.123],  # Per-token RB entropy
+        "attention_mask": [1, 1, 1]
+      }
+      // ... more sequences
+    ]
+  }
+}
+```
+
+### 8. Raw Tensors (Debug Level)
+```json
+{
+  "raw_tensors": {
+    "E_batch_S_orig": [[-45.67], [-42.13], ...],    # Original log-prob sums
+    "E_batch_S_upd": [[-45.71], [-42.18], ...],     # Updated log-prob sums  
+    "E_batch_RB_orig": [[2.345], [2.123], ...],     # Original RB entropy sums
+    "E_batch_RB_upd": [[2.356], [2.134], ...],      # Updated RB entropy sums
+    "importance_weights": [[1.023], [1.012], ...],   # exp(logw)
+    "U_batch_rewards": [[0.85, 0.72, ...], ...],    # Rewards per response
+    "U_batch_advantages": [[0.123, -0.109, ...], ...]  # Advantages per response
+  }
+}
+```
+
+## Configuration System
+
+### New Config Section:
+```yaml
+detailed_logging:
+  enabled: true                    # Master switch for detailed logging
+  level: "standard"               # minimal, standard, detailed, debug
+  log_sequences: true             # Include sequence text and individual scores
+  log_tokens: false               # Include token-level data (debug only)
+  log_raw_tensors: false          # Include raw tensor values (debug only)
+  output_directory: "entropy_experiments/logs"
+  filename_template: "entropy_probe_{timestamp}_{checkpoint_name}.json"
+  compress: true                  # Gzip the output files
+  max_files: 50                   # Auto-cleanup old log files
+```
+
+### Logging Levels:
+
+1. **minimal**: Core results + timing only (~1KB)
+2. **standard**: Core results + timing + batch statistics + ground truth (~5-10KB) 
+3. **detailed**: Standard + individual sequence data (~50-500KB depending on batch size)
+4. **debug**: Detailed + token-level data + raw tensors (~1-10MB)
+
+## Implementation Architecture
+
+### 1. New Module: detailed_logger.py
+```python
+class DetailedLogger:
+    def __init__(self, config: Dict[str, Any], base_logger: logging.Logger)
+    def log_run_start(self, checkpoint_path: str, config: Dict[str, Any]) -> str
+    def log_phase_start(self, phase_name: str) -> None
+    def log_phase_end(self, phase_name: str, results: Dict[str, Any]) -> None
+    def log_batch_data(self, batch_type: str, batch: Dict[str, Any], sequences: BatchedSequences) -> None
+    def log_ground_truth_results(self, results: Dict[str, Any]) -> None
+    def finalize_log(self, final_results: Dict[str, Any]) -> str
+```
+
+### 2. Integration Points in offline_entropy_probe.py:
+
+```python
+# In __init__:
+if self.config.get('detailed_logging', {}).get('enabled', False):
+    self.detailed_logger = DetailedLogger(self.config, self.logger)
+else:
+    self.detailed_logger = None
+
+# In run_mixed_probe:
+if self.detailed_logger:
+    log_file = self.detailed_logger.log_run_start(checkpoint_path, self.config)
+    
+# After Phase 0:
+if self.detailed_logger:
+    self.detailed_logger.log_batch_data("E_batch", E_batch, E_sequences)
+    self.detailed_logger.log_batch_data("U_batch", U_batch, U_sequences)
+    
+# After Phase 5:
+if self.detailed_logger:
+    self.detailed_logger.log_ground_truth_results(ground_truth_results)
+    
+# Before return:
+if self.detailed_logger:
+    final_log_file = self.detailed_logger.finalize_log(results)
+    self.logger.info(f"Detailed log saved to: {final_log_file}")
+```
+
+### 3. Sequence Data Extraction:
+Need to modify sequence sampling to preserve text data and intermediate computations:
+
+```python
+# In _get_or_sample_E and _get_or_sample_U:
+if self.detailed_logger:
+    # Preserve text data and intermediate results
+    batch['_debug_info'] = {
+        'prompt_texts': prompt_texts,
+        'response_texts': response_texts,
+        'dataset_indices': indices_used
+    }
+```
+
+### 4. DeltaEntropyIS Integration:
+Modify DeltaEntropyIS to optionally return detailed intermediate results:
+
+```python
+# In delta_entropy_is.py, _eval_S_and_RB_on_E:
+if detailed_logging:
+    return S, RB, {
+        'S_per_sequence': S.tolist(),
+        'RB_per_sequence': RB.tolist(),
+        'token_level_data': token_data,  # If requested
+        'rb_debug_summary': rb_debug_summary
+    }
+```
+
+## File Organization
+
+### Log Directory Structure:
+```
+entropy_experiments/logs/
+├── 2025-01-15/
+│   ├── entropy_probe_10-30-00_step_60.json.gz          # Main log file
+│   ├── entropy_probe_10-30-00_step_60_summary.json     # Quick summary
+│   └── entropy_probe_10-30-00_step_60_config.yaml      # Exact config used
+├── 2025-01-16/
+│   └── ...
+└── README.md                                            # Log format documentation
+```
+
+## Benefits
+
+1. **Debugging**: Complete visibility into all probe computations
+2. **Analysis**: Rich data for post-hoc analysis and plotting  
+3. **Reproducibility**: Full configuration and environment capture
+4. **Performance**: Configurable detail level to avoid overhead
+5. **Validation**: Ability to verify all intermediate computations
+
+## Performance Considerations
+
+- **Minimal impact**: Only serialize data that's already computed
+- **Lazy evaluation**: Don't extract text unless detailed logging enabled
+- **Compression**: Use gzip for large detailed logs
+- **Background writing**: Write logs asynchronously if needed
+- **Memory management**: Stream large tensors to disk rather than accumulating
+
+## Migration Strategy
+
+1. **Phase 1**: Implement core DetailedLogger infrastructure
+2. **Phase 2**: Add basic sequence logging (standard level)
+3. **Phase 3**: Add detailed sequence and token logging
+4. **Phase 4**: Add raw tensor logging for debug mode
+5. **Phase 5**: Add analysis utilities for log files
+
+This comprehensive logging system will provide complete visibility into entropy probe behavior while maintaining performance and configurability.

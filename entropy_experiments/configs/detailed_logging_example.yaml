@@ -1,0 +1,99 @@
+# Example configuration with detailed logging enabled
+# This shows how to configure comprehensive logging for entropy probe debugging
+
+# Model and checkpoint configuration
+checkpoint:
+  checkpoint_path: "/path/to/checkpoint/model"  # Path to LoRA adapter directory
+  optimizer_path: "/path/to/checkpoint/optimizer.pt"  # Optional, will auto-detect if not provided
+  backbone: "qwen2_5_15"  # Base model identifier
+  use_qlora: false
+  device_map: "cuda"
+  dtype: "bfloat16"
+
+# Batch configuration
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  split: "test" 
+  B_E: 64        # E batch size (evaluation batch)
+  B_U: 16        # U batch size (update batch)
+  G: 8           # Number of responses per prompt (U batch only, E always has G=1)
+
+# Generation settings
+generation:
+  temperature: 1.0
+  top_p: 0.995
+  max_new_tokens: 256
+  gen_batch_size: 8
+  tf_batch_size: 16
+  rb_requires_grad: true  # Required for RB entropy computation
+
+# Memory configuration
+memory_config:
+  amp: true
+  dtype: "bfloat16"
+  microbatch_size: 2
+
+# Probe control
+probe_rework:
+  compute_delta_h1: true          # Compute first-order prediction (Phase 1-3)
+  compute_importance_sampling: false  # Will use importance.enabled instead
+  master_seed: 42
+
+# Importance sampling (ground truth) configuration
+importance:
+  enabled: true                   # Enable ground truth computation (Phase 5)
+  training_loss: "rl"            # Use RL-aligned loss
+  importance_microbatch_size: 1  # Microbatch size for importance sampling
+  is_mode: "snis"                # Self-normalized importance sampling
+  clip_c: 10.0                   # Clipping parameter
+  report_per_token: true         # Include per-token entropy results
+  snapshot_device: "cpu"         # Device to store model snapshots
+  entropy_mode: "rb"             # Use RB entropy (not log-prob sums)
+
+# ===== DETAILED LOGGING CONFIGURATION =====
+detailed_logging:
+  enabled: true                   # Master switch for detailed logging
+  level: "detailed"               # Options: minimal, standard, detailed, debug
+  log_sequences: true             # Include individual sequence data with text
+  log_tokens: false               # Include token-level data (debug level only)
+  log_raw_tensors: false          # Include raw tensor values (debug level only)
+  output_directory: "entropy_experiments/logs"
+  filename_template: "entropy_probe_{timestamp}_{checkpoint_name}.json"
+  compress: true                  # Gzip the output files (recommended for large logs)
+  max_files: 50                   # Auto-cleanup old log files (0 = no cleanup)
+
+# Logging levels explained:
+# - minimal: Core results + timing only (~1KB)
+#   * bars_dot, deltaH1, deltaH_true, learning_rate, batch sizes, phase timings
+# 
+# - standard: minimal + batch statistics + ground truth diagnostics (~5-10KB)
+#   * + Batch size analysis, generation length stats, reward/advantage stats
+#   * + ESS, importance weight statistics, entropy before/after
+#
+# - detailed: standard + individual sequence data (~50-500KB)
+#   * + Individual prompts, responses, logprobs, rewards, advantages
+#   * + Importance sampling intermediate results 
+#   * + Per-sequence RB entropy values
+#
+# - debug: detailed + token-level data + raw tensors (~1-10MB)
+#   * + Token-by-token logprobs, RB entropies, attention masks
+#   * + Raw tensor dumps of all intermediate computations
+
+# Output configuration
+output:
+  log_level: "INFO"      # Python logging level
+  results_path: ""       # Auto-generate if empty
+
+# Example: Minimal logging (just core metrics)
+# detailed_logging:
+#   enabled: true
+#   level: "minimal"
+
+# Example: Debug logging with all details
+# detailed_logging:
+#   enabled: true  
+#   level: "debug"
+#   log_sequences: true
+#   log_tokens: true
+#   log_raw_tensors: true
+#   compress: true
