@@ -34,6 +34,10 @@ def debug_ess_issue():
     if 'true_delta_h' in probe.config:
         print(f"   Measure: {probe.config['true_delta_h'].get('measure', 'not set')}")
     
+    # Load model first
+    print("\n   Loading model and optimizer...")
+    probe._load_checkpoint()
+    
     # Initialize components
     probe._initialize_components()
     
