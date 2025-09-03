@@ -753,14 +753,14 @@ class OfflineEntropyProbe:
             B_E_global = B_E_local if not is_dist else None
             B_U_global = B_U_local if not is_dist else None
             
-                self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
-                # Set global batch sizes for downstream use
-                if is_dist:
-                    B_E_global = distributed_helpers.count_global(B_E_local)
-                    B_U_global = distributed_helpers.count_global(B_U_local)
-                else:
-                    B_E_global = B_E_local
-                    B_U_global = B_U_local
+            self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
+            # Set global batch sizes for downstream use
+            if is_dist:
+                B_E_global = distributed_helpers.count_global(B_E_local)
+                B_U_global = distributed_helpers.count_global(B_U_local)
+            else:
+                B_E_global = B_E_local
+                B_U_global = B_U_local
             
             
             # ================================================================
