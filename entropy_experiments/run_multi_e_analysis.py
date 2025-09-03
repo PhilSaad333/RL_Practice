@@ -44,6 +44,7 @@ def run_multi_e_analysis(config_path: str, num_e_samples: int = 8) -> Dict[str, 
     # Extract configuration
     batch_config = probe.config.get('batch_config', {})
     computation_config = probe.config.get('computation_options', {})
+    checkpoint_config = probe.config.get('checkpoint', {})
     B_E = batch_config.get('B_E', 512)
     B_U = batch_config.get('B_U', 64)
     G_U = batch_config.get('G', 8)
@@ -51,6 +52,14 @@ def run_multi_e_analysis(config_path: str, num_e_samples: int = 8) -> Dict[str, 
     weighting_mode = computation_config.get('weighting_mode', 'dr_grpo')
     
     print(f"📊 Configuration: B_E={B_E}, B_U={B_U}, G={G_U}, mb_size={mb_size_prompts}")
+    
+    # Load model and optimizer checkpoints
+    print(f"🔧 Loading model and optimizer...")
+    checkpoint_path = checkpoint_config.get('checkpoint_path')
+    optimizer_path = checkpoint_config.get('optimizer_path')
+    probe.load_checkpoint(checkpoint_path, optimizer_path)
+    print(f"✅ Model loaded from {checkpoint_path}")
+    print(f"✅ Optimizer loaded from {optimizer_path}")
     
     # === PHASE 1: Generate single U batch and compute Δθ ===
     print(f"\\n🎲 Phase 1: Generating single U batch...")
