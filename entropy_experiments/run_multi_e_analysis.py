@@ -61,6 +61,10 @@ def run_multi_e_analysis(config_path: str, num_e_samples: int = 8) -> Dict[str, 
     print(f"✅ Model loaded from {checkpoint_path}")
     print(f"✅ Optimizer loaded from {optimizer_path}")
     
+    # Initialize sequence processor
+    probe._ensure_sequence_processor()
+    print(f"✅ Sequence processor initialized")
+    
     # === PHASE 1: Generate single U batch and compute Δθ ===
     print(f"\\n🎲 Phase 1: Generating single U batch...")
     start_time = time.time()
