@@ -36,22 +36,21 @@ def debug_ess_issue():
     
     # Load model first
     print("\n   Loading model and optimizer...")
-    probe._load_checkpoint()
+    probe.load_checkpoint()
     
     # Initialize components
     probe._initialize_components()
     
-    print("\n2️⃣ Sampling small E batch for debugging...")
+    print("\n2️⃣ Sampling small E and U batches for debugging...")
     B_E = 8  # Very small for debugging
-    E_batch = probe._sample_E_batch_via_datasets(B_E)
-    
-    print(f"   E batch shape: sequences={E_batch['sequences'].shape}")
-    
-    # Create a minimal U batch for the optimizer step
-    print("\n3️⃣ Creating minimal U batch...")
     B_U = 2
     G = 2
-    U_batch = probe._sample_U_batch_via_datasets(B_U, G)
+    
+    # Use the sequence processor to sample both batches
+    E_batch, U_batch = probe._sample_EU_via_sequence_processor(B_E=B_E, B_U=B_U, G_U=G)
+    
+    print(f"   E batch shape: sequences={E_batch['sequences'].shape}")
+    print(f"   U batch shape: sequences={U_batch['sequences'].shape}")
     
     print("\n4️⃣ Computing logprobs BEFORE optimizer step...")
     
