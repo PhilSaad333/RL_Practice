@@ -195,9 +195,71 @@ class RLRunner:
             print(f"   Scheduler: {self.resume_scheduler_path}")
         
         try:
-            # Load optimizer state
-            optimizer_state = torch.load(self.resume_optimizer_path, map_location=f"cuda:{self.local_rank}")
-            self.optimizer.load_state_dict(optimizer_state)
+            # Load optimizer state (prefer name-ordered reconstruction if metadata exists)
+            opt_names_path = pathlib.Path(self.resume_optimizer_path).with_name("optimizer_param_names.json")
+            if opt_names_path.exists():
+                if self.rank == 0:
+                    print(f"[resume] Using optimizer_param_names.json: {opt_names_path}")
+                try:
+                    with open(opt_names_path, "r") as f:
+                        ordered_names_groups = json.load(f)  # list[list[str]]
+                    peft_mod = _unwrap(self.model)
+                    name2param = dict(peft_mod.named_parameters())
+                    # Build param groups preserving exact order from checkpoint
+                    new_param_groups = []
+                    for group_names in ordered_names_groups:
+                        params_in_order = []
+                        for n in group_names:
+                            if isinstance(n, str) and n.startswith("<unmatched:"):
+                                continue  # skip placeholders
+                            p = name2param.get(n)
+                            if p is None:
+                                raise RuntimeError(f"Param name from checkpoint not found in current model: {n}")
+                            if not p.requires_grad:
+                                p.requires_grad_(True)
+                            params_in_order.append(p)
+                        new_param_groups.append({"params": params_in_order})
+
+                    # Preserve current optimizer hyperparams
+                    base_group = self.optimizer.param_groups[0] if self.optimizer.param_groups else {}
+                    lr = float(base_group.get("lr", self.algo.cfg.get("lr", 1e-4)))
+                    betas = tuple(base_group.get("betas", (0.9, 0.999)))
+                    eps = float(base_group.get("eps", 1e-8))
+                    weight_decay = float(base_group.get("weight_decay", 0.0))
+
+                    # Rebuild optimizer with ordered param groups
+                    new_opt = torch.optim.AdamW(new_param_groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+
+                    # Load optimizer state
+                    optimizer_state = torch.load(self.resume_optimizer_path, map_location=f"cuda:{self.local_rank}")
+                    new_opt.load_state_dict(optimizer_state)
+
+                    # Swap into algo and rebind scheduler to new optimizer
+                    self.algo.opt = new_opt
+                    if self.algo.lr_sched is not None:
+                        self.algo.lr_sched.optimizer = self.algo.opt
+
+                    # Coverage summary for training-side sanity
+                    have_v = have_step = total = 0
+                    for g in self.algo.opt.param_groups:
+                        for p in g["params"]:
+                            total += 1
+                            st = self.algo.opt.state.get(p, {})
+                            if isinstance(st.get("exp_avg_sq", None), torch.Tensor):
+                                have_v += 1
+                            s = st.get("step", None)
+                            if isinstance(s, int) or isinstance(s, torch.Tensor):
+                                have_step += 1
+                    if self.rank == 0 and total > 0:
+                        print(f"[resume][optimizer-state] coverage: v {have_v}/{total} = {have_v/max(total,1):.1%}, step {have_step}/{total} = {have_step/max(total,1):.1%}")
+                except Exception as e:
+                    if self.rank == 0:
+                        print(f"[resume][warn] Name-ordered optimizer reconstruction failed ({e}); falling back to default load.")
+                    optimizer_state = torch.load(self.resume_optimizer_path, map_location=f"cuda:{self.local_rank}")
+                    self.optimizer.load_state_dict(optimizer_state)
+            else:
+                optimizer_state = torch.load(self.resume_optimizer_path, map_location=f"cuda:{self.local_rank}")
+                self.optimizer.load_state_dict(optimizer_state)
             
             # Load scheduler state if scheduler exists
             if self.scheduler is not None:
@@ -448,8 +510,30 @@ class RLRunner:
             _unwrap(self.model).save_pretrained(model_dir)
             print(f"saved model to {model_dir}")
             
-            # Save optimizer state
+            # Save optimizer state + ordered param names for robust reload
             optimizer_path = save_dir / "optimizer.pt"
+            try:
+                peft_mod = _unwrap(self.model)
+                name2param = dict(peft_mod.named_parameters())
+                paramid2name = {id(p): n for n, p in name2param.items()}
+                opt_param_names = []  # list[list[str]]
+                unmatched = 0
+                for g in self.optimizer.param_groups:
+                    group_names = []
+                    for p in g.get("params", []):
+                        n = paramid2name.get(id(p))
+                        if n is None:
+                            unmatched += 1
+                            n = f"<unmatched:{len(group_names)}>"
+                        group_names.append(n)
+                    opt_param_names.append(group_names)
+                names_path = save_dir / "optimizer_param_names.json"
+                with open(names_path, "w") as f:
+                    json.dump(opt_param_names, f, indent=2)
+                if unmatched > 0:
+                    print(f"[ckpt][warn] {unmatched} optimizer params not matched to names; kept placeholders.")
+            except Exception as e:
+                print(f"[ckpt][warn] failed to write optimizer_param_names.json: {e}")
             torch.save(self.optimizer.state_dict(), optimizer_path)
             print(f"saved optimizer state to {optimizer_path}")
             
