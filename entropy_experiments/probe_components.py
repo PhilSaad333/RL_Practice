@@ -815,6 +815,7 @@ class ProbeComponents:
         weighting_mode: str,
         adam_preconditioner,
         optimizer: Optional[torch.optim.Optimizer] = None,
+        param_update_buf: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Dict[str, Any]:
         """Compute delta H1 given packed E and U batches.
 
@@ -835,20 +836,33 @@ class ProbeComponents:
         sum_X_buf, B_E_local = self.accumulate_sum_X(E_batch, mb_size_prompts, weighting_mode)
         phase1_time = time.time() - t1
 
-        t2 = time.time()
-        sum_Y_buf, B_U_local = self.accumulate_sum_Y(U_batch, mb_size_prompts, adam_preconditioner)
-        phase2_time = time.time() - t2
-
-        # Averages
-        mu_X = {pid: buf / max(B_E_local, 1) for pid, buf in sum_X_buf.items()}
-        mu_Y = {pid: buf / max(B_U_local, 1) for pid, buf in sum_Y_buf.items()}
-
-        # Dot product and deltaH1
-        t3 = time.time()
-        bars_dot = self.dot_param_buffers(mu_X, mu_Y)
-        lr = self._get_learning_rate(optimizer)
-        delta_h1 = lr * bars_dot
-        phase3_time = time.time() - t3
+        # If we are given an actual parameter update buffer, use it directly.
+        if param_update_buf is not None:
+            t2 = time.time()
+            B_U_local = int(U_batch.get('num_prompts', len(U_batch.get('max_lengths', []))))
+            phase2_time = 0.0  # no Y accumulation in this mode
+            # Averages
+            mu_X = {pid: buf / max(B_E_local, 1) for pid, buf in sum_X_buf.items()}
+            # Dot product and deltaH1 (do NOT rescale by lr; Δθ already includes it)
+            t3 = time.time()
+            bars_dot = self.dot_param_buffers(mu_X, param_update_buf)
+            lr = 1.0
+            delta_h1 = bars_dot
+            phase3_time = time.time() - t3
+        else:
+            # Legacy path: compute preconditioned Y from U
+            t2 = time.time()
+            sum_Y_buf, B_U_local = self.accumulate_sum_Y(U_batch, mb_size_prompts, adam_preconditioner)
+            phase2_time = time.time() - t2
+            # Averages
+            mu_X = {pid: buf / max(B_E_local, 1) for pid, buf in sum_X_buf.items()}
+            mu_Y = {pid: buf / max(B_U_local, 1) for pid, buf in sum_Y_buf.items()}
+            # Dot product and deltaH1
+            t3 = time.time()
+            bars_dot = self.dot_param_buffers(mu_X, mu_Y)
+            lr = self._get_learning_rate(optimizer)
+            delta_h1 = lr * bars_dot
+            phase3_time = time.time() - t3
 
         return {
             'deltaH1': float(delta_h1),

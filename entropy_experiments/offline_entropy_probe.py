@@ -753,57 +753,6 @@ class OfflineEntropyProbe:
             B_E_global = B_E_local if not is_dist else None
             B_U_global = B_U_local if not is_dist else None
             
-            if compute_delta_h1:
-                self.logger.info("Phase 1–3: Computing delta H1 from E/U batches")
-                compute = self.probe_components.compute_delta_h1_from_batches(
-                    E_batch=E_batch,
-                    U_batch=U_batch,
-                    mb_size_prompts=mb_size_prompts,
-                    weighting_mode=weighting_mode,
-                    adam_preconditioner=self.adam_preconditioner,
-                    optimizer=self.optimizer,
-                )
-                delta_h1 = compute['deltaH1']
-                bars_dot = compute['bars_dot']
-                learning_rate = compute['learning_rate']
-                phase1_time = compute['timing']['phase1_time']
-                phase2_time = compute['timing']['phase2_time']
-                phase3_time = compute['timing']['phase3_time']
-                B_E_global = B_E
-                B_U_global = B_U
-                self.logger.info(f"[RESULTS] bars_dot={bars_dot:.10f}, lr={learning_rate:.2e}, deltaH1={delta_h1:.10f}")
-                # Optional LR sweep
-                lr_sweep = (self.config.get('probe_reuse', {}) or {}).get('lr_sweep', None)
-                sweep_results = None
-                if lr_sweep:
-                    base_bars_dot = bars_dot
-                    deltaH1_list = [float(float(lr_i) * base_bars_dot) for lr_i in lr_sweep]
-                    gt_list = []
-                    if self.config.get('true_delta_h', {}).get('enabled', False):
-                        cfg_importance = {
-                            'training_loss': self.config.get('true_delta_h', {}).get('training_loss', 'nll'),
-                            'importance_microbatch_size': self.config.get('true_delta_h', {}).get('microbatch_size', 1),
-                            'is_mode': self.config.get('true_delta_h', {}).get('is_mode', 'snis'),
-                            'clip_c': self.config.get('true_delta_h', {}).get('clip_c', 10.0),
-                            'report_per_token': self.config.get('true_delta_h', {}).get('report_per_token', False),
-                            'snapshot_device': self.config.get('true_delta_h', {}).get('snapshot_device', 'cpu')
-                        }
-                        saved_lr = self.optimizer.param_groups[0]['lr']
-                        try:
-                            for lr_i in lr_sweep:
-                                self.optimizer.param_groups[0]['lr'] = float(lr_i)
-                                gt = self.delta_entropy_is.entropy_change_two_batch(
-                                    self.model, E_batch, U_batch, self.optimizer, cfg_importance
-                                )
-                                gt_list.append(gt)
-                        finally:
-                            self.optimizer.param_groups[0]['lr'] = saved_lr
-                    sweep_results = {
-                        'lrs': [float(x) for x in lr_sweep],
-                        'deltaH1': deltaH1_list,
-                        'ground_truth': gt_list,
-                    }
-            else:
                 self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
                 # Set global batch sizes for downstream use
                 if is_dist:
