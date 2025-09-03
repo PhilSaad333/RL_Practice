@@ -27,7 +27,7 @@ computation_options:
 
 # === GROUND TRUTH ENTROPY CHANGE ===  
 true_delta_h:
-  enabled: false    # Disable for speed - we only need δH₁ estimates
+  enabled: true     # Required for DeltaEntropyIS component initialization
   training_loss: "rl"
   microbatch_size: 2
   clip_c: 10.0
