@@ -16,8 +16,8 @@ batch_config:
   # Separate splits: E batch from test set, U batch from train set
   E_split: "test"   # Evaluation batch uses test set for unbiased entropy estimation  
   U_split: "train"  # Update batch uses train set for policy gradient computation
-  B_E: 512        # E batch size - reduced for H100 testing
-  B_U: 64        # U batch size - balanced with B_E  
+  B_E: 64        # E batch size - small for testing
+  B_U: 8         # U batch size - small for testing  
   G: 8           # Number of responses per prompt (U batch)
 
 # === COMPUTATION OPTIONS ===
