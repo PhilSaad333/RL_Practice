@@ -4,8 +4,8 @@
 
 # === MODEL AND CHECKPOINT ===
 checkpoint:
-  checkpoint_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_01-53-23/training_state/step_10/model"  # Use the new RL-trained checkpoint 
-  optimizer_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_01-53-23/training_state/step_10/optimizer.pt"   # Explicit optimizer path with name-aware reconstruction
+  checkpoint_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/model"  # Use step 40 checkpoint with better optimizer states
+  optimizer_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/optimizer.pt"   # Step 40 optimizer state (should have fewer tiny exp_avg_sq values)
   backbone: "qwen2_5_15"
   dtype: "bfloat16"
   device_map: "cuda"
@@ -31,7 +31,7 @@ computation_options:
 # === GROUND TRUTH ENTROPY CHANGE ===  
 # Renamed from 'importance' to be more descriptive
 true_delta_h:
-  enabled: false                   # Disable ground truth ΔH computation (Phase 5) for now
+  enabled: true                   # Disable ground truth ΔH computation (Phase 5) for now
   training_loss: "rl"             # Use RL-aligned loss for updates
   microbatch_size: 4              # IS microbatch size
   clip_c: 10.0                    # Importance weight clipping
