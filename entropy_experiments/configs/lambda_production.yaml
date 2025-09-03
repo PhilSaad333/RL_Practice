@@ -9,7 +9,6 @@ checkpoint:
   backbone: "qwen2_5_15"
   dtype: "bfloat16"
   device_map: "cuda"
-  learning_rate: 5.0e-7              # Custom learning rate for production run
 
 # === BATCH CONFIGURATION ===
 batch_config:
