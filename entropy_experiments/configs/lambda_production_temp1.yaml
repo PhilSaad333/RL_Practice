@@ -1,0 +1,76 @@
+# 🚀 Lambda Production Multi-E-batch Config with Temperature=1.0
+# Production batch sizes with conservative memory settings and temp=1.0
+
+# === MODEL AND CHECKPOINT ===
+checkpoint:
+  checkpoint_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/model"
+  optimizer_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/optimizer.pt"
+  backbone: "qwen2_5_15"
+  dtype: "bfloat16"
+  device_map: "cuda"
+
+# === BATCH CONFIGURATION ===
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  E_split: "test"   # Evaluation batch uses test set
+  U_split: "train"  # Update batch uses train set
+  B_E: 512         # Production E batch size
+  B_U: 64          # Production U batch size
+  G: 8             # Number of responses per prompt (U batch)
+
+# === COMPUTATION OPTIONS ===
+computation_options:
+  compute_delta_h1: true
+  master_seed: none
+  mb_size_prompts: 1      # Conservative: 1 for memory efficiency
+  weighting_mode: "dr_grpo"
+
+# === GROUND TRUTH ENTROPY CHANGE ===  
+true_delta_h:
+  enabled: true                   # Required for DeltaEntropyIS component
+  training_loss: "rl"
+  microbatch_size: 1              # Conservative: 1 for memory efficiency
+  clip_c: 10.0
+  report_per_token: true
+
+# === GENERATION SETTINGS ===  
+generation:
+  temperature: 1.0                # CRITICAL: temp=1.0 to fix importance sampling
+  top_p: 0.995  
+  max_new_tokens: 150
+  gen_batch_size: 64              # Conservative: reduced from 128
+  tf_batch_size: 4                # Conservative: reduced from 8
+
+# === MEMORY CONFIGURATION ===
+memory_config:
+  amp: true
+  dtype: "bfloat16" 
+  microbatch_size: 1              # Conservative: 1 for memory efficiency
+
+# === DETAILED LOGGING ===
+detailed_logging:
+  enabled: true
+  level: "standard"
+  log_sequences: true
+  log_tokens: false               # Keep disabled for memory
+  log_raw_tensors: false         # Keep disabled for memory
+  output_directory: "entropy_experiments/logs"
+  compress: true
+  max_files: 50
+
+# === OUTPUT CONFIGURATION ===
+output:
+  log_level: "INFO"
+  results_path: ""
+
+# === CRITICAL FIX ===
+# Temperature = 1.0 to fix importance sampling sign error
+# The importance sampling computation appears to be sensitive to 
+# temperature scaling of logits, causing wrong signs at temp=0.7
+#
+# Memory optimizations:
+# - All microbatch sizes = 1 (was 2)
+# - gen_batch_size = 64 (was 128)
+# - tf_batch_size = 4 (was 8)
+# 
+# This should give correct signs with production batch sizes.
