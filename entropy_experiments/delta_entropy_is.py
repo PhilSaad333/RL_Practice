@@ -442,10 +442,11 @@ class DeltaEntropyIS:
         if 'measure' in cfg_importance:
             measure = cfg_importance.get('measure', 'p')
             use_q = (measure == 'q')
-        elif hasattr(self.sp, 'config') and hasattr(self.sp.config, 'top_p') and self.sp.config.top_p < 1.0:
-            # Default: use q if top_p < 1
-            use_q = True
-            self.logger.info(f"Auto-selecting q measure due to top_p={self.sp.config.top_p}")
+        elif hasattr(self, 'sequence_processor') and self.sequence_processor is not None:
+            if hasattr(self.sequence_processor, 'config') and hasattr(self.sequence_processor.config, 'top_p') and self.sequence_processor.config.top_p < 1.0:
+                # Default: use q if top_p < 1
+                use_q = True
+                self.logger.info(f"Auto-selecting q measure due to top_p={self.sequence_processor.config.top_p}")
         
         # A) Snapshot
         cpu_snaps, opt_state_snapshot = self._snapshot_model_optimizer(model, optimizer, snapshot_device)
