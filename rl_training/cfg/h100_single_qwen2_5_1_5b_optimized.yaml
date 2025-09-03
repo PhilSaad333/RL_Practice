@@ -33,9 +33,9 @@ save_rollouts_every: 0        # 0 = never save (saves disk space)
 # -------------- Training Configuration (Optimized for H100 80GB) ---------------- #
 
 # Buffer and batch sizes (reduced for max_new_tokens=200)
-buffer_size: 64               # Good balance for statistics and memory
+buffer_size: 128              # Increased for better statistics and gradient estimates
 microbatch_size: 4            # Reduced from 6 (33% reduction, power of 2)
-# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 64 / (1 * 4) = 16
+# grad_accum_steps = buffer_size / (world_size * microbatch_size) = 128 / (1 * 4) = 32
 
 # PPO configuration
 ppo_epochs: 1                 # Single epoch per buffer
