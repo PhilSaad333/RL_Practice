@@ -36,12 +36,12 @@ from pathlib import Path
 import yaml
 import json
 
-from .probe_components import ProbeComponents
-from .adam_preconditioner import AdamPreconditioner  
-from .delta_entropy_is import DeltaEntropyIS
-from . import distributed_helpers
-from .distributed_helpers import DistributedHelpers
-from .detailed_logger import DetailedLogger
+from entropy_experiments.probe_components import ProbeComponents
+from entropy_experiments.adam_preconditioner import AdamPreconditioner  
+from entropy_experiments.delta_entropy_is import DeltaEntropyIS
+import entropy_experiments.distributed_helpers as distributed_helpers
+from entropy_experiments.distributed_helpers import DistributedHelpers
+from entropy_experiments.detailed_logger import DetailedLogger
 
 
 class OfflineEntropyProbe:
