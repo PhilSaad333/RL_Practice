@@ -35,7 +35,7 @@ true_delta_h:
 
 # === GENERATION SETTINGS ===  
 generation:
-  temperature: 0.7
+  temperature: 1.0
   top_p: 0.995  
   max_new_tokens: 150
   gen_batch_size: 32      # ULTRA SMALL: 32 instead of 64
