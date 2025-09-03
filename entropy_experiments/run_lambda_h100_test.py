@@ -38,9 +38,9 @@ def check_environment():
     if "H100" not in gpu_name:
         print(f"⚠️  GPU is {gpu_name}, expected H100 - continuing anyway")
     
-    # Check checkpoint paths
-    checkpoint_path = "localfs/rl_training_runs/training_state/step_60/model"
-    optimizer_path = "localfs/rl_training_runs/training_state/step_60/optimizer.pt"
+    # Check checkpoint paths  
+    checkpoint_path = "/lambda/nfs/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/model"
+    optimizer_path = "/lambda/nfs/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/optimizer.pt"
     
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"❌ Checkpoint not found: {checkpoint_path}")
@@ -142,7 +142,7 @@ def run_entropy_probe():
         print(f"\n🔧 TROUBLESHOOTING:")
         print("   1. Ensure you're in the RL_Practice directory")  
         print("   2. Check that conda environment 'rl' is activated")
-        print("   3. Verify checkpoint exists: localfs/rl_training_runs/training_state/step_60/")
+        print("   3. Verify checkpoint exists: /lambda/nfs/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/")
         print("   4. Check CUDA/GPU availability")
         raise
 
