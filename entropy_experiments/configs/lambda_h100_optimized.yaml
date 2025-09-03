@@ -4,8 +4,8 @@
 
 # === MODEL AND CHECKPOINT ===
 checkpoint:
-  checkpoint_path: "/home/ubuntu/localfs/stage3_checkpoints/step_40/model"  # Use the RL-trained checkpoint 
-  optimizer_path: "/home/ubuntu/localfs/stage3_checkpoints/step_40/optimizer.pt"   # Explicit optimizer path  
+  checkpoint_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_01-53-23/training_state/step_10/model"  # Use the new RL-trained checkpoint 
+  optimizer_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_01-53-23/training_state/step_10/optimizer.pt"   # Explicit optimizer path with name-aware reconstruction
   backbone: "qwen2_5_15"
   dtype: "bfloat16"
   device_map: "cuda"
@@ -13,7 +13,9 @@ checkpoint:
 # === BATCH CONFIGURATION ===
 batch_config:
   dataset_name: "gsm8k_r1_template"
-  split: "test"
+  # Separate splits: E batch from test set, U batch from train set
+  E_split: "test"   # Evaluation batch uses test set for unbiased entropy estimation  
+  U_split: "train"  # Update batch uses train set for policy gradient computation
   B_E: 512        # E batch size - reduced for H100 testing
   B_U: 64        # U batch size - balanced with B_E  
   G: 8           # Number of responses per prompt (U batch)

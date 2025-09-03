@@ -354,13 +354,23 @@ class OfflineEntropyProbe:
     def _sample_EU_via_sequence_processor(self, *, B_E: int, B_U: int, G_U: int) -> tuple[dict, dict]:
         self._ensure_sequence_processor()
         ds_name = self.config['batch_config']['dataset_name']
-        split = self.config['batch_config']['split']
+        
+        # Support separate E_split and U_split, with backward compatibility
+        batch_config = self.config['batch_config']
+        E_split = batch_config.get('E_split', batch_config.get('split', 'test'))
+        U_split = batch_config.get('U_split', batch_config.get('split', 'test'))
+        
+        # Log split configuration for clarity
+        if 'E_split' in batch_config or 'U_split' in batch_config:
+            self.logger.info(f"Using separate splits: E_split='{E_split}', U_split='{U_split}'")
+        else:
+            self.logger.info(f"Using single split: '{E_split}' for both E and U batches")
 
         # E: with replacement, G=1, compute RB for X if needed later
         E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
             total_sequences=B_E,
             dataset_name=ds_name,
-            split=split,
+            split=E_split,
             G=1,
             compute_rb=True,
         )
@@ -371,13 +381,20 @@ class OfflineEntropyProbe:
             prompts=None,
             G=G_U,
             dataset_name=ds_name,
-            split=split,
+            split=U_split,
             num_prompts=B_U,
             compute_rb=False,
             with_grad=False,
         )
         U_batch = self._pack_U_from_sequences(U_sequences, U_lp.rewards)
         return E_batch, U_batch
+
+    def _get_splits(self) -> tuple[str, str]:
+        """Get E and U splits, supporting both separate and single split configurations."""
+        batch_config = self.config['batch_config']
+        E_split = batch_config.get('E_split', batch_config.get('split', 'test'))
+        U_split = batch_config.get('U_split', batch_config.get('split', 'test'))
+        return E_split, U_split
 
     # --- Batch cache I/O helpers ---
     def _save_batch(self, batch: Dict[str, Any], path: str) -> None:
@@ -392,9 +409,12 @@ class OfflineEntropyProbe:
                 return {k: _to_cpu(v) for k, v in obj.items()}
             return obj
         cpu_batch = _to_cpu(batch)
+        E_split, U_split = self._get_splits()
         meta = {
             'dataset_name': self.config['batch_config']['dataset_name'],
-            'split': self.config['batch_config']['split'],
+            'E_split': E_split,
+            'U_split': U_split,
+            'split': self.config['batch_config'].get('split', 'N/A'),  # For backward compatibility
             'B': int(cpu_batch.get('num_prompts', len(cpu_batch.get('prompt_lens', [])))) ,
             'G': int(cpu_batch.get('num_responses_per_prompt', 1)),
         }
@@ -425,10 +445,11 @@ class OfflineEntropyProbe:
             # Sanity: E must have G=1
             assert int(E_batch.get('num_responses_per_prompt', 1)) == 1, "Cached E-batch must have G=1"
             return E_batch
+        E_split, _ = self._get_splits()
         E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
             total_sequences=B_E,
             dataset_name=self.config['batch_config']['dataset_name'],
-            split=self.config['batch_config']['split'],
+            split=E_split,
             G=1,
             compute_rb=True,
         )
@@ -446,11 +467,12 @@ class OfflineEntropyProbe:
             self.logger.info(f"Loading cached U-batch from {cache_path}")
             U_batch = self._load_batch(cache_path, device)
             return U_batch
+        _, U_split = self._get_splits()
         U_sequences, U_lp, _U_diag = self._sequence_processor.generate_with_logprobs(
             prompts=None,
             G=G_U,
             dataset_name=self.config['batch_config']['dataset_name'],
-            split=self.config['batch_config']['split'],
+            split=U_split,
             num_prompts=B_U,
             compute_rb=False,
             with_grad=False,
@@ -587,11 +609,15 @@ class OfflineEntropyProbe:
             is_dist, rank, world_size = distributed_helpers.get_dist_info()
             self.logger.info(f"Distributed info: dist={is_dist}, rank={rank}/{world_size}")
             
-            # Load dataset to get size
+            # Load dataset to get size (use E_split for distributed sampling consistency)
             from rlp_datasets import DATASET_REGISTRY
             dataset = DATASET_REGISTRY[self.config['batch_config']['dataset_name']]
-            ds_examples = dataset(self.config['batch_config']['split'])
+            E_split, U_split = self._get_splits()
+            ds_examples = dataset(E_split)
             dataset_size = len(ds_examples)
+            
+            # Log which splits are being used
+            self.logger.info(f"Using dataset splits: E_split='{E_split}', U_split='{U_split}' (dataset size calculation based on E_split)")
             
             # Get master seed for deterministic sampling
             master_seed = self.config.get('computation_options', {}).get('master_seed', 42)
