@@ -743,7 +743,7 @@ class OfflineEntropyProbe:
             
             # Check if δH₁ computation should be performed
             probe_config = self.config.get('computation_options', {})
-            compute_delta_h1 = True
+            compute_delta_h1 = probe_config.get('compute_delta_h1', True)
             
             # Initialize variables for potential use in later stages
             delta_h1 = 0.0
@@ -753,14 +753,15 @@ class OfflineEntropyProbe:
             B_E_global = B_E_local if not is_dist else None
             B_U_global = B_U_local if not is_dist else None
             
-            self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
-            # Set global batch sizes for downstream use
-            if is_dist:
-                B_E_global = distributed_helpers.count_global(B_E_local)
-                B_U_global = distributed_helpers.count_global(B_U_local)
-            else:
-                B_E_global = B_E_local
-                B_U_global = B_U_local
+            if not compute_delta_h1:
+                self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
+                # Set global batch sizes for downstream use
+                if is_dist:
+                    B_E_global = distributed_helpers.count_global(B_E_local)
+                    B_U_global = distributed_helpers.count_global(B_U_local)
+                else:
+                    B_E_global = B_E_local
+                    B_U_global = B_U_local
             
             
             # ================================================================
