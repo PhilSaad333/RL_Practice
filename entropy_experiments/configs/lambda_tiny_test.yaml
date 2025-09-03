@@ -1,0 +1,70 @@
+# 🧪 Lambda Tiny Test Config for Quick Stage 2 Testing
+# Minimal batch sizes for rapid testing
+
+# === MODEL AND CHECKPOINT ===
+checkpoint:
+  checkpoint_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/model"
+  optimizer_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/optimizer.pt"
+  backbone: "qwen2_5_15"
+  dtype: "bfloat16"
+  device_map: "cuda"
+
+# === BATCH CONFIGURATION ===
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  E_split: "test"   # Evaluation batch uses test set
+  U_split: "train"  # Update batch uses train set
+  B_E: 32          # Tiny E batch size for quick testing
+  B_U: 8           # Tiny U batch size
+  G: 4             # Reduced number of responses per prompt
+
+# === COMPUTATION OPTIONS ===
+computation_options:
+  compute_delta_h1: true
+  master_seed: none
+  mb_size_prompts: 1
+  weighting_mode: "dr_grpo"
+
+# === GROUND TRUTH ENTROPY CHANGE ===  
+true_delta_h:
+  enabled: true
+  training_loss: "rl"
+  microbatch_size: 1
+  clip_c: 10.0
+  report_per_token: true
+  measure: "q"  # Stage 2: Use q measure for importance sampling
+
+# === GENERATION SETTINGS ===  
+generation:
+  temperature: 1.0
+  top_p: 0.995  
+  max_new_tokens: 50  # Reduced for faster generation
+  gen_batch_size: 16  # Smaller batch
+  tf_batch_size: 4
+
+# === MEMORY CONFIGURATION ===
+memory_config:
+  amp: true
+  dtype: "bfloat16" 
+  microbatch_size: 1
+
+# === DETAILED LOGGING ===
+detailed_logging:
+  enabled: true
+  level: "standard"
+  log_sequences: false
+  log_tokens: false
+  log_raw_tensors: false
+  output_directory: "entropy_experiments/logs"
+  compress: true
+  max_files: 50
+
+# === OUTPUT CONFIGURATION ===
+output:
+  log_level: "INFO"
+  results_path: ""
+
+# === TEST GOALS ===
+# Quick test of Stage 2 q-measure fix
+# Should complete in ~1-2 minutes
+# B_E=32, G=4 → only 128 sequences to generate
