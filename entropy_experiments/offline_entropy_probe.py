@@ -691,6 +691,14 @@ class OfflineEntropyProbe:
                 
                 self.logger.info(f"Single GPU: using random sampling")
             
+            # Initialize variables for later stages  
+            probe_config = self.config.get('computation_options', {})
+            compute_delta_h1 = probe_config.get('compute_delta_h1', True)
+            delta_h1 = 0.0
+            bars_dot = 0.0
+            learning_rate = 0.0
+            phase1_time = phase2_time = phase3_time = 0.0
+            
             # Phase 0: Sampling E and U batches (with optional cache reuse)
             self.logger.info("Phase 0: Sampling E and U batches")
             if self.detailed_logger:
@@ -732,26 +740,11 @@ class OfflineEntropyProbe:
             B_U_global = B_U_used
             self.logger.info(f"[RESULTS][delta-theta] bars_dot={bars_dot:.10f}, deltaH1={delta_h1:.10f}")
 
-            # Skip legacy Ybar path
-            compute_delta_h1 = False
-            
             # Log batch data for detailed logging
             if self.detailed_logger:
                 self.detailed_logger.log_phase_end("phase0_sampling")
                 self.detailed_logger.log_batch_data("E_batch", E_batch)
                 self.detailed_logger.log_batch_data("U_batch", U_batch)
-            
-            # Check if δH₁ computation should be performed
-            probe_config = self.config.get('computation_options', {})
-            compute_delta_h1 = probe_config.get('compute_delta_h1', True)
-            
-            # Initialize variables for potential use in later stages
-            delta_h1 = 0.0
-            bars_dot = 0.0
-            learning_rate = 0.0
-            phase1_time = phase2_time = phase3_time = 0.0
-            B_E_global = B_E_local if not is_dist else None
-            B_U_global = B_U_local if not is_dist else None
             
             if not compute_delta_h1:
                 self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
