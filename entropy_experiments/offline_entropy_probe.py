@@ -180,7 +180,9 @@ class OfflineEntropyProbe:
                 f"Optimizer state not found. Provide checkpoint.optimizer_path or place optimizer.pt near {adapter_path}"
             )
         # Load AdamW with state (ID remap handled inside)
-        self.optimizer = load_adam_optimizer_from_path(self.model, optimizer_path)
+        checkpoint_config = self.config.get('checkpoint', {})
+        lr = checkpoint_config.get('learning_rate', None)  # Use custom LR if specified
+        self.optimizer = load_adam_optimizer_from_path(self.model, optimizer_path, lr=lr)
         
         # Move to GPU and setup DDP if distributed
         device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
