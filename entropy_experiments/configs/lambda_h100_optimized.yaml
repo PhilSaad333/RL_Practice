@@ -33,7 +33,7 @@ computation_options:
 true_delta_h:
   enabled: true                   # Enable ground truth ΔH computation (Phase 5) - required for Δθ-based implementation
   training_loss: "rl"             # Use RL-aligned loss for updates
-  microbatch_size: 4              # IS microbatch size
+  microbatch_size: 2              # IS microbatch size
   clip_c: 10.0                    # Importance weight clipping
   report_per_token: true          # Include per-token entropy analysis
 
@@ -43,7 +43,7 @@ generation:
   temperature: 0.7
   top_p: 0.995  
   max_new_tokens: 150
-  gen_batch_size: 256
+  gen_batch_size: 64
   tf_batch_size: 8
 
 # === MEMORY CONFIGURATION ===
