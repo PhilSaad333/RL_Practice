@@ -27,6 +27,7 @@ from transformers import (
 
 from .base import RLAlgorithm, RolloutBatch
 from .gns_probe import GNSProbe
+from ..utils.optimizer_diagnostics import OptimizerDiagnostics
 
 # ============================================================================
 # UTILITIES
@@ -120,6 +121,14 @@ class DRGRPO(RLAlgorithm):
             enabled=gns_config.get("enabled", False),
             debug=gns_config.get("debug", False)
         )
+        
+        # --- Optimizer Diagnostics ---
+        # Initialize as None, will be created when needed (requires run_dir)
+        self.optimizer_diagnostics = None
+        self.optimizer_diagnostics_config = cfg.get("optimizer_diagnostics", {
+            "enabled": True,
+            "frequency": 1
+        })
         self._last_gns_metrics: Dict[str, float] = {}  # Store GNS metrics for logging
         
         # --- Entropy Probes ---
@@ -594,6 +603,19 @@ class DRGRPO(RLAlgorithm):
             
             clip_grad_norm_(self.policy.parameters(), self.cfg["grad_clip"])
             self.opt.step()
+            
+            # Optimizer diagnostics - track evolution of Adam states
+            self._ensure_optimizer_diagnostics()
+            if self.optimizer_diagnostics is not None:
+                try:
+                    self.optimizer_diagnostics.log_step(
+                        optimizer=self.opt,
+                        step=self.actual_opt_step + 1,  # +1 because actual_opt_step hasn't been incremented yet
+                        model=self.policy
+                    )
+                except Exception as e:
+                    print(f"[OptimizerDiagnostics] Error logging step {self.actual_opt_step + 1}: {e}")
+            
             if self.lr_sched is not None:
                 self.lr_sched.step()
             
@@ -639,6 +661,22 @@ class DRGRPO(RLAlgorithm):
         if getattr(self, "_ratio_log_path", None) is not None:
             return pathlib.Path(self._ratio_log_path).parent
         return pathlib.Path(".")
+
+    def _ensure_optimizer_diagnostics(self) -> None:
+        """Initialize optimizer diagnostics if enabled and not already created."""
+        if (self.optimizer_diagnostics is None and 
+            self.optimizer_diagnostics_config.get("enabled", False)):
+            try:
+                run_dir = self._run_dir_from_ratio_path()
+                self.optimizer_diagnostics = OptimizerDiagnostics(
+                    output_dir=run_dir,
+                    config=self.optimizer_diagnostics_config,
+                    logger=None  # Will create its own logger
+                )
+            except Exception as e:
+                # If initialization fails, disable diagnostics
+                print(f"[OptimizerDiagnostics] Initialization failed, disabling: {e}")
+                self.optimizer_diagnostics_config["enabled"] = False
 
     def _probe_reset_window(self) -> None:  # Added 8/11
         self._probe_sumWS = 0.0
