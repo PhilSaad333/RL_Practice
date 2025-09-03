@@ -123,12 +123,29 @@ def run_multi_e_analysis(config_path: str, num_e_samples: int = 8) -> Dict[str, 
     # Enable importance sampling
     importance_config = probe.config.get('true_delta_h', {})
     if importance_config.get('enabled', False):
-        gt_results = probe._compute_ground_truth_delta_entropy(
-            E_batch=E_batch_for_gt,
-            U_batch=U_batch, 
-            mb_size_prompts=mb_size_prompts,
-            **importance_config
+        # Initialize DeltaEntropyIS if not already done (replicate offline_entropy_probe.py logic)
+        if not hasattr(probe, 'delta_entropy_is') or probe.delta_entropy_is is None:
+            from entropy_experiments.delta_entropy_is import DeltaEntropyIS
+            probe.delta_entropy_is = DeltaEntropyIS(
+                model=probe.model, config=probe.config, logger=probe.logger,
+                sequence_processor=getattr(probe, '_sequence_processor', None)
+            )
+        
+        # Extract importance sampling configuration (replicate offline_entropy_probe.py logic)
+        cfg_importance = {
+            'training_loss': probe.config.get('true_delta_h', {}).get('training_loss', 'nll'),
+            'importance_microbatch_size': probe.config.get('true_delta_h', {}).get('microbatch_size', 1),
+            'is_mode': probe.config.get('true_delta_h', {}).get('is_mode', 'snis'),
+            'clip_c': probe.config.get('true_delta_h', {}).get('clip_c', 10.0),
+            'report_per_token': probe.config.get('true_delta_h', {}).get('report_per_token', False),
+            'snapshot_device': probe.config.get('true_delta_h', {}).get('snapshot_device', 'cpu')
+        }
+        
+        # Compute ground-truth entropy change (replicate offline_entropy_probe.py logic)
+        gt_results = probe.delta_entropy_is.entropy_change_two_batch(
+            probe.model, E_batch_for_gt, U_batch, probe.optimizer, cfg_importance
         )
+        
         delta_h_true = gt_results['deltaH_true']
         H_orig = gt_results['H_orig']
         H_upd = gt_results['H_upd']
