@@ -104,17 +104,40 @@ class OfflineEntropyProbe:
         self.logger.info(f"Initialized OfflineEntropyProbe on rank {self.rank}/{self.world_size}")
         
     def _setup_logging(self) -> logging.Logger:
-        """Setup logging configuration."""
+        """Setup logging configuration with both console and file output."""
         logger = logging.getLogger(f"entropy_probe_rank_{self.rank if hasattr(self, 'rank') else 0}")
         logger.setLevel(getattr(logging, self.config['output']['log_level']))
         
         if not logger.handlers:
-            handler = logging.StreamHandler()
+            # Console handler
+            console_handler = logging.StreamHandler()
             formatter = logging.Formatter(
                 f'[Rank {self.rank if hasattr(self, "rank") else 0}] %(asctime)s - %(name)s - %(levelname)s - %(message)s'
             )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+            
+            # File handler - save to logs directory alongside detailed logs
+            if self.config.get('detailed_logging', {}).get('enabled', False):
+                from datetime import datetime
+                from pathlib import Path
+                
+                # Use same directory structure as DetailedLogger
+                output_dir = Path(self.config.get('detailed_logging', {}).get('output_directory', 'entropy_experiments/logs'))
+                day_dir = output_dir / datetime.now().strftime('%Y-%m-%d')
+                day_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Create log file with timestamp
+                timestamp_str = datetime.now().strftime('%H-%M-%S')
+                log_file = day_dir / f"entropy_probe_{timestamp_str}_console.log"
+                
+                file_handler = logging.FileHandler(log_file, mode='w')
+                file_handler.setFormatter(formatter)
+                logger.addHandler(file_handler)
+                
+                # Store log file path for reference
+                self._console_log_file = str(log_file)
+                logger.info(f"Console logging to file: {log_file}")
             
         return logger
         
