@@ -1,0 +1,75 @@
+# 🔍 Lambda Ultra Small Multi-E-batch Analysis Config
+# Minimal memory usage with all microbatch sizes = 1
+
+# === MODEL AND CHECKPOINT ===
+checkpoint:
+  checkpoint_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/model"
+  optimizer_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/optimizer.pt"
+  backbone: "qwen2_5_15"
+  dtype: "bfloat16"
+  device_map: "cuda"
+
+# === BATCH CONFIGURATION ===
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  E_split: "test"   # Evaluation batch uses test set
+  U_split: "train"  # Update batch uses train set
+  B_E: 32          # Very small E batch size
+  B_U: 4           # Very small U batch size
+  G: 8             # Number of responses per prompt (U batch)
+
+# === COMPUTATION OPTIONS ===
+computation_options:
+  compute_delta_h1: true
+  master_seed: none
+  mb_size_prompts: 1      # ULTRA SMALL: 1 instead of 2
+  weighting_mode: "dr_grpo"
+
+# === GROUND TRUTH ENTROPY CHANGE ===  
+true_delta_h:
+  enabled: true     # Required for DeltaEntropyIS component initialization
+  training_loss: "rl"
+  microbatch_size: 1      # ULTRA SMALL: 1 instead of 2
+  clip_c: 10.0
+  report_per_token: true
+
+# === GENERATION SETTINGS ===  
+generation:
+  temperature: 0.7
+  top_p: 0.995  
+  max_new_tokens: 150
+  gen_batch_size: 32      # ULTRA SMALL: 32 instead of 64
+  tf_batch_size: 4        # ULTRA SMALL: 4 instead of 8
+
+# === MEMORY CONFIGURATION ===
+memory_config:
+  amp: true
+  dtype: "bfloat16" 
+  microbatch_size: 1      # ULTRA SMALL: 1 instead of 2
+
+# === DETAILED LOGGING ===
+detailed_logging:
+  enabled: false    # Disable for speed
+  level: "standard"
+  log_sequences: false
+  log_tokens: false
+  log_raw_tensors: false
+  output_directory: "entropy_experiments/logs"
+  compress: true
+  max_files: 50
+
+# === OUTPUT CONFIGURATION ===
+output:
+  log_level: "INFO"
+  results_path: ""
+
+# === ULTRA CONSERVATIVE MEMORY SETTINGS ===
+# All microbatch sizes set to 1:
+# - mb_size_prompts: 2 → 1
+# - true_delta_h.microbatch_size: 2 → 1  
+# - memory_config.microbatch_size: 2 → 1
+# - gen_batch_size: 64 → 32
+# - tf_batch_size: 8 → 4
+# - B_E: 64 → 32, B_U: 8 → 4
+#
+# This should use minimal GPU memory for testing the crash fix.
