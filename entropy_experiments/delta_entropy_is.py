@@ -237,7 +237,7 @@ class DeltaEntropyIS:
             responses_text=None,
         )
 
-    def _eval_S_and_RB_on_E(self, E_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _eval_S_and_RB_on_E(self, E_batch: Dict[str, Any], use_q_measure: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.sequence_processor is None:
             S = self._eval_logprobs_on_batch(E_batch, self.config.get('importance', {}).get('importance_microbatch_size', 1))
             RB = torch.zeros_like(S)
@@ -250,9 +250,19 @@ class DeltaEntropyIS:
             compute_rb=True,
         )
         device = next(self.model.parameters()).device
-        seq_lp_list: list[list[float]] = []
-        for b_list in logprob_results.sequence_logprobs:
-            seq_lp_list.append([float(x) for x in b_list])
+        
+        # Stage 2: Choose between p and q measures
+        if use_q_measure and logprob_results.sequence_logqs is not None:
+            seq_lp_list: list[list[float]] = []
+            for b_list in logprob_results.sequence_logqs:
+                seq_lp_list.append([float(x) for x in b_list])
+            self.logger.debug("Using q (sampling) measure for importance weights")
+        else:
+            seq_lp_list: list[list[float]] = []
+            for b_list in logprob_results.sequence_logprobs:
+                seq_lp_list.append([float(x) for x in b_list])
+            if use_q_measure:
+                self.logger.warning("Requested q measure but sequence_logqs not available, falling back to p")
         S = torch.tensor(seq_lp_list, device=device, dtype=torch.float32)
         RB_vals: list[list[float]] = []
         have_torch_rb = bool(getattr(logprob_results, 'rb_entropies_torch', None))
@@ -427,11 +437,21 @@ class DeltaEntropyIS:
         report_per_token = cfg_importance.get('report_per_token', False)
         snapshot_device = cfg_importance.get('snapshot_device', 'cpu')
 
+        # Stage 2: Check if we should use q measure
+        use_q = False
+        if 'measure' in cfg_importance:
+            measure = cfg_importance.get('measure', 'p')
+            use_q = (measure == 'q')
+        elif hasattr(self.sp, 'config') and hasattr(self.sp.config, 'top_p') and self.sp.config.top_p < 1.0:
+            # Default: use q if top_p < 1
+            use_q = True
+            self.logger.info(f"Auto-selecting q measure due to top_p={self.sp.config.top_p}")
+        
         # A) Snapshot
         cpu_snaps, opt_state_snapshot = self._snapshot_model_optimizer(model, optimizer, snapshot_device)
 
         # B) Original entropy on E (RB)
-        S_orig, RB_orig = self._eval_S_and_RB_on_E(E_batch)
+        S_orig, RB_orig = self._eval_S_and_RB_on_E(E_batch, use_q_measure=use_q)
         rb_sum_local = RB_orig.double().sum()
         cnt_local = torch.tensor(RB_orig.numel(), device=rb_sum_local.device, dtype=rb_sum_local.dtype)
         if dist.is_initialized():
@@ -451,7 +471,7 @@ class DeltaEntropyIS:
         self._rl_update_streaming(U_batch, optimizer, rl_grad_accum, importance_mb_size)
 
         # D) Updated entropy via SNIS with RB payload
-        S_upd, RB_upd = self._eval_S_and_RB_on_E(E_batch)
+        S_upd, RB_upd = self._eval_S_and_RB_on_E(E_batch, use_q_measure=use_q)
         logw = S_upd - S_orig
         is_results = self._compute_snis_two_batch(RB_upd, logw, report_per_token, E_batch)
         H_upd = is_results['H_upd']

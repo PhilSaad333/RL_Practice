@@ -77,6 +77,9 @@ class LogprobResults:
     rb_entropies_torch: Optional[List[List[torch.Tensor]]] = None  # [B][G] torch RB entropies (for grad path)
     # Phase 3b: Optional per-step feature matrix φ_j for regression baseline
     baseline_feats_torch: Optional[List[List[torch.Tensor]]] = None  # [B][G] features [T, d] (detached)
+    # Stage 2 fix: log-q values accounting for top-p sampling distribution
+    token_logqs: Optional[List[List[torch.Tensor]]] = None    # [B][G] per-token log-q values
+    sequence_logqs: Optional[List[List[float]]] = None        # [B][G] total sequence log-q
 
 
 @dataclass
@@ -472,6 +475,8 @@ class SequenceProcessor:
         all_entropies = [[] for _ in range(B)]
         all_rb_entropies = [[] for _ in range(B)]
         all_sequence_logprobs = [[] for _ in range(B)]
+        all_token_logqs = [[] for _ in range(B)]  # Stage 2: log-q values
+        all_sequence_logqs = [[] for _ in range(B)]  # Stage 2: sequence log-q
         
         # Build diagnostics helper once (outside loops)
         diag = DistributionDiagnostics(
@@ -552,13 +557,21 @@ class SequenceProcessor:
                                 pack = diag.compute_from_logits(gen_logits, gen_tokens)
                                 all_diagnostics[b].append(pack)
 
-                                # Naïve per-token logprobs for realized tokens
+                                # Naïve per-token logprobs for realized tokens (p measure)
                                 log_probs = torch.log_softmax(gen_logits, dim=-1)                # [T, V]
                                 token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)  # [T]
+
+                                # Stage 2: Compute log-q values (sampling measure)
+                                token_logqs = self._compute_logq_top_p(
+                                    gen_logits, gen_tokens, self.config.top_p, self.config.temperature
+                                )  # [T]
 
                                 # Convert to numpy
                                 gen_logprobs_np = token_logprobs.float().cpu().numpy()
                                 gen_logprobs_np = np.nan_to_num(gen_logprobs_np, nan=0.0, posinf=0.0, neginf=-100.0)
+                                
+                                gen_logqs_np = token_logqs.float().cpu().numpy()
+                                gen_logqs_np = np.nan_to_num(gen_logqs_np, nan=0.0, posinf=0.0, neginf=-100.0)
 
                                 # Naïve per-token "entropies" (surprisal of realized token)
                                 entropies_naive = -gen_logprobs_np                                 # [T]
@@ -573,25 +586,32 @@ class SequenceProcessor:
                                     rb_np = np.array([])
 
                                 seq_logprob = float(gen_logprobs_np.sum())
+                                seq_logq = float(gen_logqs_np.sum())  # Stage 2: sequence log-q
                         else:
                             # Size mismatch or zero generation length
                             gen_logprobs_np = np.array([])
+                            gen_logqs_np = np.array([])  # Stage 2
                             entropies_naive = np.array([])
                             rb_np = np.array([])
                             seq_logprob = 0.0
+                            seq_logq = 0.0  # Stage 2
                             all_diagnostics[b].append(empty_diagnostics_pack())
                     else:
                         # No generation found for this (b,g); record empties
                         gen_logprobs_np = np.array([])
+                        gen_logqs_np = np.array([])  # Stage 2
                         entropies_naive = np.array([])
                         rb_np = np.array([])
                         seq_logprob = 0.0
+                        seq_logq = 0.0  # Stage 2
                         all_diagnostics[b].append(empty_diagnostics_pack())
 
                     all_logprobs[b].append(torch.from_numpy(gen_logprobs_np))
                     all_entropies[b].append(entropies_naive)
                     all_rb_entropies[b].append(rb_np)
                     all_sequence_logprobs[b].append(seq_logprob)
+                    all_token_logqs[b].append(torch.from_numpy(gen_logqs_np))  # Stage 2
+                    all_sequence_logqs[b].append(seq_logq)  # Stage 2
 
         logprob_results = LogprobResults(
             logprobs=all_logprobs,
@@ -601,6 +621,8 @@ class SequenceProcessor:
             rewards=[],  # Will be filled by generate_with_logprobs
             rb_entropies_torch=None,  # no grad path doesn't compute torch tensors
             baseline_feats_torch=None,  # no grad path doesn't compute baseline features
+            token_logqs=all_token_logqs,  # Stage 2: per-token log-q
+            sequence_logqs=all_sequence_logqs,  # Stage 2: sequence log-q
         )
         
         diagnostics_results = DiagnosticsResults(
@@ -623,6 +645,8 @@ class SequenceProcessor:
         all_entropies = [[] for _ in range(B)]
         all_rb_entropies = [[] for _ in range(B)]
         all_sequence_logprobs = [[] for _ in range(B)]
+        all_token_logqs = [[] for _ in range(B)]  # Stage 2: log-q values
+        all_sequence_logqs = [[] for _ in range(B)]  # Stage 2: sequence log-q
         rb_entropies_torch = [[] for _ in range(B)] if compute_rb and self.config.rb_requires_grad else None
         baseline_feats_torch = [[] for _ in range(B)] if return_baseline_features else None
 
@@ -653,8 +677,14 @@ class SequenceProcessor:
                     gen_tokens = seq[gen_start : gen_end]          # [T]
 
                     if gen_logits.size(0) == gen_tokens.size(0) and gen_logits.size(0) > 0:
+                        # Naive per-token logprobs (p measure)
                         log_probs = torch.log_softmax(gen_logits, dim=-1)
                         token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)   # [T]
+                        
+                        # Stage 2: Compute log-q values (sampling measure)
+                        token_logqs = self._compute_logq_top_p(
+                            gen_logits, gen_tokens, self.config.top_p, self.config.temperature
+                        )  # [T]
 
                         # naive surprisal as numpy for now (diagnostic); keep torch if you want grads
                         entropies_naive = (-token_logprobs).detach().float().cpu().numpy()
@@ -674,6 +704,7 @@ class SequenceProcessor:
                                     rb_np = rb_H.float().cpu().numpy()
 
                         seq_logprob = float(token_logprobs.detach().sum().item())
+                        seq_logq = float(token_logqs.detach().sum().item())  # Stage 2
                         
                         # --- Baseline features (Phase 3b) ---
                         phi = None
@@ -738,6 +769,8 @@ class SequenceProcessor:
                         all_entropies[b].append(entropies_naive)
                         all_rb_entropies[b].append(rb_np)
                         all_sequence_logprobs[b].append(seq_logprob)
+                        all_token_logqs[b].append(token_logqs)  # Stage 2
+                        all_sequence_logqs[b].append(seq_logq)  # Stage 2
                         
                         # Store torch RB if available
                         if rb_entropies_torch is not None:
@@ -758,6 +791,8 @@ class SequenceProcessor:
                         all_entropies[b].append(np.array([]))
                         all_rb_entropies[b].append(np.array([]))
                         all_sequence_logprobs[b].append(0.0)
+                        all_token_logqs[b].append(torch.tensor([], requires_grad=True))  # Stage 2
+                        all_sequence_logqs[b].append(0.0)  # Stage 2
                         
                         # Store empty torch RB if needed
                         if rb_entropies_torch is not None:
@@ -775,6 +810,8 @@ class SequenceProcessor:
             rewards=[],  # Will be filled by generate_with_logprobs
             rb_entropies_torch=rb_entropies_torch,  # Phase 2: torch RB tensors
             baseline_feats_torch=baseline_feats_torch,  # Phase 3b: baseline features
+            token_logqs=all_token_logqs,  # Stage 2: per-token log-q
+            sequence_logqs=all_sequence_logqs,  # Stage 2: sequence log-q
         )
         
         # For now, return empty diagnostics for the with_grad version
@@ -1025,8 +1062,57 @@ class SequenceProcessor:
         H = Z_S - (q * a).sum(dim=-1)                              # [T]
         return H
 
-
-
+    def _compute_logq_top_p(
+        self,
+        gen_logits: torch.Tensor,   # [T, V] logits aligned to next-token positions
+        gen_tokens: torch.Tensor,   # [T] realized token ids
+        top_p: float,
+        temperature: float
+    ) -> torch.Tensor:
+        """
+        Compute per-token log-q values for realized tokens under the sampling distribution.
+        Accounts for temperature scaling and top-p truncation/renormalization.
+        
+        This is Stage 2 fix for importance sampling: using q (sampling distribution)
+        instead of p (raw model distribution) for correct IS weights.
+        
+        Returns:
+            token_logq: torch.Tensor [T] with per-token log-q values (nats)
+        """
+        # Temperature scaling
+        a = gen_logits / max(temperature, 1e-8)  # [T, V]
+        
+        if top_p >= 1.0:
+            # Full softmax: log-q = log-p
+            log_q = torch.log_softmax(a, dim=-1)  # [T, V]
+        else:
+            # Top-p truncation and renormalization
+            T, V = a.shape
+            
+            # Sort logits descending
+            p_sorted, idx_sorted = torch.softmax(a, dim=-1).sort(dim=-1, descending=True)  # [T, V]
+            
+            # Cumulative mass
+            c = p_sorted.cumsum(dim=-1)  # [T, V]
+            
+            # Keep tokens until cumulative mass > top_p (but always keep at least one)
+            keep_sorted = (c <= top_p) | (torch.arange(V, device=c.device).unsqueeze(0) == 0)  # [T, V]
+            
+            # Map back to original vocab order
+            keep_mask = torch.zeros_like(keep_sorted)  # [T, V]
+            keep_mask.scatter_(1, idx_sorted, keep_sorted)  # [T, V] in original order
+            
+            # Mask logits (set excluded tokens to -inf)
+            a_masked = a.masked_fill(~keep_mask, float('-inf'))  # [T, V]
+            
+            # Compute log-q (renormalized over nucleus)
+            log_q = torch.log_softmax(a_masked, dim=-1)  # [T, V]
+        
+        # Extract log-q for realized tokens
+        token_logq = log_q.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)  # [T]
+        
+        # If any realized token falls outside the nucleus, its log-q = -inf (correct for IS)
+        return token_logq
 
 
 class DistributionDiagnostics:
