@@ -137,26 +137,11 @@ class DeltaEntropyIS:
         E_batch: Dict[str, Any]
     ) -> Dict[str, Any]:
         is_dist, rank, world_size = distributed_helpers.get_dist_info()
-        
-        # STAGE 1 FIX: Global max coordination for numerical stability
-        logw_local_max = logw.max()
-        if is_dist:
-            import torch.distributed as dist
-            logw_max_tensor = logw_local_max.detach().clone()
-            dist.all_reduce(logw_max_tensor, op=dist.ReduceOp.MAX)
-            logw_max = logw_max_tensor
-        else:
-            logw_max = logw_local_max
-        
-        # STAGE 1 FIX: Float64 precision for weight arithmetic
-        logw64 = (logw - logw_max).to(torch.float64)
-        w_shift = torch.exp(logw64)
-        
-        # STAGE 1 FIX: All weight computations in float64
+        logw_max = logw.max()
+        w_shift = torch.exp(logw - logw_max)
         w_sum_local = w_shift.sum()
-        w_payload_sum_local = (w_shift * payload_upd.to(torch.float64)).sum()
-        w_sq_sum_local = (w_shift * w_shift).sum()
-        
+        w_payload_sum_local = (w_shift * payload_upd).sum()
+        w_sq_sum_local = (w_shift ** 2).sum()
         if is_dist:
             w_sum_global = distributed_helpers.all_reduce_scalar_sum(w_sum_local)
             w_payload_sum_global = distributed_helpers.all_reduce_scalar_sum(w_payload_sum_local)
@@ -171,29 +156,11 @@ class DeltaEntropyIS:
             H_upd = (w_payload_sum_global / w_sum_global) if w_sum_global != 0 else 0.0
         else:
             H_upd = (-w_payload_sum_global / w_sum_global) if w_sum_global != 0 else 0.0
-        # STAGE 1 FIX: Enhanced diagnostics for numerical health monitoring
         ESS = (w_sum_global ** 2) / w_sq_sum_global if w_sq_sum_global != 0 else 0.0
-        N_total = logw.numel()
-        ESS_fraction = ESS / max(float(N_total), 1.0)
-        
-        # Log warning if ESS is critically low
-        if ESS_fraction < 0.05:
-            self.logger.warning(f"⚠️ Critical: ESS fraction = {ESS_fraction:.2%} < 5%. "
-                              f"Importance sampling may be unreliable. "
-                              f"Consider reducing step size or using use_is=False.")
-        elif ESS_fraction < 0.10:
-            self.logger.warning(f"⚠️ Low ESS fraction = {ESS_fraction:.2%}. "
-                              f"Results may have high variance.")
-        
         results: Dict[str, Any] = {
             'H_upd': H_upd,
             'diagnostics': {
                 'ESS': ESS,
-                'ESS_fraction': ESS_fraction,
-                'N_total': N_total,
-                'logw_max_global': float(logw_max.item()),
-                'logw_mean': float(logw.mean().item()),
-                'logw_std': float(logw.std().item()) if logw.numel() > 1 else 0.0,
                 'w_max': w_shift.max().item(),
                 'w_min': w_shift.min().item(),
                 'w_sum_global': w_sum_global,
@@ -457,14 +424,6 @@ class DeltaEntropyIS:
         H_upd = is_results['H_upd']
         H_upd_tok = is_results.get('H_upd_tok')
         self.logger.info(f"Updated entropy (RB, SNIS): H(I_updated;E) = {H_upd:.6f}")
-        
-        # STAGE 1 FIX: Log enhanced diagnostics for monitoring numerical health
-        diags = is_results.get('diagnostics', {})
-        if 'ESS_fraction' in diags:
-            self.logger.info(f"[SNIS Diagnostics] ESS = {diags['ESS']:.1f}/{diags['N_total']} "
-                           f"({diags['ESS_fraction']:.1%}), "
-                           f"logw_max = {diags['logw_max_global']:.3f}, "
-                           f"logw_mean = {diags['logw_mean']:.3f}")
         
         # Store intermediate results for detailed logging if needed
         if hasattr(self, '_store_importance_details') and self._store_importance_details:

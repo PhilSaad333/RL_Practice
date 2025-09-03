@@ -1,0 +1,81 @@
+{
+  "step": 40,
+  "global_step": 40,
+  "epoch": 0,
+  "model_config": {
+    "backbone": "Qwen/Qwen2.5-1.5B",
+    "eval_backbone": "qwen2_5_15"
+  },
+  "training_config": {
+    "backbone": "Qwen/Qwen2.5-1.5B",
+    "bf16": true,
+    "buffer_size": 128,
+    "cfg[\"kl_beta\"]": 0.0,
+    "clip_+": 0.2,
+    "clip_eps": 0.2,
+    "ent_coef": 0.0,
+    "entropy_probe": {
+      "debug": false,
+      "enabled": false
+    },
+    "eval_backbone": "qwen2_5_15",
+    "eval_batch_size": 64,
+    "eval_frac": 0.02,
+    "eval_temperature": 0.7,
+    "gns_probe": {
+      "debug": false,
+      "ema_alpha": 0.1,
+      "enabled": false,
+      "window_size": 16
+    },
+    "grad_clip": 1.0,
+    "gradient_checkpointing": true,
+    "lr": 2e-06,
+    "lr_scheduler": "const",
+    "max_new_tokens": 200,
+    "microbatch_size": 4,
+    "num_generations": 8,
+    "ppo_epochs": 1,
+    "reject_all_max": true,
+    "reject_all_zero": true,
+    "reward_fns": [
+      "tag_pref"
+    ],
+    "reward_var_thresh": 0.01,
+    "rollout_batch_size": 24,
+    "save_every": 10,
+    "save_rollouts_every": 0,
+    "scheduler": {
+      "boundaries": [
+        0.2,
+        0.8
+      ],
+      "dataset_name": "gsm8k_r1_template",
+      "ema_alpha": 0.01,
+      "name": "mix_passrate",
+      "sample_weights": [
+        1,
+        1,
+        1
+      ],
+      "split": "train"
+    },
+    "simple_entropy_probe": {
+      "debug": false,
+      "enabled": false,
+      "log_every": 5,
+      "preconditioning_mode": "previous_step"
+    },
+    "temperature": 0.7,
+    "tf_micro_batch": 16,
+    "total_steps": 30,
+    "use_vllm": false,
+    "vllm_gpu_memory_utilization": 0.35,
+    "vllm_reload_every": 5
+  },
+  "distributed_info": {
+    "world_size": 1,
+    "rank": 0,
+    "local_rank": 0
+  }
+}
