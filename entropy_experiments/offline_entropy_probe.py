@@ -18,7 +18,7 @@ Usage:
 """
 
 # === Model and optimizer loading ===
-from .model_loader import load_peft_for_probe, load_adam_optimizer_from_path
+from entropy_experiments.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
 
 import torch
 import torch.distributed as dist
@@ -705,6 +705,35 @@ class OfflineEntropyProbe:
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
             self.logger.info(f"E-batch: G=1 (replacement), {E_batch['sequences'].shape[0]} prompts, {E_batch['sequences'].shape[1]} responses/prompt")
             self.logger.info(f"U-batch: G={G_U} (distinct), {U_batch['sequences'].shape[0]} prompts, {U_batch['sequences'].shape[1]} responses/prompt")
+
+            # New deltaH1 prediction: compute Delta-theta via real RL step (snapshot/restore), then deltaH1 = <Xbar, Delta-theta>
+            self.logger.info("Phase 1: Computing Delta-theta via real RL step on U (snapshot/restore)")
+            delta_theta_buf, delta_theta_norm, B_U_used = self._compute_param_update_buffer(U_batch, mb_size_prompts)
+            self.logger.info(f"Delta-theta ready: ||Delta-theta||={delta_theta_norm:.3e} across {len(delta_theta_buf)} trainables")
+
+            # Compute Xbar on E, then deltaH1 = <Xbar, Delta-theta> (no lr scaling)
+            self.logger.info("Phase 2-3: Computing Xbar on E and deltaH1 = <Xbar, Delta-theta>")
+            compute = self.probe_components.compute_delta_h1_from_batches(
+                E_batch=E_batch,
+                U_batch=U_batch,
+                mb_size_prompts=mb_size_prompts,
+                weighting_mode=weighting_mode,
+                adam_preconditioner=self.adam_preconditioner,
+                optimizer=self.optimizer,
+                param_update_buf=delta_theta_buf,
+            )
+            delta_h1 = compute['deltaH1']
+            bars_dot = compute['bars_dot']
+            learning_rate = compute['learning_rate']
+            phase1_time = compute['timing']['phase1_time']
+            phase2_time = compute['timing']['phase2_time']
+            phase3_time = compute['timing']['phase3_time']
+            B_E_global = B_E
+            B_U_global = B_U_used
+            self.logger.info(f"[RESULTS][delta-theta] bars_dot={bars_dot:.10f}, deltaH1={delta_h1:.10f}")
+
+            # Skip legacy Ybar path
+            compute_delta_h1 = False
             
             # Log batch data for detailed logging
             if self.detailed_logger:
@@ -714,7 +743,7 @@ class OfflineEntropyProbe:
             
             # Check if δH₁ computation should be performed
             probe_config = self.config.get('computation_options', {})
-            compute_delta_h1 = probe_config.get('compute_delta_h1', True)
+            compute_delta_h1 = True
             
             # Initialize variables for potential use in later stages
             delta_h1 = 0.0
@@ -912,7 +941,43 @@ class OfflineEntropyProbe:
             with open(results_path, 'w') as f:
                 json.dump(results, f, indent=2, default=str)
             self.logger.info(f"Results saved to {results_path}")
-            
+        
+    def _compute_param_update_buffer(self, U_batch: Dict[str, Any], mb_size_prompts: int) -> tuple[dict[int, torch.Tensor], float, int]:
+        """Compute actual parameter update (Delta-theta) via a real RL step on U, with snapshot/restore.
+
+        Returns: (delta_theta_buf, l2_norm, B_U_used)
+        """
+        assert self.delta_entropy_is is not None, "DeltaEntropyIS component required"
+        # Canonical trainables: match ProbeComponents' registry (requires_grad on PEFT-wrapped model)
+        peft_model = self.model.module if hasattr(self.model, "module") else self.model
+        trainable_params = [p for _, p in peft_model.named_parameters() if p.requires_grad]
+
+        # Snapshot parameters and optimizer
+        cpu_snaps, opt_state_snapshot = self.delta_entropy_is._snapshot_model_optimizer(self.model, self.optimizer, snapshot_device='cpu')
+        before: dict[int, torch.Tensor] = {id(p): p.detach().to('cpu', torch.float32).clone() for p in trainable_params}
+
+        # Perform the real RL step
+        rl_grad_accum = int(self.config.get('computation_options', {}).get('rl_grad_accum', 1))
+        importance_mb_size = int(self.config.get('true_delta_h', {}).get('microbatch_size', 1))
+        self.delta_entropy_is._rl_update_streaming(U_batch, self.optimizer, rl_grad_accum, importance_mb_size)
+
+        # Compute Delta-theta on CPU
+        delta_theta: dict[int, torch.Tensor] = {}
+        l2 = torch.zeros((), dtype=torch.float64)
+        with torch.no_grad():
+            for p in trainable_params:
+                pid = id(p)
+                after = p.detach().to('cpu', torch.float32)
+                dth = (after - before[pid]).contiguous()
+                delta_theta[pid] = dth
+                l2 += (dth.double().pow(2).sum())
+        l2 = float(l2.sqrt().item())
+
+        # Restore model and optimizer
+        self.delta_entropy_is._restore_model_optimizer(self.model, self.optimizer, cpu_snaps, opt_state_snapshot)
+        B_U_used = int(U_batch.get('num_prompts', len(U_batch.get('max_lengths', []))))
+        return delta_theta, l2, B_U_used
+
             
     @classmethod
     def from_config_file(cls, config_path: str) -> 'OfflineEntropyProbe':
