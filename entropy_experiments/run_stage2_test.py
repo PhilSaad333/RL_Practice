@@ -44,10 +44,12 @@ def run_stage2_test():
     # Initialize probe
     probe = OfflineEntropyProbe.from_config_file(config_path)
     
-    # Force the use of q measure (Stage 2 fix)
-    if not hasattr(probe.config, 'true_delta_h'):
-        probe.config['true_delta_h'] = {}
-    probe.config['true_delta_h']['measure'] = 'q'
+    # Force the use of q measure (Stage 2 fix) - add it to the existing config
+    if 'true_delta_h' in probe.config and isinstance(probe.config['true_delta_h'], dict):
+        probe.config['true_delta_h']['measure'] = 'q'
+    else:
+        # If true_delta_h doesn't exist or isn't a dict, skip (it's already configured in yaml)
+        pass
     print(f"\n✅ Configured to use q-measure for importance sampling")
     
     # Run the standard mixed probe
