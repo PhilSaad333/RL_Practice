@@ -1,0 +1,64 @@
+# 🔍 Lambda Small Multi-E-batch Analysis Config
+# Reduced batch sizes for faster testing and debugging
+
+# === MODEL AND CHECKPOINT ===
+checkpoint:
+  checkpoint_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/model"
+  optimizer_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/optimizer.pt"
+  backbone: "qwen2_5_15"
+  dtype: "bfloat16"
+  device_map: "cuda"
+
+# === BATCH CONFIGURATION ===
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  E_split: "test"   # Evaluation batch uses test set
+  U_split: "train"  # Update batch uses train set
+  B_E: 64          # Smaller E batch size for speed
+  B_U: 8           # Smaller U batch size for speed
+  G: 8             # Number of responses per prompt (U batch)
+
+# === COMPUTATION OPTIONS ===
+computation_options:
+  compute_delta_h1: true
+  master_seed: none
+  mb_size_prompts: 2
+  weighting_mode: "dr_grpo"
+
+# === GROUND TRUTH ENTROPY CHANGE ===  
+true_delta_h:
+  enabled: false    # Disable for speed - we only need δH₁ estimates
+  training_loss: "rl"
+  microbatch_size: 2
+  clip_c: 10.0
+  report_per_token: true
+
+# === GENERATION SETTINGS ===  
+generation:
+  temperature: 0.7
+  top_p: 0.995  
+  max_new_tokens: 150
+  gen_batch_size: 64
+  tf_batch_size: 8
+
+# === MEMORY CONFIGURATION ===
+memory_config:
+  amp: true
+  dtype: "bfloat16" 
+  microbatch_size: 2
+
+# === DETAILED LOGGING ===
+detailed_logging:
+  enabled: false    # Disable for speed
+  level: "standard"
+  log_sequences: false
+  log_tokens: false
+  log_raw_tensors: false
+  output_directory: "entropy_experiments/logs"
+  compress: true
+  max_files: 50
+
+# === OUTPUT CONFIGURATION ===
+output:
+  log_level: "INFO"
+  results_path: ""
