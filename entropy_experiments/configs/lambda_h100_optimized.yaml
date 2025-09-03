@@ -31,7 +31,7 @@ computation_options:
 # === GROUND TRUTH ENTROPY CHANGE ===  
 # Renamed from 'importance' to be more descriptive
 true_delta_h:
-  enabled: true                   # Disable ground truth ΔH computation (Phase 5) for now
+  enabled: false                  # Disable ground truth ΔH computation (Phase 5) for now
   training_loss: "rl"             # Use RL-aligned loss for updates
   microbatch_size: 4              # IS microbatch size
   clip_c: 10.0                    # Importance weight clipping
