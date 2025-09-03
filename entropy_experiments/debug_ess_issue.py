@@ -34,9 +34,23 @@ def debug_ess_issue():
     if 'true_delta_h' in probe.config:
         print(f"   Measure: {probe.config['true_delta_h'].get('measure', 'not set')}")
     
-    # Load model first
+    # Load model and initialize (similar to run_mixed_probe)
     print("\n   Loading model and optimizer...")
-    probe.load_checkpoint()
+    checkpoint_path = probe.config['checkpoint']['checkpoint_path']
+    optimizer_path = probe.config['checkpoint'].get('optimizer_path')
+    
+    # Load LoRA model
+    from entropy_experiments.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
+    probe.model = load_peft_for_probe(
+        base_id="Qwen/Qwen2.5-1.5B",
+        adapter_path=checkpoint_path,
+        use_qlora=False,
+        dtype="bfloat16",
+        device_map="cuda"
+    )
+    
+    # Load optimizer
+    probe.optimizer = load_adam_optimizer_from_path(probe.model, optimizer_path)
     
     # Initialize components
     probe._initialize_components()
