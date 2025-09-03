@@ -219,6 +219,13 @@ def main():
         
         print(f"✅ Checkpoint validation passed")
         
+        # Optional metadata: ordered optimizer param names for robust reload
+        names_json = checkpoint_dir / "optimizer_param_names.json"
+        if names_json.exists():
+            print(f"Found optimizer_param_names.json: {names_json}")
+        else:
+            print("Warning: optimizer_param_names.json not found; default optimizer state load will be used")
+
         # Load original config
         original_config_path = training_run_dir / "config.yaml"
         if not original_config_path.exists():

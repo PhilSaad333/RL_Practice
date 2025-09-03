@@ -1,0 +1,279 @@
+Title: Fixing oversized bars_dot in δH₁ — robust optimizer-state loading, bias correction, and guardrails
+
+Author: (your name)
+Date: (today)
+
+Scope
+-----
+The δH₁ computation uses an Adam-preconditioned gradient (“Ȳ”) and an “X̄”, returning δH₁ = η ⟨X̄, Ŷ⟩. Recently, ⟨X̄, Ŷ⟩ (“bars_dot”) has inflated by several orders of magnitude. The most likely cause is a misloaded optimizer state: LoRA parameters are missing/losing their Adam second moment v = exp_avg_sq, so preconditioning applies ~1/ε amplification. This document specifies:
+
+1) The hypothesis and quick checks to confirm it.
+2) Precise code changes to load optimizer state correctly (LoRA trainables only, aligned ordering).
+3) Bias-correction of v via Adam’s step and β₂ (using per-param step or a checkpoint_step).
+4) Safety guardrails and diagnostics to prevent blow-ups and to localize issues quickly.
+
+If you only apply one change: restrict the probe optimizer to the LoRA trainables in the same order as training before loading the state (Patch A). This typically resolves the problem immediately.
+
+
+A) Hypothesis and quick confirmation
+------------------------------------
+H1. The probe constructs an AdamW over *all* model parameters (including frozen base weights), but the saved optimizer state from QLoRA/LoRA training contains state only for LoRA trainables (and possibly LM head). When remapped *by position/id* into a different parameter list, LoRA states attach to the wrong parameters and LoRA parameters end up with no v (exp_avg_sq) at all.
+
+Consequence: Applying preconditioning g / (sqrt(v̂)+ε) with v ≈ 0 yields scaling ~1/ε ≈ 1e8, inflating Ŷ and bars_dot.
+
+Quick checks you can run now (no code changes required):
+- Inspect the logs printed during Y accumulation: counts of “zero exp_avg_sq” or “tiny exp_avg_sq” on trainables should be ~0 in a healthy run.
+- Immediately after constructing the AdamPreconditioner, print a summary: how many trainables have valid exp_avg_sq? If coverage << 100%, it confirms misalignment.
+- As a sanity test, temporarily disable preconditioning (use raw grad): if bars_dot drops to a reasonable magnitude, the preconditioner is at fault.
+
+We will implement diagnostics below to automate these checks.
+
+
+B) Code changes (precise patches)
+---------------------------------
+B.1) Model loader: build AdamW over LoRA trainables only (not all parameters)
+
+**File:** `model_loader.py`  
+**Goal:** Ensure the optimizer’s parameter list at probe time matches the training optimizer’s list (LoRA trainables + optional head) both in *membership* and *order*. PEFT’s `named_parameters()` over the PEFT-wrapped module is a stable order. The saved state is keyed by internal ids/positions; the current code creates AdamW with `model.parameters()` (including many frozen params), so positions no longer line up.
+
+**Patch A (replace optimizer construction):**
+```python
+# BEFORE (simplified):
+opt = AdamW(model.parameters(), lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)
+
+# AFTER:
+peft_mod = model.module if hasattr(model, "module") else model
+trainable_params = [p for _, p in peft_mod.named_parameters() if p.requires_grad]
+if not trainable_params:
+    raise RuntimeError("No trainable (LoRA) parameters found; cannot build optimizer for probe.")
+
+opt = AdamW(trainable_params, lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)
+Rationale: This realigns the positional mapping used by opt.load_state_dict(saved_state) so that LoRA state lands on LoRA params.
+
+B.2) After loading state: verify exp_avg_sq coverage and step consistency
+
+File: model_loader.py (immediately after opt.load_state_dict(...))
+
+Patch B (coverage + step summary):
+
+python
+Copy code
+# After: opt.load_state_dict(remapped_state_dict)
+have_v = 0
+have_step = 0
+total = 0
+for group in opt.param_groups:
+    for p in group["params"]:
+        total += 1
+        st = opt.state.get(p, {})
+        if isinstance(st.get("exp_avg_sq", None), torch.Tensor):
+            have_v += 1
+        if isinstance(st.get("step", None), int) or isinstance(st.get("step", None), torch.Tensor):
+            have_step += 1
+
+coverage_v = have_v / max(total, 1)
+coverage_step = have_step / max(total, 1)
+print(f"[optimizer-state] coverage: v(exp_avg_sq) {have_v}/{total} = {coverage_v:.1%}, step {have_step}/{total} = {coverage_step:.1%}")
+
+if coverage_v < 0.9:
+    print("[optimizer-state][WARN] Poor exp_avg_sq coverage; consider identity preconditioner fallback. See AdamPreconditioner guardrails.")
+Rationale: If coverage is poor, the preconditioner must not be trusted. We do not abort; we let guardrails in the preconditioner decide.
+
+B.3) Pass or store checkpoint_step for bias correction (optional but recommended)
+
+File: offline_entropy_probe.py or your config plumbing
+Goal: Ensure we know the training step (or per-param step) to bias-correct v̂ = v / (1 − β₂^step).
+
+Option 1 (preferred): rely on per-param state['step'] carried in the loaded optimizer state.
+Option 2: if you also store a global checkpoint_step in your training checkpoint, propagate it into the probe config:
+
+yaml
+Copy code
+importance:
+  checkpoint_step: 123456
+Then expose it to the AdamPreconditioner constructor (see next patch) so it can use it as a fallback if a param’s state['step'] is missing.
+
+B.4) AdamPreconditioner: robust application with bias correction and guardrails
+
+File: adam_preconditioner.py
+Goals:
+
+Use per-param step and β₂ for bias-correction if available; else use checkpoint_step fallback; else no correction.
+
+If v is missing/zero/tiny, do identity preconditioning (not 1/ε).
+
+Limit pathological scaling with an upper clamp.
+
+Support float64 internal arithmetic for stability.
+
+Patch C (conceptual; integrate into apply_preconditioner(param, gradient)):
+
+python
+Copy code
+def apply_preconditioner(self, param: torch.nn.Parameter, gradient: torch.Tensor) -> torch.Tensor:
+    # Fetch optimizer state for this param
+    st = self.optimizer.state.get(param, {})
+
+    v = st.get("exp_avg_sq", None)
+    if not isinstance(v, torch.Tensor):
+        # Missing v ⇒ identity preconditioner (guard against 1/eps blow-up)
+        if self.logger:
+            self.logger.warning(f"No exp_avg_sq for param {id(param)}; using identity preconditioner.")
+        return gradient
+
+    beta2 = None
+    for group in self.optimizer.param_groups:
+        if param in group["params"]:
+            beta2 = group.get("betas", (0.9, 0.999))[1]
+            eps = group.get("eps", 1e-8)
+            break
+    if beta2 is None:
+        beta2, eps = 0.999, 1e-8
+
+    # Bias correction
+    step = st.get("step", None)
+    if isinstance(step, torch.Tensor):
+        step = int(step.item())
+    if step is None:
+        step = getattr(self, "checkpoint_step", None)  # configured fallback
+    if step and step > 0:
+        v_hat = v / (1.0 - (beta2 ** step))
+    else:
+        v_hat = v
+
+    # Avoid tiny/zero denominators and limit extreme scaling
+    denom = torch.sqrt(v_hat) + eps
+    # If denom is pathologically small (e.g., uninitialized v), use identity
+    if torch.isnan(denom).any() or (denom.max() < 1e-12):
+        if self.logger:
+            self.logger.warning(f"Pathological denom for param {id(param)}; using identity preconditioner.")
+        return gradient
+
+    # Compute scaled gradient in higher precision
+    g64 = gradient.to(torch.float64)
+    scale = (1.0 / denom).to(torch.float64)
+    # Optional clamp to avoid numeric explosions if v is extremely small
+    scale = torch.clamp(scale, max=1e3)  # cap = 1e3; adjust if needed
+    gtilde = (g64 * scale).to(gradient.dtype)
+    return gtilde
+If you want to wire in a checkpoint_step fallback: modify preconditioner init:
+
+python
+Copy code
+class AdamPreconditioner:
+    def __init__(self, optimizer, logger=None, checkpoint_step: Optional[int]=None):
+        self.optimizer = optimizer
+        self.logger = logger or logging.getLogger(__name__)
+        self.checkpoint_step = checkpoint_step
+B.5) Probe components: assert eval mode for TF passes and keep counters
+
+File: probe_components.py
+Goal: Make TF deterministic across pre/post and keep visibility on preconditioner behavior.
+
+Insert just before your teacher-forced passes:
+
+python
+Copy code
+was_training = self.model.training
+self.model.eval()
+try:
+    # teacher-forcing / grad code here...
+finally:
+    self.model.train(was_training)
+You already log per-parameter counts of zero/tiny exp_avg_sq and zero outputs; keep those logs. If you did not, add cumulative counters at the end of Y accumulation:
+
+python
+Copy code
+self.logger.info(f"[Y] Adam preconditioning complete: "
+                 f"{zero_exp_avg_sq_count} zero exp_avg_sq, "
+                 f"{tiny_exp_avg_sq_count} tiny exp_avg_sq, "
+                 f"{zero_output_count} zero outputs")
+B.6) Optional: identity fallback switch if coverage is poor
+
+File: offline_entropy_probe.py or config
+Expose a config flag:
+
+yaml
+Copy code
+importance:
+  identity_preconditioner_if_coverage_below: 0.9
+In the probe setup, after building the preconditioner and printing coverage, if coverage < threshold, set a flag in the preconditioner to skip scaling (return gradient). This gives you a fail-safe run rather than aborting.
+
+C) Diagnostics to add (one-time)
+C.1) Preconditioner stats API
+Add a method in adam_preconditioner.py:
+
+python
+Copy code
+def get_stats(self) -> dict:
+    total = 0; have_v = 0; max_scale = 0.0; min_denom = float("inf")
+    for group in self.optimizer.param_groups:
+        eps = group.get("eps", 1e-8)
+        beta2 = group.get("betas", (0.9, 0.999))[1]
+        for p in group["params"]:
+            total += 1
+            st = self.optimizer.state.get(p, {})
+            v = st.get("exp_avg_sq", None)
+            if isinstance(v, torch.Tensor):
+                have_v += 1
+                step = st.get("step", 0)
+                if isinstance(step, torch.Tensor): step = int(step.item())
+                vhat = v / (1.0 - (beta2 ** step)) if step and step > 0 else v
+                denom = torch.sqrt(vhat) + eps
+                if denom.numel() > 0:
+                    min_denom = min(min_denom, float(denom.min().item()))
+                    s = float((1.0 / denom).max().item())
+                    max_scale = max(max_scale, s)
+    return {"coverage": have_v/max(total,1), "max_scale": max_scale, "min_denom": min_denom}
+Log this once at start of the probe and whenever bars_dot looks suspicious.
+
+Interpretation:
+
+coverage ~ 1.0, max_scale ≤ 1e2: healthy
+
+coverage << 1.0 or max_scale ≫ 1e3: likely mapping or step/β₂ problem
+
+C.2) Sanity cross-check of magnitudes
+Compute bars_dot twice in a dry-run (single mini-batch):
+
+With identity preconditioner (return raw gradients),
+
+With Adam preconditioner.
+
+If bars_dot_precond / bars_dot_identity ≫ 1e3, consider the preconditioner suspect and fall back.
+
+D) Bias-correction specifics
+Given Adam β₂ and per-param step t, define v̂ = v / (1 − β₂^t). If per-param step is present in the loaded state (typical), no further action is needed. If not, use a global checkpoint_step as a fallback. If neither is available, skip bias correction — this introduces a small scale error when t is large, but it is orders of magnitude smaller than the 1/ε blow-up.
+
+Note: if the saved optimizer used decoupled weight decay or different eps/betas than the probe defaults, ensure your probe AdamW is constructed with the same hparams (betas, eps, weight_decay), otherwise the implied preconditioner will not match training.
+
+E) Optional: truncated-distribution caveat (not δH₁-critical)
+Unrelated to bars_dot but relevant for your “true ΔH via SNIS” path: ensure E-batch sampling uses top_p=1.0 (i.e., from πθ) when you compute the IS weights π_{θ+}(Y)/π_θ(Y). If E was sampled with nucleus truncation, the correct denominator is the truncated distribution. This does not affect δH₁, but it matters for your ΔH (IS) estimator.
+
+F) Minimal test protocol after patch
+Load model + LoRA adapter; construct optimizer over LoRA trainables only; load remapped state.
+
+Print coverage and preconditioner stats; expect coverage ~100%, max_scale not huge (≤ 1e2–1e3).
+
+Run a tiny probe (B_E=B_U=2). Log:
+
+zero/tiny exp_avg_sq counts,
+
+bars_dot (identity) vs bars_dot (preconditioned),
+
+δH₁ = η·bars_dot (preconditioned).
+
+Expect bars_dot magnitude similar to your prior runs; identity vs preconditioned should be within a sensible factor (≲ 10–100), not 1e6–1e8.
+
+Appendix: Summary of patches
+Patch A (model_loader): build AdamW over LoRA trainables in PEFT order.
+
+Patch B (model_loader): after loading, print exp_avg_sq and step coverage (warn if low).
+
+Patch C (adam_preconditioner): bias correction + identity fallback + clamp + float64 path.
+
+probe_components: enforce eval mode for TF passes; keep/log zero/tiny exp_avg_sq counters.
+
+(Optional) config: importance.checkpoint_step, importance.identity_preconditioner_if_coverage_below.
+
+With Patch A alone, the common misalignment is removed; with Patch C, you gain hard guardrails against silent explosions. Together they should bring bars_dot back to the expected order of magnitude and make future incidents diagnosable in a few lines of logs.

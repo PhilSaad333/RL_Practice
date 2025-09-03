@@ -156,16 +156,75 @@ def load_adam_optimizer_from_path(
 
     # Instantiate AdamW over LoRA trainables only (stable order via named_parameters)
     peft_mod = model.module if hasattr(model, "module") else model
-    trainable_params = [p for _, p in peft_mod.named_parameters() if p.requires_grad]
+    name2param = dict(peft_mod.named_parameters())
+    trainable_items = [(n, p) for n, p in name2param.items() if p.requires_grad]
+    trainable_params = [p for _, p in trainable_items]
     if not trainable_params:
         raise RuntimeError("No trainable (LoRA) parameters found; cannot build optimizer for probe.")
 
-    opt = AdamW(trainable_params, lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)
-
+    # Prefer name-aware remap when optimizer_param_names.json is available
+    names_json = optimizer_path.with_name("optimizer_param_names.json")
     try:
         state_dict = torch.load(str(optimizer_path), map_location="cpu")
-        remapped = _remap_optimizer_state_ids(state_dict, opt)
-        opt.load_state_dict(remapped)
+        if names_json.exists():
+            import json as _json
+            with open(names_json, "r") as f:
+                ordered_names_groups = _json.load(f)  # list[list[str]]
+
+            # Flatten saved (name, old_id) pairs in group order
+            saved_param_groups = state_dict.get("param_groups", [])
+            saved_pairs: list[tuple[str, int]] = []
+            for gi, group in enumerate(saved_param_groups):
+                names_g = ordered_names_groups[gi] if gi < len(ordered_names_groups) else []
+                ids_g = group.get("params", [])
+                m = min(len(names_g), len(ids_g))
+                for k in range(m):
+                    saved_pairs.append((names_g[k], ids_g[k]))
+
+            trainable_names = {n for n, _ in trainable_items}
+            # Keep only trainables, preserving saved order
+            ordered_trainable_names = [n for (n, _) in saved_pairs if n in trainable_names]
+            ordered_trainable_params = [name2param[n] for n in ordered_trainable_names]
+
+            # Build name->old_id mapping for trainables
+            name_to_old_id = {n: old_id for (n, old_id) in saved_pairs if n in trainable_names}
+
+            # Create optimizer with ordered trainables
+            opt = AdamW(ordered_trainable_params, lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)
+
+            # Remap state by name
+            old_state = state_dict.get("state", {})
+            remapped_state: dict[int, dict] = {}
+            for n in ordered_trainable_names:
+                old_id = name_to_old_id.get(n)
+                if old_id is None:
+                    continue
+                st = old_state.get(old_id, None)
+                if st is None:
+                    continue
+                remapped_state[id(name2param[n])] = st
+
+            # Keep hyperparams from first non-empty saved group
+            merged_cfg = {}
+            for g in saved_param_groups:
+                if g.get("params"):
+                    merged_cfg = {k: v for k, v in g.items() if k != "params"}
+                    break
+
+            all_new_ids = [id(p) for p in ordered_trainable_params]
+            remapped_param_groups = []
+            # Current optimizer may have one group; mirror that
+            g0 = merged_cfg.copy()
+            g0["params"] = all_new_ids
+            remapped_param_groups.append(g0)
+
+            remapped = {"state": remapped_state, "param_groups": remapped_param_groups}
+            opt.load_state_dict(remapped)
+        else:
+            # Fallback: positional remap after building optimizer over trainables
+            opt = AdamW(trainable_params, lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)
+            remapped = _remap_optimizer_state_ids(state_dict, opt)
+            opt.load_state_dict(remapped)
 
         # Coverage summary: fraction of params with exp_avg_sq and step present
         have_v = 0
@@ -186,4 +245,5 @@ def load_adam_optimizer_from_path(
 
         return opt
     except Exception:
-        return opt  # Fall back to fresh optimizer
+        # Fall back to a fresh optimizer if anything fails
+        return AdamW(trainable_params, lr=(lr or 1e-4), weight_decay=weight_decay, betas=betas, eps=eps)

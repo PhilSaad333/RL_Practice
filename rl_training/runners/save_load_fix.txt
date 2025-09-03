@@ -1,0 +1,69 @@
+2.1 Save: ordered names alongside the optimizer state
+
+In your training loop (where you save model/optimizer/scheduler):
+
+# --- before torch.save(optimizer.state_dict()) ---
+# capture the exact optimizer param order (per group)
+name2param = dict(_unwrap(self.model).named_parameters())  # or model if already unwrapped
+
+opt_param_names = []
+for g in self.optimizer.param_groups:
+    group_names = []
+    for p in g["params"]:
+        # find the name by identity
+        # note: if some params are not in name2param (rare), skip or give them a placeholder
+        for name, q in name2param.items():
+            if q is p:
+                group_names.append(name)
+                break
+    opt_param_names.append(group_names)
+
+# save everything as before
+optimizer_path = save_dir / "optimizer.pt"
+torch.save(self.optimizer.state_dict(), optimizer_path)
+
+# save ordered names as metadata
+opt_names_path = save_dir / "optimizer_param_names.json"
+with open(opt_names_path, "w") as f:
+    json.dump(opt_param_names, f, indent=2)
+
+# you already save training_info.json; that’s good
+
+
+Notes:
+
+We record a list of lists (one list per param group). If you only use one group, it will be a single list.
+
+Keep using your current _unwrap(self.model).save_pretrained(model_dir) logic for LoRA weights.
+
+2.2 Load: reconstruct optimizer with names, then load state
+
+On the probe side, prefer names if available:
+
+# Pseudocode in your loader before constructing AdamW
+opt_names_path = Path(optimizer_path).with_name("optimizer_param_names.json")
+if opt_names_path.exists():
+    with open(opt_names_path, "r") as f:
+        ordered_names_groups = json.load(f)  # list[list[str]]
+
+    name2param = dict(peft_mod.named_parameters())
+    # build param groups in the exact order
+    param_groups = []
+    for group_names in ordered_names_groups:
+        params_in_order = []
+        for n in group_names:
+            p = name2param.get(n, None)
+            if p is None:
+                raise RuntimeError(f"Param name from checkpoint not found in current model: {n}")
+            if not p.requires_grad:
+                # If training used this param, it should be trainable now
+                p.requires_grad_(True)
+            params_in_order.append(p)
+        param_groups.append({"params": params_in_order})
+    opt = AdamW(param_groups, lr=..., betas=..., eps=..., weight_decay=...)
+    state_dict = torch.load(str(optimizer_path), map_location="cpu")
+    opt.load_state_dict(state_dict)
+    # coverage print as you already do
+
+
+With this, coverage should be ≈100% and correct per-param step values will be restored as well.
