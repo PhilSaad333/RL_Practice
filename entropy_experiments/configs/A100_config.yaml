@@ -36,7 +36,7 @@ true_delta_h:
   clip_c: 10.0
   report_per_token: false
   measure: "p"  # Use p measure since top_p=1.0
-  lr_override: 2e-8
+  lr_override: 2e-7
 
 # === PROBE REUSE / LOGGING ===
 probe_reuse:
