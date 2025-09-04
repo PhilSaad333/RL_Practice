@@ -34,6 +34,78 @@ def _global_max_tensor(x: torch.Tensor) -> torch.Tensor:
         return y
     return x
 
+
+# Shared RL loss (naive path, minus PPO/KL) used by update-vector builders
+def rl_loss_naive(
+    U_batch: Dict[str, Any],
+    model: torch.nn.Module,
+    *,
+    temp: float,
+    mb_size: int,
+    amp_dtype: torch.dtype | None = None,
+    use_amp: bool = False,
+) -> torch.Tensor:
+    """Compute RL-aligned naive loss over U with exact slicing/masking/normalization.
+
+    Loss per prompt b: - sum_{g,t in gen} A_{b,g} * logp_{b,g,t} / (G * L_max_b)
+    Returns a scalar tensor on the model device. Does not zero or step optimizer.
+    """
+    device = next(model.parameters()).device
+    sequences = U_batch['sequences']          # [B_U, G, L]
+    prompt_lens = U_batch['prompt_lens']      # [B_U]
+    attention_masks = U_batch['attention_masks']  # [B_U, G, L]
+    advantages = U_batch['advantages'].to(device)        # [B_U, G]
+    max_lengths = U_batch['max_lengths']      # [B_U]
+    B_U, G, Lmax = sequences.shape
+
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    for start_b in range(0, B_U, mb_size):
+        end_b = min(start_b + mb_size, B_U)
+        B_mb = end_b - start_b
+
+        mb_seqs = sequences[start_b:end_b].to(device)
+        mb_masks = attention_masks[start_b:end_b].to(device)
+        mb_adv = advantages[start_b:end_b]
+        mb_Lmax = max_lengths[start_b:end_b]
+        mb_prompt = prompt_lens[start_b:end_b]
+
+        flat_seqs = mb_seqs.view(-1, Lmax)
+        flat_masks = mb_masks.view(-1, Lmax)
+
+        with torch.amp.autocast("cuda", dtype=amp_dtype or torch.bfloat16, enabled=use_amp):
+            logits = model(flat_seqs, attention_mask=flat_masks).logits
+        logits = (logits / max(float(temp), 1e-8)).float()
+        logp_all = torch.nn.functional.log_softmax(logits, dim=-1)
+        targets = flat_seqs[:, 1:].unsqueeze(-1)
+        new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)  # [B_mb*G, L-1]
+        new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+        new_logp = new_logp.view(B_mb, G, -1)
+
+        mb_loss_terms = []
+        for b in range(B_mb):
+            prompt_len = int(mb_prompt[b])
+            L_max_b = max(int(mb_Lmax[b]), 1)
+            gen_start = prompt_len - 1
+            lp_gen = new_logp[b, :, gen_start:]              # (G, Tg)
+            mask_gen = mb_masks[b, :, prompt_len:].float()   # (G, Tg)
+            if lp_gen.numel() == 0 or mask_gen.numel() == 0:
+                continue
+            Tg = min(lp_gen.shape[1], mask_gen.shape[1])
+            lp_gen = lp_gen[:, :Tg]
+            mask_gen = mask_gen[:, :Tg]
+
+            adv_exp = mb_adv[b].unsqueeze(1).expand(-1, Tg)    # (G, Tg)
+            weighted_logp = adv_exp * mask_gen * lp_gen
+            loss_b = -weighted_logp.sum() / (G * L_max_b + 1e-8)
+            mb_loss_terms.append(loss_b)
+
+        mb_loss = (
+            torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=device)
+        )
+        total_loss += (mb_loss * (B_mb / max(B_U, 1))).to(total_loss.dtype)
+
+    return total_loss
+
 class DeltaEntropyIS:
     def __init__(
         self,
@@ -405,72 +477,71 @@ class DeltaEntropyIS:
                 # sanitize & clamp like training
                 old_logp_full = torch.nan_to_num(old_logp_full, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
 
-        # === 2) Microbatch loop (identical structure) ===
-        total_loss = 0.0
-        num_microbatches = 0
-        for start_b in range(0, B_U, importance_mb_size):
-            end_b = min(start_b + importance_mb_size, B_U)
-            B_mb = end_b - start_b
+        # === 2) Loss/backward ===
+        if use_clipping:
+            # Retain PPO path as-is for parity if enabled
+            total_loss = 0.0
+            num_microbatches = 0
+            for start_b in range(0, B_U, importance_mb_size):
+                end_b = min(start_b + importance_mb_size, B_U)
+                B_mb = end_b - start_b
 
-            mb_seqs = sequences[start_b:end_b]
-            mb_masks = attention_masks[start_b:end_b]
-            mb_adv = advantages[start_b:end_b]
-            mb_Lmax = max_lengths[start_b:end_b]
-            mb_prompt = prompt_lens[start_b:end_b]
+                mb_seqs = sequences[start_b:end_b]
+                mb_masks = attention_masks[start_b:end_b]
+                mb_adv = advantages[start_b:end_b]
+                mb_Lmax = max_lengths[start_b:end_b]
+                mb_prompt = prompt_lens[start_b:end_b]
 
-            flat_seqs = mb_seqs.view(-1, max_len)
-            flat_masks = mb_masks.view(-1, max_len)
-            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                logits = self.model(flat_seqs, attention_mask=flat_masks).logits
+                flat_seqs = mb_seqs.view(-1, max_len)
+                flat_masks = mb_masks.view(-1, max_len)
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                    logits = self.model(flat_seqs, attention_mask=flat_masks).logits
 
-            # parity with training: temperature then float32 log-softmax
-            logits = (logits / max(temp, 1e-8)).float()
-            logp_all = F.log_softmax(logits, dim=-1)
-            targets = flat_seqs[:, 1:].unsqueeze(-1)
-            new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
-            new_logp = new_logp.view(B_mb, G, -1)
-            # sanitize/clamp
-            new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+                logits = (logits / max(temp, 1e-8)).float()
+                logp_all = F.log_softmax(logits, dim=-1)
+                targets = flat_seqs[:, 1:].unsqueeze(-1)
+                new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
+                new_logp = new_logp.view(B_mb, G, -1)
+                new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
 
-            mb_loss_terms = []
-            for b in range(B_mb):
-                prompt_len = int(mb_prompt[b])
-                L_max_b = max(int(mb_Lmax[b]), 1)
-                gen_start = prompt_len - 1
-                lp_gen = new_logp[b, :, gen_start:]                       # (G, Tg_b)
-                mask_gen = mb_masks[b, :, prompt_len:].float()            # (G, Tg_b)
-                if lp_gen.numel() == 0 or mask_gen.numel() == 0:
-                    continue
-                Tg = min(lp_gen.shape[1], mask_gen.shape[1])
-                lp_gen = lp_gen[:, :Tg]
-                mask_gen = mask_gen[:, :Tg]
+                mb_loss_terms = []
+                for b in range(B_mb):
+                    prompt_len = int(mb_prompt[b])
+                    L_max_b = max(int(mb_Lmax[b]), 1)
+                    gen_start = prompt_len - 1
+                    lp_gen = new_logp[b, :, gen_start:]
+                    mask_gen = mb_masks[b, :, prompt_len:].float()
+                    if lp_gen.numel() == 0 or mask_gen.numel() == 0:
+                        continue
+                    Tg = min(lp_gen.shape[1], mask_gen.shape[1])
+                    lp_gen = lp_gen[:, :Tg]
+                    mask_gen = mask_gen[:, :Tg]
 
-                if use_clipping:
-                    # Build old_logp for same slice
-                    old_lp_gen = old_logp_full[start_b + b, :, gen_start:gen_start+Tg]  # (G, Tg)
+                    # PPO clipping branch
+                    old_lp_gen = old_logp_full[start_b + b, :, gen_start:gen_start+Tg]
                     ratios = torch.exp((lp_gen - old_lp_gen).clamp(-80, 80)) * mask_gen
-                    adv_b = mb_adv[b].unsqueeze(-1)                                   # (G,1)
+                    adv_b = mb_adv[b].unsqueeze(-1)
                     surr1 = ratios * adv_b
                     surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv_b
-                    token_loss = -torch.min(surr1, surr2) * mask_gen                  # (G, Tg)
+                    token_loss = -torch.min(surr1, surr2) * mask_gen
                     loss_b = token_loss.sum() / (G * L_max_b + 1e-8)
-                    # Optional differentiable KL, same estimator as training
-                    if do_kl:
-                        with torch.no_grad():
-                            # build the same flat view (B_mb*G, L) for ref forward if needed; or reuse above logits with ref model
-                            pass  # (left as extension if you wire in ref_model and its tokenizer)
-                else:
-                    adv_exp = mb_adv[b].unsqueeze(1).expand(-1, Tg)                   # (G, Tg)
-                    weighted_logp = adv_exp * mask_gen * lp_gen
-                    loss_b = -weighted_logp.sum() / (G * L_max_b + 1e-8)
+                    mb_loss_terms.append(loss_b)
 
-                mb_loss_terms.append(loss_b)
-
-            mb_loss = torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=sequences.device)
-            scale = (B_mb / B_U) if B_U > 0 else 1.0
-            (mb_loss * scale).backward()
-            total_loss += mb_loss.item() * B_mb
-            num_microbatches += 1
+                mb_loss = torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=sequences.device)
+                scale = (B_mb / B_U) if B_U > 0 else 1.0
+                (mb_loss * scale).backward()
+                total_loss += mb_loss.item() * B_mb
+                num_microbatches += 1
+        else:
+            loss = rl_loss_naive(
+                U_batch,
+                self.model,
+                temp=temp,
+                mb_size=importance_mb_size,
+                amp_dtype=self.amp_dtype,
+                use_amp=self.use_amp,
+            )
+            loss.backward()
 
         # --- gradient clipping parity with training ---
         max_norm = float(self.config.get("max_grad_norm", 0.0))

@@ -22,6 +22,7 @@ from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
 from entropy_experiments.update_vector import (
     compute_update_vector_adamw,
     compute_update_vector_step,
+    compute_update_vector_adamw_manual,
 )
 from entropy_experiments.param_registry import flatten_named
 
@@ -71,7 +72,7 @@ def main():
     G_U = probe.config["batch_config"]["G"]
     U_batch = probe._get_or_sample_U(B_U, G_U)
 
-    # Compute both update vectors
+    # Compute update vectors
     vec_B, stats_B = compute_update_vector_step(
         model=probe.model,
         optimizer=probe.optimizer,
@@ -86,6 +87,13 @@ def main():
         config=probe.config,
         logger=probe.logger,
     )
+    vec_C, stats_C = compute_update_vector_adamw_manual(
+        model=probe.model,
+        optimizer=probe.optimizer,
+        U_batch=U_batch,
+        config=probe.config,
+        logger=probe.logger,
+    )
 
     # Compare
     cos = cosine_named(vec_A, vec_B)
@@ -93,11 +101,16 @@ def main():
     norm_B = float(torch.sqrt(sum((v.double() ** 2).sum() for v in vec_B.values())).item())
     ratio = (norm_A / norm_B) if norm_B > 0 else float("inf")
 
+    norm_C = float(torch.sqrt(sum((v.double() ** 2).sum() for v in vec_C.values())).item())
+    cos_AC = cosine_named(vec_A, vec_C)
+    cos_BC = cosine_named(vec_B, vec_C)
+
     print("=== Update Vector Comparison ===")
     print(f"Option A (adamw_from_grads): norm={norm_A:.6e}")
     print(f"Option B (single_step):      norm={norm_B:.6e}; lr_used={stats_B.get('lr_used', float('nan')):.3e}")
-    print(f"Cosine similarity: {cos:.6f}")
-    print(f"Norm ratio A/B:    {ratio:.6f}")
+    print(f"Option C (adamw_manual):     norm={norm_C:.6e}")
+    print(f"Cosine A↔B: {cos:.6f}  A↔C: {cos_AC:.6f}  B↔C: {cos_BC:.6f}")
+    print(f"Norm ratio A/B: {ratio:.6f}")
 
     # Save summary JSON
     out = {
@@ -107,6 +120,10 @@ def main():
         "norm_ratio_A_over_B": ratio,
         "stats_A": stats_A,
         "stats_B": stats_B,
+        "norm_C": norm_C,
+        "stats_C": stats_C,
+        "cos_AC": cos_AC,
+        "cos_BC": cos_BC,
         "B_U": B_U,
         "G_U": G_U,
         "mb_size": probe.config.get("true_delta_h", {}).get("microbatch_size", None),
@@ -120,4 +137,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
