@@ -562,7 +562,24 @@ class DeltaEntropyIS:
         self.logger.info(f"Original entropy (RB): H(I;E) = {H_orig:.6f}")
 
         # C) RL-aligned optimizer step on U
-        self._rl_update_streaming(U_batch, optimizer, rl_grad_accum, importance_mb_size)
+        # Optional override of learning rate for this single step
+        lr_backup = [pg.get('lr', None) for pg in optimizer.param_groups]
+        lr_override = cfg_importance.get('lr_override', None)
+        try:
+            if lr_override is not None:
+                lr_val = float(lr_override)
+                for pg in optimizer.param_groups:
+                    pg['lr'] = lr_val
+                self.logger.info(f"[RL] Using lr_override={lr_val} for single U update")
+            self._rl_update_streaming(U_batch, optimizer, rl_grad_accum, importance_mb_size)
+        finally:
+            # Restore original learning rates
+            try:
+                for pg, lr0 in zip(optimizer.param_groups, lr_backup):
+                    if lr0 is not None:
+                        pg['lr'] = lr0
+            except Exception:
+                pass
 
         # D) Updated entropy via SNIS with RB payload
         S_upd, RB_upd = self._eval_S_and_RB_on_E(E_batch, use_q_measure=use_q)

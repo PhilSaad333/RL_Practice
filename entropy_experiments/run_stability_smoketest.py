@@ -52,7 +52,7 @@ def _sample_EU(probe: OfflineEntropyProbe, B_E: int, B_U: int, G_U: int):
     return E_batch, U_batch
 
 
-def _run_delta_is(probe: OfflineEntropyProbe, E_batch, U_batch, measure: str | None):
+def _run_delta_is(probe: OfflineEntropyProbe, E_batch, U_batch, measure: str | None, lr_override: float | None):
     # Build minimal cfg_importance matching probe conventions
     cfg_importance = {
         'training_loss': probe.config.get('true_delta_h', {}).get('training_loss', 'rl'),
@@ -64,6 +64,8 @@ def _run_delta_is(probe: OfflineEntropyProbe, E_batch, U_batch, measure: str | N
     }
     if measure is not None:
         cfg_importance['measure'] = measure  # 'p' or 'q' (auto if None)
+    if lr_override is not None:
+        cfg_importance['lr_override'] = float(lr_override)
 
     de = DeltaEntropyIS(
         model=probe.model,
@@ -86,6 +88,7 @@ def main():
     ap.add_argument('--G_U', type=int, default=4)
     ap.add_argument('--seed', type=int, default=None)
     ap.add_argument('--results_path', type=str, default='entropy_experiments/results/stability_smoketest.json')
+    ap.add_argument('--lr_override', type=float, default=None)
     args = ap.parse_args()
 
     temps = [float(x.strip()) for x in args.temps.split(',') if x.strip()]
@@ -113,9 +116,9 @@ def main():
         E_batch, U_batch = _sample_EU(probe, args.B_E, args.B_U, args.G_U)
 
         # Run three variants: measure='p', measure='q', and auto (None)
-        out_p = _run_delta_is(probe, E_batch, U_batch, measure='p')
-        out_q = _run_delta_is(probe, E_batch, U_batch, measure='q')
-        out_auto = _run_delta_is(probe, E_batch, U_batch, measure=None)
+        out_p = _run_delta_is(probe, E_batch, U_batch, measure='p', lr_override=args.lr_override)
+        out_q = _run_delta_is(probe, E_batch, U_batch, measure='q', lr_override=args.lr_override)
+        out_auto = _run_delta_is(probe, E_batch, U_batch, measure=None, lr_override=args.lr_override)
 
         def pick(o):
             di = o.get('diagnostics', {})
@@ -191,4 +194,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

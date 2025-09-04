@@ -818,7 +818,8 @@ class OfflineEntropyProbe:
                     'is_mode': self.config.get('true_delta_h', {}).get('is_mode', 'snis'),
                     'clip_c': self.config.get('true_delta_h', {}).get('clip_c', 10.0),
                     'report_per_token': self.config.get('true_delta_h', {}).get('report_per_token', False),
-                    'snapshot_device': self.config.get('true_delta_h', {}).get('snapshot_device', 'cpu')
+                    'snapshot_device': self.config.get('true_delta_h', {}).get('snapshot_device', 'cpu'),
+                    'lr_override': self.config.get('true_delta_h', {}).get('lr_override', None),
                 }
                 
                 # Compute ground-truth entropy change
