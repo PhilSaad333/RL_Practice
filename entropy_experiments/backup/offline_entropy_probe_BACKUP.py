@@ -8,9 +8,9 @@ based on the theory from RL_studies.pdf.
 Key functionality:
 - Load LoRA/QLoRA adapter and Adam optimizer state
 - Sample batches of prompts and responses - E batch for "evaluation" or "entropy", U batch for "update"  
-- Compute first-order entropy change prediction δH₁ after updating with U batch, using E batch to estimate entropy gradient
-- Compute estimators of the variance of δH₁ (optional, config-driven) to get a sense of uncertainty
-- Measure actual entropy change ΔH via importance sampling (entropy estimated on E batch before/after update with U batch)
+- Compute first-order entropy change prediction ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â´HÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â after updating with U batch, using E batch to estimate entropy gradient
+- Compute estimators of the variance of ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â´HÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â (optional, config-driven) to get a sense of uncertainty
+- Measure actual entropy change ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂH via importance sampling (entropy estimated on E batch before/after update with U batch)
 
 Usage:
     probe = OfflineEntropyProbe(config)
@@ -18,7 +18,7 @@ Usage:
 """
 
 # === Model and optimizer loading ===
-from .model_loader import load_peft_for_probe, load_adam_optimizer_from_path
+from entropy_experiments.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
 
 import torch
 import torch.distributed as dist
@@ -36,20 +36,20 @@ from pathlib import Path
 import yaml
 import json
 
-from .probe_components import ProbeComponents
-from .adam_preconditioner import AdamPreconditioner  
-from .delta_entropy_is import DeltaEntropyIS
-from . import distributed_helpers
-from .distributed_helpers import DistributedHelpers
-from .detailed_logger import DetailedLogger
+from entropy_experiments.probe_components import ProbeComponents
+from entropy_experiments.adam_preconditioner import AdamPreconditioner  
+from entropy_experiments.delta_entropy_is import DeltaEntropyIS
+import entropy_experiments.distributed_helpers as distributed_helpers
+from entropy_experiments.distributed_helpers import DistributedHelpers
+from entropy_experiments.detailed_logger import DetailedLogger
 
 
 class OfflineEntropyProbe:
     """
     Offline entropy probe for analyzing entropy changes in RL training.
     
-    This implements the complete pipeline for measuring δH₁ (predicted entropy change)
-    and ΔH (actual entropy change) given a training checkpoint.
+    This implements the complete pipeline for measuring ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â´HÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â (predicted entropy change)
+    and ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂH (actual entropy change) given a training checkpoint.
 
     Main method is run_mixed_probe.
     """
@@ -312,20 +312,30 @@ class OfflineEntropyProbe:
 
         gen_cfg = self.config.get('generation', {})
         
-        est_mode = (self.config.get('estimator', {}) or {}).get('x_estimator_mode', 'naive')
+        # Estimator mode for X (delta_h1). Allow forcing simple entropy via config.
+        est_cfg = (self.config.get('estimator', {}) or {})
+        force_simple = bool(est_cfg.get('use_simple_entropy_for_x', False))
+        est_mode = est_cfg.get('x_estimator_mode', 'naive')
+        if force_simple and est_mode != 'naive':
+            self.logger.info(
+                f"Overriding x_estimator_mode='{est_mode}' ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 'naive' (use_simple_entropy_for_x=true)"
+            )
+            est_mode = 'naive'
         rb_rg_cfg = gen_cfg.get('rb_requires_grad', False)
         rb_rg_final = True if est_mode == 'rb_residual' else rb_rg_cfg
         
         if est_mode == 'rb_residual' and not rb_rg_cfg:
             self.logger.warning(
-                f"OVERRIDING rb_requires_grad: {rb_rg_cfg} → True (required for x_estimator_mode=rb_residual)"
+                f"OVERRIDING rb_requires_grad: {rb_rg_cfg} ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ True (required for x_estimator_mode=rb_residual)"
             )
         
         self.logger.info(f"SequenceProcessor config: x_estimator_mode={est_mode}, rb_requires_grad={rb_rg_final}")
         
+        # Enforce full-support proposal across entropy_experiments runs
+        forced_top_p = 1.0
         sp_cfg = GenerationConfig(
             temperature=gen_cfg.get('temperature', 1.0),
-            top_p=gen_cfg.get('top_p', 1.0),
+            top_p=forced_top_p,
             max_new_tokens=gen_cfg.get('max_new_tokens', 256),
             do_sample=True,
             num_return_sequences=self.config['batch_config']['G'],
@@ -334,6 +344,12 @@ class OfflineEntropyProbe:
             rb_requires_grad=rb_rg_final,
         )
         self._sequence_processor = SequenceProcessor(self.model, tok, sp_cfg)
+        try:
+            self.logger.info(
+                f"[IS] Generation config enforced: top_p=1.0; temperature={sp_cfg.temperature}"
+            )
+        except Exception:
+            pass
         # Ensure DeltaEntropyIS uses the same SequenceProcessor (if already constructed)
         if hasattr(self, 'delta_entropy_is') and self.delta_entropy_is is not None:
             try:
@@ -390,6 +406,13 @@ class OfflineEntropyProbe:
             self.logger.info(f"Using single split: '{E_split}' for both E and U batches")
 
         # E: with replacement, G=1, compute RB for X if needed later
+        # Log E-generation config reminder (top_p forced to 1.0)
+        try:
+            self.logger.info(
+                f"[IS] E-generation: top_p forced to 1.0; temperature={self._sequence_processor.config.temperature}"
+            )
+        except Exception:
+            pass
         E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
             total_sequences=B_E,
             dataset_name=ds_name,
@@ -469,6 +492,13 @@ class OfflineEntropyProbe:
             assert int(E_batch.get('num_responses_per_prompt', 1)) == 1, "Cached E-batch must have G=1"
             return E_batch
         E_split, _ = self._get_splits()
+        # Log E-generation config reminder (top_p forced to 1.0)
+        try:
+            self.logger.info(
+                f"[IS] E-generation: top_p forced to 1.0; temperature={self._sequence_processor.config.temperature}"
+            )
+        except Exception:
+            pass
         E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
             total_sequences=B_E,
             dataset_name=self.config['batch_config']['dataset_name'],
@@ -537,9 +567,9 @@ class OfflineEntropyProbe:
         STAGE 1: Run mixed E/U batch entropy probe analysis.
         
         This implements the new approach with separate evaluation (E) and update (U) batches:
-        - E batch: Used for computing X gradients (∇H_w)
-        - U batch: Used for computing Y gradients (P∇J, preconditioned)
-        - Estimator: δH₁ = lr * (X̄ · Ȳ)
+        - E batch: Used for computing X gradients (ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Â¹ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¡H_w)
+        - U batch: Used for computing Y gradients (PÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Â¹ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¡J, preconditioned)
+        - Estimator: ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â´HÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â = lr * (XÃƒÆ’Ã†â€™Ãƒâ€¦Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· ÃƒÆ’Ã†â€™Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²)
         
         Returns:
             Dict with deltaH1, bars_dot, B_E, B_U, timing, and diagnostics
@@ -691,6 +721,14 @@ class OfflineEntropyProbe:
                 
                 self.logger.info(f"Single GPU: using random sampling")
             
+            # Initialize variables for later stages  
+            probe_config = self.config.get('computation_options', {})
+            compute_delta_h1 = probe_config.get('compute_delta_h1', True)
+            delta_h1 = 0.0
+            bars_dot = 0.0
+            learning_rate = 0.0
+            phase1_time = phase2_time = phase3_time = 0.0
+            
             # Phase 0: Sampling E and U batches (with optional cache reuse)
             self.logger.info("Phase 0: Sampling E and U batches")
             if self.detailed_logger:
@@ -705,91 +743,19 @@ class OfflineEntropyProbe:
             self.logger.info(f"Phase 0 complete: {phase0_time:.2f}s")
             self.logger.info(f"E-batch: G=1 (replacement), {E_batch['sequences'].shape[0]} prompts, {E_batch['sequences'].shape[1]} responses/prompt")
             self.logger.info(f"U-batch: G={G_U} (distinct), {U_batch['sequences'].shape[0]} prompts, {U_batch['sequences'].shape[1]} responses/prompt")
-            
+
             # Log batch data for detailed logging
             if self.detailed_logger:
                 self.detailed_logger.log_phase_end("phase0_sampling")
                 self.detailed_logger.log_batch_data("E_batch", E_batch)
                 self.detailed_logger.log_batch_data("U_batch", U_batch)
             
-            # Check if δH₁ computation should be performed
-            probe_config = self.config.get('computation_options', {})
-            compute_delta_h1 = probe_config.get('compute_delta_h1', True)
-            
-            # Initialize variables for potential use in later stages
-            delta_h1 = 0.0
-            bars_dot = 0.0
-            learning_rate = 0.0
-            phase1_time = phase2_time = phase3_time = 0.0
-            B_E_global = B_E_local if not is_dist else None
-            B_U_global = B_U_local if not is_dist else None
-            
-            if compute_delta_h1:
-                self.logger.info("Phase 1–3: Computing delta H1 from E/U batches")
-                compute = self.probe_components.compute_delta_h1_from_batches(
-                    E_batch=E_batch,
-                    U_batch=U_batch,
-                    mb_size_prompts=mb_size_prompts,
-                    weighting_mode=weighting_mode,
-                    adam_preconditioner=self.adam_preconditioner,
-                    optimizer=self.optimizer,
-                )
-                delta_h1 = compute['deltaH1']
-                bars_dot = compute['bars_dot']
-                learning_rate = compute['learning_rate']
-                phase1_time = compute['timing']['phase1_time']
-                phase2_time = compute['timing']['phase2_time']
-                phase3_time = compute['timing']['phase3_time']
-                B_E_global = B_E
-                B_U_global = B_U
-                self.logger.info(f"[RESULTS] bars_dot={bars_dot:.10f}, lr={learning_rate:.2e}, deltaH1={delta_h1:.10f}")
-                # Optional LR sweep
-                lr_sweep = (self.config.get('probe_reuse', {}) or {}).get('lr_sweep', None)
-                sweep_results = None
-                if lr_sweep:
-                    base_bars_dot = bars_dot
-                    deltaH1_list = [float(float(lr_i) * base_bars_dot) for lr_i in lr_sweep]
-                    gt_list = []
-                    if self.config.get('true_delta_h', {}).get('enabled', False):
-                        cfg_importance = {
-                            'training_loss': self.config.get('true_delta_h', {}).get('training_loss', 'nll'),
-                            'importance_microbatch_size': self.config.get('true_delta_h', {}).get('microbatch_size', 1),
-                            'is_mode': self.config.get('true_delta_h', {}).get('is_mode', 'snis'),
-                            'clip_c': self.config.get('true_delta_h', {}).get('clip_c', 10.0),
-                            'report_per_token': self.config.get('true_delta_h', {}).get('report_per_token', False),
-                            'snapshot_device': self.config.get('true_delta_h', {}).get('snapshot_device', 'cpu')
-                        }
-                        saved_lr = self.optimizer.param_groups[0]['lr']
-                        try:
-                            for lr_i in lr_sweep:
-                                self.optimizer.param_groups[0]['lr'] = float(lr_i)
-                                gt = self.delta_entropy_is.entropy_change_two_batch(
-                                    self.model, E_batch, U_batch, self.optimizer, cfg_importance
-                                )
-                                gt_list.append(gt)
-                        finally:
-                            self.optimizer.param_groups[0]['lr'] = saved_lr
-                    sweep_results = {
-                        'lrs': [float(x) for x in lr_sweep],
-                        'deltaH1': deltaH1_list,
-                        'ground_truth': gt_list,
-                    }
-            else:
-                self.logger.info("δH₁ computation disabled (compute_delta_h1=False)")
-                # Set global batch sizes for downstream use
-                if is_dist:
-                    B_E_global = distributed_helpers.count_global(B_E_local)
-                    B_U_global = distributed_helpers.count_global(B_U_local)
-                else:
-                    B_E_global = B_E_local
-                    B_U_global = B_U_local
-            
             
             # ================================================================
             # STAGE 2: Two-Batch Ground-Truth Entropy Change - Optional
             # ================================================================
-            compute_importance_sampling = probe_config.get('compute_importance_sampling', False)
-            importance_enabled = self.config.get('true_delta_h', {}).get('enabled', False) or compute_importance_sampling
+            compute_importance_sampling = True
+            importance_enabled = True
             ground_truth_results = {}
             
             if importance_enabled:
@@ -816,7 +782,8 @@ class OfflineEntropyProbe:
                     'is_mode': self.config.get('true_delta_h', {}).get('is_mode', 'snis'),
                     'clip_c': self.config.get('true_delta_h', {}).get('clip_c', 10.0),
                     'report_per_token': self.config.get('true_delta_h', {}).get('report_per_token', False),
-                    'snapshot_device': self.config.get('true_delta_h', {}).get('snapshot_device', 'cpu')
+                    'snapshot_device': self.config.get('true_delta_h', {}).get('snapshot_device', 'cpu'),
+                    'lr_override': self.config.get('true_delta_h', {}).get('lr_override', None),
                 }
                 
                 # Compute ground-truth entropy change
@@ -825,7 +792,7 @@ class OfflineEntropyProbe:
                 )
                 
                 phase5_time = time.time() - phase5_start
-                self.logger.info(f"🔍 [GROUND-TRUTH] deltaH_true={ground_truth_results['deltaH_true']:.10f}")
+                self.logger.info(f"ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â [GROUND-TRUTH] deltaH_true={ground_truth_results['deltaH_true']:.10f}")
                 self.logger.info(f"Phase 5 complete: {phase5_time:.2f}s")
                 
                 # Log ground truth results for detailed logging
@@ -840,7 +807,34 @@ class OfflineEntropyProbe:
                             details['S_orig'], details['S_upd'],
                             details['RB_orig'], details['RB_upd']
                         )
-            
+
+            # Reuse ÃƒÅ½Ã¢â‚¬ÂÃƒÅ½Ã‚Â¸ from ground-truth to compute ÃƒÅ½Ã‚Â´H1
+            param_update_buf_named = ground_truth_results.get('param_update_buf_named', None)
+            if param_update_buf_named is None:
+                raise RuntimeError("Ground-truth results did not include param_update_buf_named; cannot compute deltaH1")
+            self.logger.info(
+                f"Phase 2-3: Computing Xbar on E and deltaH1 using ÃƒÅ½Ã¢â‚¬ÂÃƒÅ½Ã‚Â¸ from ground-truth "
+                f"(||ÃƒÅ½Ã¢â‚¬ÂÃƒÅ½Ã‚Â¸||={ground_truth_results.get('param_update_l2', 0.0):.3e})"
+            )
+            compute = self.probe_components.compute_delta_h1_from_batches(
+                E_batch=E_batch,
+                U_batch=U_batch,
+                mb_size_prompts=mb_size_prompts,
+                weighting_mode=weighting_mode,
+                adam_preconditioner=self.adam_preconditioner,
+                optimizer=self.optimizer,
+                param_update_buf=param_update_buf_named,
+            )
+            delta_h1 = compute['deltaH1']
+            bars_dot = compute['bars_dot']
+            learning_rate = compute['learning_rate']
+            phase1_time = compute['timing']['phase1_time']
+            phase2_time = compute['timing']['phase2_time']
+            phase3_time = compute['timing']['phase3_time']
+            B_E_global = B_E
+            B_U_global = B_U
+            self.logger.info(f"[RESULTS][delta-theta(reuse)] bars_dot={bars_dot:.10f}, deltaH1={delta_h1:.10f}")
+
             # ================================================================
             # Compile Final Results  
             # ================================================================
@@ -874,16 +868,19 @@ class OfflineEntropyProbe:
                 results['sweep'] = sweep_results
             
             
-            # Add Stage 2 ground-truth results if computed
-            if importance_enabled:
-                results.update({
-                    **ground_truth_results,
-                    "importance_enabled": True
-                })
-                results["timing"]["phase5_importance"] = phase5_time
+            # Add Stage 2 ground-truth results (always)
+            # Optionally drop the raw ÃƒÅ½Ã¢â‚¬ÂÃƒÅ½Ã‚Â¸ buffer from output to keep JSONs small
+            log_buf = bool(self.config.get('probe_reuse', {}).get('log_param_update_buf', False))
+            gt_copy = dict(ground_truth_results)
+            if not log_buf and 'param_update_buf_named' in gt_copy:
+                gt_copy.pop('param_update_buf_named', None)
+            results.update({
+                **gt_copy,
+                "importance_enabled": True,
+            })
+            results["timing"]["phase5_importance"] = phase5_time
             
-            stage = "Stage 1+2" if importance_enabled else "Stage 1"
-            self.logger.info(f"{stage} Mixed probe analysis completed in {total_time:.2f}s")
+            self.logger.info(f"Stage 1+2 Mixed probe analysis completed in {total_time:.2f}s")
             
             # Finalize detailed logging
             if self.detailed_logger:
@@ -912,7 +909,62 @@ class OfflineEntropyProbe:
             with open(results_path, 'w') as f:
                 json.dump(results, f, indent=2, default=str)
             self.logger.info(f"Results saved to {results_path}")
-            
+        
+    def _compute_param_update_buffer(self, U_batch: Dict[str, Any], mb_size_prompts: int) -> tuple[dict[int, torch.Tensor], float, int]:
+        """Compute actual parameter update (Delta-theta) via a real RL step on U, with snapshot/restore.
+
+        Returns: (delta_theta_buf, l2_norm, B_U_used)
+        """
+        assert self.delta_entropy_is is not None, "DeltaEntropyIS component required"
+        # Canonical trainables: match ProbeComponents' registry (requires_grad on PEFT-wrapped model)
+        peft_model = self.model.module if hasattr(self.model, "module") else self.model
+        trainable_params = [p for _, p in peft_model.named_parameters() if p.requires_grad]
+
+        # Snapshot parameters and optimizer
+        cpu_snaps, opt_state_snapshot = self.delta_entropy_is._snapshot_model_optimizer(self.model, self.optimizer, snapshot_device='cpu')
+        before: dict[int, torch.Tensor] = {id(p): p.detach().to('cpu', torch.float32).clone() for p in trainable_params}
+
+        # Perform the real RL step
+        rl_grad_accum = int(self.config.get('computation_options', {}).get('rl_grad_accum', 1))
+        importance_mb_size = int(self.config.get('true_delta_h', {}).get('microbatch_size', 1))
+        # Optional: override LR for this single delta-theta step (scales ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ directly)
+        lr_backup = [pg.get('lr', None) for pg in self.optimizer.param_groups]
+        lr_override = (
+            self.config.get('computation_options', {}).get('delta_theta_lr_override', None)
+            or self.config.get('true_delta_h', {}).get('lr_override', None)
+        )
+        try:
+            if lr_override is not None:
+                lr_val = float(lr_override)
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = lr_val
+                self.logger.info(f"[delta-theta] Using lr_override={lr_val} for single U update")
+            self.delta_entropy_is._rl_update_streaming(U_batch, self.optimizer, rl_grad_accum, importance_mb_size)
+        finally:
+            try:
+                for pg, lr0 in zip(self.optimizer.param_groups, lr_backup):
+                    if lr0 is not None:
+                        pg['lr'] = lr0
+            except Exception:
+                pass
+
+        # Compute Delta-theta on CPU
+        delta_theta: dict[int, torch.Tensor] = {}
+        l2 = torch.zeros((), dtype=torch.float64)
+        with torch.no_grad():
+            for p in trainable_params:
+                pid = id(p)
+                after = p.detach().to('cpu', torch.float32)
+                dth = (after - before[pid]).contiguous()
+                delta_theta[pid] = dth
+                l2 += (dth.double().pow(2).sum())
+        l2 = float(l2.sqrt().item())
+
+        # Restore model and optimizer
+        self.delta_entropy_is._restore_model_optimizer(self.model, self.optimizer, cpu_snaps, opt_state_snapshot)
+        B_U_used = int(U_batch.get('num_prompts', len(U_batch.get('max_lengths', []))))
+        return delta_theta, l2, B_U_used
+
             
     @classmethod
     def from_config_file(cls, config_path: str) -> 'OfflineEntropyProbe':
