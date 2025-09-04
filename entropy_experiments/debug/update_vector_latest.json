@@ -1,0 +1,35 @@
+{
+  "cos_AB": 0.31084582392342136,
+  "cos_AC": 0.9749706751338315,
+  "cos_BC": 0.3102601011899865,
+  "norm_A": 4504.867606010918,
+  "norm_B": 1478.3933866090588,
+  "norm_C": 4539.804446297843,
+  "norm_ratio_A_over_B": 3.0471372821435447,
+  "l2_diff_BC": 4316.338443378309,
+  "l2_diff_AC": 1012.4134237914918,
+  "stats_A": {
+    "method": "adamw_from_grads",
+    "vec_norm": 4504.867606010918,
+    "num_params": 392,
+    "avg_mb_loss": 0.0019356629345566034,
+    "num_microbatches": 4
+  },
+  "stats_B": {
+    "method": "single_step",
+    "lr_groups": [
+      2e-06
+    ],
+    "vec_norm": 1478.3933866090588,
+    "num_params": 392
+  },
+  "stats_C": {
+    "method": "adamw_manual",
+    "vec_norm": 4539.804446297843,
+    "adam_comp_norm": 4539.804448449495,
+    "wd_comp_norm": 0.6625977608551292
+  },
+  "B_U": 4,
+  "G_U": 4,
+  "mb_size": 1
+}

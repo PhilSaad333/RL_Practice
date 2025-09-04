@@ -87,9 +87,10 @@ def _adamw_direction_from_grads(
         t_eff = step + 1
         bc1 = 1.0 - (beta1 ** t_eff)
         bc2 = 1.0 - (beta2 ** t_eff)
-        step_factor = (bc2 ** 0.5) / max(bc1, 1e-16)
-
-        denom = exp_avg_sq_t.sqrt().add(eps)
+        # torch.optim.AdamW bias correction:
+        # step_size_per_lr = 1 / bc1; denom = sqrt(v_t)/sqrt(bc2) + eps
+        step_factor = 1.0 / max(bc1, 1e-16)
+        denom = exp_avg_sq_t.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
         adam_dir = -step_factor * (exp_avg_t / denom)
         wd_dir = -weight_decay * p.detach()
         direction = (adam_dir + wd_dir)
@@ -312,8 +313,8 @@ def compute_update_vector_adamw_manual(
         bc1 = 1.0 - (beta1 ** t_eff)
         bc2 = 1.0 - (beta2 ** t_eff)
         # Match torch.optim.AdamW: per-lr step factor = sqrt(bc2) / bc1
-        step_per_lr = (max(bc2, 1e-16) ** 0.5) / max(bc1, 1e-16)
-        denom = exp_avg_sq_t.sqrt().add(eps)
+        step_per_lr = 1.0 / max(bc1, 1e-16)
+        denom = exp_avg_sq_t.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
         adam_comp = -(step_per_lr) * (exp_avg_t / denom)
         wd_comp = -weight_decay * p.detach()
         v = (adam_comp + wd_comp).detach().to("cpu", torch.float32)
