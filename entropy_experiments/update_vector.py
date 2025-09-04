@@ -303,8 +303,8 @@ def compute_update_vector_adamw_manual(
         wd_comp = -weight_decay * p.detach()
         v = (adam_comp + wd_comp).detach().to("cpu", torch.float32)
         vec_named[name] = v
-        adam_norm += (adam_comp.double() ** 2).sum()
-        wd_norm += (wd_comp.double() ** 2).sum()
+        adam_norm += (adam_comp.detach().to("cpu", torch.float64) ** 2).sum()
+        wd_norm += (wd_comp.detach().to("cpu", torch.float64) ** 2).sum()
 
     # Clear grads
     model.zero_grad(set_to_none=True)
