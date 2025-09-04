@@ -542,6 +542,8 @@ class DeltaEntropyIS:
                 use_amp=self.use_amp,
             )
             loss.backward()
+            total_loss = float(loss.item())
+            num_microbatches = (B_U + importance_mb_size - 1) // importance_mb_size
 
         # --- gradient clipping parity with training ---
         max_norm = float(self.config.get("max_grad_norm", 0.0))
