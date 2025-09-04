@@ -297,7 +297,8 @@ def compute_update_vector_adamw_manual(
         t_eff = step + 1
         bc1 = 1.0 - (beta1 ** t_eff)
         bc2 = 1.0 - (beta2 ** t_eff)
-        step_per_lr = (bc1 / max(bc2, 1e-16) ** 0.5)
+        # Match torch.optim.AdamW: per-lr step factor = sqrt(bc2) / bc1
+        step_per_lr = (max(bc2, 1e-16) ** 0.5) / max(bc1, 1e-16)
         denom = exp_avg_sq_t.sqrt().add(eps)
         adam_comp = -(step_per_lr) * (exp_avg_t / denom)
         wd_comp = -weight_decay * p.detach()

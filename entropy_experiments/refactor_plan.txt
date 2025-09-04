@@ -1,0 +1,121 @@
+Here’s a focused, file-by-file plan that incorporates your five points and the functional_call/jvp approach. It’s sequenced so we can validate equivalence (Option A vs B), then flip the probe to the new single‑source “update_vector” flow, and keep curvature as a separate diagnostic.
+
+Design Pillars
+
+Single source of truth for trainables/buffers and their names.
+Name‑keyed, CPU fp32 update_vector = Δθ / lr_used as the primary artifact.
+Functional evaluation for SNIS at θ + η·update_vector; no in‑place mutation.
+δH1 = η·<X̄, update_vector>; curvature optional and separate.
+New Modules
+
+entropy_experiments/param_registry.py
+
+get_trainable_named(model): returns OrderedDict[name → Parameter] for requires_grad True (adapters).
+get_named_buffers(model): returns OrderedDict[name → Tensor] for buffers.
+get_full_params_dict(model): union or helper to collect named params (trainable or all; use Docstrings to clarify).
+map_name↔param helpers; dtype/device conversion helpers.
+Acceptance: identical names/ordering across all call sites; used everywhere we build param/buffer dicts.
+entropy_experiments/update_vector.py
+
+Option A — Adam‑style direction (no optimizer step):
+compute_update_vector_adam(U_batch, model, optimizer_state, config) -> (name→Tensor fp32 CPU, stats)
+Uses your RL loss on U, computes per‑param grads, applies a corrected Adam‑like transform that accounts for:
+weight decay (decoupled if using AdamW); momentum (m, v with bias correction); epsilon; optional grad clipping as in training.
+Outputs s_t in model param shapes; define update_vector = −s_t (vector only, not multiplied by lr).
+Notes: we will improve AdamPreconditioner (or inline it here) to reflect true Adam/AdamW update math.
+Option B — Single real step snapshot (equivalence baseline):
+compute_update_vector_step(U_batch, model, optimizer, config) -> (name→Tensor fp32 CPU, stats)
+Snap model+opt; one optimizer step on U; Δθ = θ_after − θ_before; update_vector = Δθ / lr_used; restore snapshots.
+Cross‑check:
+Small U batch test: assert cosine similarity and norm ratio between vectors from A vs B within tolerance (e.g., cos > 0.99; norms within 2%).
+Acceptance: A ≈ B on your current configs; stats report lr_used, vec_norm, max_abs, nonzero_count.
+entropy_experiments/entropy_curvature.py (diagnostic, separate)
+
+curvature_metrics(E_batch, model, update_vector, mode='rb'|'naive', mb_size=…)
+Computes on E:
+gradH (scalar RB or naive entropy) via TF pass (eval mode).
+HVP along s via forward‑over‑reverse: jvp(grad(H), θ, s) on named params (using central registry).
+Metrics: grad_dot_s, sHs, curv_dir = sHs/||s||^2, eta_star = 2|grad_dot_s|/|sHs|.
+Acceptance: finite metrics; quick smoke tests vs. finite difference on tiny subsets; supports RB and naive.
+Modified Modules
+
+entropy_experiments/delta_entropy_is.py
+
+Remove in‑place update path (no fallback retained).
+Add functional evaluation entrypoint:
+entropy_change_with_update_vector(E_batch, update_vector, etas: List[float], measure='p'|'q') -> dict with per‑η results:
+S_orig/RB_orig computed once at θ.
+For each η: build params_patched = {p + η·update_vector[name]} and call SequenceProcessor TF with torch.func.functional_call(model, (params_patched, buffers), ...) to obtain S_upd/RB_upd; then compute SNIS.
+Diagnostics preserved: ESS, ESS_fraction, global max shift, fp64 accumulation, per‑token as you have now.
+Acceptance: for η = lr_used, SNIS matches the old in‑place path within tolerance; for multiple η, H(η) behaves smoothly.
+entropy_experiments/offline_entropy_probe.py
+
+Restructure the run to always do both δH1 and ground‑truth using the same update_vector:
+Sample E and U (unchanged).
+Build update_vector using update_vector.py (default Option A; run Option B in smoke test only).
+δH1: compute X̄ (unchanged TF path on E) and report δH1(η) = η·<X̄, update_vector> (for η from sweep and at lr_used).
+Ground truth (SNIS): call delta_entropy_is.entropy_change_with_update_vector with etas sweep.
+Save results; do not JSON‑dump the raw vector by default (gate remains via probe_reuse.log_param_update_buf: false).
+Remove legacy Δθ step and toggles (compute_importance_sampling, true_delta_h.enabled), as per your directive.
+Acceptance: δH1 and SNIS both present in results; single source update_vector used end‑to‑end.
+entropy_experiments/probe_components.py
+
+No Δθ construction; keep X accumulation and dot routine.
+Ensure dot uses name‑keyed buffers (keep your coerce_buffer_to_id_keys for compatibility).
+Acceptance: unchanged numerics for X̄; dot with name‑keyed update_vector matches id‑keyed mapping.
+Config Changes
+
+Simplify and centralize:
+Remove: true_delta_h.enabled, compute_importance_sampling.
+Add:
+update_vector:
+source: "adam" | "single_step" (default "adam")
+microbatch_size: int
+correct_adamw: true (apply decoupled weight decay; bias‑correct m̂, v̂)
+sweep:
+enable: true
+etas: [0.25, 0.5, 1.0] (example)
+curvature:
+enabled: false
+mode: "rb" | "naive"
+hvp_mb_size: 1
+max_prompts: 64
+probe_reuse:
+log_param_update_buf: false (keep raw vectors out of JSON by default)
+Acceptance: one YAML drives both δH1 and SNIS with update_vector and η sweep.
+Sequencing
+
+Central registry
+Add param_registry.py; refactor call sites in delta_entropy_is and update_vector to use it.
+Implement update_vector.py with both options
+Correct AdamW math; add equivalence tests against single step.
+Functional evaluation in delta_entropy_is
+Implement entropy_change_with_update_vector (p|q measure preserved).
+Keep existing SNIS numerics (fp64, global max).
+Rewire offline_entropy_probe
+Always: compute update_vector → δH1(η) → SNIS(η).
+Remove old toggles; keep log gate for raw buffers.
+Curvature module (separate)
+Implement RB|naive options; add a small runner to sample a subset of E for quick readout.
+Smoke tests
+Option A vs B vector agreement.
+η sweep: δH1(η) vs SNIS(η) sign/magnitude sanity.
+Curvature: finite values; tiny FD cross‑check.
+Implementation Notes
+
+Dtype/device: keep update_vector as CPU fp32; when patching for functional_call, cast to param dtype/device for each name; buffers passed via second dict.
+PEFT/LoRA: only adapter params are trainable; registry filters by requires_grad; names come from named_parameters() of the PEFT‑wrapped module; tied weights handled by PyTorch; no parametrizations expected for LoRA.
+Eval‑mode: enforce eval() for TF/RB and restore state (done).
+HVP path: prefer jvp(grad(f)); fall back to autograd.grad(grad_outputs=s) if needed; microbatch E.
+What We Can Remove
+
+_compute_param_update_buffer and in‑place RL step in the probe (we’ll rely on backups as you said).
+The in‑place SNIS update path in delta_entropy_is.py.
+Feature flags for enabling/disabling ground‑truth; always compute both.
+Accept/Exit Criteria
+
+Update vector Option A ≈ Option B on your current config (cosine similarity > 0.99).
+For η = lr_used, functional SNIS ≈ old in‑place SNIS within small tolerance.
+δH1(η) linear in η; SNIS(η) close to δH1 at small η, diverging reasonably as η grows.
+Curvature metrics are finite and provide η* magnitude consistent with observed divergence point.
+Want me to start with step 1 (param_registry + update_vector Option A/B skeletons) and wire a quick smoketest to compare vectors before we cut over the probe?
