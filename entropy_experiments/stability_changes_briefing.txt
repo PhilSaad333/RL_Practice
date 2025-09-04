@@ -1,0 +1,66 @@
+Title: Stability Updates for SNIS and Generation (Runbook for GPU Assistant)
+
+Summary
+- Enforce full-support proposal for E: top_p=1.0 in the probe’s SequenceProcessor.
+- Evaluate S/RB in eval-mode (dropout/bn off) to remove stochastic noise.
+- SNIS weights use a global MAX shift and compute all sums in float64; DDP-safe reductions.
+- Auto-select q-measure for IS weights when temperature ≠ 1.0 (or if top_p < 1.0). With top_p=1.0 and τ=1.0, p ≡ q.
+- SequenceProcessor now provides temperature-aware log-q outputs (token_logqs, sequence_logqs).
+
+Key Code Changes (paths)
+- delta_entropy_is.py
+  - _global_max_tensor helper and use in SNIS.
+  - Eval-mode guard in _eval_S_and_RB_on_E.
+  - Float64 used for length-weighted normalization in SNIS.
+  - Auto q-measure selection when τ ≠ 1.0.
+- offline_entropy_probe.py
+  - GenerationConfig uses forced top_p=1.0 and logs.
+  - E-batch sampling sites log the enforced top_p.
+- sequence_processing/sequence_processor.py (already present)
+  - token_logqs and sequence_logqs computed via temperature-scaled softmax (and top-p renorm if needed).
+
+What To Run
+1) Quick smoke test (small batches):
+   python entropy_experiments/run_stability_smoketest.py \
+     --config entropy_experiments/configs/lambda_test_p1.yaml \
+     --temps 1.0,0.7 --B_E 16 --B_U 8 --G_U 4
+
+2) Larger sanity (optional, GPU memory permitting):
+   - Increase B_E/B_U toward your production settings.
+
+Expected Outputs (Smoke Test)
+- For τ=1.0 and top_p=1.0:
+  - deltaH_true with measure=p and measure=q should be nearly identical (|p−q| ≲ 1e−5).
+- For τ≠1.0 and top_p=1.0:
+  - Auto measure should match explicit q result closely.
+  - p vs q may differ; prefer q (sampling measure) for unbiased SNIS.
+- Diagnostics include ESS and ESS_fraction. ESS_fraction < 5% indicates high-variance weights.
+
+Logs To Watch
+- “[IS] Generation config enforced: top_p=1.0; temperature=...”.
+- “Auto-selecting q measure due to temperature=...”.
+- “[SNIS Diagnostics] ESS = ..., ESS_fraction = ..., logw_max = ...”.
+- Warnings when ESS_fraction is below 10%, especially < 5%.
+
+Acceptance Criteria
+- Top-p is enforced to 1.0 in SP config during E sampling.
+- With τ=1.0, p vs q deltaH_true agree (numerical noise aside).
+- With τ≠1.0, auto measure aligns with explicit q.
+- No instabilities (NaNs/Inf) in SNIS; weights and sums remain finite.
+
+Failure Triage
+- ESS_fraction very low (< 5%):
+  - Reduce step size / learning rate in U.
+  - Try smaller B_E/B_U for quick validation, then scale.
+  - Consider a “no-IS” sanity run (not implemented here) to isolate weight degeneracy.
+- Missing optimizer state: verify config.checkpoint.optimizer_path or place optimizer.pt next to the adapter checkpoint.
+- GPU OOM: lower tf_batch_size/gen_batch_size; reduce B_E/B_U; shorten max_new_tokens.
+
+Environment Notes (Lambda GPU)
+- Ensure CUDA is available; run with a single GPU initially.
+- Dtype bf16 vs fp16: BF16 preferred (matches configs). The SNIS math uses fp64 accumulators regardless.
+- Dataset access: Confirm rlp_datasets is available and dataset_name in config resolves.
+
+Artifacts
+- JSON results saved to entropy_experiments/results/stability_smoketest.json with per-temperature summaries.
+

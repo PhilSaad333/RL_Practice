@@ -323,9 +323,11 @@ class OfflineEntropyProbe:
         
         self.logger.info(f"SequenceProcessor config: x_estimator_mode={est_mode}, rb_requires_grad={rb_rg_final}")
         
+        # Enforce full-support proposal across entropy_experiments runs
+        forced_top_p = 1.0
         sp_cfg = GenerationConfig(
             temperature=gen_cfg.get('temperature', 1.0),
-            top_p=gen_cfg.get('top_p', 1.0),
+            top_p=forced_top_p,
             max_new_tokens=gen_cfg.get('max_new_tokens', 256),
             do_sample=True,
             num_return_sequences=self.config['batch_config']['G'],
@@ -334,6 +336,12 @@ class OfflineEntropyProbe:
             rb_requires_grad=rb_rg_final,
         )
         self._sequence_processor = SequenceProcessor(self.model, tok, sp_cfg)
+        try:
+            self.logger.info(
+                f"[IS] Generation config enforced: top_p=1.0; temperature={sp_cfg.temperature}"
+            )
+        except Exception:
+            pass
         # Ensure DeltaEntropyIS uses the same SequenceProcessor (if already constructed)
         if hasattr(self, 'delta_entropy_is') and self.delta_entropy_is is not None:
             try:
@@ -390,6 +398,13 @@ class OfflineEntropyProbe:
             self.logger.info(f"Using single split: '{E_split}' for both E and U batches")
 
         # E: with replacement, G=1, compute RB for X if needed later
+        # Log E-generation config reminder (top_p forced to 1.0)
+        try:
+            self.logger.info(
+                f"[IS] E-generation: top_p forced to 1.0; temperature={self._sequence_processor.config.temperature}"
+            )
+        except Exception:
+            pass
         E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
             total_sequences=B_E,
             dataset_name=ds_name,
@@ -469,6 +484,13 @@ class OfflineEntropyProbe:
             assert int(E_batch.get('num_responses_per_prompt', 1)) == 1, "Cached E-batch must have G=1"
             return E_batch
         E_split, _ = self._get_splits()
+        # Log E-generation config reminder (top_p forced to 1.0)
+        try:
+            self.logger.info(
+                f"[IS] E-generation: top_p forced to 1.0; temperature={self._sequence_processor.config.temperature}"
+            )
+        except Exception:
+            pass
         E_sequences, _E_lp, _E_diag = self._sequence_processor.generate_with_replacement_sampling(
             total_sequences=B_E,
             dataset_name=self.config['batch_config']['dataset_name'],

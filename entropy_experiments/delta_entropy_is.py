@@ -23,6 +23,17 @@ from . import distributed_helpers
 from sequence_processing.sequence_processor import BatchedSequences
 
 
+def _global_max_tensor(x: torch.Tensor) -> torch.Tensor:
+    """DDP-safe global MAX for a scalar tensor (or any shape treated elementwise).
+
+    On single GPU, returns x. On DDP, returns the all-reduced elementwise max.
+    """
+    if dist.is_available() and dist.is_initialized():
+        y = x.detach().clone()
+        dist.all_reduce(y, op=dist.ReduceOp.MAX)
+        return y
+    return x
+
 class DeltaEntropyIS:
     def __init__(
         self,
@@ -36,7 +47,7 @@ class DeltaEntropyIS:
         self.config = config
         self.logger = logger
         self.sequence_processor = sequence_processor  # preferred
-        # AMP settings for TF and RL update paths
+
         self.use_amp = config.get('memory_config', {}).get('amp', False)
         dtype_name = config.get('memory_config', {}).get('dtype', 'bfloat16')
         self.amp_dtype = getattr(torch, dtype_name, torch.bfloat16)
@@ -138,15 +149,8 @@ class DeltaEntropyIS:
     ) -> Dict[str, Any]:
         is_dist, rank, world_size = distributed_helpers.get_dist_info()
         
-        # STAGE 1 FIX: Global max coordination for numerical stability
-        logw_local_max = logw.max()
-        if is_dist:
-            import torch.distributed as dist
-            logw_max_tensor = logw_local_max.detach().clone()
-            dist.all_reduce(logw_max_tensor, op=dist.ReduceOp.MAX)
-            logw_max = logw_max_tensor
-        else:
-            logw_max = logw_local_max
+        # Global max coordination for numerical stability (DDP-safe)
+        logw_max = _global_max_tensor(logw.max())
         
         # STAGE 1 FIX: Float64 precision for weight arithmetic
         logw64 = (logw - logw_max).to(torch.float64)
@@ -171,6 +175,7 @@ class DeltaEntropyIS:
             H_upd = (w_payload_sum_global / w_sum_global) if w_sum_global != 0 else 0.0
         else:
             H_upd = (-w_payload_sum_global / w_sum_global) if w_sum_global != 0 else 0.0
+
         # STAGE 1 FIX: Enhanced diagnostics for numerical health monitoring
         ESS = (w_sum_global ** 2) / w_sq_sum_global if w_sq_sum_global != 0 else 0.0
         N_total = logw.numel()
@@ -200,7 +205,7 @@ class DeltaEntropyIS:
             }
         }
         if report_per_token:
-            lengths = self._get_generation_lengths(E_batch)
+            lengths = self._get_generation_lengths(E_batch).to(torch.float64)
             wL_sum_local = (w_shift * lengths).sum()
             if is_dist:
                 wL_sum_global = distributed_helpers.all_reduce_scalar_sum(wL_sum_local)
@@ -238,17 +243,26 @@ class DeltaEntropyIS:
         )
 
     def _eval_S_and_RB_on_E(self, E_batch: Dict[str, Any], use_q_measure: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.sequence_processor is None:
-            S = self._eval_logprobs_on_batch(E_batch, self.config.get('importance', {}).get('importance_microbatch_size', 1))
-            RB = torch.zeros_like(S)
-            return S, RB
-        bs = self._to_batched_sequences_from_probe(E_batch)
-        logprob_results, diagnostics_results = self.sequence_processor.teacher_force_logprobs_with_diagnostics(
-            sequences=bs,
-            with_grad=False,
-            tf_batch_size=getattr(self.sequence_processor.config, 'tf_batch_size', None),
-            compute_rb=True,
-        )
+        # Run in eval mode to disable dropout/batchnorm noise during TF/RB evaluation
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            if self.sequence_processor is None:
+                S = self._eval_logprobs_on_batch(
+                    E_batch, self.config.get('importance', {}).get('importance_microbatch_size', 1)
+                )
+                RB = torch.zeros_like(S)
+                return S, RB
+            bs = self._to_batched_sequences_from_probe(E_batch)
+            logprob_results, diagnostics_results = self.sequence_processor.teacher_force_logprobs_with_diagnostics(
+                sequences=bs,
+                with_grad=False,
+                tf_batch_size=getattr(self.sequence_processor.config, 'tf_batch_size', None),
+                compute_rb=True,
+            )
+        finally:
+            # Restore original training/eval state
+            self.model.train(was_training)
         device = next(self.model.parameters()).device
         
         # Stage 2: Choose between p and q measures
@@ -311,66 +325,138 @@ class DeltaEntropyIS:
     # ----------------------------
     # RL-aligned update (GRPO)
     # ----------------------------
+
     def _rl_update_streaming(
         self,
         U_batch: Dict[str, Any],
         optimizer: torch.optim.Optimizer,
         rl_grad_accum: int,
         importance_mb_size: int,
+        *,
+        ref_model=None,                  # <- optional, for KL parity
     ) -> None:
         self.logger.debug("Taking RL-aligned optimizer step on U batch")
-        sequences = U_batch['sequences']
-        prompt_lens = U_batch['prompt_lens']
-        attention_masks = U_batch['attention_masks']
-        advantages = U_batch['advantages']
-        max_lengths = U_batch['max_lengths']
+
+        sequences = U_batch['sequences']          # [B_U, G, max_len]
+        prompt_lens = U_batch['prompt_lens']      # [B_U]
+        attention_masks = U_batch['attention_masks']  # [B_U, G, max_len]
+        advantages = U_batch['advantages']        # [B_U, G]
+        max_lengths = U_batch['max_lengths']      # [B_U]
         B_U, G, max_len = sequences.shape
+
+        # --- training-mode and grads ---
         self.model.train()
         optimizer.zero_grad(set_to_none=True)
-        mb_size_prompts = importance_mb_size
+
+        # --- shared config knobs used in training ---
+        temp = float(self.config.get("generation", {}).get("temperature", 1.0))  # parity with training
+        use_clipping = "clip_eps" in self.config
+        clip_eps_neg = float(self.config.get("clip_eps", 0.0))
+        clip_eps_pos = float(self.config.get("clip_+", self.config.get("clip_eps", 0.0)))
+        kl_beta = float(self.config.get("kl_beta", 0.0))
+        do_kl = (kl_beta > 0.0 and ref_model is not None)
+
+        # === 1) Compute old_logp ONCE at the snapshot (pre-update), PPO-style ===
+        old_logp_full = None
+        if use_clipping:
+            with torch.no_grad():
+                all_new_logp = []
+                for start_b in range(0, B_U, importance_mb_size):
+                    end_b = min(start_b + importance_mb_size, B_U)
+                    mb_seqs = sequences[start_b:end_b]       # [B_mb, G, L]
+                    mb_masks = attention_masks[start_b:end_b] # [B_mb, G, L]
+
+                    flat_seqs = mb_seqs.view(-1, max_len)
+                    flat_masks = mb_masks.view(-1, max_len)
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                        logits = self.model(flat_seqs, attention_mask=flat_masks).logits
+                    # temperature + float32 log-softmax
+                    logits = (logits / temp).float()
+                    logp_all = F.log_softmax(logits, dim=-1)
+                    targets = flat_seqs[:, 1:].unsqueeze(-1)
+                    logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
+                    logp = logp.view(end_b - start_b, G, -1)
+                    all_new_logp.append(logp)
+                old_logp_full = torch.cat(all_new_logp, dim=0)  # [B_U, G, L-1]
+                # sanitize & clamp like training
+                old_logp_full = torch.nan_to_num(old_logp_full, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+
+        # === 2) Microbatch loop (identical structure) ===
         total_loss = 0.0
         num_microbatches = 0
-        for start_b in range(0, B_U, mb_size_prompts):
-            end_b = min(start_b + mb_size_prompts, B_U)
+        for start_b in range(0, B_U, importance_mb_size):
+            end_b = min(start_b + importance_mb_size, B_U)
             B_mb = end_b - start_b
+
             mb_seqs = sequences[start_b:end_b]
             mb_masks = attention_masks[start_b:end_b]
-            mb_advantages = advantages[start_b:end_b]
-            mb_max_lengths = max_lengths[start_b:end_b]
-            mb_prompt_lens = prompt_lens[start_b:end_b]
+            mb_adv = advantages[start_b:end_b]
+            mb_Lmax = max_lengths[start_b:end_b]
+            mb_prompt = prompt_lens[start_b:end_b]
+
             flat_seqs = mb_seqs.view(-1, max_len)
             flat_masks = mb_masks.view(-1, max_len)
             with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                 logits = self.model(flat_seqs, attention_mask=flat_masks).logits
-            logits = logits.float()
+
+            # parity with training: temperature then float32 log-softmax
+            logits = (logits / max(temp, 1e-8)).float()
             logp_all = F.log_softmax(logits, dim=-1)
             targets = flat_seqs[:, 1:].unsqueeze(-1)
             new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
             new_logp = new_logp.view(B_mb, G, -1)
+            # sanitize/clamp
+            new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+
             mb_loss_terms = []
             for b in range(B_mb):
-                prompt_len = int(mb_prompt_lens[b])
-                A_b = mb_advantages[b]
-                L_max_b = max(int(mb_max_lengths[b]), 1)
+                prompt_len = int(mb_prompt[b])
+                L_max_b = max(int(mb_Lmax[b]), 1)
                 gen_start = prompt_len - 1
-                new_logp_gen = new_logp[b, :, gen_start:]
-                gen_mask = mb_masks[b, :, prompt_len:].float()
-                min_gen_len = min(new_logp_gen.shape[1], gen_mask.shape[1]) if new_logp_gen.shape[1] > 0 else 0
-                if min_gen_len > 0:
-                    new_logp_gen = new_logp_gen[:, :min_gen_len]
-                    gen_mask = gen_mask[:, :min_gen_len]
-                A_expanded = A_b.unsqueeze(1).expand(-1, min_gen_len) if min_gen_len > 0 else A_b.unsqueeze(1)
-                weighted_logp = A_expanded * gen_mask * new_logp_gen if min_gen_len > 0 else torch.zeros_like(A_expanded)
-                loss_b = -weighted_logp.sum() / (G * L_max_b)
+                lp_gen = new_logp[b, :, gen_start:]                       # (G, Tg_b)
+                mask_gen = mb_masks[b, :, prompt_len:].float()            # (G, Tg_b)
+                if lp_gen.numel() == 0 or mask_gen.numel() == 0:
+                    continue
+                Tg = min(lp_gen.shape[1], mask_gen.shape[1])
+                lp_gen = lp_gen[:, :Tg]
+                mask_gen = mask_gen[:, :Tg]
+
+                if use_clipping:
+                    # Build old_logp for same slice
+                    old_lp_gen = old_logp_full[start_b + b, :, gen_start:gen_start+Tg]  # (G, Tg)
+                    ratios = torch.exp((lp_gen - old_lp_gen).clamp(-80, 80)) * mask_gen
+                    adv_b = mb_adv[b].unsqueeze(-1)                                   # (G,1)
+                    surr1 = ratios * adv_b
+                    surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv_b
+                    token_loss = -torch.min(surr1, surr2) * mask_gen                  # (G, Tg)
+                    loss_b = token_loss.sum() / (G * L_max_b + 1e-8)
+                    # Optional differentiable KL, same estimator as training
+                    if do_kl:
+                        with torch.no_grad():
+                            # build the same flat view (B_mb*G, L) for ref forward if needed; or reuse above logits with ref model
+                            pass  # (left as extension if you wire in ref_model and its tokenizer)
+                else:
+                    adv_exp = mb_adv[b].unsqueeze(1).expand(-1, Tg)                   # (G, Tg)
+                    weighted_logp = adv_exp * mask_gen * lp_gen
+                    loss_b = -weighted_logp.sum() / (G * L_max_b + 1e-8)
+
                 mb_loss_terms.append(loss_b)
+
             mb_loss = torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=sequences.device)
             scale = (B_mb / B_U) if B_U > 0 else 1.0
             (mb_loss * scale).backward()
             total_loss += mb_loss.item() * B_mb
             num_microbatches += 1
+
+        # --- gradient clipping parity with training ---
+        max_norm = float(self.config.get("max_grad_norm", 0.0))
+        if max_norm and max_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], max_norm)
+
         optimizer.step()
         avg_loss = total_loss / B_U if B_U > 0 else 0.0
         self.logger.info(f"RL-aligned optimizer step completed: avg_loss = {avg_loss:.6f}, {num_microbatches} microbatches")
+
 
     # ----------------------------
     # Local fallback evaluator (naive S only)
@@ -437,16 +523,23 @@ class DeltaEntropyIS:
         report_per_token = cfg_importance.get('report_per_token', False)
         snapshot_device = cfg_importance.get('snapshot_device', 'cpu')
 
-        # Stage 2: Check if we should use q measure
+        # Stage 2: Choose measure for weights (p vs q)
+        # - If explicitly configured, honor it.
+        # - Otherwise, auto-select q if either (top_p < 1) OR (temperature != 1).
         use_q = False
         if 'measure' in cfg_importance:
             measure = cfg_importance.get('measure', 'p')
             use_q = (measure == 'q')
-        elif hasattr(self, 'sequence_processor') and self.sequence_processor is not None:
-            if hasattr(self.sequence_processor, 'config') and hasattr(self.sequence_processor.config, 'top_p') and self.sequence_processor.config.top_p < 1.0:
-                # Default: use q if top_p < 1
+        elif hasattr(self, 'sequence_processor') and self.sequence_processor is not None and hasattr(self.sequence_processor, 'config'):
+            sp_cfg = self.sequence_processor.config
+            if getattr(sp_cfg, 'top_p', 1.0) < 1.0:
                 use_q = True
-                self.logger.info(f"Auto-selecting q measure due to top_p={self.sequence_processor.config.top_p}")
+                self.logger.info(f"Auto-selecting q measure due to top_p={sp_cfg.top_p}")
+            else:
+                temp_val = float(getattr(sp_cfg, 'temperature', 1.0) or 1.0)
+                if abs(temp_val - 1.0) > 1e-8:
+                    use_q = True
+                    self.logger.info(f"Auto-selecting q measure due to temperature={temp_val}")
         
         # A) Snapshot
         cpu_snaps, opt_state_snapshot = self._snapshot_model_optimizer(model, optimizer, snapshot_device)
