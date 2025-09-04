@@ -139,12 +139,20 @@ def compute_update_vector_step(
     imp_mb = int(config.get("true_delta_h", {}).get("microbatch_size", 1))
     de._rl_update_streaming(U_batch, optimizer, rl_grad_accum, imp_mb)
 
-    # Compute Δθ and normalize by lr (use group 0 lr by default)
-    lr_used = float(optimizer.param_groups[0].get("lr", 1.0))
+    # Build per-parameter LR map from optimizer groups
+    lr_map: Dict[int, float] = {}
+    lr_groups: Dict[float, int] = {}
+    for gi, group in enumerate(optimizer.param_groups):
+        lr_g = float(group.get("lr", 1.0))
+        lr_groups[lr_g] = lr_groups.get(lr_g, 0) + 1
+        for p in group.get("params", []):
+            if p is not None:
+                lr_map[id(p)] = lr_g
     delta_over_lr: Dict[str, torch.Tensor] = {}
     for name, p in trainable.items():
         after = p.detach()
         dtheta = (after - before[name])
+        lr_used = lr_map.get(id(p), 1.0)
         vec = (dtheta / max(lr_used, 1e-38)).to("cpu", torch.float32)
         delta_over_lr[name] = vec
 
@@ -154,7 +162,7 @@ def compute_update_vector_step(
     vec_norm = torch.sqrt(sum((v.to(torch.float64) ** 2).sum() for v in delta_over_lr.values())).item()
     stats = {
         "method": "single_step",
-        "lr_used": lr_used,
+        "lr_groups": sorted(list(lr_groups.keys())),
         "vec_norm": vec_norm,
         "num_params": len(delta_over_lr),
     }

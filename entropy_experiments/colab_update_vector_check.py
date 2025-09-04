@@ -48,6 +48,17 @@ def topk_by_norm(vec: Dict[str, torch.Tensor], k: int = 10):
     return items[:k]
 
 
+def l2_diff_named(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> float:
+    acc = torch.zeros((), dtype=torch.float64)
+    for k, va in a.items():
+        vb = b.get(k)
+        if vb is None:
+            continue
+        d = (va.double() - vb.double())
+        acc += (d * d).sum()
+    return float(acc.sqrt().item())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
@@ -116,6 +127,10 @@ def main():
     print(f"Cosine A↔B: {cos_AB:.6f}  A↔C: {cos_AC:.6f}  B↔C: {cos_BC:.6f}")
     print(f"Norm ratio A/B: {ratio_AB:.6f}")
 
+    diff_BC = l2_diff_named(vec_B, vec_C)
+    diff_AC = l2_diff_named(vec_A, vec_C)
+    print(f"L2 diff ||B−C||: {diff_BC:.6e}   ||A−C||: {diff_AC:.6e}")
+
     print("\nTop-10 params by update norm (A):")
     for n, v in topk_by_norm(vec_A, 10):
         print(f"  {n}: {v:.3e}")
@@ -135,6 +150,10 @@ def main():
         lr = g.get("lr", float('nan'))
         n = len(g.get("params", []))
         print(f"  Group {i}: lr={lr:.3e} betas={betas} eps={eps:.1e} weight_decay={wd:.3e} n_params={n}")
+    # Warn if multiple distinct LRs
+    lr_set = sorted({float(g.get('lr', float('nan'))) for g in probe.optimizer.param_groups})
+    if len(lr_set) > 1:
+        print(f"WARNING: Multiple distinct learning rates across param groups: {lr_set}")
 
     total = have_v = have_step = 0
     for group in probe.optimizer.param_groups:
@@ -174,6 +193,8 @@ def main():
         "norm_B": norm_B,
         "norm_C": norm_C,
         "norm_ratio_A_over_B": ratio_AB,
+        "l2_diff_BC": diff_BC,
+        "l2_diff_AC": diff_AC,
         "stats_A": stats_A,
         "stats_B": stats_B,
         "stats_C": stats_C,
@@ -190,4 +211,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
