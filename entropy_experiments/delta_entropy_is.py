@@ -52,6 +52,30 @@ class DeltaEntropyIS:
         dtype_name = config.get('memory_config', {}).get('dtype', 'bfloat16')
         self.amp_dtype = getattr(torch, dtype_name, torch.bfloat16)
 
+    # --- NEW: build named-parameter update buffer and its L2 norm ---
+    def _build_param_update_buf_named(
+        self,
+        model: torch.nn.Module,
+        cpu_snaps: Dict[str, torch.Tensor],
+        *,
+        to_device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> Tuple[Dict[str, torch.Tensor], float]:
+        """
+        Construct Δθ buffer keyed by parameter name: Δθ[name] = (θ_after − θ_before).
+        Returns (buffer, l2_norm).
+        """
+        update_buf: Dict[str, torch.Tensor] = {}
+        l2_accum = 0.0
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                after = p.detach().to("cpu", torch.float32)
+                before = cpu_snaps[name].to("cpu", torch.float32)
+                upd = (after - before).to(to_device, dtype=dtype)
+                update_buf[name] = upd
+                l2_accum += float((upd.double() * upd.double()).sum().item())
+        return update_buf, float(l2_accum ** 0.5)
+
     # Public API (kept compatible with orchestrator)
     def entropy_change_two_batch(
         self,
@@ -522,6 +546,8 @@ class DeltaEntropyIS:
         importance_mb_size = cfg_importance.get('importance_microbatch_size', 1)
         report_per_token = cfg_importance.get('report_per_token', False)
         snapshot_device = cfg_importance.get('snapshot_device', 'cpu')
+        # New cfg knob: optionally return named Δθ buffer for reuse by Stage-1
+        return_param_update_buf = bool(cfg_importance.get('return_param_update_buf', True))
 
         # Stage 2: Choose measure for weights (p vs q)
         # - If explicitly configured, honor it.
@@ -581,6 +607,16 @@ class DeltaEntropyIS:
             except Exception:
                 pass
 
+        # C.1) Build named Δθ buffer immediately after the step (before restore)
+        param_update_buf_named, param_update_l2 = (None, 0.0)
+        if return_param_update_buf:
+            try:
+                param_update_buf_named, param_update_l2 = self._build_param_update_buf_named(
+                    model, cpu_snaps, to_device="cpu", dtype=torch.float32
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to build named param update buffer: {e}")
+
         # D) Updated entropy via SNIS with RB payload
         S_upd, RB_upd = self._eval_S_and_RB_on_E(E_batch, use_q_measure=use_q)
         logw = S_upd - S_orig
@@ -630,6 +666,14 @@ class DeltaEntropyIS:
                 **is_results.get('diagnostics', {}),
             },
         }
+        if return_param_update_buf:
+            results['param_update_buf_named'] = param_update_buf_named
+            results['param_update_l2'] = float(param_update_l2)
+            try:
+                lr_used = float(lr_override) if lr_override is not None else float(optimizer.param_groups[0]['lr'])
+            except Exception:
+                lr_used = float(lr_override) if lr_override is not None else 0.0
+            results['learning_rate_used'] = lr_used
         if deltaH_true_tok is not None:
             results.update({
                 'H_orig_tok': H_orig_tok,

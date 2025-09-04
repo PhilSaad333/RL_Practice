@@ -144,6 +144,9 @@ class ProbeComponents:
         ]
         self._trainable_params = [p for _, p in self._trainable_named]
         self._trainable_ids    = {id(p) for p in self._trainable_params}
+        # --- NEW: name/id registries for buffer coercion ---
+        self._name_to_param = {n: p for (n, p) in self._trainable_named}
+        self._id_to_name    = {id(p): n for (n, p) in self._trainable_named}
 
         # LoRA-only (plus lm_head if trainable) convenience view
         self._lora_named = [
@@ -168,6 +171,32 @@ class ProbeComponents:
         x_estimator_mode = self.config.get('estimator', {}).get('x_estimator_mode', 'naive')
         baseline_mode = bl_cfg.get('mode', 'residual_mu')
         self.logger.info(f"Phase 3 config: x_estimator_mode={x_estimator_mode}, baseline_mode={baseline_mode}")
+
+    # --- NEW: accept both name-keyed and id-keyed buffers ---
+    def coerce_buffer_to_id_keys(self, any_buf: Dict) -> Dict[int, torch.Tensor]:
+        """
+        Convert a possibly name-keyed buffer to an id-keyed buffer that matches self._trainable_params.
+        - If keys are str (names), map to id(param) using registry.
+        - If keys are int and found in current trainable ids, return as-is.
+        Unmatched names are skipped with a warning.
+        """
+        if not isinstance(any_buf, dict):
+            raise TypeError("param_update_buf must be a dict keyed by param name or id")
+        if len(any_buf) == 0:
+            return {}
+        k0 = next(iter(any_buf.keys()))
+        if isinstance(k0, int):
+            return any_buf
+        if isinstance(k0, str):
+            out: Dict[int, torch.Tensor] = {}
+            for name, tensor in any_buf.items():
+                p = self._name_to_param.get(name)
+                if p is None:
+                    self.logger.warning(f"[coerce] Unknown param name in update buf: {name}; skipping")
+                    continue
+                out[id(p)] = tensor
+            return out
+        raise TypeError("param_update_buf keys must be str (names) or int (ids)")
         
     def _to_batched_sequences_from_probe(self, batch: Dict[str, Any]) -> BatchedSequences:
         """
@@ -851,6 +880,8 @@ class ProbeComponents:
             mu_X = {pid: buf / max(B_E_local, 1) for pid, buf in sum_X_buf.items()}
             # Dot product and deltaH1 (do NOT rescale by lr; Δθ already includes it)
             t3 = time.time()
+            # Accept name-keyed or id-keyed buffers
+            param_update_buf = self.coerce_buffer_to_id_keys(param_update_buf)
             bars_dot = self.dot_param_buffers(mu_X, param_update_buf)
             lr = 1.0
             delta_h1 = bars_dot

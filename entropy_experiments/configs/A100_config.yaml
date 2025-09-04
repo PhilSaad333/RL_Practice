@@ -38,6 +38,11 @@ true_delta_h:
   measure: "p"  # Use p measure since top_p=1.0
   lr_override: 2e-8
 
+# === PROBE REUSE / LOGGING ===
+probe_reuse:
+  # Do not write the raw Δθ buffer to JSON results (kept in-memory only)
+  log_param_update_buf: false
+
 
 # === GENERATION SETTINGS ===  
 generation:

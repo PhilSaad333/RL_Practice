@@ -1,0 +1,393 @@
+Below is a ready-to-hand-off implementation plan (TXT) to switch to Option B: perform one RL step inside Stage-2, compute and return the named-parameter update buffer from that step, and then compute 
+𝛿
+𝐻
+1
+δH
+1
+	​
+
+ from that very 
+Δ
+𝜃
+Δθ (no second step). It also standardizes on named parameters and adds a small adapter so existing code that uses id-keyed buffers keeps working.
+
+IMPLEMENT OPTION B: Single-Step ΔH_true + Reuse Δθ for δH₁
+
+Files touched:
+
+delta_entropy_is.py (Stage-2: compute ground truth ΔH and produce Δθ buffer keyed by names)
+
+probe_components.py (accept name-keyed buffers; add key-coercion util)
+
+offline_entropy_probe.py (reorder run_mixed_probe to call Stage-2 once, then compute δH₁ using returned Δθ)
+
+1) delta_entropy_is.py: return the parameter update buffer (named) from Stage-2
+1.1 Add a helper to compute a named-parameter update buffer
+
+Insert near the other private helpers:
+
+# --- NEW: build named-parameter update buffer and its L2 norm ---
+def _build_param_update_buf_named(
+    self,
+    model: torch.nn.Module,
+    cpu_snaps: Dict[str, torch.Tensor],
+    *,
+    to_device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[Dict[str, torch.Tensor], float]:
+    """
+    Construct Δθ buffer keyed by parameter *name*: Δθ[name] = (θ_after - θ_before).
+    Returns (buffer, l2_norm).
+    """
+    update_buf: Dict[str, torch.Tensor] = {}
+    l2_accum = 0.0
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            after = p.detach().to("cpu", torch.float32)
+            before = cpu_snaps[name].to("cpu", torch.float32)
+            upd = (after - before).to(to_device, dtype=dtype)
+            update_buf[name] = upd
+            l2_accum += float((upd.double() * upd.double()).sum().item())
+    return update_buf, float(l2_accum ** 0.5)
+
+1.2 Make Stage-2 optionally override LR, compute Δθ, and include it in results
+
+In entropy_change_two_batch_rl(...), at the top where you read cfg_importance, add:
+
+# --- NEW cfg knobs ---
+lr_override = cfg_importance.get('lr_override', None)
+return_param_update_buf = bool(cfg_importance.get('return_param_update_buf', True))
+
+
+Immediately after snapshotting (cpu_snaps, opt_state_snapshot = self._snapshot_model_optimizer(...)), and before the RL step:
+
+Keep your existing computation of S_orig, RB_orig on E (unchanged).
+
+Apply LR override just for the single step:
+
+# --- NEW: temporary LR override for the *single* U step ---
+lr_backup = [pg.get('lr', None) for pg in optimizer.param_groups]
+try:
+    if lr_override is not None:
+        for pg in optimizer.param_groups:
+            pg['lr'] = float(lr_override)
+    # C) Take the RL step on U
+    self._rl_update_streaming(U_batch, optimizer, rl_grad_accum, importance_mb_size)
+finally:
+    # restore LR in param groups (optimizer state is restored later anyway)
+    for pg, lr0 in zip(optimizer.param_groups, lr_backup):
+        if lr0 is not None:
+            pg['lr'] = lr0
+
+
+Immediately after the step, before measuring S_upd, build the named update buffer:
+
+param_update_buf_named, param_update_l2 = (None, 0.0)
+if return_param_update_buf:
+    param_update_buf_named, param_update_l2 = self._build_param_update_buf_named(
+        model, cpu_snaps, to_device="cpu", dtype=torch.float32
+    )
+
+
+Proceed to compute S_upd, RB_upd, compute SNIS, and finally restore the snapshot (unchanged).
+
+Add these fields to the returned dict:
+
+results = {
+    # ... existing fields ...
+    'param_update_buf_named': param_update_buf_named,   # may be None if disabled
+    'param_update_l2': float(param_update_l2),
+    'learning_rate_used': float(lr_override if lr_override is not None else optimizer.param_groups[0]['lr']),
+}
+
+
+Notes
+• Keeping the buffer on CPU/FP32 is intentional to make the dot product numerically stable and memory-friendly.
+• The returned 
+Δ
+𝜃
+Δθ already includes any LR scaling and preconditioning from Adam/weight-decay.
+
+2) probe_components.py: accept name-keyed buffers
+
+We standardize internal registries and add a small adapter so both id-keyed and name-keyed dictionaries are accepted.
+
+2.1 Ensure we have a name↔param mapping in the registry (you already build _trainable_named)
+
+Confirm you have (or add if missing) in the constructor:
+
+self._trainable_named = [(n, p) for (n, p) in self._peft.named_parameters() if p.requires_grad]
+self._trainable_params = [p for _, p in self._trainable_named]
+self._trainable_ids    = {id(p) for p in self._trainable_params}
+# --- NEW ---
+self._name_to_param = {n: p for (n, p) in self._trainable_named}
+self._id_to_name    = {id(p): n for (n, p) in self._trainable_named}
+
+2.2 Add a small coercion utility
+
+Place near your buffer utilities:
+
+# --- NEW: accept both name-keyed and id-keyed buffers ---
+def coerce_buffer_to_id_keys(
+    self,
+    buf: Dict[Union[str, int], torch.Tensor]
+) -> Dict[int, torch.Tensor]:
+    """
+    Convert a possibly name-keyed buffer to an id-keyed buffer that matches self._trainable_params.
+    Unknown entries are ignored.
+    """
+    if not buf:
+        return {}
+    # Fast path: already id-keyed
+    any_key = next(iter(buf.keys()))
+    if isinstance(any_key, int):
+        return buf  # assume already keyed by id(p)
+    # Convert name -> id
+    out: Dict[int, torch.Tensor] = {}
+    for name, t in buf.items():
+        p = self._name_to_param.get(name, None)
+        if p is None:
+            continue
+        out[id(p)] = t
+    return out
+
+2.3 Use the coercion when computing δH₁ with a provided Δθ buffer
+
+In compute_delta_h1_from_batches(...), in the branch that handles param_update_buf is not None, coerce before the dot:
+
+if param_update_buf is not None:
+    # 1) Compute ΣX/μX on E as you already do
+    # ...
+    mu_X = {pid: buf / max(B_E_local, 1) for pid, buf in sum_X_buf.items()}
+
+    # --- NEW: accept name-keyed or id-keyed incoming Δθ ---
+    param_update_buf = self.coerce_buffer_to_id_keys(param_update_buf)
+
+    # 2) Dot product: NOTE lr=1.0 because Δθ already contains the step size
+    bars_dot = self.dot_param_buffers(mu_X, param_update_buf)
+    lr = 1.0
+    delta_h1 = bars_dot
+    # ...
+
+
+No other changes to the legacy path are required.
+
+3) offline_entropy_probe.py: call Stage-2 once, reuse Δθ for δH₁
+
+We will remove the separate Stage-1 call that took an additional optimizer step to build 
+Δ
+𝜃
+Δθ. The flow becomes:
+
+Sample E and U
+
+Stage-2: call entropy_change_two_batch(...) with cfg_importance including return_param_update_buf=True (and lr_override if you are sweeping). This takes one RL step on U, measures 
+𝐻
+orig
+H
+orig
+	​
+
+ and 
+𝐻
+upd
+H
+upd
+	​
+
+ on E with SNIS, builds Δθ (named), and then restores the snapshot.
+
+Compute 
+𝛿
+𝐻
+1
+δH
+1
+	​
+
+ by calling probe_components.compute_delta_h1_from_batches(..., param_update_buf=Δθ_named); this recomputes the X-gradients on E at the restored parameters θ (correct for first-order), and uses the supplied Δθ to form the dot product.
+
+3.1 Remove the earlier Δθ computation
+
+Delete (or comment out) the block that called:
+
+delta_theta_buf, delta_theta_norm, B_U_used = self._compute_param_update_buffer(U_batch, mb_size_prompts)
+# ... and the immediate compute_delta_h1_from_batches that used this buffer ...
+
+3.2 Replace with: Stage-2 first, then δH₁
+
+Right after sampling E and U (and any logging), insert:
+
+# --- Phase 1: Ground-truth ΔH via SNIS, *and* get Δθ from the same step ---
+cfg_importance = dict(self.config.get('true_delta_h', {}))
+cfg_importance.setdefault('return_param_update_buf', True)
+
+# If sweeping LR, ensure the override is provided here (single source of truth)
+if 'lr_override' in self.config.get('true_delta_h', {}):
+    cfg_importance['lr_override'] = self.config['true_delta_h']['lr_override']
+
+gt_start = time.time()
+ground_truth_results = self.delta_entropy_is.entropy_change_two_batch(
+    self.model, E_batch, U_batch, self.optimizer, cfg_importance
+)
+gt_time = time.time() - gt_start
+
+# Δθ buffer comes back keyed by parameter *name*
+delta_theta_named = ground_truth_results.get('param_update_buf_named', None)
+delta_theta_l2 = ground_truth_results.get('param_update_l2', 0.0)
+lr_used = ground_truth_results.get('learning_rate_used', None)
+
+self.logger.info(
+    f"[GT] deltaH_true = {ground_truth_results['deltaH_true']:.10f} "
+    f"(||Δθ||₂={delta_theta_l2:.4e}, lr_used={lr_used})"
+)
+
+# --- Phase 2: δH₁ using X on E and the *same* Δθ ---
+if delta_theta_named is None:
+    raise RuntimeError("Ground-truth stage did not return param_update_buf_named; set return_param_update_buf=True")
+
+compute = self.probe_components.compute_delta_h1_from_batches(
+    E_batch=E_batch,
+    U_batch=U_batch,                         # not used in buffer path
+    mb_size_prompts=mb_size_prompts,
+    weighting_mode=self.config['estimator'].get('weighting_mode', 'dr_grpo'),
+    adam_preconditioner=self.adam_preconditioner,
+    optimizer=self.optimizer,                # learning_rate field will be 1.0 in buffer path
+    param_update_buf=delta_theta_named,      # <-- named-keyed; class will coerce
+)
+delta_h1   = compute['deltaH1']
+bars_dot   = compute['bars_dot']
+B_E_global = compute['B_E']
+B_U_global = compute['B_U']  # (may reflect local accounting; fine for logs)
+
+self.logger.info(f"[δH1] bars_dot={bars_dot:.10f}, deltaH1={delta_h1:.10f} (uses same Δθ)")
+
+
+You can then proceed to collate and log both estimates, plot comparisons, etc.
+
+4) Behavior and correctness notes
+
+Exactly one optimizer step. The only parameter update happens inside Stage-2, and that step is both:
+(i) the step used to measure 
+𝐻
+upd
+H
+upd
+	​
+
+ for ΔH_true, and
+(ii) the source of 
+Δ
+𝜃
+Δθ for the δH₁ dot-product.
+
+First-order point of expansion is correct. entropy_change_two_batch_rl restores the snapshot before returning; thus, compute_delta_h1_from_batches computes 
+∇
+𝜃
+𝐻
+∇
+θ
+	​
+
+H at the pre-update parameters θ, as required by the first-order expansion 
+𝐻
+(
+𝜃
++
+Δ
+𝜃
+)
+−
+𝐻
+(
+𝜃
+)
+≈
+⟨
+∇
+𝐻
+(
+𝜃
+)
+,
+Δ
+𝜃
+⟩
+H(θ+Δθ)−H(θ)≈⟨∇H(θ),Δθ⟩.
+
+Learning-rate proportionality.
+
+Δθ includes the LR scaling.
+
+In the “buffer path”, compute_delta_h1_from_batches sets lr=1.0 and reports deltaH1 = bars_dot.
+
+If you sweep lr_override in Stage-2, both 
+∥
+Δ
+𝜃
+∥
+2
+∥Δθ∥
+2
+	​
+
+ and 
+𝛿
+𝐻
+1
+δH
+1
+	​
+
+ should scale approximately linearly with the override (up to clipping/second-order effects). Log the ratio across two runs as a sanity check.
+
+Keying by names. Returning a name-keyed Δθ is safer and future-proof. The probe_components coercion converts it to id-keyed buffers internally to reuse your existing dot product path without rewriting.
+
+Distributed (DDP).
+
+The RL step uses DDP all-reduce on grads, so the post-step parameters are identical across ranks; the name-keyed Δθ built per rank will be identical.
+
+compute_delta_h1_from_batches will perform its usual local micro-batching; your existing reductions (if any) remain unchanged.
+
+5) Optional: guardrails and diagnostics
+
+Add invariant logs: in Stage-2, log param_update_l2 and (optionally) the top-K parameter names by 
+∥
+Δ
+𝜃
+∥
+∥Δθ∥.
+
+Scale check: print param_update_l2 for two LR settings and the ratio.
+
+ESS checks: keep your SNIS ESS diagnostics; abort the run or warn if ESS_fraction drops below a threshold (e.g., 0.1), since large LR breaks the linear regime.
+
+6) Minimal API expectations after this change
+
+DeltaEntropyIS.entropy_change_two_batch(...) now returns:
+
+existing keys (e.g., H_orig, H_upd, deltaH_true, diagnostics, optional per-token variants),
+
+plus:
+
+param_update_buf_named: Dict[str, Tensor] (CPU/FP32),
+
+param_update_l2: float,
+
+learning_rate_used: float.
+
+ProbeComponents.compute_delta_h1_from_batches(..., param_update_buf=...) accepts either name-keyed or id-keyed buffers (internally coerced).
+
+OfflineEntropyProbe.run_mixed_probe(...) no longer calls a second _rl_update_streaming to build Δθ; it consumes Stage-2’s Δθ and computes δH₁ from it.
+
+7) Post-patch quick test (manual)
+
+Run once with baseline LR 
+𝜂
+η. Record:
+param_update_l2(η), deltaH1(η), deltaH_true(η).
+
+Run again with lr_override = η/10. Expect approximately:
+param_update_l2(η)/param_update_l2(η/10) ≈ 10, and likewise for deltaH1 (if clipping and second-order terms are mild).
+
+Confirm only one optimizer step occurs (you can add a counter in the optimizer wrapper or assert that pre/post hashes of parameters match after the function returns).
