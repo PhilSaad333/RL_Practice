@@ -312,7 +312,15 @@ class OfflineEntropyProbe:
 
         gen_cfg = self.config.get('generation', {})
         
-        est_mode = (self.config.get('estimator', {}) or {}).get('x_estimator_mode', 'naive')
+        # Estimator mode for X (delta_h1). Allow forcing simple entropy via config.
+        est_cfg = (self.config.get('estimator', {}) or {})
+        force_simple = bool(est_cfg.get('use_simple_entropy_for_x', False))
+        est_mode = est_cfg.get('x_estimator_mode', 'naive')
+        if force_simple and est_mode != 'naive':
+            self.logger.info(
+                f"Overriding x_estimator_mode='{est_mode}' → 'naive' (use_simple_entropy_for_x=true)"
+            )
+            est_mode = 'naive'
         rb_rg_cfg = gen_cfg.get('rb_requires_grad', False)
         rb_rg_final = True if est_mode == 'rb_residual' else rb_rg_cfg
         

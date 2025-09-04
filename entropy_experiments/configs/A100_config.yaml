@@ -1,0 +1,68 @@
+# 🧪 Lambda Test with top_p=1.0
+# Testing full distribution (no truncation)
+
+# === MODEL AND CHECKPOINT ===
+checkpoint:
+  checkpoint_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/model"
+  optimizer_path: "/home/ubuntu/localfs/training_runs/run_2025-09-03_03-59-57/training_state/step_40/optimizer.pt"
+  backbone: "qwen2_5_15"
+  dtype: "bfloat16"
+  device_map: "cuda"
+
+# === BATCH CONFIGURATION ===
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  E_split: "test"
+  U_split: "train"
+  B_E: 512          # Smaller batch for debugging
+  B_U: 64
+  G: 8
+
+# === COMPUTATION OPTIONS ===
+computation_options:
+  compute_delta_h1: true
+  master_seed: none
+  mb_size_prompts: 1
+  weighting_mode: "dr_grpo"
+
+estimator:
+  use_simple_entropy_for_x: true
+
+# === GROUND TRUTH ENTROPY CHANGE ===  
+true_delta_h:
+  enabled: true
+  training_loss: "rl"
+  microbatch_size: 1
+  clip_c: 10.0
+  report_per_token: false
+  measure: "p"  # Use p measure since top_p=1.0
+
+# === GENERATION SETTINGS ===  
+generation:
+  temperature: 1.0
+  top_p: 1.0      # Full distribution - no truncation
+  max_new_tokens: 150
+  gen_batch_size: 64
+  tf_batch_size: 8
+
+# === MEMORY CONFIGURATION ===
+memory_config:
+  amp: true
+  dtype: "bfloat16" 
+  microbatch_size: 1
+
+# === DETAILED LOGGING ===
+detailed_logging:
+  enabled: true
+  level: "standard"
+  log_sequences: false
+  log_tokens: false
+  log_raw_tensors: false
+  output_directory: "entropy_experiments/logs"
+  compress: true
+  max_files: 50
+
+# === OUTPUT CONFIGURATION ===
+output:
+  log_level: "INFO"
+  results_path: ""

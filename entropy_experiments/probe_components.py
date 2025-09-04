@@ -590,7 +590,13 @@ class ProbeComponents:
         sum_X_buf = self.zeros_like_params(dtype=torch.float32, device='cpu')
         
         # Phase 3: Check estimator mode
-        mode = (self.config.get('estimator', {}) or {}).get('x_estimator_mode', 'naive')
+        est_cfg = (self.config.get('estimator', {}) or {})
+        mode = est_cfg.get('x_estimator_mode', 'naive')
+        if est_cfg.get('use_simple_entropy_for_x', False) and mode != 'naive':
+            self.logger.info(
+                f"[X] Forcing simple entropy: mode override '{mode}' → 'naive'"
+            )
+            mode = 'naive'
         normalize_by_length = bool(self.config.get('estimator', {}).get('rb_normalize_by_length', True))
         
         self.logger.debug(f"X accumulation mode: {mode}, normalize_by_length: {normalize_by_length}")
