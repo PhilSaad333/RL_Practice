@@ -48,7 +48,10 @@ def _adamw_direction_from_grads(
 ) -> Dict[str, torch.Tensor]:
     """Compute per-parameter AdamW direction (per unit lr), using current grads and optimizer state.
 
-    Returns name->cpu fp32 tensor for the direction: dir = -(m_hat / (sqrt(v_hat)+eps) + wd * p).
+    Matches torch.optim.AdamW update rule (decoupled weight decay) excluding lr:
+        step_size = sqrt(bc2) / bc1
+        p <- p - lr * [ step_size * exp_avg / (sqrt(exp_avg_sq) + eps) + weight_decay * p ]
+    We form dir_per_lr = - [ step_size * exp_avg_t / (sqrt(exp_avg_sq_t)+eps) + weight_decay * p ].
     """
     hparams = _infer_group_hparams(optimizer)
     trainable = get_trainable_named(model)
@@ -59,38 +62,31 @@ def _adamw_direction_from_grads(
             # No grad -> zero direction
             dir_named[name] = torch.zeros_like(p.detach()).to("cpu", torch.float32)
             continue
-        hp = hparams.get(pid, None)
-        if hp is None:
-            # Fallback hyperparams
-            betas = (0.9, 0.999)
-            eps = 1e-8
-            weight_decay = 0.0
-            step = 0
-        else:
-            betas = hp["betas"]
-            eps = hp["eps"]
-            weight_decay = hp["weight_decay"]
-            step = hp["step"]
+        hp = hparams.get(pid, None) or {}
+        beta1, beta2 = map(float, hp.get("betas", (0.9, 0.999)))
+        eps = float(hp.get("eps", 1e-8))
+        weight_decay = float(hp.get("weight_decay", 0.0))
+        step = int(hp.get("step", 0))
 
-        beta1, beta2 = float(betas[0]), float(betas[1])
         st = optimizer.state.get(p, {})
-        m = st.get("exp_avg", torch.zeros_like(p))
-        v = st.get("exp_avg_sq", torch.zeros_like(p))
+        exp_avg = st.get("exp_avg", torch.zeros_like(p))
+        exp_avg_sq = st.get("exp_avg_sq", torch.zeros_like(p))
 
-        # Update first/second moments with current grad
+        # Update moments with current grad (like AdamW.step)
         g = p.grad
-        m_t = beta1 * m + (1.0 - beta1) * g
-        v_t = beta2 * v + (1.0 - beta2) * (g * g)
-        # Bias corrections use step+1 for the update being formed
+        exp_avg_t = exp_avg.mul(beta1).add(g, alpha=(1.0 - beta1))
+        exp_avg_sq_t = exp_avg_sq.mul(beta2).addcmul(g, g, value=(1.0 - beta2))
+
+        # Bias correction factors for the step being formed
         t_eff = step + 1
         bc1 = 1.0 - (beta1 ** t_eff)
         bc2 = 1.0 - (beta2 ** t_eff)
-        m_hat = m_t / max(bc1, 1e-16)
-        v_hat = v_t / max(bc2, 1e-16)
-        denom = v_hat.sqrt() + eps
-        adam_term = m_hat / denom
-        wd_term = weight_decay * p.detach()
-        direction = -(adam_term + wd_term)
+        step_factor = (bc2 ** 0.5) / max(bc1, 1e-16)
+
+        denom = exp_avg_sq_t.sqrt().add(eps)
+        adam_dir = -step_factor * (exp_avg_t / denom)
+        wd_dir = -weight_decay * p.detach()
+        direction = (adam_dir + wd_dir)
         dir_named[name] = direction.detach().to("cpu", torch.float32)
     return dir_named
 
@@ -208,7 +204,12 @@ def compute_update_vector_adamw(
         # Flat forward
         flat_seqs = mb_seqs.view(-1, Lmax)
         flat_masks = mb_masks.view(-1, Lmax)
-        logits = model(flat_seqs, attention_mask=flat_masks).logits
+        # AMP parity with training
+        amp_enabled = bool(config.get("memory_config", {}).get("amp", False))
+        dtype_name = config.get("memory_config", {}).get("dtype", "bfloat16")
+        amp_dtype = getattr(torch, dtype_name, torch.bfloat16)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+            logits = model(flat_seqs, attention_mask=flat_masks).logits
         logits = (logits / max(temp, 1e-8)).float()
         logp_all = F.log_softmax(logits, dim=-1)
         targets = flat_seqs[:, 1:].unsqueeze(-1)
