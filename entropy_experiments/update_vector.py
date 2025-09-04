@@ -230,7 +230,6 @@ def compute_update_vector_adamw(
     return dir_named, stats
 
 
-@torch.no_grad()
 def compute_update_vector_adamw_manual(
     *,
     model: torch.nn.Module,
@@ -246,21 +245,29 @@ def compute_update_vector_adamw_manual(
     3) Return vector and simple component norms for inspection
     """
     device = next(model.parameters()).device
-    # Ensure grads
+    
+    # Ensure grads and training mode
     model.zero_grad(set_to_none=True)
+    was_training = model.training
+    model.train()
+    
     temp = float(config.get("generation", {}).get("temperature", 1.0))
     importance_mb_size = int(config.get("true_delta_h", {}).get("microbatch_size", 1))
-    loss = rl_loss_naive(
-        U_batch,
-        model,
-        temp=temp,
-        mb_size=importance_mb_size,
-        amp_dtype=getattr(torch, config.get("memory_config", {}).get("dtype", "bfloat16"), torch.bfloat16)
-        if hasattr(torch, str(config.get("memory_config", {}).get("dtype", "bfloat16")))
-        else torch.bfloat16,
-        use_amp=bool(config.get("memory_config", {}).get("amp", False)),
-    )
-    loss.backward()
+    
+    try:
+        loss = rl_loss_naive(
+            U_batch,
+            model,
+            temp=temp,
+            mb_size=importance_mb_size,
+            amp_dtype=getattr(torch, config.get("memory_config", {}).get("dtype", "bfloat16"), torch.bfloat16)
+            if hasattr(torch, str(config.get("memory_config", {}).get("dtype", "bfloat16")))
+            else torch.bfloat16,
+            use_amp=bool(config.get("memory_config", {}).get("amp", False)),
+        )
+        loss.backward()
+    finally:
+        model.train(was_training)
 
     # Optional grad clipping
     max_norm = float(config.get("max_grad_norm", 0.0))
