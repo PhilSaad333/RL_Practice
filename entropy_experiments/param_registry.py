@@ -32,6 +32,27 @@ def get_named_buffers(model: torch.nn.Module) -> OrderedDict[str, torch.Tensor]:
     return bufs
 
 
+def get_optimizer_named_params(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer
+) -> OrderedDict[str, torch.nn.Parameter]:
+    """Return ordered mapping of parameters that the optimizer updates.
+
+    Filters model.named_parameters() by membership in optimizer.param_groups.
+    """
+    # Build set of parameter object IDs present in optimizer groups
+    opt_param_ids = set()
+    for group in optimizer.param_groups:
+        for p in group.get("params", []):
+            if p is not None:
+                opt_param_ids.add(id(p))
+
+    params: OrderedDict[str, torch.nn.Parameter] = OrderedDict()
+    for name, p in model.named_parameters():
+        if id(p) in opt_param_ids:
+            params[name] = p
+    return params
+
+
 def to_cpu_fp32_named(named_tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Detach, move to CPU, and cast to float32 (cloned)."""
     out: Dict[str, torch.Tensor] = {}
@@ -60,4 +81,3 @@ def flatten_named(a: Dict[str, torch.Tensor]) -> torch.Tensor:
         return torch.zeros(0, dtype=torch.float32)
     parts = [v.detach().to("cpu", torch.float32).reshape(-1) for _, v in a.items()]
     return torch.cat(parts, dim=0)
-

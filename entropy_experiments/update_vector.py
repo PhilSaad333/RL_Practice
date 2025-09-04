@@ -12,7 +12,11 @@ from typing import Any, Dict, Tuple
 import torch
 import torch.nn.functional as F
 
-from .param_registry import get_trainable_named, to_cpu_fp32_named
+from .param_registry import (
+    get_trainable_named,
+    get_optimizer_named_params,
+    to_cpu_fp32_named,
+)
 from .delta_entropy_is import DeltaEntropyIS, rl_loss_naive
 
 
@@ -45,6 +49,8 @@ def _infer_group_hparams(optimizer: torch.optim.Optimizer) -> Dict[int, Dict[str
 def _adamw_direction_from_grads(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    *,
+    only_optimizer_params: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Compute per-parameter AdamW direction (per unit lr), using current grads and optimizer state.
 
@@ -54,7 +60,7 @@ def _adamw_direction_from_grads(
     We form dir_per_lr = - [ step_size * exp_avg_t / (sqrt(exp_avg_sq_t)+eps) + weight_decay * p ].
     """
     hparams = _infer_group_hparams(optimizer)
-    trainable = get_trainable_named(model)
+    trainable = get_optimizer_named_params(model, optimizer) if only_optimizer_params else get_trainable_named(model)
     dir_named: Dict[str, torch.Tensor] = {}
     for name, p in trainable.items():
         pid = id(p)
@@ -122,7 +128,7 @@ def compute_update_vector_step(
             p.requires_grad_(True)
     
     # Record before params first (before snapshot which detaches)
-    trainable = get_trainable_named(model)
+    trainable = get_optimizer_named_params(model, optimizer)
     before = {name: p.detach().clone() for name, p in trainable.items()}
     
     # Now snapshot for restoration later
@@ -214,7 +220,7 @@ def compute_update_vector_adamw(
         torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm)
 
     # Build direction using AdamW math (per unit lr)
-    dir_named = _adamw_direction_from_grads(model, optimizer)
+    dir_named = _adamw_direction_from_grads(model, optimizer, only_optimizer_params=True)
 
     # Clear grads to be polite
     model.zero_grad(set_to_none=True)
@@ -276,7 +282,7 @@ def compute_update_vector_adamw_manual(
 
     # Manual AdamW direction (per unit lr)
     hparams = _infer_group_hparams(optimizer)
-    trainable = get_trainable_named(model)
+    trainable = get_optimizer_named_params(model, optimizer)
     vec_named: Dict[str, torch.Tensor] = {}
     adam_norm = torch.zeros((), dtype=torch.float64)
     wd_norm = torch.zeros((), dtype=torch.float64)
