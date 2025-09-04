@@ -933,7 +933,26 @@ class OfflineEntropyProbe:
         # Perform the real RL step
         rl_grad_accum = int(self.config.get('computation_options', {}).get('rl_grad_accum', 1))
         importance_mb_size = int(self.config.get('true_delta_h', {}).get('microbatch_size', 1))
-        self.delta_entropy_is._rl_update_streaming(U_batch, self.optimizer, rl_grad_accum, importance_mb_size)
+        # Optional: override LR for this single delta-theta step (scales Δθ directly)
+        lr_backup = [pg.get('lr', None) for pg in self.optimizer.param_groups]
+        lr_override = (
+            self.config.get('computation_options', {}).get('delta_theta_lr_override', None)
+            or self.config.get('true_delta_h', {}).get('lr_override', None)
+        )
+        try:
+            if lr_override is not None:
+                lr_val = float(lr_override)
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = lr_val
+                self.logger.info(f"[delta-theta] Using lr_override={lr_val} for single U update")
+            self.delta_entropy_is._rl_update_streaming(U_batch, self.optimizer, rl_grad_accum, importance_mb_size)
+        finally:
+            try:
+                for pg, lr0 in zip(self.optimizer.param_groups, lr_backup):
+                    if lr0 is not None:
+                        pg['lr'] = lr0
+            except Exception:
+                pass
 
         # Compute Delta-theta on CPU
         delta_theta: dict[int, torch.Tensor] = {}
