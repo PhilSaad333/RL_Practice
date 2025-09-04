@@ -122,7 +122,8 @@ def main():
 
     print("=== Update Vector Comparison ===")
     print(f"Option A (adamw_from_grads): norm={norm_A:.6e}")
-    print(f"Option B (single_step):      norm={norm_B:.6e}; lr_used={stats_B.get('lr_used', float('nan')):.3e}")
+    lr_groups = stats_B.get('lr_groups', [])
+    print(f"Option B (single_step):      norm={norm_B:.6e}; lr_groups={lr_groups}")
     print(f"Option C (adamw_manual):     norm={norm_C:.6e}")
     print(f"Cosine A↔B: {cos_AB:.6f}  A↔C: {cos_AC:.6f}  B↔C: {cos_BC:.6f}")
     print(f"Norm ratio A/B: {ratio_AB:.6f}")
