@@ -95,7 +95,6 @@ def _adamw_direction_from_grads(
     return dir_named
 
 
-@torch.no_grad()
 def compute_update_vector_step(
     *,
     model: torch.nn.Module,
@@ -109,11 +108,29 @@ def compute_update_vector_step(
     Uses DeltaEntropyIS._snapshot_model_optimizer and _rl_update_streaming to ensure parity with existing code.
     """
     de = DeltaEntropyIS(model=model, config=config, logger=logger or _NullLogger())
-    cpu_snaps, opt_state_snapshot = de._snapshot_model_optimizer(model, optimizer, snapshot_device="cpu")
-
-    # Record before params
+    
+    # Get model device
+    device = next(model.parameters()).device
+    
+    # Move U_batch tensors to the same device as model
+    if "sequences" in U_batch and U_batch["sequences"].device != device:
+        U_batch["sequences"] = U_batch["sequences"].to(device)
+    if "attention_masks" in U_batch and U_batch["attention_masks"].device != device:
+        U_batch["attention_masks"] = U_batch["attention_masks"].to(device)
+    if "advantages" in U_batch and U_batch["advantages"].device != device:
+        U_batch["advantages"] = U_batch["advantages"].to(device)
+    
+    # Ensure model parameters require gradients (may have been disabled)
+    for p in model.parameters():
+        if hasattr(p, 'requires_grad'):
+            p.requires_grad_(True)
+    
+    # Record before params first (before snapshot which detaches)
     trainable = get_trainable_named(model)
     before = {name: p.detach().clone() for name, p in trainable.items()}
+    
+    # Now snapshot for restoration later
+    cpu_snaps, opt_state_snapshot = de._snapshot_model_optimizer(model, optimizer, snapshot_device="cpu")
 
     # Execute one RL-aligned step on U
     rl_grad_accum = int(config.get("computation_options", {}).get("rl_grad_accum", 1))
