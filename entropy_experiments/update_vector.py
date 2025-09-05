@@ -129,8 +129,9 @@ def compute_update_vector_step(
             p.requires_grad_(True)
     
     # Record before params first (before snapshot which detaches)
+    # IMPORTANT: Clone to CPU to avoid doubling GPU memory usage!
     trainable = get_optimizer_named_params(model, optimizer)
-    before = {name: p.detach().clone() for name, p in trainable.items()}
+    before = {name: p.detach().clone().cpu() for name, p in trainable.items()}
     
     # Now snapshot for restoration later
     cpu_snaps, opt_state_snapshot = de._snapshot_model_optimizer(model, optimizer, snapshot_device="cpu")
@@ -151,8 +152,8 @@ def compute_update_vector_step(
                 lr_map[id(p)] = lr_g
     delta_over_lr: Dict[str, torch.Tensor] = {}
     for name, p in trainable.items():
-        after = p.detach()
-        dtheta = (after - before[name])
+        after = p.detach().cpu()  # Move to CPU for comparison
+        dtheta = (after - before[name])  # before is already on CPU
         lr_used = lr_map.get(id(p), 1.0)
         vec = (dtheta / max(lr_used, 1e-38)).to("cpu", torch.float32)
         delta_over_lr[name] = vec
