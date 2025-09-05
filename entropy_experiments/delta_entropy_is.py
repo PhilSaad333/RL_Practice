@@ -422,7 +422,7 @@ class DeltaEntropyIS:
     # RL-aligned update (GRPO)
     # ----------------------------
 
-    def _rl_update_streaming(
+    def _rl_update_streaming_old(
         self,
         U_batch: Dict[str, Any],
         optimizer: torch.optim.Optimizer,
@@ -561,6 +561,50 @@ class DeltaEntropyIS:
         optimizer.step()
         avg_loss = total_loss / B_U if B_U > 0 else 0.0
         self.logger.info(f"RL-aligned optimizer step completed: avg_loss = {avg_loss:.6f}, {num_microbatches} microbatches")
+
+
+    def _rl_update_streaming(
+        self,
+        U_batch: Dict[str, Any],
+        optimizer: torch.optim.Optimizer,
+        rl_grad_accum: int,
+        importance_mb_size: int,
+    ) -> None:
+        self.logger.debug("Taking RL-aligned optimizer step on U batch")
+
+        sequences = U_batch['sequences']          # [B_U, G, max_len]
+        B_U, G, max_len = sequences.shape
+
+        # --- training-mode and grads ---
+        self.model.train()
+        optimizer.zero_grad(set_to_none=True)
+
+        # --- shared config knobs used in training ---
+        temp = float(self.config.get("generation", {}).get("temperature", 1.0))  # parity with training
+
+        loss = rl_loss_naive(
+            U_batch,
+            self.model,
+            temp=temp,
+            mb_size=importance_mb_size,
+            amp_dtype=self.amp_dtype,
+            use_amp=self.use_amp,
+        )
+        loss.backward()
+        total_loss = float(loss.item())
+        num_microbatches = (B_U + importance_mb_size - 1) // importance_mb_size
+
+        # --- gradient clipping parity with training ---
+        max_norm = float(self.config.get("max_grad_norm", 0.0))
+        if max_norm and max_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], max_norm)
+
+        optimizer.step()
+        avg_loss = total_loss / B_U if B_U > 0 else 0.0
+        self.logger.info(f"RL-aligned optimizer step completed: avg_loss = {avg_loss:.6f}, {num_microbatches} microbatches")
+
+
+
 
 
     # ----------------------------
