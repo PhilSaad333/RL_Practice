@@ -135,11 +135,18 @@ def compute_update_vector_step(
     
     # Now snapshot for restoration later
     cpu_snaps, opt_state_snapshot = de._snapshot_model_optimizer(model, optimizer, snapshot_device="cpu")
+    
+    if torch.cuda.is_available():
+        print(f"  [Step] After snapshot: GPU alloc={torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
 
     # Execute one RL-aligned step on U
     rl_grad_accum = int(config.get("computation_options", {}).get("rl_grad_accum", 1))
     imp_mb = int(config.get("true_delta_h", {}).get("microbatch_size", 1))
+    print(f"  [Step] Calling _rl_update_streaming with rl_grad_accum={rl_grad_accum}, imp_mb={imp_mb}")
     de._rl_update_streaming(U_batch, optimizer, rl_grad_accum, imp_mb)
+    
+    if torch.cuda.is_available():
+        print(f"  [Step] After RL update: GPU alloc={torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
 
     # Build per-parameter LR map from optimizer groups
     lr_map: Dict[int, float] = {}
@@ -207,6 +214,10 @@ def compute_update_vector_adamw(
     # Ensure train mode for grad path
     was_training = model.training
     model.train()
+    
+    if torch.cuda.is_available():
+        print(f"  [AdamW] Before forward pass: GPU alloc={torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+    
     try:
         loss = rl_loss_naive(
             U_batch,

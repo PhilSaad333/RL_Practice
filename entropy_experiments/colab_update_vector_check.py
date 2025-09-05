@@ -88,7 +88,21 @@ def main():
     G_U = probe.config["batch_config"]["G"]
     U_batch = probe._get_or_sample_U(B_U, G_U)
 
-    # Compute update vectors
+    # Compute update vectors with memory tracking
+    print(f"\n=== Starting update vector computations ===")
+    print(f"U_batch shapes: sequences={U_batch['sequences'].shape}, device={U_batch['sequences'].device}")
+    
+    # Get GPU memory usage helper
+    def get_gpu_memory():
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            reserved = torch.cuda.memory_reserved(0) / 1024**3
+            return f"Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB"
+        return "No GPU"
+    
+    print(f"Initial GPU memory: {get_gpu_memory()}")
+    
+    print("\n>>> Computing Option B (single_step)...")
     vec_B, stats_B = compute_update_vector_step(
         model=probe.model,
         optimizer=probe.optimizer,
@@ -96,6 +110,10 @@ def main():
         config=probe.config,
         logger=probe.logger,
     )
+    print(f"After Option B: {get_gpu_memory()}")
+    print(f"Option B stats: {stats_B}")
+    
+    print("\n>>> Computing Option A (adamw_from_grads)...")
     vec_A, stats_A = compute_update_vector_adamw(
         model=probe.model,
         optimizer=probe.optimizer,
@@ -103,6 +121,10 @@ def main():
         config=probe.config,
         logger=probe.logger,
     )
+    print(f"After Option A: {get_gpu_memory()}")
+    print(f"Option A stats: {stats_A}")
+    
+    print("\n>>> Computing Option C (adamw_manual)...")
     vec_C, stats_C = compute_update_vector_adamw_manual(
         model=probe.model,
         optimizer=probe.optimizer,
@@ -110,6 +132,8 @@ def main():
         config=probe.config,
         logger=probe.logger,
     )
+    print(f"After Option C: {get_gpu_memory()}")
+    print(f"Option C stats: {stats_C}")
 
     # Metrics
     cos_AB = cosine_named(vec_A, vec_B)
