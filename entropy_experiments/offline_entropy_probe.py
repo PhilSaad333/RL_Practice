@@ -36,7 +36,7 @@ from pathlib import Path
 import yaml
 import json
 
-from entropy_experiments.probe_components import ProbeComponents
+from entropy_experiments.delta_entropy_approx import DeltaEntropyApprox
 from entropy_experiments.adam_preconditioner import AdamPreconditioner  
 from entropy_experiments.delta_entropy_is import DeltaEntropyIS
 import entropy_experiments.distributed_helpers as distributed_helpers
@@ -79,7 +79,7 @@ class OfflineEntropyProbe:
             self.world_size = dist.get_world_size() if self.distributed else 1
         
         # Initialize components
-        self.probe_components = None
+        self.delta_entropy_approx = None
         self.adam_preconditioner = None  
         self.delta_entropy_is = None
         self.u_statistics = None
@@ -259,7 +259,7 @@ class OfflineEntropyProbe:
         
     def _initialize_components(self) -> None:
         """Initialize all probe components after model/optimizer are loaded."""
-        self.probe_components = ProbeComponents(
+        self.delta_entropy_approx = DeltaEntropyApprox(
             model=self.model,
             config=self.config,
             logger=self.logger
@@ -816,7 +816,7 @@ class OfflineEntropyProbe:
                 f"Phase 2-3: Computing Xbar on E and deltaH1 using ÃƒÅ½Ã¢â‚¬ÂÃƒÅ½Ã‚Â¸ from ground-truth "
                 f"(||ÃƒÅ½Ã¢â‚¬ÂÃƒÅ½Ã‚Â¸||={ground_truth_results.get('param_update_l2', 0.0):.3e})"
             )
-            compute = self.probe_components.compute_delta_h1_from_batches(
+            compute = self.delta_entropy_approx.compute_delta_h1_from_batches(
                 E_batch=E_batch,
                 U_batch=U_batch,
                 mb_size_prompts=mb_size_prompts,

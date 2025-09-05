@@ -12,7 +12,7 @@ We can roughly split what I'm doing into:
 - **1/3 Infrastructure & Tooling**: Setting up training and experimentation code in the distributed setting, as well as various analysis tools
 - **1/3 Empirical Exploration**: Taking lots of detours to get more familiar with interesting and useful things I'm learning about along the way (grdient noise scale for getting a sense of what is a good batch size, experimenting with various variance reduction techniques like Rao-Blackwellization and control variates, basically anything that seems worthwhile for doing better science)
 
-For anyone readign this: the main folders to look at to see what I'm doing are the docs folder, containing my notes, and the entropy_experiments folder, which contains the main experimentation code. 
+**For anyone reading this: the main folders to look at to see what I'm doing are the docs folder, containing my notes, and the entropy_experiments folder, which contains the main experimentation code.** 
 
 Here's a summary of the idea behind the project:
 

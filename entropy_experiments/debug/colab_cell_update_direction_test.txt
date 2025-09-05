@@ -1,0 +1,190 @@
+# === Colab cell: run the compare-update-directions flow without the CLI ===
+# Uses your config at /content/A100_config.yaml and your checkpoint paths.
+
+# ---------------- user-configurable ----------------
+CONFIG_PATH  = "/content/A100_config.yaml"
+ETA          = 2e-6      # learning rate used for the RL step / manual direction
+B_U_OVERRIDE = 64         # if None, use YAML; else override
+G_U_OVERRIDE = 8         # if None, use YAML; else override
+MB_SIZE      = 4         # microbatch for the RL update
+PROJECT_ROOT = "/content/RL_Practice"
+# ---------------------------------------------------
+
+import os, sys, json
+from pathlib import Path
+
+# 1) Mount Drive (for checkpoint paths)
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+except Exception as e:
+    print("Drive mount skipped:", e)
+
+# 2) Ensure repo is importable
+assert Path(PROJECT_ROOT).is_dir(), f"Project root not found: {PROJECT_ROOT}"
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+os.environ["PYTHONPATH"] = PROJECT_ROOT + (":" + os.environ["PYTHONPATH"] if "PYTHONPATH" in os.environ else "")
+
+# 3) Load YAML config
+import yaml
+with open(CONFIG_PATH, "r") as f:
+    cfg = yaml.safe_load(f)
+
+# Ensure microbatch is set as requested
+cfg.setdefault("true_delta_h", {})
+cfg["true_delta_h"]["microbatch_size"] = int(MB_SIZE)
+
+# Pull B_U, G from YAML unless overridden here
+B_U = int(B_U_OVERRIDE) if B_U_OVERRIDE is not None else int(cfg.get("batch_config", {}).get("B_U", 2))
+G_U = int(G_U_OVERRIDE) if G_U_OVERRIDE is not None else int(cfg.get("batch_config", {}).get("G", 4))
+
+ckpt_cfg = cfg.get("checkpoint", {})
+adapter_path   = ckpt_cfg.get("checkpoint_path", "")
+optimizer_path = ckpt_cfg.get("optimizer_path", "")
+print("Config says adapter_path:", adapter_path)
+print("Optimizer path:", optimizer_path)
+
+# 4) Robust PEFT loader: works for adapter folder OR full PEFT checkpoint
+def _robust_load_peft_for_probe(base_model, adapter_path: str, is_trainable: bool = True, **kwargs):
+    import os
+    from peft import PeftModel, AutoPeftModelForCausalLM
+
+    ap = os.path.abspath(adapter_path)
+    if not os.path.isdir(ap):
+        raise FileNotFoundError(f"Adapter path not found: {ap}")
+
+    files = set(os.listdir(ap))
+    has_adapter_here = ("adapter_config.json" in files) and any(
+        fn.startswith("adapter_model") or fn == "pytorch_model.bin" for fn in files
+    )
+    if has_adapter_here:
+        return PeftModel.from_pretrained(base_model, ap, is_trainable=is_trainable)
+
+    parent = os.path.dirname(ap)
+    if os.path.isdir(parent):
+        files2 = set(os.listdir(parent))
+        has_adapter_parent = ("adapter_config.json" in files2) and any(
+            fn.startswith("adapter_model") or fn == "pytorch_model.bin" for fn in files2
+        )
+        if has_adapter_parent:
+            return PeftModel.from_pretrained(base_model, parent, is_trainable=is_trainable)
+
+    # Fallback: treat as a full PEFT checkpoint (wrapped model saved)
+    try:
+        return AutoPeftModelForCausalLM.from_pretrained(
+            ap, is_trainable=is_trainable, torch_dtype="auto", device_map="auto"
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Neither {ap} nor its parent look like an adapter dir; "
+            f"and loading as a full PEFT checkpoint failed.\nUnderlying error: {e}"
+        )
+
+# 5) Monkey-patch your project’s loader to use the robust handler
+import importlib
+ml = importlib.import_module("entropy_experiments.model_loader")
+setattr(ml, "load_peft_for_probe", _robust_load_peft_for_probe)
+
+# 6) Project imports
+import torch
+from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
+from entropy_experiments.update_vector import (
+    compute_update_vector_step,
+    compute_update_vector_adamw_manual,
+)
+from entropy_experiments.param_registry import flatten_named
+
+# Fallbacks in case your API differs across branches
+def _build_probe_from_cfg(cfg_dict, config_path):
+    """
+    Try, in order:
+      - OfflineEntropyProbe.from_config(cfg_dict)
+      - OfflineEntropyProbe.from_config_file(config_path)
+      - OfflineEntropyProbe(cfg_dict)  # direct constructor taking a dict
+    """
+    if hasattr(OfflineEntropyProbe, "from_config") and callable(getattr(OfflineEntropyProbe, "from_config")):
+        return OfflineEntropyProbe.from_config(cfg_dict)
+    elif hasattr(OfflineEntropyProbe, "from_config_file") and callable(getattr(OfflineEntropyProbe, "from_config_file")):
+        return OfflineEntropyProbe.from_config_file(config_path)
+    else:
+        return OfflineEntropyProbe(cfg_dict)
+
+# Similar helpers
+def _cosine_named(a, b):
+    va = flatten_named(a).double()
+    vb = flatten_named(b).double()
+    n = min(va.numel(), vb.numel())
+    if n == 0:
+        return float("nan")
+    va, vb = va[:n], vb[:n]
+    den = va.norm() * vb.norm()
+    return float((va @ vb) / den) if den.item() != 0.0 else float("nan")
+
+def _l2_diff_named(a, b):
+    va = flatten_named(a).double()
+    vb = flatten_named(b).double()
+    n = min(va.numel(), vb.numel())
+    return float((va[:n] - vb[:n]).norm())
+
+# 7) Build probe, load checkpoint, optimizer
+probe = _build_probe_from_cfg(cfg, CONFIG_PATH)
+print("Loading checkpoint via robust PEFT handler …")
+probe.load_checkpoint(adapter_path, optimizer_path)
+
+
+if hasattr(probe, "build_optimizer") and callable(getattr(probe, "build_optimizer")):
+    optimizer = probe.build_optimizer(lr=ETA)
+else:
+    trainable = [p for _, p in probe.model.named_parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=ETA)
+print(f"Optimizer ready with lr={ETA:g}")
+
+# 8) Sample/prepare U_batch and ensure CPU residency to keep GPU memory flat
+probe._ensure_sequence_processor()
+
+get_u = getattr(probe, "_get_or_sample_U", None) or getattr(probe, "get_or_sample_U", None)
+assert callable(get_u), "Probe is missing a U-batch sampler (_get_or_sample_U / get_or_sample_U)."
+U_batch = get_u(B_U, G_U)
+
+def _to_cpu_batch(b):
+    out = {}
+    for k, v in b.items():
+        out[k] = v.cpu() if torch.is_tensor(v) else v
+    return out
+U_batch = _to_cpu_batch(U_batch)
+
+
+# 9) Compute update vectors
+print("Computing Option B (real RL step, Δθ/lr) …")
+vec_B, stats_B = compute_update_vector_step(
+    model=probe.model,
+    optimizer=optimizer,
+    U_batch=U_batch,
+    config=probe.config,
+    logger=getattr(probe, "logger", None),
+)
+
+print("Computing Option C (manual AdamW per-unit-lr) …")
+vec_C, stats_C = compute_update_vector_adamw_manual(
+    model=probe.model,
+    optimizer=optimizer,
+    U_batch=U_batch,
+    config=probe.config,
+    logger=getattr(probe, "logger", None),
+)
+
+
+# 10) Parity metrics
+cos_BC = _cosine_named(vec_B, vec_C)
+norm_B = float(torch.sqrt(sum((v.double() ** 2).sum() for v in vec_B.values())).item())
+norm_C = float(torch.sqrt(sum((v.double() ** 2).sum() for v in vec_C.values())).item())
+ratio  = norm_C / max(norm_B, 1e-38)
+diff   = _l2_diff_named(vec_B, vec_C)
+
+print("\n=== Parity Harness Results ===")
+print(f"cos(B,C)   = {cos_BC:.6f}")
+print(f"||C||/||B||= {ratio:.6f}")
+print(f"L2 ||B−C|| = {diff:.6e}")
+print(f"B stats: {stats_B}")
+print(f"C stats: {stats_C}")

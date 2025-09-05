@@ -17,7 +17,7 @@ except ImportError:
     rlp_datasets = None
 
 from transformers import LogitsProcessor
-
+from entropy_experiments.param_registry import get_trainable_named, get_named_buffers
 
 class StopAfterAnswer(LogitsProcessor):
     """Stop generation after seeing '</answer>' tag - correct logic from collect_rollouts.py"""
@@ -422,13 +422,19 @@ class SequenceProcessor:
                               with_grad: bool = False,
                               tf_batch_size: Optional[int] = None,
                               compute_rb: bool = False,
-                              return_baseline_features: bool = False) -> LogprobResults:
+                              return_baseline_features: bool = False,
+                              params_override: dict[str, Tensor] | None = None,
+                              buffers_override: dict[str, Tensor] | None = None) -> LogprobResults:
         """Compute logprobs for generated sequences using teacher forcing.
         
         Args:
             sequences: BatchedSequences from generation
             with_grad: Whether to compute gradients (True) or not (False)
             tf_batch_size: Batch size for teacher forcing (uses config default if None)
+            compute_rb: Whether to compute RB entropies
+            return_baseline_features: Whether to compute baseline features φ_j for regression baseline
+            params_override: Optional dict of parameter overrides for model (name -> Tensor)
+            buffers_override: Optional dict of buffer overrides for model (name -> Tensor)
             
         Returns:
             LogprobResults containing logprobs and entropies
@@ -445,7 +451,9 @@ class SequenceProcessor:
                                               with_grad: bool = False,
                                               tf_batch_size: Optional[int] = None,
                                               compute_rb: bool = False,
-                                              return_baseline_features: bool = False) -> Tuple[LogprobResults, DiagnosticsResults]:
+                                              return_baseline_features: bool = False,
+                                              params_override: dict[str, Tensor] | None = None,
+                                              buffers_override: dict[str, Tensor] | None = None) -> Tuple[LogprobResults, DiagnosticsResults]:
         """Compute logprobs and diagnostics for generated sequences using teacher forcing.
         
         Args:
@@ -453,6 +461,11 @@ class SequenceProcessor:
             with_grad: Whether to compute gradients (True) or not (False)
             tf_batch_size: Batch size for teacher forcing (uses config default if None)
             compute_rb: Whether to compute RB entropies
+            return_baseline_features: Whether to compute baseline features φ_j for regression baseline
+            params_override: Optional dict of parameter overrides for model (name -> Tensor)
+            buffers_override: Optional dict of buffer overrides for model (name -> Tensor)
+
+            (Last two only for the no-grad version currently)
             
         Returns:
             (LogprobResults, DiagnosticsResults)
@@ -463,10 +476,14 @@ class SequenceProcessor:
         if with_grad:
             return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
         else:
-            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
+            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb, return_baseline_features, params_override, buffers_override)
     
-    def _teacher_force_no_grad(
-        self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool, return_baseline_features: bool = False
+    def _teacher_force_no_grad(self, sequences: BatchedSequences, 
+                               tf_batch_size: int, 
+                               compute_rb: bool, 
+                               return_baseline_features: bool = False,
+                               params_override: dict[str, torch.Tensor] | None = None,
+                               buffers_override: dict[str, torch.Tensor] | None = None
     ) -> Tuple[LogprobResults, DiagnosticsResults]:
         model = self._unwrap(self.model)
         B, G = sequences.sequences.shape[:2]
@@ -540,7 +557,15 @@ class SequenceProcessor:
                         # ATTENTION: use the attention mask so left pads are ignored correctly
                         attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(input_seq.device)
 
-                        outputs = model(input_seq, attention_mask=attn)
+                        if params_override:
+                            outputs = self._call_model_tf(
+                                input_ids=input_seq,
+                                attention_mask=attn,
+                                params_override=params_override,
+                                buffers_override=buffers_override
+                            )
+                        else:
+                            outputs = model(input_seq, attention_mask=attn)
                         logits = outputs.logits[0]  # [actual_len, V]
 
                         gen_start = prompt_len_padded
@@ -635,8 +660,7 @@ class SequenceProcessor:
         self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool, return_baseline_features: bool = False
     ) -> Tuple[LogprobResults, DiagnosticsResults]:
         """
-        Gradient-enabled version. By default we do NOT build a gradient graph for RB entropies,
-        since these are typically diagnostics. If you want grads for RB later, remove .detach().
+        Gradient-enabled version
         """
         model = self._unwrap(self.model)
         B, G = sequences.sequences.shape[:2]
@@ -706,7 +730,8 @@ class SequenceProcessor:
                         seq_logprob = float(token_logprobs.detach().sum().item())
                         seq_logq = float(token_logqs.detach().sum().item())  # Stage 2
                         
-                        # --- Baseline features (Phase 3b) ---
+                        # --- Baseline features (For diagonstics but also for regression baseline
+                        #  in RB entropy gradient, as well as candidates for control variates) ---
                         phi = None
                         if return_baseline_features:
                             with torch.no_grad():
@@ -1113,6 +1138,18 @@ class SequenceProcessor:
         
         # If any realized token falls outside the nucleus, its log-q = -inf (correct for IS)
         return token_logq
+
+
+    def _call_model_tf(self, input_ids, attention_mask, *, params_override=None):
+        """Helper to call model in teacher forcing mode, with optional param overrides (for functorch)."""
+        mdl = self._unwrap(self.model)
+        if params_override is None:
+            return mdl(input_ids, attention_mask=attention_mask)
+        bufs = get_named_buffers(mdl)
+        return torch.func.functional_call(
+            mdl, {**params_override, **bufs}, (input_ids,), {'attention_mask': attention_mask}
+        )
+
 
 
 class DistributionDiagnostics:

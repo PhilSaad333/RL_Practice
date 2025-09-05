@@ -1,5 +1,5 @@
 """
-Probe Components
+Delta Entropy Approx
 
 Core computational components for the computation of \delta H_1 and related quantities.
 The computation of the variance estimates is handled in conditional_variance.py (moved from here).
@@ -70,7 +70,7 @@ class BaselineState:
         return self.mu[:J].detach()  # [J], no grad
 
 
-class ProbeComponents:
+class DeltaEntropyApprox:
     """
     Core computational components for entropy probe analysis.
     

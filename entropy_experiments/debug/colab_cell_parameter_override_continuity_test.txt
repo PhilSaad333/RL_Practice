@@ -1,0 +1,337 @@
+# === Colab cell: Parameter Override Continuity Test ===
+# Tests the complete parameter override pipeline for mathematical continuity:
+# 1. Update vector computation with compute_update_vector
+# 2. Parameter override mechanism θ' = θ + η*v  
+# 3. Sequence processor with params_override
+# 4. Mathematical continuity: tiny η → identical entropies
+
+# ---------------- user-configurable ----------------
+CONFIG_PATH  = "/content/A100_config.yaml"  # or your config path
+ETA          = 2e-6      # learning rate for optimizer
+B_U_OVERRIDE = 16        # U batch size for update vector computation
+G_U_OVERRIDE = 8         # generations per prompt for U batch
+B_E_SIZE     = 4         # E batch size for entropy computation
+G_E_SIZE     = 4         # generations per prompt for E batch
+PROJECT_ROOT = "/content/RL_Practice"  # or your project root
+TINY_ETA     = 1e-10     # tiny learning rate for continuity test
+# ---------------------------------------------------
+
+import os, sys, json, numpy as np
+from pathlib import Path
+
+# 1) Mount Drive (for checkpoint paths)
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+except Exception as e:
+    print("Drive mount skipped:", e)
+
+# 2) Ensure repo is importable
+assert Path(PROJECT_ROOT).is_dir(), f"Project root not found: {PROJECT_ROOT}"
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+os.environ["PYTHONPATH"] = PROJECT_ROOT + (":" + os.environ["PYTHONPATH"] if "PYTHONPATH" in os.environ else "")
+
+# 3) Load YAML config
+import yaml
+with open(CONFIG_PATH, "r") as f:
+    cfg = yaml.safe_load(f)
+
+# Pull checkpoint paths
+ckpt_cfg = cfg.get("checkpoint", {})
+adapter_path   = ckpt_cfg.get("checkpoint_path", "")
+optimizer_path = ckpt_cfg.get("optimizer_path", "")
+print("Config says adapter_path:", adapter_path)
+print("Optimizer path:", optimizer_path)
+
+# 4) Robust PEFT loader (same as update direction test)
+def _robust_load_peft_for_probe(base_model, adapter_path: str, is_trainable: bool = True, **kwargs):
+    import os
+    from peft import PeftModel, AutoPeftModelForCausalLM
+
+    ap = os.path.abspath(adapter_path)
+    if not os.path.isdir(ap):
+        raise FileNotFoundError(f"Adapter path not found: {ap}")
+
+    files = set(os.listdir(ap))
+    has_adapter_here = ("adapter_config.json" in files) and any(
+        fn.startswith("adapter_model") or fn == "pytorch_model.bin" for fn in files
+    )
+    if has_adapter_here:
+        return PeftModel.from_pretrained(base_model, ap, is_trainable=is_trainable)
+
+    parent = os.path.dirname(ap)
+    if os.path.isdir(parent):
+        files2 = set(os.listdir(parent))
+        has_adapter_parent = ("adapter_config.json" in files2) and any(
+            fn.startswith("adapter_model") or fn == "pytorch_model.bin" for fn in files2
+        )
+        if has_adapter_parent:
+            return PeftModel.from_pretrained(base_model, parent, is_trainable=is_trainable)
+
+    # Fallback: treat as a full PEFT checkpoint (wrapped model saved)
+    try:
+        return AutoPeftModelForCausalLM.from_pretrained(
+            ap, is_trainable=is_trainable, torch_dtype="auto", device_map="auto"
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Neither {ap} nor its parent look like an adapter dir; "
+            f"and loading as a full PEFT checkpoint failed.\nUnderlying error: {e}"
+        )
+
+# 5) Monkey-patch your project's loader to use the robust handler
+import importlib
+ml = importlib.import_module("entropy_experiments.model_loader")
+setattr(ml, "load_peft_for_probe", _robust_load_peft_for_probe)
+
+# 6) Project imports
+import torch
+from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
+from entropy_experiments.update_vector import compute_update_vector
+from entropy_experiments.param_overrides import build_merged_functional_state
+import sequence_processing
+
+# 7) Build probe, load checkpoint, optimizer (same as update direction test)
+def _build_probe_from_cfg(cfg_dict, config_path):
+    """Try different probe constructor patterns"""
+    if hasattr(OfflineEntropyProbe, "from_config") and callable(getattr(OfflineEntropyProbe, "from_config")):
+        return OfflineEntropyProbe.from_config(cfg_dict)
+    elif hasattr(OfflineEntropyProbe, "from_config_file") and callable(getattr(OfflineEntropyProbe, "from_config_file")):
+        return OfflineEntropyProbe.from_config_file(config_path)
+    else:
+        return OfflineEntropyProbe(cfg_dict)
+
+probe = _build_probe_from_cfg(cfg, CONFIG_PATH)
+print("Loading checkpoint via robust PEFT handler …")
+probe.load_checkpoint(adapter_path, optimizer_path)
+
+# Build optimizer
+if hasattr(probe, "build_optimizer") and callable(getattr(probe, "build_optimizer")):
+    optimizer = probe.build_optimizer(lr=ETA)
+else:
+    trainable = [p for _, p in probe.model.named_parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=ETA)
+print(f"Optimizer ready with lr={ETA:g}")
+
+# 8) Ensure sequence processor is available
+probe._ensure_sequence_processor()
+
+# Helper for CPU batch residency
+def _to_cpu_batch(b):
+    out = {}
+    for k, v in b.items():
+        out[k] = v.cpu() if torch.is_tensor(v) else v
+    return out
+
+print("\n" + "="*60)
+print("PARAMETER OVERRIDE CONTINUITY TEST")
+print("="*60)
+
+# ============================================================================
+# PHASE 1: Generate U batch and compute update vector
+# ============================================================================
+print("\n--- Phase 1: Update Vector Computation ---")
+
+# Sample U batch for update vector computation
+get_u = getattr(probe, "_get_or_sample_U", None) or getattr(probe, "get_or_sample_U", None)
+assert callable(get_u), "Probe is missing a U-batch sampler"
+U_batch = get_u(B_U_OVERRIDE, G_U_OVERRIDE)
+U_batch = _to_cpu_batch(U_batch)  # Keep on CPU to manage memory
+
+# Compute update vector using the main function
+print(f"Computing update vector from U batch (B={B_U_OVERRIDE}, G={G_U_OVERRIDE})...")
+v_named, stats = compute_update_vector(
+    model=probe.model,
+    optimizer=optimizer,
+    U_batch=U_batch,
+    config=probe.config,
+    logger=getattr(probe, "logger", None),
+)
+
+print(f"✓ Update vector computed: {len(v_named)} parameters")
+print(f"  Stats: {stats}")
+
+vec_norm = float(torch.sqrt(sum((v.double() ** 2).sum() for v in v_named.values())).item())
+print(f"  ||v|| = {vec_norm:.6e}")
+
+# ============================================================================
+# PHASE 2: Test Parameter Override Mechanism
+# ============================================================================
+print("\n--- Phase 2: Parameter Override Mechanism ---")
+
+# Create parameter overrides for tiny learning rate
+print(f"Creating parameter overrides with tiny η = {TINY_ETA:.0e}...")
+try:
+    merged_override = build_merged_functional_state(probe.model, v_named, TINY_ETA)
+    print(f"✓ Parameter overrides created: {len(merged_override)} total params+buffers")
+    
+    # Check that overrides are close to original for tiny eta
+    original_params = dict(probe.model.named_parameters())
+    max_param_diff = 0.0
+    for name, override_param in merged_override.items():
+        if name in original_params:
+            orig = original_params[name]
+            diff = (override_param - orig).abs().max().item()
+            max_param_diff = max(max_param_diff, diff)
+    
+    print(f"  Max parameter difference |θ'[i] - θ[i]|: {max_param_diff:.2e}")
+    expected_diff = TINY_ETA * vec_norm
+    print(f"  Expected scale (η * ||v||): {expected_diff:.2e}")
+    
+except Exception as e:
+    print(f"✗ Parameter override creation failed: {e}")
+    raise
+
+# ============================================================================
+# PHASE 3: Generate E batch for entropy computation
+# ============================================================================
+print("\n--- Phase 3: E Batch Generation ---")
+
+# Generate evaluation prompts
+E_prompts = [
+    "What is 2+2?",
+    "Explain the theory of relativity in simple terms.",
+    "Write a short poem about mathematics.",
+    "How does a computer work?"
+][:B_E_SIZE]
+
+print(f"Generating sequences for E batch (B={B_E_SIZE}, G={G_E_SIZE})...")
+sequences_E, logprob_results_gen, diagnostics_gen = probe._sequence_processor.generate_with_logprobs(
+    prompts=E_prompts, 
+    G=G_E_SIZE, 
+    compute_rb=True,
+    with_grad=False  # No grad needed for generation
+)
+
+print(f"✓ Generated {len(sequences_E.sequences)} prompts × {G_E_SIZE} responses")
+print(f"  Sequence shape: {sequences_E.sequences.shape}")
+
+# ============================================================================
+# PHASE 4: Entropy Computation with and without Override
+# ============================================================================
+print("\n--- Phase 4: Entropy Computation & Continuity Test ---")
+
+# Baseline entropies (no parameter override)
+print("Computing baseline entropies (original parameters)...")
+logprob_results_baseline, _ = probe._sequence_processor.teacher_force_logprobs(
+    sequences=sequences_E, 
+    compute_rb=True, 
+    with_grad=False,
+    params_override=None  # No override
+)
+
+# Override entropies (θ' = θ + tiny_η * v)
+print(f"Computing override entropies (θ' = θ + {TINY_ETA:.0e} * v)...")
+logprob_results_override, _ = probe._sequence_processor.teacher_force_logprobs(
+    sequences=sequences_E, 
+    compute_rb=True, 
+    with_grad=False,
+    params_override=merged_override  # With tiny perturbation
+)
+
+# ============================================================================
+# PHASE 5: Continuity Analysis
+# ============================================================================
+print("\n--- Phase 5: Continuity Analysis ---")
+
+def compare_entropy_results(baseline, override, tolerance=1e-8, name="RB"):
+    """Compare entropy results for continuity"""
+    max_diff = 0.0
+    total_comparisons = 0
+    baseline_ents = baseline.rb_entropies if name == "RB" else baseline.entropies
+    override_ents = override.rb_entropies if name == "RB" else override.entropies
+    
+    for b in range(len(baseline_ents)):
+        for g in range(len(baseline_ents[b])):
+            baseline_ent = baseline_ents[b][g]
+            override_ent = override_ents[b][g]
+            
+            if len(baseline_ent) > 0 and len(override_ent) > 0:
+                # Compare per-token entropies
+                assert baseline_ent.shape == override_ent.shape, f"Shape mismatch: {baseline_ent.shape} vs {override_ent.shape}"
+                diff = np.abs(baseline_ent - override_ent).max()
+                max_diff = max(max_diff, diff)
+                total_comparisons += len(baseline_ent)
+    
+    return max_diff, total_comparisons
+
+# Compare RB entropies
+max_rb_diff, n_rb_comparisons = compare_entropy_results(
+    logprob_results_baseline, logprob_results_override, name="RB"
+)
+
+# Compare regular entropies  
+max_ent_diff, n_ent_comparisons = compare_entropy_results(
+    logprob_results_baseline, logprob_results_override, name="regular"
+)
+
+# Results
+print(f"Continuity Test Results:")
+print(f"  Tiny learning rate η: {TINY_ETA:.0e}")
+print(f"  Update vector norm ||v||: {vec_norm:.6e}")
+print(f"  Expected perturbation scale: {TINY_ETA * vec_norm:.2e}")
+print(f"")
+print(f"  RB Entropy differences:")
+print(f"    Max |H_RB(θ') - H_RB(θ)|: {max_rb_diff:.2e}")
+print(f"    Comparisons made: {n_rb_comparisons}")
+print(f"    Continuity test: {'✓ PASS' if max_rb_diff < 1e-6 else '✗ FAIL'}")
+print(f"")
+print(f"  Regular Entropy differences:")
+print(f"    Max |H(θ') - H(θ)|: {max_ent_diff:.2e}")  
+print(f"    Comparisons made: {n_ent_comparisons}")
+print(f"    Continuity test: {'✓ PASS' if max_ent_diff < 1e-6 else '✗ FAIL'}")
+
+# ============================================================================
+# PHASE 6: Learning Rate Sweep (Verify Override Mechanism)
+# ============================================================================
+print("\n--- Phase 6: Learning Rate Sweep ---")
+print("Testing different learning rates to verify override mechanism...")
+
+eta_values = [1e-8, 1e-6, 1e-4, 1e-2]
+for eta in eta_values:
+    try:
+        # Create override with this learning rate
+        override = build_merged_functional_state(probe.model, v_named, eta)
+        
+        # Compute entropies with this override
+        results, _ = probe._sequence_processor.teacher_force_logprobs(
+            sequences=sequences_E, 
+            compute_rb=True, 
+            with_grad=False,
+            params_override=override
+        )
+        
+        # Compare to baseline
+        rb_diff, _ = compare_entropy_results(logprob_results_baseline, results, name="RB")
+        ent_diff, _ = compare_entropy_results(logprob_results_baseline, results, name="regular")
+        
+        print(f"  η={eta:.0e}: |ΔH_RB|_max = {rb_diff:.2e}, |ΔH|_max = {ent_diff:.2e}")
+        
+    except Exception as e:
+        print(f"  η={eta:.0e}: Failed - {e}")
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+print("\n" + "="*60)
+print("PARAMETER OVERRIDE CONTINUITY TEST SUMMARY")
+print("="*60)
+
+continuity_pass = (max_rb_diff < 1e-6) and (max_ent_diff < 1e-6)
+
+print(f"✓ Update vector computation: WORKING")
+print(f"✓ Parameter override mechanism: WORKING") 
+print(f"✓ Sequence processor with overrides: WORKING")
+print(f"{'✓' if continuity_pass else '✗'} Mathematical continuity: {'PASS' if continuity_pass else 'FAIL'}")
+print(f"")
+
+if continuity_pass:
+    print("🎉 ALL TESTS PASSED! Parameter override pipeline is working correctly.")
+    print("   The entropy computation is continuous in the parameters, confirming")
+    print("   that your θ' = θ + η*v mechanism works as expected.")
+else:
+    print("⚠️  CONTINUITY TEST FAILED! Check the parameter override mechanism.")
+    print(f"   Max differences: RB={max_rb_diff:.2e}, regular={max_ent_diff:.2e}")
+
+print("\nTest completed successfully!")

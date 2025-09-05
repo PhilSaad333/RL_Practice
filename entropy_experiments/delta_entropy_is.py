@@ -35,84 +35,6 @@ def _global_max_tensor(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-# Shared RL loss (naive path, minus PPO/KL) used by update-vector builders
-def rl_loss_naive(
-    U_batch: Dict[str, Any],
-    model: torch.nn.Module,
-    *,
-    temp: float,
-    mb_size: int,
-    amp_dtype: torch.dtype | None = None,
-    use_amp: bool = False,
-    backward_per_microbatch: bool = True,
-) -> torch.Tensor | float:
-    """Compute RL-aligned naive loss over U with exact slicing/masking/normalization.
-
-    Loss per prompt b: - sum_{g,t in gen} A_{b,g} * logp_{b,g,t} / (G * L_max_b)
-    Returns a scalar tensor on the model device. Does not zero or step optimizer.
-    """
-    device = next(model.parameters()).device
-    sequences = U_batch['sequences']          # [B_U, G, L]
-    prompt_lens = U_batch['prompt_lens']      # [B_U]
-    attention_masks = U_batch['attention_masks']  # [B_U, G, L]
-    advantages = U_batch['advantages'].to(device)        # [B_U, G]
-    max_lengths = U_batch['max_lengths']      # [B_U]
-    B_U, G, Lmax = sequences.shape
-
-    total_loss = torch.zeros((), device=device, dtype=torch.float32)
-    total_loss_val: float = 0.0
-    for start_b in range(0, B_U, mb_size):
-        end_b = min(start_b + mb_size, B_U)
-        B_mb = end_b - start_b
-
-        mb_seqs = sequences[start_b:end_b].to(device)
-        mb_masks = attention_masks[start_b:end_b].to(device)
-        mb_adv = advantages[start_b:end_b]
-        mb_Lmax = max_lengths[start_b:end_b]
-        mb_prompt = prompt_lens[start_b:end_b]
-
-        flat_seqs = mb_seqs.view(-1, Lmax)
-        flat_masks = mb_masks.view(-1, Lmax)
-
-        with torch.amp.autocast("cuda", dtype=amp_dtype or torch.bfloat16, enabled=use_amp):
-            logits = model(flat_seqs, attention_mask=flat_masks).logits
-        logits = (logits / max(float(temp), 1e-8)).float()
-        logp_all = torch.nn.functional.log_softmax(logits, dim=-1)
-        targets = flat_seqs[:, 1:].unsqueeze(-1)
-        new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)  # [B_mb*G, L-1]
-        new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
-        new_logp = new_logp.view(B_mb, G, -1)
-
-        mb_loss_terms = []
-        for b in range(B_mb):
-            prompt_len = int(mb_prompt[b])
-            L_max_b = max(int(mb_Lmax[b]), 1)
-            gen_start = prompt_len - 1
-            lp_gen = new_logp[b, :, gen_start:]              # (G, Tg)
-            mask_gen = mb_masks[b, :, prompt_len:].float()   # (G, Tg)
-            if lp_gen.numel() == 0 or mask_gen.numel() == 0:
-                continue
-            Tg = min(lp_gen.shape[1], mask_gen.shape[1])
-            lp_gen = lp_gen[:, :Tg]
-            mask_gen = mask_gen[:, :Tg]
-
-            adv_exp = mb_adv[b].unsqueeze(1).expand(-1, Tg)    # (G, Tg)
-            weighted_logp = adv_exp * mask_gen * lp_gen
-            loss_b = -weighted_logp.sum() / (G * L_max_b + 1e-8)
-            mb_loss_terms.append(loss_b)
-
-        mb_loss = (
-            torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=device)
-        )
-        if backward_per_microbatch:
-            (mb_loss * (B_mb / max(B_U, 1))).backward()
-            total_loss_val += float(mb_loss.item()) * B_mb
-        else:
-            total_loss += (mb_loss * (B_mb / max(B_U, 1))).to(total_loss.dtype)
-
-    if backward_per_microbatch:
-        return (total_loss_val / max(B_U, 1))
-    return total_loss
 
 class DeltaEntropyIS:
     def __init__(
@@ -430,8 +352,7 @@ class DeltaEntropyIS:
     # RL-aligned update (GRPO)
     # ----------------------------
 
-
-    def _rl_update_streaming(
+    def _rl_update(
         self,
         U_batch: Dict[str, Any],
         optimizer: torch.optim.Optimizer,
@@ -450,7 +371,7 @@ class DeltaEntropyIS:
         # --- shared config knobs used in training ---
         temp = float(self.config.get("generation", {}).get("temperature", 1.0))  # parity with training
 
-        total_loss = rl_loss_naive(
+        total_loss = rl_loss(
             U_batch,
             self.model,
             temp=temp,
@@ -596,7 +517,7 @@ class DeltaEntropyIS:
                 for pg in optimizer.param_groups:
                     pg['lr'] = lr_val
                 self.logger.info(f"[RL] Using lr_override={lr_val} for single U update")
-            self._rl_update_streaming(U_batch, optimizer, rl_grad_accum, importance_mb_size)
+            self._rl_update(U_batch, optimizer, rl_grad_accum, importance_mb_size)
         finally:
             # Restore original learning rates
             try:
