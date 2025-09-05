@@ -249,7 +249,12 @@ def compute_update_vector_adamw(
     # Optional grad clipping
     max_norm = float(config.get("max_grad_norm", 0.0))
     if max_norm and max_norm > 0.0:
-        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm)
+        # Clip over exactly the params the optimizer will step
+        params_to_clip = []
+        for g in optimizer.param_groups:
+            params_to_clip.extend([p for p in g.get("params", []) if p is not None])
+        if params_to_clip:
+            torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm)
 
     # Build direction using AdamW math (per unit lr)
     dir_named = _adamw_direction_from_grads(model, optimizer, only_optimizer_params=True)
@@ -308,7 +313,11 @@ def compute_update_vector_adamw_manual(
     # Optional grad clipping
     max_norm = float(config.get("max_grad_norm", 0.0))
     if max_norm and max_norm > 0.0:
-        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm)
+        params_to_clip = []
+        for g in optimizer.param_groups:
+            params_to_clip.extend([p for p in g.get("params", []) if p is not None])
+        if params_to_clip:
+            torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm)
 
     # Manual AdamW direction (per unit lr)
     hparams = _infer_group_hparams(optimizer)

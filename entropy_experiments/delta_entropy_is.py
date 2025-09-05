@@ -464,7 +464,14 @@ class DeltaEntropyIS:
         # --- gradient clipping parity with training ---
         max_norm = float(self.config.get("max_grad_norm", 0.0))
         if max_norm and max_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], max_norm)
+            # Clip over the exact parameter set the optimizer will step (not all requires_grad params)
+            params_to_clip = []
+            for g in optimizer.param_groups:
+                for p in g.get('params', []):
+                    if p is not None:
+                        params_to_clip.append(p)
+            if params_to_clip:
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm)
 
         optimizer.step()
         avg_loss = float(total_loss) / B_U if B_U > 0 else 0.0
