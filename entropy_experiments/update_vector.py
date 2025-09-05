@@ -219,7 +219,7 @@ def compute_update_vector_adamw(
         print(f"  [AdamW] Before forward pass: GPU alloc={torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
     
     try:
-        loss = rl_loss_naive(
+        total_loss_val = rl_loss_naive(
             U_batch,
             model,
             temp=temp,
@@ -228,9 +228,8 @@ def compute_update_vector_adamw(
             if hasattr(torch, str(config.get("memory_config", {}).get("dtype", "bfloat16")))
             else torch.bfloat16,
             use_amp=bool(config.get("memory_config", {}).get("amp", False)),
+            backward_per_microbatch=True,
         )
-        loss.backward()
-        total_loss_val = float(loss.item())
         num_microbatches = (B + importance_mb_size - 1) // importance_mb_size
     finally:
         model.train(was_training)
@@ -282,17 +281,17 @@ def compute_update_vector_adamw_manual(
     importance_mb_size = int(config.get("true_delta_h", {}).get("microbatch_size", 1))
     
     try:
-        loss = rl_loss_naive(
-            U_batch,
-            model,
-            temp=temp,
-            mb_size=importance_mb_size,
-            amp_dtype=getattr(torch, config.get("memory_config", {}).get("dtype", "bfloat16"), torch.bfloat16)
-            if hasattr(torch, str(config.get("memory_config", {}).get("dtype", "bfloat16")))
-            else torch.bfloat16,
-            use_amp=bool(config.get("memory_config", {}).get("amp", False)),
-        )
-        loss.backward()
+    _ = rl_loss_naive(
+        U_batch,
+        model,
+        temp=temp,
+        mb_size=importance_mb_size,
+        amp_dtype=getattr(torch, config.get("memory_config", {}).get("dtype", "bfloat16"), torch.bfloat16)
+        if hasattr(torch, str(config.get("memory_config", {}).get("dtype", "bfloat16")))
+        else torch.bfloat16,
+        use_amp=bool(config.get("memory_config", {}).get("amp", False)),
+        backward_per_microbatch=True,
+    )
     finally:
         model.train(was_training)
 

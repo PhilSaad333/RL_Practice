@@ -44,7 +44,8 @@ def rl_loss_naive(
     mb_size: int,
     amp_dtype: torch.dtype | None = None,
     use_amp: bool = False,
-) -> torch.Tensor:
+    backward_per_microbatch: bool = True,
+) -> torch.Tensor | float:
     """Compute RL-aligned naive loss over U with exact slicing/masking/normalization.
 
     Loss per prompt b: - sum_{g,t in gen} A_{b,g} * logp_{b,g,t} / (G * L_max_b)
@@ -59,6 +60,7 @@ def rl_loss_naive(
     B_U, G, Lmax = sequences.shape
 
     total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    total_loss_val: float = 0.0
     for start_b in range(0, B_U, mb_size):
         end_b = min(start_b + mb_size, B_U)
         B_mb = end_b - start_b
@@ -102,8 +104,14 @@ def rl_loss_naive(
         mb_loss = (
             torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=device)
         )
-        total_loss += (mb_loss * (B_mb / max(B_U, 1))).to(total_loss.dtype)
+        if backward_per_microbatch:
+            (mb_loss * (B_mb / max(B_U, 1))).backward()
+            total_loss_val += float(mb_loss.item()) * B_mb
+        else:
+            total_loss += (mb_loss * (B_mb / max(B_U, 1))).to(total_loss.dtype)
 
+    if backward_per_microbatch:
+        return (total_loss_val / max(B_U, 1))
     return total_loss
 
 class DeltaEntropyIS:
@@ -422,146 +430,6 @@ class DeltaEntropyIS:
     # RL-aligned update (GRPO)
     # ----------------------------
 
-    def _rl_update_streaming_old(
-        self,
-        U_batch: Dict[str, Any],
-        optimizer: torch.optim.Optimizer,
-        rl_grad_accum: int,
-        importance_mb_size: int,
-        *,
-        ref_model=None,                  # <- optional, for KL parity
-    ) -> None:
-        self.logger.debug("Taking RL-aligned optimizer step on U batch")
-
-        sequences = U_batch['sequences']          # [B_U, G, max_len]
-        prompt_lens = U_batch['prompt_lens']      # [B_U]
-        attention_masks = U_batch['attention_masks']  # [B_U, G, max_len]
-        advantages = U_batch['advantages']        # [B_U, G]
-        max_lengths = U_batch['max_lengths']      # [B_U]
-        B_U, G, max_len = sequences.shape
-
-        # --- training-mode and grads ---
-        self.model.train()
-        optimizer.zero_grad(set_to_none=True)
-
-        # --- shared config knobs used in training ---
-        temp = float(self.config.get("generation", {}).get("temperature", 1.0))  # parity with training
-        use_clipping = "clip_eps" in self.config
-        clip_eps_neg = float(self.config.get("clip_eps", 0.0))
-        clip_eps_pos = float(self.config.get("clip_+", self.config.get("clip_eps", 0.0)))
-        kl_beta = float(self.config.get("kl_beta", 0.0))
-        do_kl = (kl_beta > 0.0 and ref_model is not None)
-
-        # === 1) Compute old_logp ONCE at the snapshot (pre-update), PPO-style ===
-        old_logp_full = None
-        if use_clipping:
-            with torch.no_grad():
-                all_new_logp = []
-                for start_b in range(0, B_U, importance_mb_size):
-                    end_b = min(start_b + importance_mb_size, B_U)
-                    mb_seqs = sequences[start_b:end_b]       # [B_mb, G, L]
-                    mb_masks = attention_masks[start_b:end_b] # [B_mb, G, L]
-
-                    flat_seqs = mb_seqs.view(-1, max_len)
-                    flat_masks = mb_masks.view(-1, max_len)
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                        logits = self.model(flat_seqs, attention_mask=flat_masks).logits
-                    # temperature + float32 log-softmax
-                    logits = (logits / temp).float()
-                    logp_all = F.log_softmax(logits, dim=-1)
-                    targets = flat_seqs[:, 1:].unsqueeze(-1)
-                    logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
-                    logp = logp.view(end_b - start_b, G, -1)
-                    all_new_logp.append(logp)
-                    # Explicitly delete intermediate tensors to free memory
-                    del logits, logp_all, targets
-                    torch.cuda.empty_cache()  # Force GPU memory cleanup
-                old_logp_full = torch.cat(all_new_logp, dim=0)  # [B_U, G, L-1]
-                # sanitize & clamp like training
-                old_logp_full = torch.nan_to_num(old_logp_full, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
-                # Clear the list to release references
-                del all_new_logp
-                torch.cuda.empty_cache()
-
-        # === 2) Loss/backward ===
-        if use_clipping:
-            # Retain PPO path as-is for parity if enabled
-            total_loss = 0.0
-            num_microbatches = 0
-            for start_b in range(0, B_U, importance_mb_size):
-                end_b = min(start_b + importance_mb_size, B_U)
-                B_mb = end_b - start_b
-
-                mb_seqs = sequences[start_b:end_b]
-                mb_masks = attention_masks[start_b:end_b]
-                mb_adv = advantages[start_b:end_b]
-                mb_Lmax = max_lengths[start_b:end_b]
-                mb_prompt = prompt_lens[start_b:end_b]
-
-                flat_seqs = mb_seqs.view(-1, max_len)
-                flat_masks = mb_masks.view(-1, max_len)
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                    logits = self.model(flat_seqs, attention_mask=flat_masks).logits
-
-                logits = (logits / max(temp, 1e-8)).float()
-                logp_all = F.log_softmax(logits, dim=-1)
-                targets = flat_seqs[:, 1:].unsqueeze(-1)
-                new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
-                new_logp = new_logp.view(B_mb, G, -1)
-                new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
-                # Free memory from intermediate tensors
-                del logits, logp_all, targets
-
-                mb_loss_terms = []
-                for b in range(B_mb):
-                    prompt_len = int(mb_prompt[b])
-                    L_max_b = max(int(mb_Lmax[b]), 1)
-                    gen_start = prompt_len - 1
-                    lp_gen = new_logp[b, :, gen_start:]
-                    mask_gen = mb_masks[b, :, prompt_len:].float()
-                    if lp_gen.numel() == 0 or mask_gen.numel() == 0:
-                        continue
-                    Tg = min(lp_gen.shape[1], mask_gen.shape[1])
-                    lp_gen = lp_gen[:, :Tg]
-                    mask_gen = mask_gen[:, :Tg]
-
-                    # PPO clipping branch
-                    old_lp_gen = old_logp_full[start_b + b, :, gen_start:gen_start+Tg]
-                    ratios = torch.exp((lp_gen - old_lp_gen).clamp(-80, 80)) * mask_gen
-                    adv_b = mb_adv[b].unsqueeze(-1)
-                    surr1 = ratios * adv_b
-                    surr2 = torch.clamp(ratios, 1 - clip_eps_neg, 1 + clip_eps_pos) * adv_b
-                    token_loss = -torch.min(surr1, surr2) * mask_gen
-                    loss_b = token_loss.sum() / (G * L_max_b + 1e-8)
-                    mb_loss_terms.append(loss_b)
-
-                mb_loss = torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=sequences.device)
-                scale = (B_mb / B_U) if B_U > 0 else 1.0
-                (mb_loss * scale).backward()
-                total_loss += mb_loss.item() * B_mb
-                num_microbatches += 1
-        else:
-            loss = rl_loss_naive(
-                U_batch,
-                self.model,
-                temp=temp,
-                mb_size=importance_mb_size,
-                amp_dtype=self.amp_dtype,
-                use_amp=self.use_amp,
-            )
-            loss.backward()
-            total_loss = float(loss.item())
-            num_microbatches = (B_U + importance_mb_size - 1) // importance_mb_size
-
-        # --- gradient clipping parity with training ---
-        max_norm = float(self.config.get("max_grad_norm", 0.0))
-        if max_norm and max_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], max_norm)
-
-        optimizer.step()
-        avg_loss = total_loss / B_U if B_U > 0 else 0.0
-        self.logger.info(f"RL-aligned optimizer step completed: avg_loss = {avg_loss:.6f}, {num_microbatches} microbatches")
-
 
     def _rl_update_streaming(
         self,
@@ -582,16 +450,15 @@ class DeltaEntropyIS:
         # --- shared config knobs used in training ---
         temp = float(self.config.get("generation", {}).get("temperature", 1.0))  # parity with training
 
-        loss = rl_loss_naive(
+        total_loss = rl_loss_naive(
             U_batch,
             self.model,
             temp=temp,
             mb_size=importance_mb_size,
             amp_dtype=self.amp_dtype,
             use_amp=self.use_amp,
+            backward_per_microbatch=True,
         )
-        loss.backward()
-        total_loss = float(loss.item())
         num_microbatches = (B_U + importance_mb_size - 1) // importance_mb_size
 
         # --- gradient clipping parity with training ---
@@ -600,7 +467,7 @@ class DeltaEntropyIS:
             torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], max_norm)
 
         optimizer.step()
-        avg_loss = total_loss / B_U if B_U > 0 else 0.0
+        avg_loss = float(total_loss) / B_U if B_U > 0 else 0.0
         self.logger.info(f"RL-aligned optimizer step completed: avg_loss = {avg_loss:.6f}, {num_microbatches} microbatches")
 
 
