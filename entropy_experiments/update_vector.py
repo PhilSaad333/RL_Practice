@@ -10,6 +10,7 @@ from collections import OrderedDict
 from typing import Any, Dict, Tuple
 
 import torch
+import gc
 import torch.nn.functional as F
 
 from .param_registry import (
@@ -357,16 +358,15 @@ def compute_update_vector_adamw_manual(
         v = (adam_comp + wd_comp).detach().to("cpu", torch.float32)
         vec_named[name] = v
 
-        # reduce residency of temporaries
-        del exp_avg_t, exp_avg_sq_t, adam_comp, wd_comp, denom
+        # accumulate component norms before freeing temporaries
         adam_norm += (adam_comp.detach().to("cpu", torch.float64) ** 2).sum()
         wd_norm += (wd_comp.detach().to("cpu", torch.float64) ** 2).sum()
 
+        # reduce residency of temporaries
+        del exp_avg_t, exp_avg_sq_t, adam_comp, wd_comp, denom
+
     # Clear grads
     model.zero_grad(set_to_none=True)
-    model.zero_grad(set_to_none=True)
-
-    import torch, gc
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
