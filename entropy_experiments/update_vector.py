@@ -120,16 +120,8 @@ def compute_update_vector_step(
     """
     de = DeltaEntropyIS(model=model, config=config, logger=logger or _NullLogger())
     
-    # Get model device
-    device = next(model.parameters()).device
-    
-    # Move U_batch tensors to the same device as model
-    if "sequences" in U_batch and U_batch["sequences"].device != device:
-        U_batch["sequences"] = U_batch["sequences"].to(device)
-    if "attention_masks" in U_batch and U_batch["attention_masks"].device != device:
-        U_batch["attention_masks"] = U_batch["attention_masks"].to(device)
-    if "advantages" in U_batch and U_batch["advantages"].device != device:
-        U_batch["advantages"] = U_batch["advantages"].to(device)
+    # Don't move U_batch to device here - let _rl_update_streaming handle it with microbatching!
+    # This was causing OOM by moving ALL data to GPU at once instead of streaming
     
     # Ensure model parameters require gradients (may have been disabled)
     for p in model.parameters():
