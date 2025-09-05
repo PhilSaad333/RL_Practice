@@ -22,9 +22,11 @@ from .delta_entropy_is import DeltaEntropyIS, rl_loss_naive
 
 
 def _infer_group_hparams(optimizer: torch.optim.Optimizer) -> Dict[int, Dict[str, Any]]:
-    """Build a map: param_id -> hyperparams (betas, eps, weight_decay, lr, step).
+    """Map param_id to group hyperparams and per-param step.
 
-    Note: step is read from optimizer.state[p]['step'] when present.
+    Returns a dict mapping id(param) -> {
+        'betas', 'eps', 'weight_decay', 'lr', 'amsgrad', 'step'
+    } using the optimizer's param_groups and state.
     """
     param_hparams: Dict[int, Dict[str, Any]] = {}
     for group in optimizer.param_groups:
@@ -55,12 +57,14 @@ def _adamw_direction_from_grads(
     *,
     only_optimizer_params: bool = True,
 ) -> Dict[str, torch.Tensor]:
-    """Compute per-parameter AdamW direction (per unit lr), using current grads and optimizer state.
+    """Compute per-parameter AdamW direction (per-unit-LR) from grads/state.
 
-    Matches torch.optim.AdamW update rule (decoupled weight decay) excluding lr:
-        step_size = sqrt(bc2) / bc1
-        p <- p - lr * [ step_size * exp_avg / (sqrt(exp_avg_sq) + eps) + weight_decay * p ]
-    We form dir_per_lr = - [ step_size * exp_avg_t / (sqrt(exp_avg_sq_t)+eps) + weight_decay * p ].
+    Mirrors PyTorch 2.5.x AdamW math excluding LR scaling:
+      step_size_per_lr = 1 / (1 - beta1^t)
+      denom            = sqrt(v_t) / sqrt(1 - beta2^t) + eps
+      dir_per_lr       = - [ step_size_per_lr * (exp_avg_t / denom) + weight_decay * p ]
+
+    If amsgrad=True, denom uses max_exp_avg_sq. Operates over optimizer params by default.
     """
     hparams = _infer_group_hparams(optimizer)
     trainable = get_optimizer_named_params(model, optimizer) if only_optimizer_params else get_trainable_named(model)
