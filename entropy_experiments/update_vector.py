@@ -309,39 +309,59 @@ def compute_update_vector_adamw_manual(
     wd_norm = torch.zeros((), dtype=torch.float64)
     for name, p in trainable.items():
         pid = id(p)
-        hp = hparams.get(pid, None) or {}
+        hp = hparams.get(pid, {})  # betas, eps, weight_decay, step, amsgrad
         beta1, beta2 = map(float, hp.get("betas", (0.9, 0.999)))
         eps = float(hp.get("eps", 1e-8))
         weight_decay = float(hp.get("weight_decay", 0.0))
         step = int(hp.get("step", 0))
         amsgrad = bool(hp.get("amsgrad", False))
-        st = optimizer.state.get(p, {})
-        exp_avg = st.get("exp_avg", torch.zeros_like(p))
-        exp_avg_sq = st.get("exp_avg_sq", torch.zeros_like(p))
 
-        g = p.grad if p.grad is not None else torch.zeros_like(p)
-        exp_avg_t = exp_avg.mul(beta1).add(g, alpha=(1.0 - beta1))
-        exp_avg_sq_t = exp_avg_sq.mul(beta2).addcmul(g, g, value=(1.0 - beta2))
+        st = optimizer.state.get(p, None)
+        g = p.grad if p.grad is not None else torch.zeros_like(p)  # already allocated by backward
+
+        # --- avoid zeros_like(p) for missing state ---
+        if st is not None and "exp_avg" in st and "exp_avg_sq" in st:
+            exp_avg = st["exp_avg"]
+            exp_avg_sq = st["exp_avg_sq"]
+            exp_avg_t = exp_avg.mul(beta1).add(g, alpha=(1.0 - beta1))
+            exp_avg_sq_t = exp_avg_sq.mul(beta2).addcmul(g, g, value=(1.0 - beta2))
+        else:
+            # First-step math without allocating exp_avg/exp_avg_sq:
+            #   exp_avg_t    = (1 - beta1) * g
+            #   exp_avg_sq_t = (1 - beta2) * (g*g)
+            exp_avg_t = g.mul(1.0 - beta1)
+            exp_avg_sq_t = g.mul(g).mul(1.0 - beta2)
+
         t_eff = step + 1
         bc1 = 1.0 - (beta1 ** t_eff)
         bc2 = 1.0 - (beta2 ** t_eff)
-        # Match torch.optim.AdamW: per-lr step factor = sqrt(bc2) / bc1
         step_per_lr = 1.0 / max(bc1, 1e-16)
-        if amsgrad:
-            max_v = st.get("max_exp_avg_sq", exp_avg_sq)
-            v_eff = torch.maximum(max_v, exp_avg_sq_t)
+
+        if amsgrad and st is not None and "max_exp_avg_sq" in st:
+            v_eff = torch.maximum(st["max_exp_avg_sq"], exp_avg_sq_t)
             denom = v_eff.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
         else:
             denom = exp_avg_sq_t.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
+
         adam_comp = -(step_per_lr) * (exp_avg_t / denom)
         wd_comp = -weight_decay * p.detach()
+
         v = (adam_comp + wd_comp).detach().to("cpu", torch.float32)
         vec_named[name] = v
+
+        # reduce residency of temporaries
+        del exp_avg_t, exp_avg_sq_t, adam_comp, wd_comp, denom
         adam_norm += (adam_comp.detach().to("cpu", torch.float64) ** 2).sum()
         wd_norm += (wd_comp.detach().to("cpu", torch.float64) ** 2).sum()
 
     # Clear grads
     model.zero_grad(set_to_none=True)
+    model.zero_grad(set_to_none=True)
+
+    import torch, gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
     stats = {
         "method": "adamw_manual",
