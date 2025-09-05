@@ -473,9 +473,15 @@ class DeltaEntropyIS:
                     logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
                     logp = logp.view(end_b - start_b, G, -1)
                     all_new_logp.append(logp)
+                    # Explicitly delete intermediate tensors to free memory
+                    del logits, logp_all, targets
+                    torch.cuda.empty_cache()  # Force GPU memory cleanup
                 old_logp_full = torch.cat(all_new_logp, dim=0)  # [B_U, G, L-1]
                 # sanitize & clamp like training
                 old_logp_full = torch.nan_to_num(old_logp_full, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+                # Clear the list to release references
+                del all_new_logp
+                torch.cuda.empty_cache()
 
         # === 2) Loss/backward ===
         if use_clipping:
@@ -503,6 +509,8 @@ class DeltaEntropyIS:
                 new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
                 new_logp = new_logp.view(B_mb, G, -1)
                 new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+                # Free memory from intermediate tensors
+                del logits, logp_all, targets
 
                 mb_loss_terms = []
                 for b in range(B_mb):
