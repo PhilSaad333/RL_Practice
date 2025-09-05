@@ -31,6 +31,7 @@ def _infer_group_hparams(optimizer: torch.optim.Optimizer) -> Dict[int, Dict[str
         eps = float(group.get("eps", 1e-8))
         weight_decay = float(group.get("weight_decay", 0.0))
         lr = float(group.get("lr", 1.0))
+        amsgrad = bool(group.get("amsgrad", False))
         for p in group["params"]:
             if p is None:
                 continue
@@ -41,6 +42,7 @@ def _infer_group_hparams(optimizer: torch.optim.Optimizer) -> Dict[int, Dict[str
                 "eps": eps,
                 "weight_decay": weight_decay,
                 "lr": lr,
+                "amsgrad": amsgrad,
                 "step": step,
             }
     return param_hparams
@@ -73,6 +75,7 @@ def _adamw_direction_from_grads(
         eps = float(hp.get("eps", 1e-8))
         weight_decay = float(hp.get("weight_decay", 0.0))
         step = int(hp.get("step", 0))
+        amsgrad = bool(hp.get("amsgrad", False))
 
         st = optimizer.state.get(p, {})
         exp_avg = st.get("exp_avg", torch.zeros_like(p))
@@ -90,7 +93,12 @@ def _adamw_direction_from_grads(
         # torch.optim.AdamW bias correction:
         # step_size_per_lr = 1 / bc1; denom = sqrt(v_t)/sqrt(bc2) + eps
         step_factor = 1.0 / max(bc1, 1e-16)
-        denom = exp_avg_sq_t.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
+        if amsgrad:
+            max_v = st.get("max_exp_avg_sq", exp_avg_sq)
+            v_eff = torch.maximum(max_v, exp_avg_sq_t)
+            denom = v_eff.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
+        else:
+            denom = exp_avg_sq_t.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
         adam_dir = -step_factor * (exp_avg_t / denom)
         wd_dir = -weight_decay * p.detach()
         direction = (adam_dir + wd_dir)
@@ -302,6 +310,7 @@ def compute_update_vector_adamw_manual(
         eps = float(hp.get("eps", 1e-8))
         weight_decay = float(hp.get("weight_decay", 0.0))
         step = int(hp.get("step", 0))
+        amsgrad = bool(hp.get("amsgrad", False))
         st = optimizer.state.get(p, {})
         exp_avg = st.get("exp_avg", torch.zeros_like(p))
         exp_avg_sq = st.get("exp_avg_sq", torch.zeros_like(p))
@@ -314,7 +323,12 @@ def compute_update_vector_adamw_manual(
         bc2 = 1.0 - (beta2 ** t_eff)
         # Match torch.optim.AdamW: per-lr step factor = sqrt(bc2) / bc1
         step_per_lr = 1.0 / max(bc1, 1e-16)
-        denom = exp_avg_sq_t.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
+        if amsgrad:
+            max_v = st.get("max_exp_avg_sq", exp_avg_sq)
+            v_eff = torch.maximum(max_v, exp_avg_sq_t)
+            denom = v_eff.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
+        else:
+            denom = exp_avg_sq_t.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
         adam_comp = -(step_per_lr) * (exp_avg_t / denom)
         wd_comp = -weight_decay * p.detach()
         v = (adam_comp + wd_comp).detach().to("cpu", torch.float32)
