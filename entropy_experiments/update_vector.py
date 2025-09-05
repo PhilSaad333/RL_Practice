@@ -281,17 +281,17 @@ def compute_update_vector_adamw_manual(
     importance_mb_size = int(config.get("true_delta_h", {}).get("microbatch_size", 1))
     
     try:
-    _ = rl_loss_naive(
-        U_batch,
-        model,
-        temp=temp,
-        mb_size=importance_mb_size,
-        amp_dtype=getattr(torch, config.get("memory_config", {}).get("dtype", "bfloat16"), torch.bfloat16)
-        if hasattr(torch, str(config.get("memory_config", {}).get("dtype", "bfloat16")))
-        else torch.bfloat16,
-        use_amp=bool(config.get("memory_config", {}).get("amp", False)),
-        backward_per_microbatch=True,
-    )
+        _ = rl_loss_naive(
+            U_batch,
+            model,
+            temp=temp,
+            mb_size=importance_mb_size,
+            amp_dtype=getattr(torch, config.get("memory_config", {}).get("dtype", "bfloat16"), torch.bfloat16)
+            if hasattr(torch, str(config.get("memory_config", {}).get("dtype", "bfloat16")))
+            else torch.bfloat16,
+            use_amp=bool(config.get("memory_config", {}).get("amp", False)),
+            backward_per_microbatch=True,
+        )
     finally:
         model.train(was_training)
 
