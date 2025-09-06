@@ -558,16 +558,14 @@ class SequenceProcessor:
                         # ATTENTION: use the attention mask so left pads are ignored correctly
                         attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(input_seq.device)
 
-                        if params_override:
-                            outputs = self._call_model_tf(
-                                input_ids=input_seq,
-                                attention_mask=attn,
-                                params_override=params_override,
-                                buffers_override=buffers_override
-                            )
-                        else:
-                            outputs = model(input_seq, attention_mask=attn)
-                        logits = outputs.logits[0]  # [actual_len, V]
+                        outputs = self._call_model_tf(
+                            input_seq, attn,
+                            params_override=params_override,
+                            buffers_override=buffers_override
+                        )
+                        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                        logits = logits[0]  # [actual_len, V]
+
 
                         gen_start = prompt_len_padded
                         gen_end   = prompt_len_padded + gen_len
@@ -1141,15 +1139,23 @@ class SequenceProcessor:
         return token_logq
 
 
+
     def _call_model_tf(self, input_ids, attention_mask, *, params_override=None):
-        """Helper to call model in teacher forcing mode, with optional param overrides (for functorch)."""
-        mdl = self._unwrap(self.model)
-        if params_override is None:
-            return mdl(input_ids, attention_mask=attention_mask)
-        bufs = get_named_buffers(mdl)
-        return torch.func.functional_call(
-            mdl, {**params_override, **bufs}, (input_ids,), {'attention_mask': attention_mask}
-        )
+        mdl = self._unwrap(self.model)  # DDP-safe
+        was_training = mdl.training
+        mdl.eval()
+        buffers_override = get_named_buffers(mdl)
+        try:
+            if params_override is None:
+                return mdl(input_ids, attention_mask=attention_mask)
+            else:
+                mapping = {**params_override, **(buffers_override or {})}
+                return torch.func.functional_call(
+                    mdl, mapping, (input_ids,), {'attention_mask': attention_mask}
+                )
+        finally:
+            if was_training:
+                mdl.train()
 
 
 
