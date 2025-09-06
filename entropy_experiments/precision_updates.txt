@@ -1,0 +1,304 @@
+✅ Summary of required changes
+
+Add a new utility: entropy_experiments/precision_utils.py.
+
+In sequence_processor.py:
+
+Use precision contexts in _call_model_tf, teacher_force_with_grad, and upcast logits in no-grad TF.
+
+Ensure teacher_force_logprobs passes params_override through to _teacher_force_no_grad.
+
+In param_overrides.py: you already added force_param_dtype/force_buffer_dtype. No further change other than keeping build_merged_functional_state only for debugging.
+
+In both delta_entropy_is.py and offline_entropy_probe.py:
+
+Replace all uses of build_merged_functional_state(...) with params-only calls to build_functional_params_named(...) and pass them to SequenceProcessor’s teacher_force_logprobs(..., params_override=...).
+
+Add global precision settings (TF32/matmul) where the config is first loaded and the model is about to be built.
+
+A minimal precision config block is also included below.
+
+0) New file: entropy_experiments/precision_utils.py
+
+Create this file with the following contents:
+
+# entropy_experiments/precision_utils.py
+from __future__ import annotations
+import contextlib
+from typing import Iterator
+import torch
+
+def apply_global_precision(allow_tf32: bool = True, matmul_precision: str = "high") -> None:
+    """Call once at startup (after parsing config)."""
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+        torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+    except Exception:
+        pass
+    if hasattr(torch, "set_float32_matmul_precision"):
+        try:
+            torch.set_float32_matmul_precision(matmul_precision)
+        except Exception:
+            pass
+
+@contextlib.contextmanager
+def forward_precision_ctx(*, autocast: bool, dtype: torch.dtype) -> Iterator[None]:
+    """Context to run a forward under autocast(dtype) or pure FP32."""
+    if autocast:
+        with torch.autocast(device_type="cuda", dtype=dtype):
+            yield
+    else:
+        # Ensure no stale autocast context is active
+        with torch.cuda.amp.autocast(False):
+            yield
+
+def str_to_dtype(name: str) -> torch.dtype:
+    m = {
+        "float32": torch.float32, "fp32": torch.float32,
+        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+        "float16": torch.float16, "fp16": torch.float16,
+        "float64": torch.float64, "fp64": torch.float64,
+    }
+    return m.get(name.lower(), torch.float32)
+
+def maybe_cast_logits_fp32(x: torch.Tensor) -> torch.Tensor:
+    return x.float() if x.is_floating_point() and x.dtype != torch.float32 else x
+
+def force_grads_fp32(module: torch.nn.Module) -> None:
+    """Optionally normalize any existing gradients to fp32 (after backward)."""
+    for p in module.parameters():
+        if p.grad is not None and p.grad.dtype != torch.float32:
+            p.grad = p.grad.float()
+
+1) sequence_processor.py
+1a) Imports (near the top)
+
+Ensure these imports exist (deduplicate if already present):
+
+from param_registry import get_named_buffers
+from entropy_experiments.precision_utils import forward_precision_ctx, str_to_dtype, maybe_cast_logits_fp32
+
+1b) _call_model_tf — replace the function body with the precision-aware version
+
+Locate your _call_model_tf(...) and replace its content with:
+
+def _call_model_tf(
+    self,
+    input_ids,
+    attention_mask,
+    *,
+    params_override: dict[str, torch.Tensor] | None = None,
+):
+    """
+    Functional teacher-forcing call with precision control:
+
+    - If params_override is None: run the live module in eval() (no dropout),
+      under 'precision.tf_nograd'.
+    - If params_override is given (PARAMS ONLY): combine with live buffers and
+      call via torch.func.functional_call under 'precision.func_override'.
+
+    Both branches use use_cache=False for teacher forcing.
+    """
+    mdl = self._unwrap(self.model)  # DDP-safe
+    was_training = mdl.training
+    mdl.eval()
+
+    # Read precision profile
+    cfg = getattr(self, "config", None)
+    if hasattr(cfg, "get"):  # dict-like
+        prec_cfg = cfg.get("precision", {}) or {}
+    else:                    # object-like
+        prec_cfg = getattr(cfg, "precision", {}) or {}
+
+    profile = "func_override" if params_override is not None else "tf_nograd"
+    pcfg = prec_cfg.get(profile, {}) if isinstance(prec_cfg, dict) else {}
+
+    default_autocast = (profile == "tf_nograd")
+    default_dtype = "bfloat16" if default_autocast else "float32"
+    use_autocast = bool(pcfg.get("autocast", default_autocast))
+    ac_dtype = str_to_dtype(pcfg.get("dtype", default_dtype))
+
+    try:
+        with forward_precision_ctx(autocast=use_autocast, dtype=ac_dtype):
+            if params_override is None:
+                return mdl(input_ids, attention_mask=attention_mask, use_cache=False)
+
+            bufs = get_named_buffers(mdl)
+
+            # Strip any accidental buffer entries from params_override
+            if any(k in bufs for k in params_override.keys()):
+                params_override = {k: v for k, v in params_override.items() if k not in bufs}
+
+            mapping = {**bufs, **params_override}
+            return torch.func.functional_call(
+                mdl,
+                mapping,
+                (input_ids,),
+                {'attention_mask': attention_mask, 'use_cache': False},
+            )
+    finally:
+        if was_training:
+            mdl.train()
+
+1c) _teacher_force_no_grad — upcast logits to fp32 (optional but recommended)
+
+After you extract logits, insert:
+
+# logits is of shape [actual_len, V]
+# Optionally upcast to fp32 for entropy/math (config.precision.tf_nograd.cast_logits_fp32, default True)
+cfg = getattr(self, "config", None)
+cast_logits = True
+if hasattr(cfg, "get"):
+    cast_logits = (cfg.get("precision", {}).get("tf_nograd", {}).get("cast_logits_fp32", True))
+else:
+    prec = getattr(cfg, "precision", None)
+    if prec is not None:
+        tfng = getattr(prec, "tf_nograd", {})
+        cast_logits = getattr(tfng, "cast_logits_fp32", True)
+if cast_logits:
+    logits = maybe_cast_logits_fp32(logits)
+
+1d) teacher_force_with_grad — replace the two-line forward with precision context
+
+Find:
+
+outputs = model(input_seq, attention_mask=attn)  # grads enabled
+logits = outputs.logits[0]
+
+
+Replace with:
+
+# Select with-grad precision profile (default: fp32, no autocast)
+cfg = getattr(self, "config", None)
+if hasattr(cfg, "get"):
+    tfwg = (cfg.get("precision", {}) or {}).get("tf_withgrad", {}) or {}
+else:
+    prec = getattr(cfg, "precision", None)
+    tfwg = getattr(prec, "tf_withgrad", {}) if prec is not None else {}
+
+use_autocast = bool(tfwg.get("autocast", False))
+ac_dtype = str_to_dtype(tfwg.get("dtype", "float32"))
+
+with forward_precision_ctx(autocast=use_autocast, dtype=ac_dtype):
+    outputs = model(input_seq, attention_mask=attn, use_cache=False)
+
+logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+logits = logits[0]
+# Optional: if config asks, upcast logits to fp32 for downstream math
+if bool(tfwg.get("cast_logits_fp32", False)):
+    logits = maybe_cast_logits_fp32(logits)
+
+1e) teacher_force_logprobs — ensure overrides are forwarded
+
+Ensure the no-grad branch passes params_override (and not a merged mapping):
+
+if with_grad:
+    return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
+else:
+    return self._teacher_force_no_grad(
+        sequences, tf_batch_size, compute_rb, return_baseline_features,
+        params_override=params_override,
+        buffers_override=None,  # buffers fetched internally
+    )
+
+2) param_overrides.py
+
+You already added:
+
+def build_functional_params_named(..., force_param_dtype=None, force_buffer_dtype=None):
+    ...
+
+
+No further change required here other than keeping build_merged_functional_state only for debugging and not using it in main paths. (If present, move it under a # -------- DEBUG -------- section.)
+
+3) delta_entropy_is.py — use params-only overrides
+
+Imports near the top (add if missing):
+
+from entropy_experiments.param_overrides import build_functional_params_named
+from entropy_experiments.precision_utils import str_to_dtype
+
+
+Replace every occurrence of:
+
+override = build_merged_functional_state(self.model, v_named, eta)
+logprob_results_override, _ = self._sequence_processor.teacher_force_logprobs(
+    sequences=E_sequences,
+    compute_rb=True,
+    with_grad=False,
+    params_override=override,
+)
+
+
+with:
+
+fo_cfg = self.config.get('precision', {}).get('func_override', {})
+force_dtype = str_to_dtype(fo_cfg.get('dtype', 'float32')) if fo_cfg.get('cast_params', False) else None
+
+params_override, _ = build_functional_params_named(
+    self.model, v_named, eta,
+    force_param_dtype=force_dtype,
+    detach_params=True, detach_buffers=True,
+)
+
+logprob_results_override, _ = self._sequence_processor.teacher_force_logprobs(
+    sequences=E_sequences,
+    compute_rb=True,
+    with_grad=False,
+    params_override=params_override,  # params-only; buffers fetched inside _call_model_tf
+)
+
+
+Make this replacement at all sites where an override for θ′ is constructed.
+
+4) offline_entropy_probe.py — same replacement as (3)
+
+Imports near the top (add if missing):
+
+from entropy_experiments.param_overrides import build_functional_params_named
+from entropy_experiments.precision_utils import str_to_dtype, apply_global_precision
+
+
+A) Apply global precision once after loading config (exact snippet you requested):
+
+Locate the earliest place after cfg is available and insert:
+
+from entropy_experiments.precision_utils import apply_global_precision, str_to_dtype
+
+pcfg = cfg.get('precision', {})
+apply_global_precision(
+    allow_tf32=pcfg.get('allow_tf32', True),
+    matmul_precision=pcfg.get('matmul_precision', 'high')
+)
+
+
+B) Replace any use of build_merged_functional_state with params-only:
+
+fo_cfg = self.config.get('precision', {}).get('func_override', {})
+force_dtype = str_to_dtype(fo_cfg.get('dtype', 'float32')) if fo_cfg.get('cast_params', False) else None
+
+params_override, _ = build_functional_params_named(
+    self.model, v_named, eta,
+    force_param_dtype=force_dtype,
+    detach_params=True, detach_buffers=True,
+)
+
+results, _ = self._sequence_processor.teacher_force_logprobs(
+    sequences=sequences_E,
+    compute_rb=True,
+    with_grad=False,
+    params_override=params_override,
+)
+
+5) (Optional but recommended) update_vector.py
+
+If not already done, after you finish the micro-batch backward accumulation and before you synthesize the AdamW direction, normalize gradients to fp32 if configured:
+
+from entropy_experiments.precision_utils import force_grads_fp32, str_to_dtype
+
+uv_cfg = config.get('precision', {}).get('update_vector', {})
+if uv_cfg.get('grads_fp32', True):
+    force_grads_fp32(model)
+
+
+Also ensure the AMP flags used in the forward come from precision.update_vector (use_amp, amp_dtype) rather than an old location.

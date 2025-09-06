@@ -13,12 +13,13 @@ import torch
 import gc
 import torch.nn.functional as F
 
-from .param_registry import (
+from .utils.param_registry import (
     get_trainable_named,
     get_optimizer_named_params,
     to_cpu_fp32_named,
 )
 
+from entropy_experiments.utils.precision_utils import force_grads_fp32, str_to_dtype
 
 
 
@@ -67,23 +68,30 @@ def compute_update_vector_adamw(
     # Ensure train mode for grad path
     was_training = model.training
     model.train()
-    
+
+
     if torch.cuda.is_available():
         print(f"  [AdamW] Before forward pass: GPU alloc={torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
     
+    uv_cfg = config.get('precision', {}).get('update_vector', {})
+
     try:
         total_loss_val = rl_loss(
             U_batch,
             model,
             temp=temp,
             mb_size=importance_mb_size,
-            amp_dtype=_resolve_amp_dtype(config),
-            use_amp=bool(config.get("memory_config", {}).get("amp", False)),
+            amp_dtype=uv_cfg.get("amp_dtype", False),
+            use_amp=bool(uv_cfg.get("use_amp", False)),
             backward_per_microbatch=True,
         )
         num_microbatches = (B + importance_mb_size - 1) // importance_mb_size
     finally:
         model.train(was_training)
+
+    if uv_cfg.get('grads_fp32', True):
+        force_grads_fp32(model)
+
 
     # Optional grad clipping
     max_norm = float(config.get("max_grad_norm", 0.0))

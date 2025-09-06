@@ -18,7 +18,10 @@ except ImportError:
     rlp_datasets = None
 
 from transformers import LogitsProcessor
-from entropy_experiments.param_registry import get_trainable_named, get_named_buffers
+from entropy_experiments.utils.param_registry import get_trainable_named, get_named_buffers
+from entropy_experiments.utils.precision_utils import (
+    forward_precision_ctx, str_to_dtype, maybe_cast_logits_fp32
+)
 
 class StopAfterAnswer(LogitsProcessor):
     """Stop generation after seeing '</answer>' tag - correct logic from collect_rollouts.py"""
@@ -568,8 +571,23 @@ class SequenceProcessor:
                             input_seq, attn,
                             params_override=params_override,
                         )
+
+                        # Extract logits and (optionally) cast to fp32 for entropy/log-prob math
                         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
                         logits = logits[0]  # [actual_len, V]
+
+                        # Optional logits upcast per config: precision.tf_nograd.cast_logits_fp32 (default True)
+                        prec_root = getattr(self, "config", None)
+                        if hasattr(prec_root, "get"):
+                            cast_logits = (prec_root.get("precision", {})
+                                                .get("tf_nograd", {})
+                                                .get("cast_logits_fp32", True))
+                        else:
+                            # object-like config
+                            prec = getattr(prec_root, "precision", None)
+                            cast_logits = True if prec is None else getattr(getattr(prec, "tf_nograd", prec), "cast_logits_fp32", True)
+                        if cast_logits and logits.dtype != torch.float32:
+                            logits = logits.float()
 
 
                         gen_start = prompt_len_padded
@@ -695,8 +713,29 @@ class SequenceProcessor:
                     # ATTENTION: use the attention mask so left pads are ignored correctly
                     attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(input_seq.device)
 
-                    outputs = model(input_seq, attention_mask=attn)  # grads enabled
-                    logits = outputs.logits[0]                # [actual_len, V]
+                    # Select precision profile for with-grad TF
+                    prec_root = getattr(self, "config", None)
+                    if hasattr(prec_root, "get"):  # dict-like config
+                        tfwg = (prec_root.get("precision", {}) or {}).get("tf_withgrad", {}) or {}
+                    else:                           # object-like config
+                        prec = getattr(prec_root, "precision", None)
+                        tfwg = getattr(prec, "tf_withgrad", {}) if prec is not None else {}
+
+                    use_autocast = bool(tfwg.get("autocast", False))          # default: False (pure fp32)
+                    ac_dtype     = str_to_dtype(tfwg.get("dtype", "float32")) # default: fp32
+
+                    # Forward pass with gradients enabled, teacher forcing never needs KV cache
+                    with forward_precision_ctx(autocast=use_autocast, dtype=ac_dtype):
+                        outputs = model(input_seq, attention_mask=attn, use_cache=False)
+
+                    # Extract logits (HF-style or tuple) and keep them in graph
+                    logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                    logits = logits[0]  # [actual_len, V]
+
+                    # (Optional) if you want logits arithmetic in fp32 even when autocast=True
+                    if bool(tfwg.get("cast_logits_fp32", False)) and logits.dtype != torch.float32:
+                        logits = logits.float()
+
 
                     gen_start = prompt_len_padded
                     gen_end   = prompt_len_padded + gen_len
@@ -1145,7 +1184,6 @@ class SequenceProcessor:
         # If any realized token falls outside the nucleus, its log-q = -inf (correct for IS)
         return token_logq
 
-
     def _call_model_tf(
         self,
         input_ids,
@@ -1154,41 +1192,67 @@ class SequenceProcessor:
         params_override: dict[str, torch.Tensor] | None = None,
     ):
         """
-        Functional teacher-forcing call:
-        - If params_override is None, run the live module in eval() (no dropout).
-        - If params_override is given (params only), combine with the model's buffers
-            and call via torch.func.functional_call.
+        Functional teacher-forcing call with precision control:
+
+        - If params_override is None: run the live module in eval() (no dropout),
+        under the 'precision.tf_nograd' context.
+        - If params_override is given (PARAMS ONLY): combine with live buffers and
+        call via torch.func.functional_call under 'precision.func_override'.
+
+        Both branches set use_cache=False for teacher forcing.
         """
         mdl = self._unwrap(self.model)  # DDP-safe
         was_training = mdl.training
         mdl.eval()
+
+        # ---- select precision profile from config ----
+        # Expected config schema:
+        #   precision:
+        #     tf_nograd:   { autocast: true,  dtype: bfloat16 }
+        #     func_override:{ autocast: false, dtype: float32 }
+        prec_root = getattr(self, "config", None)
+        if hasattr(prec_root, "get"):          # dict-like
+            prec_cfg = prec_root.get("precision", {}) or {}
+        else:                                   # object-like
+            prec_cfg = getattr(prec_root, "precision", {}) or {}
+
+        profile = "func_override" if params_override is not None else "tf_nograd"
+        pcfg = prec_cfg.get(profile, {}) if isinstance(prec_cfg, dict) else {}
+
+        # Sensible defaults if keys are missing:
+        default_autocast = (profile == "tf_nograd")          # True for baseline TF, False for override by default
+        default_dtype    = "bfloat16" if default_autocast else "float32"
+
+        use_autocast = bool(pcfg.get("autocast", default_autocast))
+        ac_dtype     = str_to_dtype(pcfg.get("dtype", default_dtype))
+
         try:
-            if params_override is None:
-                # Keep inference path identical; also disable KV cache in TF if your model uses it
-                return mdl(input_ids, attention_mask=attention_mask, use_cache=False)
+            # ---- precision guard for the forward pass ----
+            with forward_precision_ctx(autocast=use_autocast, dtype=ac_dtype):
+                if params_override is None:
+                    return mdl(input_ids, attention_mask=attention_mask, use_cache=False)
 
-            # Fetch buffers from the *unwrapped* module (authoritative source)
-            bufs = get_named_buffers(mdl)
+                # Fetch buffers from the *unwrapped* module (authoritative source)
+                bufs = get_named_buffers(mdl)
 
-            # (Guard) If caller accidentally passed a merged dict, strip out any buffer entries
-            # to avoid name collisions or double-passing. You can turn this into an assert if preferred.
-            intersect = set(params_override.keys()).intersection(bufs.keys())
-            if intersect:
-                # Keep parameters only; buffers will come from `bufs`
-                params_override = {k: v for k, v in params_override.items() if k not in bufs}
+                # (Guard) If caller accidentally passed a merged dict, strip out any buffer entries
+                # to avoid name collisions or double-passing.
+                if any(k in bufs for k in params_override.keys()):
+                    params_override = {k: v for k, v in params_override.items() if k not in bufs}
 
-            # Compose mapping for functional_call. (Param/buffer namespaces should be disjoint.)
-            mapping = {**bufs, **params_override}
+                # Compose mapping for functional_call. (Param/buffer namespaces are disjoint.)
+                mapping = {**bufs, **params_override}
 
-            return torch.func.functional_call(
-                mdl,
-                mapping,
-                (input_ids,),
-                {'attention_mask': attention_mask, 'use_cache': False},
-            )
+                return torch.func.functional_call(
+                    mdl,
+                    mapping,
+                    (input_ids,),
+                    {'attention_mask': attention_mask, 'use_cache': False},
+                )
         finally:
             if was_training:
                 mdl.train()
+
 
 
 

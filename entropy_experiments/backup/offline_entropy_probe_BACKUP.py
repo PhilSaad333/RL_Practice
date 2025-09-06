@@ -18,7 +18,7 @@ Usage:
 """
 
 # === Model and optimizer loading ===
-from entropy_experiments.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
+from entropy_experiments.utils.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
 
 import torch
 import torch.distributed as dist
@@ -37,11 +37,11 @@ import yaml
 import json
 
 from entropy_experiments.probe_components import ProbeComponents
-from entropy_experiments.adam_preconditioner import AdamPreconditioner  
+from entropy_experiments.utils.adam_preconditioner import AdamPreconditioner  
 from entropy_experiments.delta_entropy_is import DeltaEntropyIS
-import entropy_experiments.distributed_helpers as distributed_helpers
-from entropy_experiments.distributed_helpers import DistributedHelpers
-from entropy_experiments.detailed_logger import DetailedLogger
+import entropy_experiments.utils.distributed_helpers as distributed_helpers
+from entropy_experiments.utils.distributed_helpers import DistributedHelpers
+from entropy_experiments.utils.detailed_logger import DetailedLogger
 
 
 class OfflineEntropyProbe:

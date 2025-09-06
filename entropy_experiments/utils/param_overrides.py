@@ -84,6 +84,8 @@ def build_functional_params_named(
     allow_frozen_updates: bool = False,
     detach_params: bool = True,
     detach_buffers: bool = True,
+    force_param_dtype=None,
+    force_buffer_dtype=None
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """
     Build name-keyed dictionaries of parameters and buffers suitable for torch.func.functional_call.
@@ -133,17 +135,20 @@ def build_functional_params_named(
                     f"[param_overrides] shape mismatch for '{name}': param {tuple(p.shape)} vs v {tuple(v.shape)}"
                 )
             eff = base + (eta * _to_like(v, p))
+            if force_param_dtype is not None and eff.is_floating_point():
+                eff = eff.to(dtype=force_param_dtype)
             params_out[name] = eff
         else:
             params_out[name] = base
 
+
     # Buffers dict (pass-through; some backbones carry critical buffers)
     buffers_out: Dict[str, torch.Tensor] = {}
     for name, b in buffers_named.items():
-        if isinstance(b, torch.Tensor) and detach_buffers:
-            buffers_out[name] = b.detach()
-        else:
-            buffers_out[name] = b
+        t = b.detach() if (isinstance(b, torch.Tensor) and detach_buffers) else b
+        if force_buffer_dtype is not None and isinstance(t, torch.Tensor) and t.is_floating_point():
+            t = t.to(dtype=force_buffer_dtype)
+        buffers_out[name] = t
 
     return params_out, buffers_out
 

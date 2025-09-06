@@ -19,8 +19,10 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from . import distributed_helpers
+from .utils import distributed_helpers
 from sequence_processing.sequence_processor import BatchedSequences
+from .utils.param_overrides import build_functional_params_named
+from .utils.precision_utils import str_to_dtype
 
 
 def _global_max_tensor(x: torch.Tensor) -> torch.Tensor:
@@ -446,6 +448,201 @@ class DeltaEntropyIS:
         finally:
             self.model.train(was_training)
         return torch.stack(S_list, dim=0)
+
+    # ----------------------------
+    # NEW: Parameter Override method for entropy change
+    # ----------------------------
+    def entropy_change_with_param_overrides(
+        self,
+        model: torch.nn.Module,
+        E_batch: Dict[str, Any],
+        update_vector_named: Dict[str, torch.Tensor],
+        eta: float,
+        cfg_importance: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Compute entropy change using parameter overrides θ' = θ + η * v instead of real optimizer steps.
+        
+        Args:
+            model: The model to evaluate
+            E_batch: Evaluation batch
+            update_vector_named: Dict[param_name, update_tensor] from update_vector computation
+            eta: Learning rate multiplier for the update vector
+            cfg_importance: Configuration dict for importance sampling
+            
+        Returns:
+            Results dict compatible with existing entropy_change_two_batch_rl output
+        """
+        start_time = time.time()
+        self.logger.info(f"Starting parameter override entropy change computation with eta={eta:.2e}")
+        
+        # Extract config
+        report_per_token = cfg_importance.get('report_per_token', False)
+        
+        # Stage 2: Choose measure for weights (p vs q) - same logic as RL method
+        use_q = False
+        if 'measure' in cfg_importance:
+            measure = cfg_importance.get('measure', 'p')
+            use_q = (measure == 'q')
+        elif hasattr(self, 'sequence_processor') and self.sequence_processor is not None and hasattr(self.sequence_processor, 'config'):
+            sp_cfg = self.sequence_processor.config
+            if getattr(sp_cfg, 'top_p', 1.0) < 1.0:
+                use_q = True
+                self.logger.info(f"Auto-selecting q measure due to top_p={sp_cfg.top_p}")
+            else:
+                temp_val = float(getattr(sp_cfg, 'temperature', 1.0) or 1.0)
+                if abs(temp_val - 1.0) > 1e-8:
+                    use_q = True
+                    self.logger.info(f"Auto-selecting q measure due to temperature={temp_val}")
+        
+        # A) Original entropy on E (RB) - using base model parameters
+        self.logger.debug("Evaluating original entropy with base model parameters")
+        S_orig, RB_orig = self._eval_S_and_RB_on_E(E_batch, use_q_measure=use_q)
+        rb_sum_local = RB_orig.double().sum()
+        cnt_local = torch.tensor(RB_orig.numel(), device=rb_sum_local.device, dtype=rb_sum_local.dtype)
+        if dist.is_initialized():
+            dist.all_reduce(rb_sum_local, op=dist.ReduceOp.SUM)
+            dist.all_reduce(cnt_local, op=dist.ReduceOp.SUM)
+        H_orig = (rb_sum_local / cnt_local).item() if cnt_local.item() > 0 else 0.0
+        
+        H_orig_tok = None
+        if report_per_token:
+            lengths = self._get_generation_lengths(E_batch).to(RB_orig.device)
+            L_sum_local = lengths.double().sum()
+            if dist.is_initialized():
+                dist.all_reduce(L_sum_local, op=dist.ReduceOp.SUM)
+            H_orig_tok = (rb_sum_local / L_sum_local).item() if L_sum_local.item() > 0 else 0.0
+        
+        self.logger.info(f"Original entropy (RB): H(I;E) = {H_orig:.6f}")
+        
+        # B) Build parameter overrides θ' = θ + η * v
+        self.logger.debug(f"Building parameter overrides with {len(update_vector_named)} parameter updates")
+        
+        # Get precision config for func_override profile
+        fo_cfg = self.config.get('precision', {}).get('func_override', {})
+        force_dtype = str_to_dtype(fo_cfg.get('dtype', 'float32')) if fo_cfg.get('cast_params', False) else None
+        
+        params_override, _ = build_functional_params_named(
+            model, update_vector_named, eta,
+            force_param_dtype=force_dtype,
+            detach_params=True, detach_buffers=True,
+        )
+        
+        # C) Updated entropy using parameter overrides
+        self.logger.debug("Evaluating updated entropy with parameter overrides")
+        if self.sequence_processor is None:
+            raise ValueError("Parameter override method requires SequenceProcessor with params_override support")
+        
+        # Convert batch to BatchedSequences format
+        bs = self._to_batched_sequences_from_probe(E_batch)
+        
+        # Evaluate with parameter overrides
+        logprob_results, diagnostics_results = self.sequence_processor.teacher_force_logprobs_with_diagnostics(
+            sequences=bs,
+            with_grad=False,
+            tf_batch_size=getattr(self.sequence_processor.config, 'tf_batch_size', None),
+            compute_rb=True,
+            params_override=params_override,  # Key difference: use parameter overrides
+        )
+        
+        # Extract updated S and RB values (same logic as _eval_S_and_RB_on_E but from override results)
+        device = next(model.parameters()).device
+        
+        # Extract S_upd
+        if use_q and logprob_results.sequence_logqs is not None:
+            seq_lp_list: list[list[float]] = []
+            for b_list in logprob_results.sequence_logqs:
+                seq_lp_list.append([float(x) for x in b_list])
+            self.logger.debug("Using q (sampling) measure for importance weights")
+        else:
+            seq_lp_list: list[list[float]] = []
+            for b_list in logprob_results.sequence_logprobs:
+                seq_lp_list.append([float(x) for x in b_list])
+            if use_q:
+                self.logger.warning("Requested q measure but sequence_logqs not available, falling back to p")
+        S_upd = torch.tensor(seq_lp_list, device=device, dtype=torch.float32)
+        
+        # Extract RB_upd
+        RB_vals: list[list[float]] = []
+        have_torch_rb = bool(getattr(logprob_results, 'rb_entropies_torch', None))
+        have_np_rb = bool(getattr(logprob_results, 'rb_entropies', None))
+        if have_torch_rb:
+            for b in range(len(logprob_results.rb_entropies_torch)):
+                row = []
+                for g in range(len(logprob_results.rb_entropies_torch[b])):
+                    rb_t = logprob_results.rb_entropies_torch[b][g]
+                    row.append(float(rb_t.detach().sum().item()) if rb_t is not None and rb_t.numel() > 0 else 0.0)
+                RB_vals.append(row)
+        elif have_np_rb:
+            for b in range(len(logprob_results.rb_entropies)):
+                row = []
+                for g in range(len(logprob_results.rb_entropies[b])):
+                    rb_np = logprob_results.rb_entropies[b][g]
+                    row.append(float(rb_np.sum()) if rb_np is not None else 0.0)
+                RB_vals.append(row)
+        else:
+            # Fallback to diagnostics packs
+            diag = getattr(diagnostics_results, 'diagnostics', None)
+            if diag is not None:
+                for b in range(len(diag)):
+                    row = []
+                    for g in range(len(diag[b])):
+                        seq_diag = getattr(diag[b][g], 'seq', None)
+                        rb_sum = float(getattr(seq_diag, 'rb_entropy_sum', 0.0)) if seq_diag is not None else 0.0
+                        row.append(rb_sum)
+                    RB_vals.append(row)
+            else:
+                RB_vals = [[0.0 for _ in range(S_upd.shape[1])] for _ in range(S_upd.shape[0])]
+        RB_upd = torch.tensor(RB_vals, device=device, dtype=torch.float32)
+        
+        # D) SNIS computation
+        logw = S_upd - S_orig
+        is_results = self._compute_snis_two_batch(RB_upd, logw, report_per_token, E_batch)
+        H_upd = is_results['H_upd']
+        H_upd_tok = is_results.get('H_upd_tok')
+        
+        self.logger.info(f"Updated entropy (RB, SNIS, param override): H(I_updated;E) = {H_upd:.6f}")
+        
+        # Log diagnostics
+        diags = is_results.get('diagnostics', {})
+        if 'ESS_fraction' in diags:
+            self.logger.info(f"[SNIS Diagnostics] ESS = {diags['ESS']:.1f}/{diags['N_total']} "
+                           f"({diags['ESS_fraction']:.1%}), "
+                           f"logw_max = {diags['logw_max_global']:.3f}, "
+                           f"logw_mean = {diags['logw_mean']:.3f}")
+        
+        # E) Compute delta entropy
+        deltaH_true = H_upd - H_orig
+        deltaH_true_tok = (H_upd_tok - H_orig_tok) if (H_upd_tok is not None and H_orig_tok is not None) else None
+        compute_time = time.time() - start_time
+        
+        self.logger.info(f"Parameter override delta entropy: deltaH_true = {deltaH_true:.10f}")
+        
+        # F) Build results (compatible with existing pipeline)
+        results: Dict[str, Any] = {
+            'H_orig': H_orig,
+            'H_upd': H_upd,
+            'deltaH_true': deltaH_true,
+            'timing': {
+                'total_time': compute_time,
+            },
+            'diagnostics': {
+                'is_mode': 'snis_rb_param_override',
+                'training_loss': 'param_override',
+                'eta_used': float(eta),
+                'num_override_params': len(update_vector_named),
+                **is_results.get('diagnostics', {}),
+            },
+        }
+        
+        if deltaH_true_tok is not None:
+            results.update({
+                'H_orig_tok': H_orig_tok,
+                'H_upd_tok': H_upd_tok,
+                'deltaH_true_tok': deltaH_true_tok,
+            })
+        
+        return results
 
     # ----------------------------
     # RL + SNIS (RB payload)

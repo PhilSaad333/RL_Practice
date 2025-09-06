@@ -18,7 +18,7 @@ Usage:
 """
 
 # === Model and optimizer loading ===
-from entropy_experiments.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
+from entropy_experiments.utils.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
 
 import torch
 import torch.distributed as dist
@@ -37,11 +37,14 @@ import yaml
 import json
 
 from entropy_experiments.delta_entropy_approx import DeltaEntropyApprox
-from entropy_experiments.adam_preconditioner import AdamPreconditioner  
+from entropy_experiments.utils.adam_preconditioner import AdamPreconditioner  
 from entropy_experiments.delta_entropy_is import DeltaEntropyIS
-import entropy_experiments.distributed_helpers as distributed_helpers
-from entropy_experiments.distributed_helpers import DistributedHelpers
-from entropy_experiments.detailed_logger import DetailedLogger
+from entropy_experiments.update_vector import compute_update_vector
+from entropy_experiments.utils.param_overrides import build_functional_params_named
+from entropy_experiments.utils.precision_utils import apply_global_precision, str_to_dtype
+import entropy_experiments.utils.distributed_helpers as distributed_helpers
+from entropy_experiments.utils.distributed_helpers import DistributedHelpers
+from entropy_experiments.utils.detailed_logger import DetailedLogger
 
 
 class OfflineEntropyProbe:
@@ -62,6 +65,14 @@ class OfflineEntropyProbe:
             config: Configuration dictionary matching probe_config_template.yaml
         """
         self.config = config
+        
+        # Apply global precision settings once at initialization
+        pcfg = config.get('precision', {})
+        apply_global_precision(
+            allow_tf32=pcfg.get('allow_tf32', True),
+            matmul_precision=pcfg.get('matmul_precision', 'high')
+        )
+        
         self.logger = self._setup_logging()
         
         # Single GPU mode for probe (from fix.txt)
@@ -786,9 +797,21 @@ class OfflineEntropyProbe:
                     'lr_override': self.config.get('true_delta_h', {}).get('lr_override', None),
                 }
                 
-                # Compute ground-truth entropy change
-                ground_truth_results = self.delta_entropy_is.entropy_change_two_batch(
-                    self.model, E_batch, U_batch, self.optimizer, cfg_importance
+                # STAGE 2A: Compute update vector using update_vector.py (no real optimizer step)
+                self.logger.info("Computing parameter update vector using compute_update_vector")
+                update_vector_named, update_stats = compute_update_vector(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    U_batch=U_batch,
+                    config=self.config,
+                    logger=self.logger,
+                )
+                
+                self.logger.info(f"Update vector computed: {len(update_vector_named)} parameters, ||v||={update_stats.get('vec_norm', 0.0):.6e}")
+                
+                # STAGE 2B: Compute ground-truth entropy change using parameter overrides
+                ground_truth_results = self.delta_entropy_is.entropy_change_with_param_overrides(
+                    self.model, E_batch, update_vector_named, self.optimizer, cfg_importance
                 )
                 
                 phase5_time = time.time() - phase5_start

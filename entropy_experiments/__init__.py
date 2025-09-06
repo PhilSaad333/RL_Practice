@@ -15,9 +15,9 @@ Main components:
 
 from .offline_entropy_probe import OfflineEntropyProbe
 from .delta_entropy_approx import DeltaEntropyApprox
-from .adam_preconditioner import AdamPreconditioner
+from .utils.adam_preconditioner import AdamPreconditioner
 from .delta_entropy_is import DeltaEntropyIS
-from .distributed_helpers import DistributedHelpers
+from .utils.distributed_helpers import DistributedHelpers
 
 __all__ = [
     'OfflineEntropyProbe',
