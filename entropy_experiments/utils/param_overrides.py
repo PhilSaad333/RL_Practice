@@ -134,10 +134,12 @@ def build_functional_params_named(
                 raise ValueError(
                     f"[param_overrides] shape mismatch for '{name}': param {tuple(p.shape)} vs v {tuple(v.shape)}"
                 )
-            eff = base + (eta * _to_like(v, p))
+            
+            eff = base + (eta * _to_like(v, p))    # compute delta in p’s shape
             if force_param_dtype is not None and eff.is_floating_point():
-                eff = eff.to(dtype=force_param_dtype)
+                eff = eff.to(dtype=force_param_dtype)   # ← cast to fp32 when requested
             params_out[name] = eff
+
         else:
             params_out[name] = base
 
