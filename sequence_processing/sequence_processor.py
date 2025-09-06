@@ -6,6 +6,7 @@ reusable interface for sequence generation across the RL_Practice project.
 """
 
 import torch
+from torch import Tensor
 from dataclasses import dataclass
 from typing import List, Optional, Union, Tuple, Dict
 import random
