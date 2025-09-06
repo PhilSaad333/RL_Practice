@@ -270,7 +270,14 @@ class DeltaEntropyIS:
             responses_text=None,
         )
 
-    def _eval_S_and_RB_on_E(self, E_batch: Dict[str, Any], use_q_measure: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def _eval_S_and_RB_on_E(
+        self,
+        E_batch: Dict[str, Any],
+        use_q_measure: bool = False,
+        params_override: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
         # Run in eval mode to disable dropout/batchnorm noise during TF/RB evaluation
         was_training = self.model.training
         self.model.eval()
@@ -287,6 +294,7 @@ class DeltaEntropyIS:
                 with_grad=False,
                 tf_batch_size=getattr(self.sequence_processor.config, 'tf_batch_size', None),
                 compute_rb=True,
+                params_override=params_override,   # <— NEW: forward overrides
             )
         finally:
             # Restore original training/eval state
@@ -596,64 +604,12 @@ class DeltaEntropyIS:
         bs = self._to_batched_sequences_from_probe(E_batch)
         
         # Evaluate with parameter overrides
-        logprob_results, diagnostics_results = self.sequence_processor.teacher_force_logprobs_with_diagnostics(
-            sequences=bs,
-            with_grad=False,
-            tf_batch_size=getattr(self.sequence_processor.config, 'tf_batch_size', None),
-            compute_rb=True,
-            params_override=params_override,  # Key difference: use parameter overrides
+        S_upd, RB_upd = self._eval_S_and_RB_on_E(
+            E_batch,
+            use_q_measure=use_q,
+            params_override=params_override,   # <— NEW
         )
-        
-        # Extract updated S and RB values (same logic as _eval_S_and_RB_on_E but from override results)
-        device = next(model.parameters()).device
-        
-        # Extract S_upd
-        if use_q and logprob_results.sequence_logqs is not None:
-            seq_lp_list: list[list[float]] = []
-            for b_list in logprob_results.sequence_logqs:
-                seq_lp_list.append([float(x) for x in b_list])
-            self.logger.debug("Using q (sampling) measure for importance weights")
-        else:
-            seq_lp_list: list[list[float]] = []
-            for b_list in logprob_results.sequence_logprobs:
-                seq_lp_list.append([float(x) for x in b_list])
-            if use_q:
-                self.logger.warning("Requested q measure but sequence_logqs not available, falling back to p")
-        S_upd = torch.tensor(seq_lp_list, device=device, dtype=torch.float32)
-        
-        # Extract RB_upd
-        RB_vals: list[list[float]] = []
-        have_torch_rb = bool(getattr(logprob_results, 'rb_entropies_torch', None))
-        have_np_rb = bool(getattr(logprob_results, 'rb_entropies', None))
-        if have_torch_rb:
-            for b in range(len(logprob_results.rb_entropies_torch)):
-                row = []
-                for g in range(len(logprob_results.rb_entropies_torch[b])):
-                    rb_t = logprob_results.rb_entropies_torch[b][g]
-                    row.append(float(rb_t.detach().sum().item()) if rb_t is not None and rb_t.numel() > 0 else 0.0)
-                RB_vals.append(row)
-        elif have_np_rb:
-            for b in range(len(logprob_results.rb_entropies)):
-                row = []
-                for g in range(len(logprob_results.rb_entropies[b])):
-                    rb_np = logprob_results.rb_entropies[b][g]
-                    row.append(float(rb_np.sum()) if rb_np is not None else 0.0)
-                RB_vals.append(row)
-        else:
-            # Fallback to diagnostics packs
-            diag = getattr(diagnostics_results, 'diagnostics', None)
-            if diag is not None:
-                for b in range(len(diag)):
-                    row = []
-                    for g in range(len(diag[b])):
-                        seq_diag = getattr(diag[b][g], 'seq', None)
-                        rb_sum = float(getattr(seq_diag, 'rb_entropy_sum', 0.0)) if seq_diag is not None else 0.0
-                        row.append(rb_sum)
-                    RB_vals.append(row)
-            else:
-                RB_vals = [[0.0 for _ in range(S_upd.shape[1])] for _ in range(S_upd.shape[0])]
-        RB_upd = torch.tensor(RB_vals, device=device, dtype=torch.float32)
-        
+                
 
         dS = (S_upd - S_orig)
         dRB = (RB_upd - RB_orig)
