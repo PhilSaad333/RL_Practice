@@ -84,6 +84,9 @@ def test_parameter_override_pipeline():
             print(f"  {profile}: {settings}")
     
     print(f"✓ Model loaded: {probe.model}")
+    
+    # Ensure sequence processor is initialized
+    probe._ensure_sequence_processor()
     print(f"✓ Sequence processor: {probe._sequence_processor}")
     
     print("\n--- Phase 2: Generate Test Batches ---")

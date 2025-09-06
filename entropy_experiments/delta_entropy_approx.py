@@ -1,12 +1,12 @@
 """
 Delta Entropy Approx
 
-Core computational components for the computation of \delta H_1 and related quantities.
+Core computational components for the computation of \\delta H_1 and related quantities.
 The computation of the variance estimates is handled in conditional_variance.py (moved from here).
 
 The main strategy is to compute the quantities Xbar and Ybar described in my notes. Each of these are a
 sum over prompts from the E and U batches respectively, and are computed as the gradients of auxiliarly
-loss functions L_X and L_Y. In the end, \delta H_1 is simply \eta Xbar \cdot Ybar, where \eta is the learning rate.
+loss functions L_X and L_Y. In the end, \\delta H_1 is simply \\eta Xbar \\cdot Ybar, where \\eta is the learning rate.
 
 Pretty straightforward, but I seemed to be having some issues with numerical precision, so I added some safeguards.
 
