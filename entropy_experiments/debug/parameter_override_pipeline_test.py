@@ -97,7 +97,7 @@ def test_parameter_override_pipeline():
     
     # Ensure sequence processor is initialized
     probe._ensure_sequence_processor()
-    print(f"✓ Sequence processor: {probe._sequence_processor}")
+    print(f"✓ Sequence processor: {probe.sequence_processor}")
     
     print("\n--- Phase 2: Generate Test Batches ---")
     
@@ -108,7 +108,7 @@ def test_parameter_override_pipeline():
     
     # Generate U batch for update vector computation
     print("Generating U batch for update vector computation...")
-    U_sequences, U_logprobs, _U_diag = probe._sequence_processor.generate_with_logprobs(
+    U_sequences, U_logprobs, _U_diag = probe.sequence_processor.generate_with_logprobs(
         prompts=None,
         G=G_U_SIZE,
         dataset_name=dataset_name,
@@ -121,7 +121,7 @@ def test_parameter_override_pipeline():
     
     # Generate E batch for entropy evaluation  
     print("Generating E batch for entropy evaluation...")
-    E_sequences, _E_logprobs, _E_diag = probe._sequence_processor.generate_with_replacement_sampling(
+    E_sequences, _E_logprobs, _E_diag = probe.sequence_processor.generate_with_replacement_sampling(
         total_sequences=B_E_SIZE,
         dataset_name=dataset_name,
         split=E_split,
