@@ -101,23 +101,34 @@ def test_parameter_override_pipeline():
     
     print("\n--- Phase 2: Generate Test Batches ---")
     
-    # Create test batches
+    # Get dataset configuration
+    dataset_name = cfg['batch_config']['dataset_name']
+    E_split, U_split = probe._get_splits()
+    print(f"Using dataset: {dataset_name}, E_split: {E_split}, U_split: {U_split}")
+    
+    # Generate U batch for update vector computation
     print("Generating U batch for update vector computation...")
-    U_batch = probe._generate_batch(
-        split_name='train',  # U batch from training split
-        B=B_U_SIZE,
+    U_sequences, U_logprobs, _U_diag = probe._sequence_processor.generate_with_logprobs(
+        prompts=None,
         G=G_U_SIZE,
-        seed=42
+        dataset_name=dataset_name,
+        split=U_split,
+        num_prompts=B_U_SIZE,
+        compute_rb=True,
     )
+    U_batch = probe._pack_U_from_sequences(U_sequences, U_logprobs.rewards)
     print(f"✓ U batch: {U_batch['sequences'].shape}")
     
+    # Generate E batch for entropy evaluation  
     print("Generating E batch for entropy evaluation...")
-    E_batch = probe._generate_batch(
-        split_name='test',   # E batch from test split  
-        B=B_E_SIZE,
-        G=G_E_SIZE,
-        seed=43
+    E_sequences, _E_logprobs, _E_diag = probe._sequence_processor.generate_with_replacement_sampling(
+        total_sequences=B_E_SIZE,
+        dataset_name=dataset_name,
+        split=E_split,
+        G=1,  # E batch uses G=1 (single generation per prompt)
+        compute_rb=True,
     )
+    E_batch = probe._pack_E_from_sequences(E_sequences)
     print(f"✓ E batch: {E_batch['sequences'].shape}")
     
     print("\n--- Phase 3: Compute Update Vector ---")
