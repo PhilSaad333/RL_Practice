@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 # Configuration - Adjust these paths for your environment
-CONFIG_PATH = "entropy_experiments/configs/A100_config.yaml"  # Relative to project root
+CONFIG_PATH = "entropy_experiments/configs/colab_config.yaml"  # Relative to project root
 PROJECT_ROOT = os.getcwd()  # Assumes we're running from project root
 ETA = 1e-5  # Main learning rate for update vector computation
 TINY_ETA = 1e-10  # Tiny learning rate for continuity test
@@ -144,8 +144,9 @@ def test_parameter_override_pipeline():
     )
     
     print(f"✓ Update vector computed: {len(update_vector_named)} parameters")
-    print(f"  L2 norm: {update_stats['param_l2']:.6f}")
-    print(f"  Avg loss: {update_stats['avg_loss']:.6f}")
+    print(f"  L2 norm: {update_stats['vec_norm']:.6f}")
+    print(f"  Avg loss: {update_stats['avg_mb_loss']:.6f}")
+    print(f"  Num microbatches: {update_stats['num_microbatches']}")
     
     # Verify update vector has reasonable magnitude
     total_norm = 0.0
