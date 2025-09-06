@@ -13,7 +13,7 @@ Pretty straightforward, but I seemed to be having some issues with numerical pre
 Another complicating factor is that we need to incorporate the preconditioning factors from the adam optimizer, since Ybar
 is supposed to be the actual update direction, not just the raw gradient.
 
-For now we only compute the first order term \delta H_1, but depending on how things go we might want to add the second order
+For now we only compute the first order term \\delta H_1, but depending on how things go we might want to add the second order
 term (eg. if I find in tests I am running that the entropy change deviates from linear in learning rate at learning rates of order the ones
 I use in training)
 """

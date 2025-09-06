@@ -83,6 +83,9 @@ def test_parameter_override_pipeline():
         if isinstance(settings, dict):
             print(f"  {profile}: {settings}")
     
+    # Load checkpoint (required before sequence processor initialization)
+    print("Loading checkpoint...")
+    probe.load_checkpoint()
     print(f"✓ Model loaded: {probe.model}")
     
     # Ensure sequence processor is initialized
