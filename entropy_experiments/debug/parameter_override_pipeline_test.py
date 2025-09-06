@@ -200,7 +200,7 @@ def test_parameter_override_pipeline():
     }
     
     # Run the new method
-    results = probe._delta_entropy_is.entropy_change_with_param_overrides(
+    results = probe.delta_entropy_is.entropy_change_with_param_overrides(
         model=probe.model,
         E_batch=E_batch,
         update_vector_named=update_vector_named,
@@ -220,7 +220,7 @@ def test_parameter_override_pipeline():
     # Test mathematical continuity with tiny learning rate
     print(f"Testing continuity with tiny η = {TINY_ETA:.0e}...")
     
-    tiny_results = probe._delta_entropy_is.entropy_change_with_param_overrides(
+    tiny_results = probe.delta_entropy_is.entropy_change_with_param_overrides(
         model=probe.model,
         E_batch=E_batch,
         update_vector_named=update_vector_named,
