@@ -219,6 +219,38 @@ def test_parameter_override_pipeline():
         force_param_dtype=force_dtype, detach_params=True, detach_buffers=True,
     )
 
+    # --- Quantization check on the effective overrides passed to SP ---
+    base_params = dict(probe.model.named_parameters())
+
+    def delta_stats(params_over):
+        same_as_base = 0
+        total = 0
+        max_abs = 0.0
+        for k, eff in params_over.items():
+            if k not in base_params: 
+                continue
+            d = (eff - base_params[k]).detach()
+            total += d.numel()
+            same_as_base += int((d == 0).sum().item())
+            md = float(d.abs().max().item())
+            if md > max_abs: 
+                max_abs = md
+        return same_as_base, total, max_abs
+
+    same0, tot0, max0 = delta_stats(params_zero)
+    sameT, totT, maxT = delta_stats(params_tiny)
+    sameM, totM, maxM = delta_stats(params_main)
+
+    print(f"[Δθ-eq] η=0 elements exactly unchanged: {same0}/{tot0}")
+    print(f"[Δθ]    η=tiny unchanged elems: {sameT}/{totT}, max|Δ|={maxT:.3e}")
+    print(f"[Δθ]    η=main unchanged elems: {sameM}/{totM}, max|Δ|={maxM:.3e}")
+
+
+
+
+
+
+
     # Choose a single (b,g) to keep it tiny
     b0, g0 = 0, 0
     dbg0 = probe._sequence_processor.teacher_force_debug_probe(E_sequences, b_idx=b0, g_idx=g0, params_override=None)
