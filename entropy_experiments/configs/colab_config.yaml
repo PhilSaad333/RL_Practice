@@ -100,6 +100,6 @@ precision:
 
   # update-vector builder (rl_loss microbatched on U)
   update_vector:
-    use_amp: true            # keep as you have today if stable
-    amp_dtype: bfloat16      # use bf16 autocast in the microbatched forward
+    use_amp: false            # keep as you have today if stable
+    amp_dtype: float32      # use bf16 autocast in the microbatched forward
     grads_fp32: true         # ensure grads stored/used in fp32

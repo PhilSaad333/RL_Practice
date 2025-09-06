@@ -125,32 +125,39 @@ def build_functional_params_named(
     # Build parameter dict: include *all* named parameters; add deltas where provided.
     params_out: Dict[str, torch.Tensor] = {}
     for name, p in m.named_parameters():
+        v_present = (v_named is not None) and (name in v_named)
         base = p.detach() if detach_params else p
-        if v_named is not None and name in v_named:
-            v = v_named[name]
-            if v is None:
-                raise ValueError(f"[param_overrides] v_named['{name}'] is None.")
-            if tuple(v.shape) != tuple(p.shape):
-                raise ValueError(
-                    f"[param_overrides] shape mismatch for '{name}': param {tuple(p.shape)} vs v {tuple(v.shape)}"
-                )
-            
-            eff = base + (eta * _to_like(v, p))    # compute delta in p’s shape
-            if force_param_dtype is not None and eff.is_floating_point():
-                eff = eff.to(dtype=force_param_dtype)   # ← cast to fp32 when requested
-            params_out[name] = eff
 
-        else:
+        if not torch.is_floating_point(base):
+            # ints/bools/etc.: no math, and no casting
             params_out[name] = base
+            continue
 
+        # Decide the compute dtype: prefer forced dtype; else keep param dtype
+        compute_dtype = force_param_dtype if force_param_dtype is not None else base.dtype
+
+        # Upcast BEFORE doing base + eta*v  (critical for small-eta behavior)
+        base_f = base.to(dtype=compute_dtype)
+        if v_present:
+            v_f = v_named[name].to(dtype=compute_dtype, device=base.device)
+            eff = base_f + (eta * v_f)
+        else:
+            eff = base_f
+
+        params_out[name] = eff
 
     # Buffers dict (pass-through; some backbones carry critical buffers)
     buffers_out: Dict[str, torch.Tensor] = {}
     for name, b in buffers_named.items():
-        t = b.detach() if (isinstance(b, torch.Tensor) and detach_buffers) else b
-        if force_buffer_dtype is not None and isinstance(t, torch.Tensor) and t.is_floating_point():
-            t = t.to(dtype=force_buffer_dtype)
-        buffers_out[name] = t
+        if isinstance(b, torch.Tensor) and torch.is_floating_point(b):
+            if force_buffer_dtype is not None:
+                b = b.to(dtype=force_buffer_dtype)
+            elif detach_buffers:
+                b = b.detach()
+        elif detach_buffers and isinstance(b, torch.Tensor):
+            b = b.detach()
+        buffers_out[name] = b
+
 
     return params_out, buffers_out
 
