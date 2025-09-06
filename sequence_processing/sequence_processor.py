@@ -1282,8 +1282,13 @@ class DistributionDiagnostics:
             eos_prob = q[..., self.eos_token_id]
 
         # naive per-step surprisal for realized tokens (for comparison)
+
+        if realized_tokens.device != gen_logits.device:
+            realized_tokens = realized_tokens.to(gen_logits.device, non_blocking=True)
+
         log_probs = torch.log_softmax(gen_logits, dim=-1)
-        token_lp = log_probs.gather(1, realized_tokens.view(-1, 1)).squeeze(1)  # [T]
+        token_lp = log_probs.gather(1, realized_tokens.view(-1, 1)).squeeze(1)
+
         naive_surprisal = (-token_lp).float()                                   # [T]
 
         # convert to numpy
