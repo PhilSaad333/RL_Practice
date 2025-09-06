@@ -83,23 +83,23 @@ precision:
   # forward-only (generation, teacher-forcing without grads)
   tf_nograd:
     autocast: false
-    dtype: float32           # for accurate entropy, use true fp32 math
-    cast_logits_fp32: true   # upcast logits to fp32 before entropy/logprob math
+    dtype: float64           # for accurate entropy, use true fp32 math
+    cast_logits_fp32: false   # upcast logits to fp32 before entropy/logprob math
 
   # forward with grads (used by ΔH1, RB-with-grad, update-vector loss)
   tf_withgrad:
     autocast: false          # turn off autocast here by default
-    dtype: float32           # compute in true fp32 for stability
+    dtype: float64           # compute in true fp32 for stability
     grad_to_fp32: true       # force-accum grads to fp32 if mixed modes leak in
 
   # functional_call with param overrides θ' = θ + η v
   func_override:
     autocast: false
-    dtype: float32           # do this path in fp32 to keep tiny η effects visible
+    dtype: float64           # do this path in fp32 to keep tiny η effects visible
     cast_params: true       # if true, explicitly cast effective params to this dtype
 
   # update-vector builder (rl_loss microbatched on U)
   update_vector:
     use_amp: false            # keep as you have today if stable
-    amp_dtype: float32      # use bf16 autocast in the microbatched forward
+    amp_dtype: float64      # use bf16 autocast in the microbatched forward
     grads_fp32: true         # ensure grads stored/used in fp32
