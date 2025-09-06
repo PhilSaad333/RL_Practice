@@ -6,11 +6,15 @@ reusable interface for sequence generation across the RL_Practice project.
 """
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from dataclasses import dataclass
 from typing import List, Optional, Union, Tuple, Dict
 import random
 import numpy as np
+
+
+
 
 try:
     import rlp_datasets
@@ -1252,6 +1256,104 @@ class SequenceProcessor:
         finally:
             if was_training:
                 mdl.train()
+
+
+    @torch.no_grad()
+    def teacher_force_debug_probe(
+        self,
+        sequences,
+        *,
+        b_idx: int = 0,
+        g_idx: int = 0,
+        params_override: Optional[Dict[str, torch.Tensor]] = None,
+        max_T: int = 64,
+        topk: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        A lightweight, no-grad teacher-forcing forward for a single (b,g) sample that:
+        - uses the same _call_model_tf() path (so it honors params_override & precision),
+        - extracts the TF next-token logits for the generated region,
+        - returns compact per-token diagnostics (on CPU, fp32) for debugging continuity.
+
+        Returns a dict with:
+        'tokens'        : LongTensor [T]             -- realized next tokens
+        'logit_on_tok'  : FloatTensor [T]            -- logits at the realized token
+        'logprob_on_tok': FloatTensor [T]            -- log-probs at the realized token
+        'entropy_naive' : FloatTensor [T]            -- naive entropy per step: -∑ p log p
+        'topk_vals'     : FloatTensor [T, K]         -- top-K logit values (for quick inspection)
+        'topk_idx'      : LongTensor  [T, K]         -- their token ids
+        'gen_start'/'gen_end'/'T'                    -- indices for the generated region
+        """
+        mdl = self._unwrap(self.model)
+        device = next(mdl.parameters()).device
+
+        seq = sequences.sequences[b_idx, g_idx]              # [total_len]
+        prompt_len_padded = sequences.prompt_lens[b_idx]     # padded prompt length for this batch
+        gen_len = sequences.gen_lens[b_idx][g_idx]
+        total_len = seq.size(0)
+
+        if gen_len <= 0 or total_len <= prompt_len_padded:
+            return {
+                "tokens": torch.empty(0, dtype=torch.long),
+                "logit_on_tok": torch.empty(0, dtype=torch.float32),
+                "logprob_on_tok": torch.empty(0, dtype=torch.float32),
+                "entropy_naive": torch.empty(0, dtype=torch.float32),
+                "topk_vals": torch.empty(0, topk, dtype=torch.float32),
+                "topk_idx": torch.empty(0, topk, dtype=torch.long),
+                "gen_start": int(prompt_len_padded),
+                "gen_end": int(prompt_len_padded),
+                "T": 0,
+            }
+
+        actual_len = min(prompt_len_padded + gen_len, total_len)
+        input_seq = seq[:actual_len].unsqueeze(0).to(device)  # [1, actual_len]
+        attn = sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(device)
+
+        # Use the same functional path + precision profile as normal no-grad TF.
+        outputs = self._call_model_tf(input_seq, attn, params_override=params_override)
+
+        logits_full = outputs.logits if hasattr(outputs, "logits") else outputs[0]  # [1, L, V]
+        logits_full = logits_full[0]  # [L, V]
+
+        gen_start = int(prompt_len_padded)
+        gen_end   = int(prompt_len_padded + gen_len)
+
+        # Align logits to next-token targets over the generated region
+        gen_logits = logits_full[gen_start - 1 : gen_end - 1]    # [T, V] where T=gen_len
+        gen_tokens = seq[gen_start : gen_end].to(device)         # [T]
+
+        # Optionally truncate for memory
+        if max_T is not None and gen_logits.size(0) > max_T:
+            gen_logits = gen_logits[:max_T]
+            gen_tokens = gen_tokens[:max_T]
+            gen_end = gen_start + int(max_T)
+
+        # Compute compact diagnostics on CPU (fp32)
+        log_probs = F.log_softmax(gen_logits.float(), dim=-1).cpu()     # [T, V]
+        probs     = log_probs.exp()                                     # [T, V]
+        entropy   = (-(probs * log_probs).sum(dim=-1))                  # [T]
+        tok_ix    = gen_tokens.view(-1, 1).cpu()                        # [T,1]
+        logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)              # [T]
+        logit_on_t= gen_logits.float().cpu().gather(1, tok_ix).squeeze(1)  # [T]
+
+        # Top-K logits for quick inspection (CPU)
+        K = min(topk, gen_logits.size(1))
+        topv, topi = gen_logits.float().cpu().topk(k=K, dim=-1)
+
+        return {
+            "tokens": gen_tokens.cpu(),
+            "logit_on_tok": logit_on_t.contiguous(),
+            "logprob_on_tok": logp_on_t.contiguous(),
+            "entropy_naive": entropy.contiguous(),
+            "topk_vals": topv.contiguous(),
+            "topk_idx": topi.contiguous(),
+            "gen_start": gen_start,
+            "gen_end": gen_end,
+            "T": gen_end - gen_start,
+        }
+
+
+
 
 
 
