@@ -487,6 +487,7 @@ class SequenceProcessor:
                                buffers_override: dict[str, torch.Tensor] | None = None
     ) -> Tuple[LogprobResults, DiagnosticsResults]:
         model = self._unwrap(self.model)
+        model_device = next(model.parameters()).device
         B, G = sequences.sequences.shape[:2]
 
         all_logprobs = [[] for _ in range(B)]
@@ -553,10 +554,11 @@ class SequenceProcessor:
                     if gen_len > 0 and seq_len_total > prompt_len_padded:
                         # Take prompt + exactly gen_len tokens (prefix used for TF)
                         actual_len = min(prompt_len_padded + gen_len, seq_len_total)
-                        input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
+                        input_seq = seq[:actual_len].unsqueeze(0).to(model_device, non_blocking=True)  # [1, actual_len]
 
                         # ATTENTION: use the attention mask so left pads are ignored correctly
-                        attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(input_seq.device)
+                        attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(model_device, non_blocking=True)
+
 
                         outputs = self._call_model_tf(
                             input_seq, attn,
