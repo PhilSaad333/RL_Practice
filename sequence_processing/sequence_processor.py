@@ -561,7 +561,6 @@ class SequenceProcessor:
                         outputs = self._call_model_tf(
                             input_seq, attn,
                             params_override=params_override,
-                            buffers_override=buffers_override
                         )
                         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
                         logits = logits[0]  # [actual_len, V]
@@ -1139,23 +1138,50 @@ class SequenceProcessor:
         return token_logq
 
 
-
-    def _call_model_tf(self, input_ids, attention_mask, *, params_override=None):
+    def _call_model_tf(
+        self,
+        input_ids,
+        attention_mask,
+        *,
+        params_override: dict[str, torch.Tensor] | None = None,
+    ):
+        """
+        Functional teacher-forcing call:
+        - If params_override is None, run the live module in eval() (no dropout).
+        - If params_override is given (params only), combine with the model's buffers
+            and call via torch.func.functional_call.
+        """
         mdl = self._unwrap(self.model)  # DDP-safe
         was_training = mdl.training
         mdl.eval()
-        buffers_override = get_named_buffers(mdl)
         try:
             if params_override is None:
-                return mdl(input_ids, attention_mask=attention_mask)
-            else:
-                mapping = {**params_override, **(buffers_override or {})}
-                return torch.func.functional_call(
-                    mdl, mapping, (input_ids,), {'attention_mask': attention_mask}
-                )
+                # Keep inference path identical; also disable KV cache in TF if your model uses it
+                return mdl(input_ids, attention_mask=attention_mask, use_cache=False)
+
+            # Fetch buffers from the *unwrapped* module (authoritative source)
+            bufs = get_named_buffers(mdl)
+
+            # (Guard) If caller accidentally passed a merged dict, strip out any buffer entries
+            # to avoid name collisions or double-passing. You can turn this into an assert if preferred.
+            intersect = set(params_override.keys()).intersection(bufs.keys())
+            if intersect:
+                # Keep parameters only; buffers will come from `bufs`
+                params_override = {k: v for k, v in params_override.items() if k not in bufs}
+
+            # Compose mapping for functional_call. (Param/buffer namespaces should be disjoint.)
+            mapping = {**bufs, **params_override}
+
+            return torch.func.functional_call(
+                mdl,
+                mapping,
+                (input_ids,),
+                {'attention_mask': attention_mask, 'use_cache': False},
+            )
         finally:
             if was_training:
                 mdl.train()
+
 
 
 
