@@ -85,7 +85,14 @@ def test_parameter_override_pipeline():
     
     # Load checkpoint (required before sequence processor initialization)
     print("Loading checkpoint...")
-    probe.load_checkpoint()
+    ckpt_cfg = cfg.get("checkpoint", {})
+    checkpoint_path = ckpt_cfg.get("checkpoint_path", "")
+    optimizer_path = ckpt_cfg.get("optimizer_path", "")
+    
+    if not checkpoint_path:
+        raise ValueError("checkpoint_path not found in config. Please ensure config has checkpoint.checkpoint_path")
+    
+    probe.load_checkpoint(checkpoint_path, optimizer_path if optimizer_path else None)
     print(f"✓ Model loaded: {probe.model}")
     
     # Ensure sequence processor is initialized
