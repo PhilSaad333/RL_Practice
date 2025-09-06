@@ -446,7 +446,11 @@ class SequenceProcessor:
         if with_grad:
             return self._teacher_force_with_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
         else:
-            return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb, return_baseline_features)
+            return self._teacher_force_no_grad(
+                sequences, tf_batch_size, compute_rb, return_baseline_features,
+                params_override=params_override,
+                buffers_override=buffers_override,
+            )
     
     def teacher_force_logprobs_with_diagnostics(self, sequences: BatchedSequences, 
                                               with_grad: bool = False,
