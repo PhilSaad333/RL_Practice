@@ -7,21 +7,21 @@ in RL_studies.pdf and the implementation strategy in offline_entropy_probe_strat
 
 Main components:
 - OfflineEntropyProbe: Main orchestrator class
-- ProbeComponents: Core gradient computation and microbatching
+- DeltaEntropyApprox: Core gradient computation and entropy probe components
 - AdamPreconditioner: Extract and apply P from Adam optimizer state
 - DeltaEntropyIS: Compute actual ΔH with true model update and importance sampling
 - DistributedHelpers: Multi-GPU scalar communication helpers
 """
 
 from .offline_entropy_probe import OfflineEntropyProbe
-from .probe_components import ProbeComponents
+from .delta_entropy_approx import DeltaEntropyApprox
 from .adam_preconditioner import AdamPreconditioner
 from .delta_entropy_is import DeltaEntropyIS
 from .distributed_helpers import DistributedHelpers
 
 __all__ = [
     'OfflineEntropyProbe',
-    'ProbeComponents', 
+    'DeltaEntropyApprox', 
     'AdamPreconditioner',
     'DeltaEntropyIS',
     'DistributedHelpers'
