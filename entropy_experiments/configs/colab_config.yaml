@@ -82,7 +82,7 @@ precision:
 
   # forward-only (generation, teacher-forcing without grads)
   tf_nograd:
-    autocast: true
+    autocast: false
     dtype: float32           # for accurate entropy, use true fp32 math
     cast_logits_fp32: true   # upcast logits to fp32 before entropy/logprob math
 
@@ -96,7 +96,7 @@ precision:
   func_override:
     autocast: false
     dtype: float32           # do this path in fp32 to keep tiny η effects visible
-    cast_params: false       # if true, explicitly cast effective params to this dtype
+    cast_params: true       # if true, explicitly cast effective params to this dtype
 
   # update-vector builder (rl_loss microbatched on U)
   update_vector:
