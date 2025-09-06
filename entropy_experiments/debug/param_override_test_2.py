@@ -303,6 +303,58 @@ def main():
               f"Δ∞ ratio≈{safe_ratio(a[1], b[1]):.3f}, Δ₂ ratio≈{safe_ratio(a[2], b[2]):.3f}, "
               f"expected≈{a[0]/b[0]:.3f}")
 
+
+
+    # --- single-layer poke sanity: force v_named to touch one small weight block ---
+    mdl = unwrap(model)
+    # pick a small, always-hit param (e.g., lm_head or first LoRA B)
+    target_name, target_param = None, None
+    for n, p in mdl.named_parameters():
+        if "lm_head.weight" in n:   # fall back to any small Linear if needed
+            target_name, target_param = n, p
+            break
+    if target_name is None:
+        for n, p in mdl.named_parameters():
+            if p.ndim == 2 and p.numel() <= 1_000_000:
+                target_name, target_param = n, p
+                break
+    assert target_name is not None, "Couldn't find a small target param."
+
+    v_named_poke = {target_name: torch.zeros_like(target_param, dtype=torch.float32)}
+    # Touch a tiny, fixed slice so Δθ is fully controlled and above ULP
+    with torch.no_grad():
+        v_named_poke[target_name].view(-1)[:1024] = 1.0  # 1k elements = 1.0
+
+    def map_for_eta(eta):
+        return build_params_only_floating(mdl, v_named_poke, eta, dtype=torch.float32)
+
+    m0 = map_for_eta(0.0)
+    m1 = map_for_eta(1e-6)
+    m2 = map_for_eta(1e-8)
+
+    # parameter-space check (should be ~100x ratio)
+    def l2_delta(ma, mb):
+        s = 0.0
+        for k in ma:
+            a, b = ma[k], mb[k]
+            if torch.is_floating_point(a): s += (a - b).float().pow(2).sum().item()
+        return s ** 0.5
+
+    print("[poke] ||Δθ|| ratio (1e-8 / 1e-6):",
+        l2_delta(m2, m0) / l2_delta(m1, m0))
+
+    # logit-space check (should also be ~100x for small-enough etas)
+    lo0 = forward_under_mapping_noautocast(mdl, input_ids, attention_mask, m0).detach().cpu()
+    lo1 = forward_under_mapping_noautocast(mdl, input_ids, attention_mask, m1).detach().cpu()
+    lo2 = forward_under_mapping_noautocast(mdl, input_ids, attention_mask, m2).detach().cpu()
+    d1 = (lo1 - lo0); d2 = (lo2 - lo0)
+    print("[poke] ||Δlogits||∞ ratio (1e-8 / 1e-6):", float(d2.abs().max())/float(d1.abs().max()))
+    print("[poke] ||Δlogits||₂ ratio (1e-8 / 1e-6):", float(d2.pow(2).sum().sqrt())/float(d1.pow(2).sum().sqrt()))
+
+
+
+
+
     report_mem("after probes")
     del logits0, logits0_cpu
     gc.collect(); torch.cuda.empty_cache()
