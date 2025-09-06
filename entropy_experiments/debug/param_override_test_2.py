@@ -310,7 +310,7 @@ def main():
         preview = ", ".join([f"(t={i}, tok='{toks[i]}', Δ∞={linf_tok[i].item():.2e})" for i in idx_top])
         print(f"η={eta: .1e}  ||Δlogits||∞={linf:.3e}  ||Δlogits||₂={l2:.3e}")
         print("   top Δ∞ tokens:", preview)
-        del params_eta, logits_eta, d
+        del logits_eta, d
         torch.cuda.empty_cache()
 
     nzA = [(e, L, N) for (e, L, N) in records_A if e > 0]
@@ -337,7 +337,7 @@ def main():
         preview = ", ".join([f"(t={i}, tok='{toks[i]}', Δ∞={linf_tok[i].item():.2e})" for i in idx_top])
         print(f"η={eta: .1e}  ||Δlogits||∞={linf:.3e}  ||Δlogits||₂={l2:.3e}")
         print("   top Δ∞ tokens:", preview)
-        del params_dict, buffers_dict, mapping, logits_eta, d
+        del mapping, logits_eta, d
         torch.cuda.empty_cache()
 
     nzB = [(e, L, N) for (e, L, N) in records_B if e > 0]
