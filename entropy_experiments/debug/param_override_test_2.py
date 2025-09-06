@@ -1,91 +1,84 @@
 #!/usr/bin/env python3
 """
-Fixed-Sequence Param-Override Sanity Probe (no SequenceProcessor)
-=================================================================
+Fixed-Sequence Param-Override Sanity Probe
+==========================================
 
-What this does
---------------
-1) Initializes OfflineEntropyProbe from your config and loads the LoRA checkpoint.
-2) Samples a small U-batch and computes the update vector v_named (per-unit-LR).
-3) Uses param_overrides.build_functional_params_named(...) to form θ' = θ + η·v.
-4) Runs torch.func.functional_call directly on a fixed tokenized sentence
-   (no SequenceProcessor), with use_cache=False for determinism.
-5) Reports Δlogits norms across an η-grid and a linearity sanity ratio.
+- Loads your model via OfflineEntropyProbe and LoRA checkpoint
+- Builds an update vector v_named from a tiny U-batch
+- Runs two functional_call probes on a fixed tokenized sentence:
+  A) PARAMS-ONLY mapping (expected: Δlogits ∝ η in small-η regime)
+  B) PARAMS+BUFFERS mapping (demonstrates instability if buffers are injected)
 
-Why this matters
-----------------
-If this script shows clean linear scaling of Δlogits with η, your param-override
-path and functional_call mapping are sound. Any nonlinearity then likely lives
-in SequenceProcessor post-processing or precision divergence between paths.
-
-Usage
------
-$ python fixed_seq_param_override_sanity.py \
-    --config entropy_experiments/configs/colab_config.yaml \
-    --eta_main 1e-5 --eta_tiny 1e-10 \
-    --text "this is a test sequence. the logits should change continuously!"
-
-Dependencies in your repo
--------------------------
-- entropy_experiments/offline_entropy_probe.py
-- entropy_experiments/update_vector.py             (compute_update_vector)
-- entropy_experiments/utils/param_overrides.py     (build_functional_params_named, merge)
-- entropy_experiments/utils/precision_utils.py     (optional: apply_global_precision)
+This script is self-locating and does not depend on the current working dir.
 """
 
-import os
-import sys
-import gc
-import math
-import argparse
-from typing import Dict, Tuple, Any
-
+import os, sys, gc, math, argparse
+from pathlib import Path
+from typing import Dict, Any, Tuple
 import torch
-import numpy as np
 import yaml
+import numpy as np
 from transformers import AutoTokenizer
 
-# --- CLI ---------------------------------------------------------------------
+# --- BEGIN: self-locating import bootstrap -----------------------------------
+def _infer_project_root_from_argv():
+    # If --config .../entropy_experiments/configs/... is provided, repo root is parent of "entropy_experiments"
+    for i, a in enumerate(sys.argv):
+        if a == "--config" and i + 1 < len(sys.argv):
+            cfg_path = Path(sys.argv[i + 1]).resolve()
+            parts = list(cfg_path.parts)
+            if "entropy_experiments" in parts:
+                idx = parts.index("entropy_experiments")
+                return Path(*parts[:idx])
+            return cfg_path.parent.parent
+    return Path.cwd()
+
+PROJECT_ROOT = _infer_project_root_from_argv()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+os.environ["PYTHONPATH"] = (
+    f"{PROJECT_ROOT}:{os.environ.get('PYTHONPATH','')}"
+    if os.environ.get("PYTHONPATH") else str(PROJECT_ROOT)
+)
+
+pkg_dir = PROJECT_ROOT / "entropy_experiments"
+if pkg_dir.is_dir():
+    init_file = pkg_dir / "__init__.py"
+    if not init_file.exists():
+        try: init_file.touch()
+        except Exception: pass
+# --- END: self-locating import bootstrap -------------------------------------
+
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=str, required=True,
-                   help="Path to YAML config (e.g., entropy_experiments/configs/colab_config.yaml)")
-    p.add_argument("--text", type=str, default="this is a test sequence. the logits should change continuously!",
+    p.add_argument("--config", required=True,
+                   help="Path to YAML config (e.g. /content/RL_Practice/entropy_experiments/configs/colab_config.yaml)")
+    p.add_argument("--text", default="this is a test sequence. the logits should change continuously!",
                    help="Fixed text to tokenize and probe.")
-    p.add_argument("--tokenizer_id", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
-                   help="Tokenizer ID to use (must match model's vocab).")
-    p.add_argument("--eta_main", type=float, default=1e-5, help="Main η used in linearity ratio.")
-    p.add_argument("--eta_tiny", type=float, default=1e-10, help="Tiny η used in linearity ratio.")
-    p.add_argument("--eta_grid", type=float, nargs="*", default=[0.0, 1e-10, 1e-8, 3e-8, 1e-7, 3e-7, 1e-6, 3e-6, 1e-5],
-                   help="Grid of η values to sweep.")
-    p.add_argument("--u_batch", type=int, default=8, help="U batch size for update-vector estimation.")
-    p.add_argument("--u_G", type=int, default=4, help="Generations per prompt for U.")
-    p.add_argument("--print_topk", type=int, default=5, help="How many token positions to preview by max Δ∞.")
-    p.add_argument("--dtype", type=str, default="float32", choices=["float32","float64"],
-                   help="Compute dtype for the forward path and overrides.")
+    p.add_argument("--tokenizer_id", default="Qwen/Qwen2.5-1.5B-Instruct",
+                   help="Tokenizer ID; must be vocab-compatible with the model.")
+    p.add_argument("--eta_grid", type=float, nargs="*", default=[0.0, 1e-10, 1e-8, 3e-8, 1e-7, 3e-7, 1e-6, 3e-6, 1e-5])
+    p.add_argument("--eta_main", type=float, default=1e-5)
+    p.add_argument("--eta_tiny", type=float, default=1e-10)
+    p.add_argument("--u_batch", type=int, default=8)
+    p.add_argument("--u_G", type=int, default=4)
+    p.add_argument("--print_topk", type=int, default=5)
+    p.add_argument("--fp64", action="store_true", help="Use float64 for the probe (safer, slower).")
     return p.parse_args()
 
-# --- Utilities ----------------------------------------------------------------
 
-def setup_pythonpath(project_root: str):
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-    os.environ["PYTHONPATH"] = project_root + (":" + os.environ.get("PYTHONPATH","") if os.environ.get("PYTHONPATH") else "")
-
-def unwrap(module: torch.nn.Module) -> torch.nn.Module:
-    m = module
-    while hasattr(m, "module"):
-        m = m.module
+# --- small helpers ------------------------------------------------------------
+def unwrap(mod: torch.nn.Module) -> torch.nn.Module:
+    m = mod
+    while hasattr(m, "module"): m = m.module
     if hasattr(m, "_orig_mod"):
-        try:
-            m = m._orig_mod
-        except Exception:
-            pass
+        try: m = m._orig_mod
+        except Exception: pass
     return m
 
-def get_model_device(module: torch.nn.Module) -> torch.device:
-    return next(unwrap(module).parameters()).device
+def device_of(mod: torch.nn.Module) -> torch.device:
+    return next(unwrap(mod).parameters()).device
 
 def report_mem(tag: str):
     if not torch.cuda.is_available():
@@ -93,16 +86,10 @@ def report_mem(tag: str):
         return
     torch.cuda.synchronize()
     gb = 1024**3
-    alloc = torch.cuda.memory_allocated() / gb
-    reserv = torch.cuda.memory_reserved() / gb
-    print(f"[{tag}] GPU mem: alloc={alloc:.2f} GB, reserved={reserv:.2f} GB")
+    print(f"[{tag}] alloc={torch.cuda.memory_allocated()/gb:.2f} GB, "
+          f"reserved={torch.cuda.memory_reserved()/gb:.2f} GB")
 
-def logits_under_params(mdl, input_ids, attention_mask, *, mapping: Dict[str, torch.Tensor] | None):
-    """
-    Eval forward pass with optional name→tensor mapping via functional_call.
-    Always disables KV cache to avoid hidden state carryover.
-    Returns logits [1, T, V] (on device).
-    """
+def logits_under_mapping(mdl, input_ids, attention_mask, mapping: Dict[str, torch.Tensor] | None):
     mdl = unwrap(mdl)
     was_training = mdl.training
     mdl.eval()
@@ -120,85 +107,70 @@ def logits_under_params(mdl, input_ids, attention_mask, *, mapping: Dict[str, to
             mdl.train()
 
 def tokenwise_norms(delta_logits_cpu: torch.Tensor):
-    """delta_logits_cpu: [1, T, V] -> per-token (∞-norm, ℓ2)"""
     d = delta_logits_cpu.squeeze(0)         # [T, V]
-    linf = d.abs().max(dim=-1).values       # [T]
-    l2   = d.pow(2).sum(dim=-1).sqrt()      # [T]
+    linf = d.abs().max(dim=-1).values
+    l2   = d.pow(2).sum(dim=-1).sqrt()
     return linf, l2
 
-def safe_ratio(a: float, b: float) -> float:
-    return float(a / b) if (b != 0.0 and math.isfinite(b)) else float("nan")
+def safe_ratio(a, b):
+    return float(a / b) if (b != 0.0 and math.isfinite(a) and math.isfinite(b)) else float("nan")
 
-# --- Main ---------------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    # Project root = CWD; adjust if launching elsewhere
-    project_root = os.getcwd()
-    setup_pythonpath(project_root)
-
-    # Torch/global precision: keep it explicit and consistent
+    # Precision defaults for the probe
     torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True  # ok for f32; set False if you want stricter match
-    if args.dtype == "float64":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    if args.fp64:
         torch.set_default_dtype(torch.float64)
     else:
         torch.set_default_dtype(torch.float32)
 
     # Load config
-    cfg_path = os.path.join(project_root, args.config)
-    if not os.path.exists(cfg_path):
-        raise FileNotFoundError(f"Config not found: {cfg_path}")
-    with open(cfg_path, "r") as f:
+    with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
     print(f"✓ Loaded config: {args.config}")
 
-    # Apply optional global precision profile if you keep one in your repo
+    # Optional global precision from your utils (ignored if missing)
     try:
         from entropy_experiments.utils.precision_utils import apply_global_precision
-        apply_global_precision(
-            allow_tf32=True,
-            matmul_precision="high",
-        )
+        apply_global_precision(allow_tf32=True, matmul_precision="high")
     except Exception:
-        pass  # optional
+        pass
 
-    # Import project bits late (PYTHONPATH is ready)
+    # Project imports
     from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
     from entropy_experiments.update_vector import compute_update_vector
     from entropy_experiments.utils.param_overrides import (
         build_functional_params_named,
-        merge_params_and_buffers,
+        merge_params_and_buffers,   # used only in the buffers probe
     )
 
-    # Build the probe & load checkpoint
+    # Build probe & load checkpoint
     probe = OfflineEntropyProbe(cfg)
     ckpt_cfg = cfg.get("checkpoint", {})
     adapter_path   = ckpt_cfg.get("checkpoint_path", "")
     optimizer_path = ckpt_cfg.get("optimizer_path", "")
     if not adapter_path:
         raise ValueError("Config missing checkpoint.checkpoint_path")
-
     print("Loading LoRA checkpoint …")
     probe.load_checkpoint(adapter_path, optimizer_path if optimizer_path else None)
     model = probe.model
-    device = get_model_device(model)
-    print(f"✓ Model ready on {device}: {type(unwrap(model)).__name__}")
+    dev = device_of(model)
+    print(f"✓ Model on {dev}: {type(unwrap(model)).__name__}")
 
-    # --- Phase A: compute update vector from a tiny U-batch -------------------
-    print("Sampling a small U-batch and computing update vector …")
+    # --- Compute update vector v_named from a tiny U-batch --------------------
     probe._ensure_sequence_processor()
     dataset = cfg["batch_config"]["dataset_name"]
     _, U_split = probe._get_splits()
-
     U_sequences, U_logprobs, _ = probe._sequence_processor.generate_with_logprobs(
         prompts=None, G=args.u_G, dataset_name=dataset, split=U_split,
         num_prompts=args.u_batch, compute_rb=True
     )
     U_batch = probe._pack_U_from_sequences(U_sequences, U_logprobs.rewards)
 
-    # Build or reuse optimizer
+    # Optimizer (only to get state if needed by your compute_update_vector)
     if getattr(probe, "optimizer", None) is not None:
         optimizer = probe.optimizer
     else:
@@ -211,101 +183,100 @@ def main():
     v_norm = float(torch.sqrt(sum((v.double()**2).sum() for v in v_named.values())).item())
     print(f"✓ Update vector: {len(v_named)} tensors, ||v||₂ ≈ {v_norm:.3e}")
 
-    # --- Phase B: fixed-sequence logits under θ and θ+ηv ---------------------
-    print("\nFixed-sequence functional_call probe (no SequenceProcessor) …")
+    # --- Fixed sequence & baseline logits ------------------------------------
     tok = AutoTokenizer.from_pretrained(args.tokenizer_id, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-
     enc = tok(args.text, return_tensors="pt", add_special_tokens=True, padding=False)
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
+    input_ids = enc["input_ids"].to(dev); attention_mask = enc["attention_mask"].to(dev)
 
-    # Guard: vocab mismatch
+    # Vocab guard
     mdl_unwrapped = unwrap(model)
-    vocab_param = None
-    vocab_size  = None
+    vocab_size = None
     for n, p in mdl_unwrapped.named_parameters():
         if n.endswith("model.embed_tokens.weight"):
-            vocab_param, vocab_size = n, p.shape[0]
-            break
+            vocab_size = p.shape[0]; break
     if vocab_size is None:
         for n, p in mdl_unwrapped.named_parameters():
-            if n.endswith("lm_head.weight"):
-                vocab_param, vocab_size = n, p.shape[0]
-                break
-    if vocab_size is not None:
-        max_id = int(input_ids.max().item())
-        if max_id >= vocab_size:
-            raise RuntimeError(
-                f"Token id {max_id} exceeds model vocab size {vocab_size} (param: {vocab_param}). "
-                f"Tokenizer/model mismatch."
-            )
+            if n.endswith("lm_head.weight"): vocab_size = p.shape[0]; break
+    if vocab_size is not None and int(input_ids.max()) >= vocab_size:
+        raise RuntimeError("Tokenizer/model vocab mismatch (token id exceeds vocab size).")
 
-    # Baseline logits at θ (direct call; no mapping)
     with torch.no_grad():
-        logits0 = logits_under_params(model, input_ids, attention_mask, mapping=None)
-    logits0_cpu = logits0.detach().cpu()    # [1, T, V]
+        logits0 = logits_under_mapping(model, input_ids, attention_mask, mapping=None)
+    logits0_cpu = logits0.detach().cpu()
     T = logits0_cpu.shape[1]
-    tokens = tok.convert_ids_to_tokens(input_ids.squeeze(0).tolist())
+    toks = tok.convert_ids_to_tokens(input_ids.squeeze(0).tolist())
+    print(f"\nFixed-sequence functional_call probe …")
     print(f"Sequence length T={T}, vocab={logits0_cpu.shape[-1]}")
 
-    # Sweep over η
-    records = []
+    # --- PROBE A: PARAMS-ONLY mapping (expected: good scaling) ---------------
+    print("\n[PROBE A] PARAMS-ONLY mapping (recommended)")
+    records_A = []
     for eta in args.eta_grid:
-        # Build θ' = θ + η v (params only), plus buffers passthrough
+        # Build θ' with PARAMS ONLY; force params to float32/64 for continuity
+        params_dict, _ = build_functional_params_named(
+            model, v_named, eta,
+            detach_params=True, detach_buffers=True,
+            force_param_dtype=(torch.float64 if args.fp64 else torch.float32),
+            force_buffer_dtype=None,   # ← do not cast buffers; not used
+        )
+        mapping = params_dict  # ← PARAMS ONLY
+        logits_eta = logits_under_mapping(model, input_ids, attention_mask, mapping=mapping)
+        d = (logits_eta.detach().cpu() - logits0_cpu)
+        linf = float(d.abs().max().item()); l2 = float(d.pow(2).sum().sqrt().item())
+        records_A.append((eta, linf, l2))
+        # per-token preview
+        linf_tok, _ = tokenwise_norms(d)
+        idx_top = torch.topk(linf_tok, k=min(args.print_topk, T)).indices.tolist()
+        preview = ", ".join([f"(t={i}, tok='{toks[i]}', Δ∞={linf_tok[i].item():.2e})" for i in idx_top])
+        print(f"η={eta: .1e}  ||Δlogits||∞={linf:.3e}  ||Δlogits||₂={l2:.3e}")
+        print("   top Δ∞ tokens:", preview)
+        del params_dict, mapping, logits_eta, d
+        torch.cuda.empty_cache()
+
+    # Linearity: compare tiniest two nonzero etas if present
+    nzA = [(e, L, N) for (e, L, N) in records_A if e > 0]
+    if len(nzA) >= 2:
+        a, b = nzA[0], nzA[1]
+        print(f"Linearity sanity (A): (η={a[0]:.1e} vs {b[0]:.1e}) "
+              f"Δ∞ ratio≈{safe_ratio(a[1], b[1]):.3f}, Δ₂ ratio≈{safe_ratio(a[2], b[2]):.3f}, "
+              f"expected≈{a[0]/b[0]:.3f}")
+
+    # --- PROBE B: PARAMS+BUFFERS mapping (to reproduce instability) ----------
+    print("\n[PROBE B] PARAMS+BUFFERS mapping (diagnostic; often unstable)")
+    records_B = []
+    for eta in args.eta_grid:
         params_dict, buffers_dict = build_functional_params_named(
             model, v_named, eta,
             detach_params=True, detach_buffers=True,
-            force_param_dtype=torch.float32 if args.dtype == "float32" else torch.float64,
-            force_buffer_dtype=torch.float32 if args.dtype == "float32" else torch.float64,
+            force_param_dtype=(torch.float64 if args.fp64 else torch.float32),
+            force_buffer_dtype=(torch.float64 if args.fp64 else torch.float32),
         )
-        mapping = merge_params_and_buffers(params_dict, buffers_dict)
-
-        logits_eta = logits_under_params(model, input_ids, attention_mask, mapping=mapping)
-        d_logits = (logits_eta.detach().cpu() - logits0_cpu)  # [1,T,V]
-        linf_all = float(d_logits.abs().max().item())
-        l2_all   = float(d_logits.pow(2).sum().sqrt().item())
-
-        # per-token norms (∞, 2)
-        linf_tok, l2_tok = tokenwise_norms(d_logits)
+        # Merge for mapping; PARAMETERS TAKE PRECEDENCE on name collisions
+        mapping = dict(buffers_dict); mapping.update(params_dict)
+        logits_eta = logits_under_mapping(model, input_ids, attention_mask, mapping=mapping)
+        d = (logits_eta.detach().cpu() - logits0_cpu)
+        linf = float(d.abs().max().item()); l2 = float(d.pow(2).sum().sqrt().item())
+        records_B.append((eta, linf, l2))
+        linf_tok, _ = tokenwise_norms(d)
         idx_top = torch.topk(linf_tok, k=min(args.print_topk, T)).indices.tolist()
-        preview = ", ".join([f"(t={i}, tok='{tokens[i]}', Δ∞={linf_tok[i].item():.2e})" for i in idx_top])
-
-        print(f"η={eta: .1e}  ||Δlogits||∞={linf_all:.3e}  ||Δlogits||₂={l2_all:.3e}")
-        print(f"   top Δ∞ tokens: {preview}")
-
-        records.append({
-            "eta": eta, "linf_all": linf_all, "l2_all": l2_all,
-            "linf_tok": linf_tok, "l2_tok": l2_tok
-        })
-
-        # cleanup
-        del params_dict, buffers_dict, mapping, logits_eta, d_logits
+        preview = ", ".join([f"(t={i}, tok='{toks[i]}', Δ∞={linf_tok[i].item():.2e})" for i in idx_top])
+        print(f"η={eta: .1e}  ||Δlogits||∞={linf:.3e}  ||Δlogits||₂={l2:.3e}")
+        print("   top Δ∞ tokens:", preview)
+        del params_dict, buffers_dict, mapping, logits_eta, d
         torch.cuda.empty_cache()
 
-    # Linearity check: compare two smallest non-zero η
-    nz = [r for r in records if r["eta"] > 0]
-    if len(nz) >= 2:
-        a, b = nz[0], nz[1]      # e.g., 1e-10 and 1e-8
-        r_inf = safe_ratio(a["linf_all"], b["linf_all"])
-        r_l2  = safe_ratio(a["l2_all"], b["l2_all"])
-        print(f"\nLinearity sanity (η={a['eta']:.1e} vs η={b['eta']:.1e}): "
-              f"Δ∞ ratio≈{r_inf:.3f}, Δ₂ ratio≈{r_l2:.3f}, expected≈{a['eta']/b['eta']:.3f}")
+    nzB = [(e, L, N) for (e, L, N) in records_B if e > 0]
+    if len(nzB) >= 2:
+        a, b = nzB[0], nzB[1]
+        print(f"Linearity sanity (B): (η={a[0]:.1e} vs {b[0]:.1e}) "
+              f"Δ∞ ratio≈{safe_ratio(a[1], b[1]):.3f}, Δ₂ ratio≈{safe_ratio(a[2], b[2]):.3f}, "
+              f"expected≈{a[0]/b[0]:.3f}")
 
-    # Targeted ratio: tiny vs main
-    eta_to_rec = {r["eta"]: r for r in records}
-    if args.eta_tiny in eta_to_rec and args.eta_main in eta_to_rec:
-        ra = eta_to_rec[args.eta_tiny]; rb = eta_to_rec[args.eta_main]
-        r_inf = safe_ratio(ra["linf_all"], rb["linf_all"])
-        r_l2  = safe_ratio(ra["l2_all"],  rb["l2_all"])
-        print(f"\nTargeted ratio η_tiny/η_main={args.eta_tiny/args.eta_main:.3e}: "
-              f"Δ∞ ratio≈{r_inf:.3e}, Δ₂ ratio≈{r_l2:.3e}")
-
-    report_mem("after fixed-seq probe")
+    report_mem("after probes")
     del logits0, logits0_cpu
-    gc.collect()
-    torch.cuda.empty_cache()
+    gc.collect(); torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()
