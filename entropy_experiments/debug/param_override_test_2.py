@@ -209,7 +209,11 @@ def main():
 
     # Baseline logits via functional_call with PARAMS-ONLY mapping, autocast off
     float_dtype = (torch.float64 if args.fp64 else torch.float32)
-    params0 = build_params_only_floating(mdl_unwrapped, None, 0.0, dtype=float_dtype)
+
+    params0 = build_functional_params_named(model, None, 0.0,
+                                            force_param_dtype=torch.float32,
+                                            detach_params=True, detach_buffers=True)[0]
+
     logits0 = forward_under_mapping_noautocast(mdl_unwrapped, input_ids, attention_mask, params0).detach().cpu()
 
     logits0_cpu = logits0  # already cpu
@@ -217,6 +221,31 @@ def main():
     toks = tok.convert_ids_to_tokens(input_ids.squeeze(0).tolist())
     print(f"\nFixed-sequence functional_call probe …")
     print(f"Sequence length T={T}, vocab={logits0_cpu.shape[-1]}")
+
+
+    p_main  = build_functional_params_named(model, v_named, 1e-5,
+                                            force_param_dtype=torch.float32,
+                                            detach_params=True, detach_buffers=True)[0]
+    p_tiny  = build_functional_params_named(model, v_named, 1e-10,
+                                            force_param_dtype=torch.float32,
+                                            detach_params=True, detach_buffers=True)[0]
+
+    # L2(Δθ) should scale with η
+    def l2_of_delta(pa, pb):
+        s = 0.0
+        for k in pa:
+            a, b = pa[k], pb[k]
+            if torch.is_floating_point(a):
+                s += (a - b).float().pow(2).sum().item()
+        return s ** 0.5
+
+    r = l2_of_delta(p_tiny, params0) / l2_of_delta(p_main, params0)
+    print(f"||Δθ|| ratio (tiny/main): {r:.3e}  (expected ≈ 1e-5)")
+
+
+
+
+
 
     # --- PROBE A: PARAMS-ONLY mapping (recommended) --------------------------
     print("\n[PROBE A] PARAMS-ONLY mapping (recommended)")
