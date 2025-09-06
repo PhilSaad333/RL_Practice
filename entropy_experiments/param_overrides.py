@@ -23,7 +23,7 @@ import warnings
 import torch
 import torch.nn as nn
 
-from param_registry import (
+from .param_registry import (
     get_trainable_named,
     get_named_buffers,
 )
