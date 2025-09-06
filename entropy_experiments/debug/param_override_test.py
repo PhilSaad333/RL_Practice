@@ -246,7 +246,19 @@ def test_parameter_override_pipeline():
     print(f"[Δθ]    η=main unchanged elems: {sameM}/{totM}, max|Δ|={maxM:.3e}")
 
 
-
+    # (3) Δθ norms scale by η (sanity on the inputs we pass)
+    base_params = dict(probe.model.named_parameters())
+    def dtheta_l2(params_over):
+        acc = 0.0
+        for k, eff in params_over.items():
+            if k in base_params:
+                d = (eff - base_params[k]).detach().double()
+                acc += float((d*d).sum().item())
+        return acc**0.5
+    nM = dtheta_l2(params_main)
+    nT = dtheta_l2(params_tiny)
+    print(f"[SP-Δθ] ||Δθ||₂(main)={nM:.3e}  ||Δθ||₂(tiny)={nT:.3e}  ratio={nT/nM if nM>0 else float('nan'):.3e}  "
+          f"(expected≈{TINY_ETA/ETA:.3e})")
 
 
 
@@ -282,19 +294,7 @@ def test_parameter_override_pipeline():
         if linfM > 0 and abs(ratio_inf - (TINY_ETA/ETA)) > 10*(TINY_ETA/ETA):
             raise RuntimeError(f"[SP-η-cont] FAILED for {name}: observed {ratio_inf:.3e}, expected {TINY_ETA/ETA:.3e}")
 
-    # (3) Δθ norms scale by η (sanity on the inputs we pass)
-    base_params = dict(probe.model.named_parameters())
-    def dtheta_l2(params_over):
-        acc = 0.0
-        for k, eff in params_over.items():
-            if k in base_params:
-                d = (eff - base_params[k]).detach().double()
-                acc += float((d*d).sum().item())
-        return acc**0.5
-    nM = dtheta_l2(params_main)
-    nT = dtheta_l2(params_tiny)
-    print(f"[SP-Δθ] ||Δθ||₂(main)={nM:.3e}  ||Δθ||₂(tiny)={nT:.3e}  ratio={nT/nM if nM>0 else float('nan'):.3e}  "
-          f"(expected≈{TINY_ETA/ETA:.3e})")
+
 
 
 if __name__ == "__main__":
