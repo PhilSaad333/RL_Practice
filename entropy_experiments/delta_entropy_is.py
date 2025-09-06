@@ -543,16 +543,16 @@ class DeltaEntropyIS:
             m  = attn[b0, g0, :L].unsqueeze(0).to(device)
 
             # Base logits
-            base_out = self._sequence_processor._unwrap(self.model)(x, attention_mask=m, use_cache=False)
+            base_out = self.sequence_processor._unwrap(self.model)(x, attention_mask=m, use_cache=False)
             base_logits = base_out.logits[0].float()
 
             # Override logits, using the same helper SequenceProcessor uses
-            from entropy_experiments.param_overrides import get_named_buffers
-            bufs = get_named_buffers(self._sequence_processor._unwrap(self.model))
+            from entropy_experiments.utils.param_overrides import get_named_buffers
+            bufs = get_named_buffers(self.sequence_processor._unwrap(self.model))
             mapping = {**bufs, **params_override}  # params_override is the per-eta dict you just built
 
             upd_out = torch.func.functional_call(
-                self._sequence_processor._unwrap(self.model), mapping,
+                self.sequence_processor._unwrap(self.model), mapping,
                 (x,), {'attention_mask': m, 'use_cache': False}
             )
             upd_logits = upd_out.logits[0].float()
