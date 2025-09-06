@@ -529,37 +529,61 @@ class DeltaEntropyIS:
         )
         
 
+        # --- SANITY: scaling check using the *same* forward path as SP (_call_model_tf) ---
+        # Use identical precision/profile and buffer handling as production TF.
+        bs   = self._to_batched_sequences_from_probe(E_batch)
+        mdl  = self.sequence_processor._unwrap(self.model)
+        dev  = next(mdl.parameters()).device
 
-        with torch.no_grad():
-            mdl = self._unwrap(self.model) if hasattr(self, "_unwrap") else self.model
-            device = next(mdl.parameters()).device
+        # Single short prefix to keep it cheap and deterministic
+        b0, g0 = 0, 0
+        pl = int(E_batch["prompt_lens"][b0])
+        # Prefer an explicit small prefix of the generated region; fall back to 16 tokens
+        gen_len_guess = 16
+        L = min(pl + gen_len_guess, int(E_batch["sequences"].shape[-1]))
+        x = E_batch["sequences"][b0, g0, :L].unsqueeze(0).to(dev)
+        m = E_batch["attention_masks"][b0, g0, :L].unsqueeze(0).to(dev)
 
-            # Pull a tiny prefix from the first E example
-            seqs = E_batch["sequences"]             # [B, G, L]
-            attn = E_batch["attention_masks"]
-            b0, g0 = 0, 0
-            L = int(E_batch["prompt_lens"][b0]) + min(16, int(E_batch["max_lengths"][b0]))
-            x  = seqs[b0, g0, :L].unsqueeze(0).to(device)
-            m  = attn[b0, g0, :L].unsqueeze(0).to(device)
+        # Build a much smaller step as comparator
+        eta_small = max(eta * 1e-5, 1e-12)
+        fo_cfg = self.config.get('precision', {}).get('func_override', {})
+        force_dtype = str_to_dtype(fo_cfg.get('dtype', 'float32')) if fo_cfg.get('cast_params', False) else None
 
-            # Base logits
-            base_out = self.sequence_processor._unwrap(self.model)(x, attention_mask=m, use_cache=False)
-            base_logits = base_out.logits[0].float()
+        params_override_small, _ = build_functional_params_named(
+            model, update_vector_named, eta_small,
+            force_param_dtype=force_dtype,
+            detach_params=True, detach_buffers=True,
+        )
 
-            # Override logits, using the same helper SequenceProcessor uses
-            from entropy_experiments.utils.param_overrides import get_named_buffers
-            bufs = get_named_buffers(self.sequence_processor._unwrap(self.model))
-            mapping = {**bufs, **params_override}  # params_override is the per-eta dict you just built
+        # IMPORTANT: use the same SP helper, which sets eval(), disables cache, and injects buffers consistently
+        mdl_was_training = mdl.training
+        mdl.eval()
+        try:
+            out0      = self.sequence_processor._call_model_tf(x, m, params_override=None)
+            out_small = self.sequence_processor._call_model_tf(x, m, params_override=params_override_small)
+            out_big   = self.sequence_processor._call_model_tf(x, m, params_override=params_override)
 
-            upd_out = torch.func.functional_call(
-                self.sequence_processor._unwrap(self.model), mapping,
-                (x,), {'attention_mask': m, 'use_cache': False}
+            logits0      = (out0.logits      if hasattr(out0, "logits")      else out0[0]).float()
+            logits_small = (out_small.logits if hasattr(out_small, "logits") else out_small[0]).float()
+            logits_big   = (out_big.logits   if hasattr(out_big, "logits")   else out_big[0]).float()
+        finally:
+            if mdl_was_training:
+                mdl.train()
+
+        d_small = (logits_small - logits0).detach()
+        d_big   = (logits_big   - logits0).detach()
+        linf_small = float(d_small.abs().max().item())
+        linf_big   = float(d_big.abs().max().item())
+        ratio = (linf_small / linf_big) if linf_big > 0 else float('nan')
+        self.logger.info(f"[SANITY-SP] ||Δlogits||∞ small={linf_small:.3e}, big={linf_big:.3e}, "
+                        f"ratio={ratio:.3e} (expected≈{eta_small/eta:.3e})")
+
+        # Hard tripwire: if scaling is off by >10×, fail fast
+        if linf_big > 0 and abs(ratio - (eta_small/eta)) > 10*(eta_small/eta):
+            raise RuntimeError(
+                f"Parameter-override scaling failed: observed ratio {ratio:.3e}, "
+                f"expected {eta_small/eta:.3e}. Override not applied or precision paths differ."
             )
-            upd_logits = upd_out.logits[0].float()
-
-            dlogits = (upd_logits - base_logits)
-            print(f"[SANITY η={eta:.1e}] ||Δlogits||_∞={dlogits.abs().max().item():.3e} "
-                f"||Δlogits||₂={dlogits.norm().item():.3e}")
 
 
 
