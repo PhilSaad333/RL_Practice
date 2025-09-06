@@ -575,6 +575,8 @@ class SequenceProcessor:
                         # token t at position i uses logits at i-1
                         gen_logits = logits[gen_start-1 : gen_end-1]   # [T = gen_len, V]
                         gen_tokens = seq[gen_start : gen_end]          # [T]
+                        gen_tokens = gen_tokens.to(gen_logits.device, non_blocking=True)
+
 
                         if gen_logits.size(0) == gen_tokens.size(0) and gen_logits.size(0) > 0:
                                 
