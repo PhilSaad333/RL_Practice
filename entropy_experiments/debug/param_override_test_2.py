@@ -98,18 +98,50 @@ def safe_ratio(a, b):
     return float(a / b) if (b != 0.0 and math.isfinite(a) and math.isfinite(b)) else float("nan")
 
 
+# --- unified functional_call forward, autocast disabled ---
+@torch.no_grad()
+def _fc_logits_noautocast(mdl, input_ids, attention_mask, mapping: dict[str, torch.Tensor]):
+    m = unwrap(mdl)
+    was = m.training
+    m.eval()
+    try:
+        # same precision path for EVERY call (baseline + all etas)
+        with torch.autocast(device_type="cuda", enabled=False):
+            out = torch.func.functional_call(
+                m, mapping, (input_ids,),
+                {'attention_mask': attention_mask, 'use_cache': False}
+            )
+        return out.logits if hasattr(out, "logits") else out[0]
+    finally:
+        if was: m.train()
+
+
+
+
 # --- FP32/FP64 param-only mapping builders -----------------------------------
 from entropy_experiments.utils.param_overrides import build_functional_params_named
 
-def build_params_only_floating(model, v_named, eta: float, dtype: torch.dtype):
-    """Return PARAMS-ONLY mapping; floating tensors cast to dtype; ints/bools unchanged."""
+def _params_only_fp(m: torch.nn.Module, v_named, eta: float, dtype=torch.float32):
+    # Build mapping keyed for THIS module, parameters only
     params, _ = build_functional_params_named(
-        model, v_named, eta,
+        m, v_named, eta,
         detach_params=True, detach_buffers=True,
-        force_param_dtype=dtype,       # ← cast float params to fp32/fp64
-        force_buffer_dtype=None        # ← buffers not returned here
+        force_param_dtype=dtype,
+        force_buffer_dtype=None
     )
     return params
+
+def _params_plus_buffers_fp(m: torch.nn.Module, v_named, eta: float, dtype=torch.float32):
+    params, bufs = build_functional_params_named(
+        m, v_named, eta,
+        detach_params=True, detach_buffers=True,
+        force_param_dtype=dtype,
+        force_buffer_dtype=dtype
+    )
+    merged = dict(bufs); merged.update(params)  # params take precedence
+    return merged
+
+
 
 @torch.no_grad()
 def forward_under_mapping_noautocast(mdl, input_ids, attention_mask, mapping: Dict[str, torch.Tensor]):
@@ -165,6 +197,14 @@ def main():
     dev = device_of(model)
     print(f"✓ Model on {dev}: {type(unwrap(model)).__name__}")
 
+
+    mdl_target = unwrap(model)  # use this EVERYWHERE
+    fp_dtype = torch.float64 if args.fp64 else torch.float32
+
+
+
+
+
     # --- Compute update vector v_named from a tiny U-batch --------------------
     probe._ensure_sequence_processor()
     dataset = cfg["batch_config"]["dataset_name"]
@@ -178,11 +218,11 @@ def main():
     # Optimizer (only to get state if needed by compute_update_vector)
     optimizer = getattr(probe, "optimizer", None)
     if optimizer is None:
-        trainable = [p for _, p in model.named_parameters() if p.requires_grad]
+        trainable = [p for _, p in mdl_target.named_parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(trainable, lr=args.eta_main)
 
     v_named, stats = compute_update_vector(
-        model=model, optimizer=optimizer, U_batch=U_batch, config=probe.config, logger=probe.logger
+        model=mdl_target, optimizer=optimizer, U_batch=U_batch, config=probe.config, logger=probe.logger
     )
     v_norm = float(torch.sqrt(sum((v.double()**2).sum() for v in v_named.values())).item())
     print(f"✓ Update vector: {len(v_named)} tensors, ||v||₂ ≈ {v_norm:.3e}")
@@ -195,13 +235,12 @@ def main():
     input_ids = enc["input_ids"].to(dev); attention_mask = enc["attention_mask"].to(dev)
 
     # Vocab guard
-    mdl_unwrapped = unwrap(model)
     vocab_size = None
-    for n, p in mdl_unwrapped.named_parameters():
+    for n, p in mdl_target.named_parameters():
         if n.endswith("model.embed_tokens.weight"):
             vocab_size = p.shape[0]; break
     if vocab_size is None:
-        for n, p in mdl_unwrapped.named_parameters():
+        for n, p in mdl_target.named_parameters():
             if n.endswith("lm_head.weight"):
                 vocab_size = p.shape[0]; break
     if vocab_size is not None and int(input_ids.max()) >= vocab_size:
@@ -210,11 +249,20 @@ def main():
     # Baseline logits via functional_call with PARAMS-ONLY mapping, autocast off
     float_dtype = (torch.float64 if args.fp64 else torch.float32)
 
-    params0 = build_functional_params_named(model, None, 0.0,
+    params0 = build_functional_params_named(mdl_target, None, 0.0,
                                             force_param_dtype=torch.float32,
                                             detach_params=True, detach_buffers=True)[0]
 
-    logits0 = forward_under_mapping_noautocast(mdl_unwrapped, input_ids, attention_mask, params0).detach().cpu()
+    # Baseline mapping at eta=0 (params only) against mdl_target
+    map0 = _params_only_fp(mdl_target, v_named=None, eta=0.0, dtype=fp_dtype)
+    logits0 = _fc_logits_noautocast(mdl_target, input_ids, attention_mask, map0).detach().cpu()
+
+    # (optional) hard zero-check vs direct forward in the SAME precision
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda", enabled=False):
+            out_dir = mdl_target(input_ids, attention_mask=attention_mask, use_cache=False)
+    logits_dir = (out_dir.logits if hasattr(out_dir, "logits") else out_dir[0]).detach().cpu()
+    print(f"[zero-check] max|direct - fc(eta=0)| = {(logits_dir - logits0).abs().max().item():.3e}")
 
     logits0_cpu = logits0  # already cpu
     T = logits0_cpu.shape[1]
@@ -223,10 +271,10 @@ def main():
     print(f"Sequence length T={T}, vocab={logits0_cpu.shape[-1]}")
 
 
-    p_main  = build_functional_params_named(model, v_named, 1e-5,
+    p_main  = build_functional_params_named(mdl_target, v_named, 1e-5,
                                             force_param_dtype=torch.float32,
                                             detach_params=True, detach_buffers=True)[0]
-    p_tiny  = build_functional_params_named(model, v_named, 1e-10,
+    p_tiny  = build_functional_params_named(mdl_target, v_named, 1e-10,
                                             force_param_dtype=torch.float32,
                                             detach_params=True, detach_buffers=True)[0]
 
@@ -248,12 +296,13 @@ def main():
 
 
     # --- PROBE A: PARAMS-ONLY mapping (recommended) --------------------------
+
     print("\n[PROBE A] PARAMS-ONLY mapping (recommended)")
     records_A = []
     for eta in args.eta_grid:
-        params_eta = build_params_only_floating(mdl_unwrapped, v_named, eta, dtype=float_dtype)
-        logits_eta = forward_under_mapping_noautocast(mdl_unwrapped, input_ids, attention_mask, params_eta)
-        d = (logits_eta.detach().cpu() - logits0_cpu)
+        m_eta = _params_only_fp(mdl_target, v_named, eta, dtype=fp_dtype)
+        logits_eta = _fc_logits_noautocast(mdl_target, input_ids, attention_mask, m_eta).detach().cpu()
+        d = logits_eta - logits0
         linf = float(d.abs().max().item()); l2 = float(d.pow(2).sum().sqrt().item())
         records_A.append((eta, linf, l2))
         linf_tok, _ = tokenwise_norms(d)
@@ -273,19 +322,14 @@ def main():
 
     # --- PROBE B: PARAMS+BUFFERS mapping (diagnostic) ------------------------
     from entropy_experiments.utils.param_overrides import build_functional_params_named as _build_full
+
+
     print("\n[PROBE B] PARAMS+BUFFERS mapping (diagnostic; often unstable)")
     records_B = []
     for eta in args.eta_grid:
-        # Build full mapping; cast both params & buffers to the same float dtype
-        params_dict, buffers_dict = _build_full(
-            mdl_unwrapped, v_named, eta,
-            detach_params=True, detach_buffers=True,
-            force_param_dtype=float_dtype,
-            force_buffer_dtype=float_dtype,
-        )
-        mapping = dict(buffers_dict); mapping.update(params_dict)  # params take precedence
-        logits_eta = forward_under_mapping_noautocast(mdl_unwrapped, input_ids, attention_mask, mapping)
-        d = (logits_eta.detach().cpu() - logits0_cpu)
+        mapping = _params_plus_buffers_fp(mdl_target, v_named, eta, dtype=fp_dtype)
+        logits_eta = _fc_logits_noautocast(mdl_target, input_ids, attention_mask, mapping).detach().cpu()
+        d = logits_eta - logits0
         linf = float(d.abs().max().item()); l2 = float(d.pow(2).sum().sqrt().item())
         records_B.append((eta, linf, l2))
         linf_tok, _ = tokenwise_norms(d)
@@ -306,15 +350,14 @@ def main():
 
 
     # --- single-layer poke sanity: force v_named to touch one small weight block ---
-    mdl = unwrap(model)
     # pick a small, always-hit param (e.g., lm_head or first LoRA B)
     target_name, target_param = None, None
-    for n, p in mdl.named_parameters():
+    for n, p in mdl_target.named_parameters():
         if "lm_head.weight" in n:   # fall back to any small Linear if needed
             target_name, target_param = n, p
             break
     if target_name is None:
-        for n, p in mdl.named_parameters():
+        for n, p in mdl_target.named_parameters():
             if p.ndim == 2 and p.numel() <= 1_000_000:
                 target_name, target_param = n, p
                 break
@@ -326,7 +369,7 @@ def main():
         v_named_poke[target_name].view(-1)[:1024] = 1.0  # 1k elements = 1.0
 
     def map_for_eta(eta):
-        return build_params_only_floating(mdl, v_named_poke, eta, dtype=torch.float32)
+        return build_params_only_floating(mdl_target, v_named_poke, eta, dtype=torch.float32)
 
     m0 = map_for_eta(0.0)
     m1 = map_for_eta(1e-6)
@@ -344,9 +387,9 @@ def main():
         l2_delta(m2, m0) / l2_delta(m1, m0))
 
     # logit-space check (should also be ~100x for small-enough etas)
-    lo0 = forward_under_mapping_noautocast(mdl, input_ids, attention_mask, m0).detach().cpu()
-    lo1 = forward_under_mapping_noautocast(mdl, input_ids, attention_mask, m1).detach().cpu()
-    lo2 = forward_under_mapping_noautocast(mdl, input_ids, attention_mask, m2).detach().cpu()
+    lo0 = forward_under_mapping_noautocast(mdl_target, input_ids, attention_mask, m0).detach().cpu()
+    lo1 = forward_under_mapping_noautocast(mdl_target, input_ids, attention_mask, m1).detach().cpu()
+    lo2 = forward_under_mapping_noautocast(mdl_target, input_ids, attention_mask, m2).detach().cpu()
     d1 = (lo1 - lo0); d2 = (lo2 - lo0)
     print("[poke] ||Δlogits||∞ ratio (1e-8 / 1e-6):", float(d2.abs().max())/float(d1.abs().max()))
     print("[poke] ||Δlogits||₂ ratio (1e-8 / 1e-6):", float(d2.pow(2).sum().sqrt())/float(d1.pow(2).sum().sqrt()))
