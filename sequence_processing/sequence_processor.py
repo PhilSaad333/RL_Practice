@@ -1243,80 +1243,80 @@ class SequenceProcessor:
                 mdl.train()
 
 
-@torch.no_grad()
-def teacher_force_debug_probe(
-    self,
-    sequences,
-    *,
-    b_idx: int = 0,
-    g_idx: int = 0,
-    params_override: dict[str, torch.Tensor] | None = None,
-    max_T: int = 64,
-    topk: int = 10,
-) -> Dict[str, Any]:
-    """
-    Run the *same* TF path as production (via _call_model_tf) for one (b,g).
-    Returns compact per-token diagnostics on CPU (fp32):
+    @torch.no_grad()
+    def teacher_force_debug_probe(
+        self,
+        sequences,
+        *,
+        b_idx: int = 0,
+        g_idx: int = 0,
+        params_override: dict[str, torch.Tensor] | None = None,
+        max_T: int = 64,
+        topk: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Run the *same* TF path as production (via _call_model_tf) for one (b,g).
+        Returns compact per-token diagnostics on CPU (fp32):
 
-      tokens [T]               realized next tokens
-      logit_on_tok [T]         logits at realized token
-      logprob_on_tok [T]       log-probs at realized token
-      entropy_naive [T]        -∑ p log p per step
-      topk_vals [T,K], topk_idx [T,K]
-      gen_start, gen_end, T
-    """
-    mdl = self._unwrap(self.model)
-    device = next(mdl.parameters()).device
+        tokens [T]               realized next tokens
+        logit_on_tok [T]         logits at realized token
+        logprob_on_tok [T]       log-probs at realized token
+        entropy_naive [T]        -∑ p log p per step
+        topk_vals [T,K], topk_idx [T,K]
+        gen_start, gen_end, T
+        """
+        mdl = self._unwrap(self.model)
+        device = next(mdl.parameters()).device
 
-    seq = sequences.sequences[b_idx, g_idx]
-    pl  = int(sequences.prompt_lens[b_idx])
-    Tgen= int(sequences.gen_lens[b_idx][g_idx])
-    Ltot= int(seq.size(0))
-    if Tgen <= 0 or Ltot <= pl:
-        return {"tokens": torch.empty(0, dtype=torch.long),
-                "logit_on_tok": torch.empty(0), "logprob_on_tok": torch.empty(0),
-                "entropy_naive": torch.empty(0),
-                "topk_vals": torch.empty(0, topk), "topk_idx": torch.empty(0, topk, dtype=torch.long),
-                "gen_start": pl, "gen_end": pl, "T": 0}
+        seq = sequences.sequences[b_idx, g_idx]
+        pl  = int(sequences.prompt_lens[b_idx])
+        Tgen= int(sequences.gen_lens[b_idx][g_idx])
+        Ltot= int(seq.size(0))
+        if Tgen <= 0 or Ltot <= pl:
+            return {"tokens": torch.empty(0, dtype=torch.long),
+                    "logit_on_tok": torch.empty(0), "logprob_on_tok": torch.empty(0),
+                    "entropy_naive": torch.empty(0),
+                    "topk_vals": torch.empty(0, topk), "topk_idx": torch.empty(0, topk, dtype=torch.long),
+                    "gen_start": pl, "gen_end": pl, "T": 0}
 
-    actual_len = min(pl + Tgen, Ltot)
-    x = seq[:actual_len].unsqueeze(0).to(device)
-    m = sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(device)
+        actual_len = min(pl + Tgen, Ltot)
+        x = seq[:actual_len].unsqueeze(0).to(device)
+        m = sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(device)
 
-    out = self._call_model_tf(x, m, params_override=params_override)
-    logits_full = out.logits if hasattr(out, "logits") else out[0]
-    logits_full = logits_full[0]  # [L, V]
+        out = self._call_model_tf(x, m, params_override=params_override)
+        logits_full = out.logits if hasattr(out, "logits") else out[0]
+        logits_full = logits_full[0]  # [L, V]
 
-    gen_start = pl
-    gen_end   = pl + Tgen
-    gen_logits = logits_full[gen_start-1:gen_end-1]  # [T,V]
-    gen_tokens = seq[gen_start:gen_end].to(device)
+        gen_start = pl
+        gen_end   = pl + Tgen
+        gen_logits = logits_full[gen_start-1:gen_end-1]  # [T,V]
+        gen_tokens = seq[gen_start:gen_end].to(device)
 
-    if max_T is not None and gen_logits.size(0) > max_T:
-        gen_logits = gen_logits[:max_T]
-        gen_tokens = gen_tokens[:max_T]
-        gen_end    = gen_start + int(max_T)
+        if max_T is not None and gen_logits.size(0) > max_T:
+            gen_logits = gen_logits[:max_T]
+            gen_tokens = gen_tokens[:max_T]
+            gen_end    = gen_start + int(max_T)
 
-    import torch.nn.functional as F
-    log_probs = F.log_softmax(gen_logits.float(), dim=-1).cpu()   # [T,V]
-    probs     = log_probs.exp()
-    entropy   = (-(probs * log_probs).sum(dim=-1))                # [T]
-    tok_ix    = gen_tokens.view(-1,1).cpu()
-    logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)            # [T]
-    logit_on_t= gen_logits.float().cpu().gather(1, tok_ix).squeeze(1)
+        import torch.nn.functional as F
+        log_probs = F.log_softmax(gen_logits.float(), dim=-1).cpu()   # [T,V]
+        probs     = log_probs.exp()
+        entropy   = (-(probs * log_probs).sum(dim=-1))                # [T]
+        tok_ix    = gen_tokens.view(-1,1).cpu()
+        logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)            # [T]
+        logit_on_t= gen_logits.float().cpu().gather(1, tok_ix).squeeze(1)
 
-    K = min(topk, gen_logits.size(1))
-    topv, topi = gen_logits.float().cpu().topk(k=K, dim=-1)
+        K = min(topk, gen_logits.size(1))
+        topv, topi = gen_logits.float().cpu().topk(k=K, dim=-1)
 
-    return {
-        "tokens": gen_tokens.cpu(),
-        "logit_on_tok": logit_on_t.contiguous(),
-        "logprob_on_tok": logp_on_t.contiguous(),
-        "entropy_naive": entropy.contiguous(),
-        "topk_vals": topv.contiguous(),
-        "topk_idx": topi.contiguous(),
-        "gen_start": gen_start, "gen_end": gen_end, "T": gen_end - gen_start,
-    }
+        return {
+            "tokens": gen_tokens.cpu(),
+            "logit_on_tok": logit_on_t.contiguous(),
+            "logprob_on_tok": logp_on_t.contiguous(),
+            "entropy_naive": entropy.contiguous(),
+            "topk_vals": topv.contiguous(),
+            "topk_idx": topi.contiguous(),
+            "gen_start": gen_start, "gen_end": gen_end, "T": gen_end - gen_start,
+        }
 
 
 
