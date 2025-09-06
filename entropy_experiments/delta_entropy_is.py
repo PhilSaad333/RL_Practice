@@ -528,6 +528,41 @@ class DeltaEntropyIS:
             detach_params=True, detach_buffers=True,
         )
         
+
+
+        with torch.no_grad():
+            mdl = self._unwrap(self.model) if hasattr(self, "_unwrap") else self.model
+            device = next(mdl.parameters()).device
+
+            # Pull a tiny prefix from the first E example
+            seqs = E_batch["sequences"]             # [B, G, L]
+            attn = E_batch["attention_masks"]
+            b0, g0 = 0, 0
+            L = int(E_batch["prompt_lens"][b0]) + min(16, int(E_batch["max_lengths"][b0]))
+            x  = seqs[b0, g0, :L].unsqueeze(0).to(device)
+            m  = attn[b0, g0, :L].unsqueeze(0).to(device)
+
+            # Base logits
+            base_out = self._sequence_processor._unwrap(self.model)(x, attention_mask=m, use_cache=False)
+            base_logits = base_out.logits[0].float()
+
+            # Override logits, using the same helper SequenceProcessor uses
+            from entropy_experiments.param_overrides import get_named_buffers
+            bufs = get_named_buffers(self._sequence_processor._unwrap(self.model))
+            mapping = {**bufs, **params_override}  # params_override is the per-eta dict you just built
+
+            upd_out = torch.func.functional_call(
+                self._sequence_processor._unwrap(self.model), mapping,
+                (x,), {'attention_mask': m, 'use_cache': False}
+            )
+            upd_logits = upd_out.logits[0].float()
+
+            dlogits = (upd_logits - base_logits)
+            print(f"[SANITY η={eta:.1e}] ||Δlogits||_∞={dlogits.abs().max().item():.3e} "
+                f"||Δlogits||₂={dlogits.norm().item():.3e}")
+
+
+
         # C) Updated entropy using parameter overrides
         self.logger.debug("Evaluating updated entropy with parameter overrides")
         if self.sequence_processor is None:
@@ -595,6 +630,14 @@ class DeltaEntropyIS:
                 RB_vals = [[0.0 for _ in range(S_upd.shape[1])] for _ in range(S_upd.shape[0])]
         RB_upd = torch.tensor(RB_vals, device=device, dtype=torch.float32)
         
+
+        dS = (S_upd - S_orig)
+        dRB = (RB_upd - RB_orig)
+        print(f"[SANITY η={eta:.1e}] mean(ΔS)={dS.mean().item():.3e}, std(ΔS)={dS.std().item():.3e}, "
+            f"mean(ΔRB)={dRB.mean().item():.3e}, std(ΔRB)={dRB.std().item():.3e}")
+
+
+
         # D) SNIS computation
         logw = S_upd - S_orig
         is_results = self._compute_snis_two_batch(RB_upd, logw, report_per_token, E_batch)

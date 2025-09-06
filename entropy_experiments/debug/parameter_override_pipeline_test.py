@@ -29,8 +29,8 @@ ETA = 1e-5  # Main learning rate for update vector computation
 TINY_ETA = 1e-10  # Tiny learning rate for continuity test
 B_U_SIZE = 8  # U batch size for update vector computation
 G_U_SIZE = 4  # Generations per prompt for U batch
-B_E_SIZE = 4  # E batch size for entropy computation  
-G_E_SIZE = 4  # Generations per prompt for E batch
+B_E_SIZE = 16  # E batch size for entropy computation  
+G_E_SIZE = 1  # Generations per prompt for E batch
 
 def setup_environment():
     """Ensure project imports work correctly"""
