@@ -1196,60 +1196,45 @@ class SequenceProcessor:
         params_override: dict[str, torch.Tensor] | None = None,
     ):
         """
-        Functional teacher-forcing call with precision control:
+        Functional teacher-forcing call with precision control.
 
         - If params_override is None: run the live module in eval() (no dropout),
-        under the 'precision.tf_nograd' context.
-        - If params_override is given (PARAMS ONLY): combine with live buffers and
-        call via torch.func.functional_call under 'precision.func_override'.
+        under 'precision.tf_nograd'.
+        - If params_override is given (PARAMS ONLY): DO NOT inject buffers; we call
+        torch.func.functional_call with just the parameter overrides, so the
+        *live* buffers are used in both baseline and override paths.
 
-        Both branches set use_cache=False for teacher forcing.
+        All branches use use_cache=False for teacher forcing.
         """
-        mdl = self._unwrap(self.model)  # DDP-safe
+        mdl = self._unwrap(self.model)
         was_training = mdl.training
         mdl.eval()
 
-        # ---- select precision profile from config ----
-        # Expected config schema:
-        #   precision:
-        #     tf_nograd:   { autocast: true,  dtype: bfloat16 }
-        #     func_override:{ autocast: false, dtype: float32 }
-        prec_root = getattr(self, "config", None)
-        if hasattr(prec_root, "get"):          # dict-like
-            prec_cfg = prec_root.get("precision", {}) or {}
-        else:                                   # object-like
-            prec_cfg = getattr(prec_root, "precision", {}) or {}
+        # Precision profile selection
+        cfg = getattr(self, "config", None)
+        if hasattr(cfg, "get"):  # dict-like
+            prec_cfg = cfg.get("precision", {}) or {}
+        else:                    # object-like
+            prec_cfg = getattr(cfg, "precision", {}) or {}
 
         profile = "func_override" if params_override is not None else "tf_nograd"
         pcfg = prec_cfg.get(profile, {}) if isinstance(prec_cfg, dict) else {}
 
-        # Sensible defaults if keys are missing:
-        default_autocast = (profile == "tf_nograd")          # True for baseline TF, False for override by default
-        default_dtype    = "bfloat16" if default_autocast else "float32"
-
+        default_autocast = (profile == "tf_nograd")
+        default_dtype = "bfloat16" if default_autocast else "float32"
         use_autocast = bool(pcfg.get("autocast", default_autocast))
-        ac_dtype     = str_to_dtype(pcfg.get("dtype", default_dtype))
+        ac_dtype = str_to_dtype(pcfg.get("dtype", default_dtype))
 
         try:
-            # ---- precision guard for the forward pass ----
             with forward_precision_ctx(autocast=use_autocast, dtype=ac_dtype):
                 if params_override is None:
                     return mdl(input_ids, attention_mask=attention_mask, use_cache=False)
 
-                # Fetch buffers from the *unwrapped* module (authoritative source)
-                bufs = get_named_buffers(mdl)
-
-                # (Guard) If caller accidentally passed a merged dict, strip out any buffer entries
-                # to avoid name collisions or double-passing.
-                if any(k in bufs for k in params_override.keys()):
-                    params_override = {k: v for k, v in params_override.items() if k not in bufs}
-
-                # Compose mapping for functional_call. (Param/buffer namespaces are disjoint.)
-                mapping = {**bufs, **params_override}
-
+                # Guard: ensure only parameters are provided (no accidental buffers)
+                # If you prefer, assert that all keys exist in named_parameters()
                 return torch.func.functional_call(
                     mdl,
-                    mapping,
+                    params_override,               # ← PARAMS ONLY
                     (input_ids,),
                     {'attention_mask': attention_mask, 'use_cache': False},
                 )
@@ -1258,99 +1243,80 @@ class SequenceProcessor:
                 mdl.train()
 
 
-    @torch.no_grad()
-    def teacher_force_debug_probe(
-        self,
-        sequences,
-        *,
-        b_idx: int = 0,
-        g_idx: int = 0,
-        params_override: Optional[Dict[str, torch.Tensor]] = None,
-        max_T: int = 64,
-        topk: int = 10,
-    ) -> Dict[str, Any]:
-        """
-        A lightweight, no-grad teacher-forcing forward for a single (b,g) sample that:
-        - uses the same _call_model_tf() path (so it honors params_override & precision),
-        - extracts the TF next-token logits for the generated region,
-        - returns compact per-token diagnostics (on CPU, fp32) for debugging continuity.
+@torch.no_grad()
+def teacher_force_debug_probe(
+    self,
+    sequences,
+    *,
+    b_idx: int = 0,
+    g_idx: int = 0,
+    params_override: dict[str, torch.Tensor] | None = None,
+    max_T: int = 64,
+    topk: int = 10,
+) -> Dict[str, Any]:
+    """
+    Run the *same* TF path as production (via _call_model_tf) for one (b,g).
+    Returns compact per-token diagnostics on CPU (fp32):
 
-        Returns a dict with:
-        'tokens'        : LongTensor [T]             -- realized next tokens
-        'logit_on_tok'  : FloatTensor [T]            -- logits at the realized token
-        'logprob_on_tok': FloatTensor [T]            -- log-probs at the realized token
-        'entropy_naive' : FloatTensor [T]            -- naive entropy per step: -∑ p log p
-        'topk_vals'     : FloatTensor [T, K]         -- top-K logit values (for quick inspection)
-        'topk_idx'      : LongTensor  [T, K]         -- their token ids
-        'gen_start'/'gen_end'/'T'                    -- indices for the generated region
-        """
-        mdl = self._unwrap(self.model)
-        device = next(mdl.parameters()).device
+      tokens [T]               realized next tokens
+      logit_on_tok [T]         logits at realized token
+      logprob_on_tok [T]       log-probs at realized token
+      entropy_naive [T]        -∑ p log p per step
+      topk_vals [T,K], topk_idx [T,K]
+      gen_start, gen_end, T
+    """
+    mdl = self._unwrap(self.model)
+    device = next(mdl.parameters()).device
 
-        seq = sequences.sequences[b_idx, g_idx]              # [total_len]
-        prompt_len_padded = sequences.prompt_lens[b_idx]     # padded prompt length for this batch
-        gen_len = sequences.gen_lens[b_idx][g_idx]
-        total_len = seq.size(0)
+    seq = sequences.sequences[b_idx, g_idx]
+    pl  = int(sequences.prompt_lens[b_idx])
+    Tgen= int(sequences.gen_lens[b_idx][g_idx])
+    Ltot= int(seq.size(0))
+    if Tgen <= 0 or Ltot <= pl:
+        return {"tokens": torch.empty(0, dtype=torch.long),
+                "logit_on_tok": torch.empty(0), "logprob_on_tok": torch.empty(0),
+                "entropy_naive": torch.empty(0),
+                "topk_vals": torch.empty(0, topk), "topk_idx": torch.empty(0, topk, dtype=torch.long),
+                "gen_start": pl, "gen_end": pl, "T": 0}
 
-        if gen_len <= 0 or total_len <= prompt_len_padded:
-            return {
-                "tokens": torch.empty(0, dtype=torch.long),
-                "logit_on_tok": torch.empty(0, dtype=torch.float32),
-                "logprob_on_tok": torch.empty(0, dtype=torch.float32),
-                "entropy_naive": torch.empty(0, dtype=torch.float32),
-                "topk_vals": torch.empty(0, topk, dtype=torch.float32),
-                "topk_idx": torch.empty(0, topk, dtype=torch.long),
-                "gen_start": int(prompt_len_padded),
-                "gen_end": int(prompt_len_padded),
-                "T": 0,
-            }
+    actual_len = min(pl + Tgen, Ltot)
+    x = seq[:actual_len].unsqueeze(0).to(device)
+    m = sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(device)
 
-        actual_len = min(prompt_len_padded + gen_len, total_len)
-        input_seq = seq[:actual_len].unsqueeze(0).to(device)  # [1, actual_len]
-        attn = sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(device)
+    out = self._call_model_tf(x, m, params_override=params_override)
+    logits_full = out.logits if hasattr(out, "logits") else out[0]
+    logits_full = logits_full[0]  # [L, V]
 
-        # Use the same functional path + precision profile as normal no-grad TF.
-        outputs = self._call_model_tf(input_seq, attn, params_override=params_override)
+    gen_start = pl
+    gen_end   = pl + Tgen
+    gen_logits = logits_full[gen_start-1:gen_end-1]  # [T,V]
+    gen_tokens = seq[gen_start:gen_end].to(device)
 
-        logits_full = outputs.logits if hasattr(outputs, "logits") else outputs[0]  # [1, L, V]
-        logits_full = logits_full[0]  # [L, V]
+    if max_T is not None and gen_logits.size(0) > max_T:
+        gen_logits = gen_logits[:max_T]
+        gen_tokens = gen_tokens[:max_T]
+        gen_end    = gen_start + int(max_T)
 
-        gen_start = int(prompt_len_padded)
-        gen_end   = int(prompt_len_padded + gen_len)
+    import torch.nn.functional as F
+    log_probs = F.log_softmax(gen_logits.float(), dim=-1).cpu()   # [T,V]
+    probs     = log_probs.exp()
+    entropy   = (-(probs * log_probs).sum(dim=-1))                # [T]
+    tok_ix    = gen_tokens.view(-1,1).cpu()
+    logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)            # [T]
+    logit_on_t= gen_logits.float().cpu().gather(1, tok_ix).squeeze(1)
 
-        # Align logits to next-token targets over the generated region
-        gen_logits = logits_full[gen_start - 1 : gen_end - 1]    # [T, V] where T=gen_len
-        gen_tokens = seq[gen_start : gen_end].to(device)         # [T]
+    K = min(topk, gen_logits.size(1))
+    topv, topi = gen_logits.float().cpu().topk(k=K, dim=-1)
 
-        # Optionally truncate for memory
-        if max_T is not None and gen_logits.size(0) > max_T:
-            gen_logits = gen_logits[:max_T]
-            gen_tokens = gen_tokens[:max_T]
-            gen_end = gen_start + int(max_T)
-
-        # Compute compact diagnostics on CPU (fp32)
-        log_probs = F.log_softmax(gen_logits.float(), dim=-1).cpu()     # [T, V]
-        probs     = log_probs.exp()                                     # [T, V]
-        entropy   = (-(probs * log_probs).sum(dim=-1))                  # [T]
-        tok_ix    = gen_tokens.view(-1, 1).cpu()                        # [T,1]
-        logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)              # [T]
-        logit_on_t= gen_logits.float().cpu().gather(1, tok_ix).squeeze(1)  # [T]
-
-        # Top-K logits for quick inspection (CPU)
-        K = min(topk, gen_logits.size(1))
-        topv, topi = gen_logits.float().cpu().topk(k=K, dim=-1)
-
-        return {
-            "tokens": gen_tokens.cpu(),
-            "logit_on_tok": logit_on_t.contiguous(),
-            "logprob_on_tok": logp_on_t.contiguous(),
-            "entropy_naive": entropy.contiguous(),
-            "topk_vals": topv.contiguous(),
-            "topk_idx": topi.contiguous(),
-            "gen_start": gen_start,
-            "gen_end": gen_end,
-            "T": gen_end - gen_start,
-        }
+    return {
+        "tokens": gen_tokens.cpu(),
+        "logit_on_tok": logit_on_t.contiguous(),
+        "logprob_on_tok": logp_on_t.contiguous(),
+        "entropy_naive": entropy.contiguous(),
+        "topk_vals": topv.contiguous(),
+        "topk_idx": topi.contiguous(),
+        "gen_start": gen_start, "gen_end": gen_end, "T": gen_end - gen_start,
+    }
 
 
 
