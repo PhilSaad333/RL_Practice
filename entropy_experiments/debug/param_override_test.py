@@ -200,7 +200,20 @@ def test_parameter_override_pipeline():
         {'autocast': False, 'dtype': 'float32', 'cast_logits_fp32': True})
     cfg['precision'].setdefault('func_override', {}).update(
         {'autocast': False, 'dtype': 'float32', 'cast_params': False})
-    probe._sequence_processor.config = cfg  # ensure SP sees these
+
+    # Update SP precision profiles in place; do not replace its GenerationConfig.
+    sp = probe._sequence_processor
+    prec = cfg['precision']
+    try:
+        sp._fo_cfg.update(prec.get('func_override', {}))
+        sp._tf_cfg.update(prec.get('tf_nograd', {}))
+        from entropy_experiments.utils.precision_utils import apply_global_precision
+        apply_global_precision(
+            allow_tf32=bool(prec.get('allow_tf32', True)),
+            matmul_precision=prec.get('matmul_precision', 'high')
+        )
+    except Exception:
+        pass
 
     fo_cfg = cfg['precision']['func_override']
     force_dtype = str_to_dtype(fo_cfg.get('dtype', 'float32')) if fo_cfg.get('cast_params', False) else None

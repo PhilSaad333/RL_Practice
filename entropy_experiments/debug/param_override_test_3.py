@@ -257,7 +257,23 @@ def main():
         {'autocast': False, 'dtype': 'float32', 'cast_logits_fp32': True})
     cfg['precision'].setdefault('func_override', {}).update(
         {'autocast': False, 'dtype': 'float32', 'cast_params': False})
-    probe._sequence_processor.config = cfg
+
+    # Do NOT replace SequenceProcessor.config (a GenerationConfig) with a dict.
+    # Instead, update precision profiles in-place so attribute access (e.g., gen_batch_size)
+    # continues to work.
+    sp = probe._sequence_processor
+    prec = cfg['precision']
+    try:
+        sp._fo_cfg.update(prec.get('func_override', {}))
+        sp._tf_cfg.update(prec.get('tf_nograd', {}))
+        # Optional global precision knobs
+        from entropy_experiments.utils.precision_utils import apply_global_precision
+        apply_global_precision(
+            allow_tf32=bool(prec.get('allow_tf32', True)),
+            matmul_precision=prec.get('matmul_precision', 'high')
+        )
+    except Exception:
+        pass
 
 
     processor = probe._sequence_processor
