@@ -210,10 +210,12 @@ def main():
     probe._ensure_sequence_processor()
     dataset = cfg["batch_config"]["dataset_name"]
     _, U_split = probe._get_splits()
+    
     U_sequences, U_logprobs, _ = probe._sequence_processor.generate_with_logprobs(
         prompts=None, G=args.u_G, dataset_name=dataset, split=U_split,
-        num_prompts=args.u_batch, compute_rb=True
+        num_prompts=args.u_batch, compute_rb=False
     )
+
     U_batch = probe._pack_U_from_sequences(U_sequences, U_logprobs.rewards)
 
     # Optimizer (only to get state if needed by compute_update_vector)

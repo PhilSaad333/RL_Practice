@@ -705,18 +705,22 @@ class SequenceProcessor:
                         if cast_logits and logits.dtype != torch.float32:
                             logits = logits.float()
 
-                        # ---- Guardrails: catch & neutralize non-finite logits early ----
-                        if not torch.isfinite(logits).all():
-                            # Log a compact summary once per sequence
-                            bad = (~torch.isfinite(logits)).any(dim=-1)  # [actual_len]
-                            n_bad = int(bad.sum().item())
-                            self._log_once("tf_nonfinite_logit_rows",
-                                           f"[TF no-grad] Non-finite logits: {n_bad}/{int(logits.size(0))} rows. "
-                                           f"Replacing with finite sentinels.")
-                            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e30, neginf=-1e30)
 
-                        # Optional: clamp extreme magnitude to prevent softmax overflow in debug runs
-                        # logits = logits.clamp(min=-1e6, max=1e6)
+
+
+
+                        # ----DEBUG Guardrails: catch non-finite logits early ----
+                        if not torch.isfinite(logits).all():
+                            bad_row = (~torch.isfinite(logits)).any(dim=-1).nonzero(as_tuple=False).flatten()
+                            idx = int(bad_row[0].item()) if bad_row.numel() > 0 else -1
+                            row = logits[idx] if idx >= 0 else logits[0]
+                            rmin = float(torch.nan_to_num(row, nan=0.0, posinf=1e30, neginf=-1e30).min().item())
+                            rmax = float(torch.nan_to_num(row, nan=0.0, posinf=1e30, neginf=-1e30).max().item())
+                            self._log_once("tf_nonfinite_logit_rows",
+                                        f"[TF no-grad] Non-finite logits ({int(bad_row.numel())}/{int(logits.size(0))} rows). "
+                                        f"First bad row t={idx}, approx range ~[{rmin:.2e},{rmax:.2e}].")
+                            raise RuntimeError("Non-finite logits in TF no-grad (disable clamp; investigate η=0 functional_call).")
+
 
 
 
