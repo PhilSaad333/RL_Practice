@@ -258,6 +258,15 @@ class SequenceProcessor:
                 m.train()
 
 
+    def _log_once(self, key: str, msg: str):
+        """Deduplicated one-time logger for noisy guards."""
+        if not hasattr(self, "_once_keys"):
+            self._once_keys = set()
+        if key not in self._once_keys:
+            self._once_keys.add(key)
+            if self.logger: self.logger.warning(msg)
+
+
 
     # --------------- Batched generation and related stuff (no logprobs) ---------------
 
@@ -696,9 +705,34 @@ class SequenceProcessor:
                         if cast_logits and logits.dtype != torch.float32:
                             logits = logits.float()
 
+                        # ---- Guardrails: catch & neutralize non-finite logits early ----
+                        if not torch.isfinite(logits).all():
+                            # Log a compact summary once per sequence
+                            bad = (~torch.isfinite(logits)).any(dim=-1)  # [actual_len]
+                            n_bad = int(bad.sum().item())
+                            self._log_once("tf_nonfinite_logit_rows",
+                                           f"[TF no-grad] Non-finite logits: {n_bad}/{int(logits.size(0))} rows. "
+                                           f"Replacing with finite sentinels.")
+                            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e30, neginf=-1e30)
+
+                        # Optional: clamp extreme magnitude to prevent softmax overflow in debug runs
+                        # logits = logits.clamp(min=-1e6, max=1e6)
+
+
+
+
 
                         gen_start = prompt_len_padded
                         gen_end   = prompt_len_padded + gen_len
+
+                        # Sanity: the generation window must be non-empty and aligned
+                        assert gen_end > gen_start >= 1, (
+                            f"Bad generation slice: gen_start={gen_start}, gen_end={gen_end}, "
+                            f"prompt_len_padded={prompt_len_padded}, actual_len={actual_len}"
+                        )
+
+
+
 
                         # Logits aligned to next-token targets for the generated tokens:
                         # token t at position i uses logits at i-1
