@@ -210,6 +210,7 @@ def main():
 
 
 
+
     # --- Compute update vector v_named from a tiny U-batch --------------------
     dataset = cfg["batch_config"]["dataset_name"]
     _, U_split = probe._get_splits()
@@ -292,7 +293,9 @@ def main():
     )
     E_batch = probe._pack_E_from_sequences(E_sequences)
 
-
+    dbg = sp.teacher_force_debug_probe(E_sequences, b_idx=0, g_idx=0,
+                                    params_override=sp._build_params_override(None, 0.0))
+    print("[dbg] logits dtype:", dbg["topk_vals"].dtype)
 
 
     # --- SP LOGITS CONTINUITY (full vocab) ---

@@ -204,6 +204,9 @@ class SequenceProcessor:
         self._matmul_precision = prec_cfg.get("matmul_precision", "high")
         apply_global_precision(self._allow_tf32, self._matmul_precision)
 
+        self._fo_dtype = str_to_dtype(self._fo_cfg.get("dtype", "float32"))
+        self._tf_dtype = str_to_dtype(self._tf_cfg.get("dtype", "float32"))
+
         # Optional determinism (probe‑only)
         det = bool(prec_cfg.get("deterministic_probe", False))
         if det:
@@ -235,13 +238,14 @@ class SequenceProcessor:
         else:
             force_dtype = str_to_dtype(self._fo_cfg.get("dtype", "float32")) if cast_params else None
 
+
         params_dict, _ = build_functional_params_named(
             self._mdl_target, v_named, eta,
-            detach_params=True,          # do not backprop through base params
-            detach_buffers=True,         # snapshot buffers but do not override in default path
-            force_param_dtype=force_dtype,
+            detach_params=True, detach_buffers=True,
+            force_param_dtype=self._fo_dtype,
             force_buffer_dtype=None
         )
+
         return params_dict
 
     @torch.no_grad()
@@ -251,19 +255,19 @@ class SequenceProcessor:
         eval mode, and use_cache=False. Returns logits tensor in compute precision.
         """
         m = self._mdl_target
-        was_training = m.training
+        was = m.training
         m.eval()
         try:
+            # Disable autocast so the forward runs in the params' actual dtype (fp64 if mapped)
             with torch.autocast(device_type="cuda", enabled=False):
                 out = torch.func.functional_call(
-                    m, params_mapping, (input_ids,),
-                    {"attention_mask": attention_mask, "use_cache": False}
+                    m, mapping, (input_ids,),
+                    {'attention_mask': attention_mask, 'use_cache': False}
                 )
-            logits = out.logits if hasattr(out, "logits") else out[0]
-            return logits
+            return out.logits if hasattr(out, "logits") else out[0]
         finally:
-            if was_training:
-                m.train()
+            if was: m.train()
+
 
 
     def _log_once(self, key: str, msg: str):

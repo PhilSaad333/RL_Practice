@@ -108,6 +108,21 @@ def build_functional_params_named(
     """
     m = _unwrap_module(model)
 
+    # Normalize dtype arguments if callers pass strings
+    if isinstance(force_param_dtype, str):
+        try:
+            from .precision_utils import str_to_dtype as _s2d
+            force_param_dtype = _s2d(force_param_dtype)
+        except Exception:
+            force_param_dtype = None
+    if isinstance(force_buffer_dtype, str):
+        try:
+            from .precision_utils import str_to_dtype as _s2d
+            force_buffer_dtype = _s2d(force_buffer_dtype)
+        except Exception:
+            force_buffer_dtype = None
+
+
     # Registry: authoritative enumeration
     trainable_named = get_trainable_named(m)     # ordered mapping of trainables
     buffers_named   = get_named_buffers(m)       # ordered mapping of buffers
