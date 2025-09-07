@@ -688,6 +688,12 @@ class SequenceProcessor:
                         else:
                             mapping = params_override  # already a params-only mapping dict
 
+                        if any(not torch.isfinite(v).all() for v in mapping.values()):
+                            bads = [k for k,v in mapping.items() if not torch.isfinite(v).all()]
+                            raise RuntimeError(f"Non-finite values inside params_override at η=0: e.g. {bads[:3]}")
+
+
+
                         logits_full = self._fc_logits_noautocast(input_seq, attn, mapping)
                         logits = logits_full[0]  # [actual_len, V]
 

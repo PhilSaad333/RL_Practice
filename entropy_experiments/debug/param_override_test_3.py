@@ -210,7 +210,7 @@ def main():
     probe._ensure_sequence_processor()
     dataset = cfg["batch_config"]["dataset_name"]
     _, U_split = probe._get_splits()
-    
+
     U_sequences, U_logprobs, _ = probe._sequence_processor.generate_with_logprobs(
         prompts=None, G=args.u_G, dataset_name=dataset, split=U_split,
         num_prompts=args.u_batch, compute_rb=False
@@ -249,6 +249,15 @@ def main():
     #    "func_override": {"autocast": False, "cast_params": True, "dtype": "float32"},
     #    "tf_nograd":    {"autocast": False, "cast_logits_fp32": True},
     #}})
+
+
+    # force identical precision profiles for this probe
+    cfg.setdefault('precision', {})
+    cfg['precision'].setdefault('tf_nograd', {}).update(
+        {'autocast': False, 'dtype': 'float32', 'cast_logits_fp32': True})
+    cfg['precision'].setdefault('func_override', {}).update(
+        {'autocast': False, 'dtype': 'float32', 'cast_params': False})
+    probe._sequence_processor.config = cfg
 
 
     processor = probe._sequence_processor
@@ -299,7 +308,7 @@ def main():
     H_vals = []
 
     for eta in eta_grid:
-        params_override = mapping_for_eta(eta) if eta != 0.0 else None
+        params_override = mapping_for_eta(eta)
         logprob_res, diag_res = processor.teacher_force_logprobs(
             E_sequences,
             with_grad=False,
