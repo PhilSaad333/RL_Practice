@@ -19,7 +19,6 @@ import torch
 import yaml
 import numpy as np
 from transformers import AutoTokenizer
-from sequence_processing.sequence_processor import SequenceProcessor, GenerationConfig
 
 
 # --- BEGIN: self-locating import bootstrap -----------------------------------
