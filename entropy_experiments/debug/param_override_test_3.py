@@ -161,6 +161,61 @@ def forward_under_mapping_noautocast(mdl, input_ids, attention_mask, mapping: Di
         if was_training: m.train()
 
 
+
+import torch
+
+def _unwrap(mod: torch.nn.Module) -> torch.nn.Module:
+    m = mod
+    while hasattr(m, "module"): m = m.module
+    if hasattr(m, "_orig_mod"):
+        try: m = m._orig_mod
+        except Exception: pass
+    return m
+
+@torch.no_grad()
+def force_model_fp32_runtime(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    In-place, best-effort promotion of the whole model to fp32 runtime.
+    - Casts ALL floating-point params and buffers to torch.float32
+    - Updates config.torch_dtype = torch.float32
+    - Forces attention implementation to 'eager' (avoids FA fp64/bf16 surprises)
+    """
+    m = _unwrap(model)
+
+    # 1) Upcast parameters
+    for p in m.parameters():
+        if p.is_floating_point():
+            p.data = p.data.float()
+
+    # 2) Upcast buffers (e.g., RoPE cos/sin, norm eps tensors, etc.)
+    for b in m.buffers():
+        if isinstance(b, torch.Tensor) and b.is_floating_point():
+            b.data = b.data.float()
+
+    # 3) Config & attention impl
+    if hasattr(m, "config"):
+        try:
+            m.config.torch_dtype = torch.float32
+        except Exception:
+            pass
+        # Force eager attention; robust for Qwen2.5 when we want strict dtypes
+        try:
+            if hasattr(m, "_set_attn_implementation"):
+                m._set_attn_implementation("eager")
+            elif hasattr(m.config, "attn_implementation"):
+                m.config.attn_implementation = "eager"
+        except Exception:
+            pass
+
+    return model
+
+
+
+
+
+
+
+
 def main():
     args = parse_args()
 
@@ -194,6 +249,11 @@ def main():
         raise ValueError("Config missing checkpoint.checkpoint_path")
     print("Loading LoRA checkpoint …")
     probe.load_checkpoint(adapter_path, optimizer_path if optimizer_path else None)
+
+    force_model_fp32_runtime(probe.model)
+
+
+
     probe._ensure_sequence_processor()
     sp = probe._sequence_processor
     mdl_target = sp._mdl_target
