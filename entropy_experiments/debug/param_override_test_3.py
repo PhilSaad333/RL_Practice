@@ -300,6 +300,39 @@ def main():
 
 
 
+    # --- SP vs test_4: fixed-(b,g) functional_call probe ------------------------
+    print("fo dtype:", sp._fo_cfg.get("dtype"), "tf dtype:", sp._tf_cfg.get("dtype"))
+
+    # Pick one (b,g) and build input slice exactly as SP uses in TF
+    b_idx, g_idx = 0, 0
+    seq = E_sequences.sequences[b_idx, g_idx]
+    pl  = int(E_sequences.prompt_lens[b_idx])
+    Tg  = int(E_sequences.gen_lens[b_idx][g_idx])
+    Lt  = int(seq.size(0))
+    actual_len = min(pl + Tg, Lt)
+    ids = seq[:actual_len].unsqueeze(0).to(next(sp._mdl_target.parameters()).device)
+    mask= E_sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(ids.device)
+
+    # Baseline logits via functional_call (η=0) in SP’s path
+    map0 = sp._build_params_override(None, 0.0)
+    logits0 = sp._fc_logits_noautocast(ids, mask, map0).detach().cpu()
+    print("[dbg] logits dtype:", logits0.dtype)
+
+    # Small-η probe — PARAMS-ONLY, identical path as test_4
+    etas = [1e-8, 3e-8, 1e-7, 3e-7, 1e-6]
+    for eta in etas:
+        m_eta = sp._build_params_override(v_named, eta)
+        logits_eta = sp._fc_logits_noautocast(ids, mask, m_eta).detach().cpu()
+        d = logits_eta - logits0
+        linf = float(d.abs().amax().item())
+        l2   = float(d.pow(2).sum().sqrt().item())
+        print(f"[SP full-V] eta={eta: .0e} ||Δlogits||∞={linf:.3e} ||Δlogits||₂={l2:.3e}")
+
+
+
+
+
+
     # --- SP LOGITS CONTINUITY (full vocab) ---
 
     b, g = 0, 0

@@ -204,6 +204,24 @@ class SequenceProcessor:
         self._matmul_precision = prec_cfg.get("matmul_precision", "high")
         apply_global_precision(self._allow_tf32, self._matmul_precision)
 
+        # If we are going to run functional_call with fp64 parameters, avoid FlashAttention kernels.
+        # Qwen2.5 + FA2 doesn’t support fp64 and will produce NaNs. Force eager attention.
+        try:
+            fo_dtype = str_to_dtype(self._fo_cfg.get("dtype", "float32"))
+            if fo_dtype == torch.float64:
+                m = self._mdl_target
+                # Transformers ≥4.40
+                if hasattr(m, "_set_attn_implementation"):
+                    m._set_attn_implementation("eager")
+                # Older field name
+                elif hasattr(m, "config") and hasattr(m.config, "attn_implementation"):
+                    m.config.attn_implementation = "eager"
+                self.logger.info("[SP] Forced attention implementation to 'eager' for fp64 functional_call.")
+        except Exception as _e:
+            # Non-fatal; we’ll still fall back to fp32 if needed.
+            pass
+
+
         self._fo_dtype = str_to_dtype(self._fo_cfg.get("dtype", "float32"))
         self._tf_dtype = str_to_dtype(self._tf_cfg.get("dtype", "float32"))
         # new: control buffer casting + fallback policy
@@ -230,28 +248,22 @@ class SequenceProcessor:
 
     # --------------- Functional override helpers ---------------
     
-    def _build_params_override(self, v_named, eta: float, *, cast_buffers: bool | None = None):
-        """Build mapping for torch.func.functional_call at dtype self._fo_dtype.
-        By default cast all params; optionally also cast/include buffers.
-        """
-        if cast_buffers is None:
-            cast_buffers = self._fo_cast_buffers
-        params, bufs = build_functional_params_named(
+    def _build_params_override(self, v_named: dict|None, eta: float) -> dict[str, torch.Tensor]:
+        """Build a *parameters-only* mapping for self._mdl_target in the requested dtype (like test_4)."""
+        cast_params = bool(self._fo_cfg.get("cast_params", True))
+        force_dtype = str_to_dtype(self._fo_cfg.get("dtype", "float32")) if cast_params else None
+
+        params_dict, _ = build_functional_params_named(
             self._mdl_target, v_named, eta,
-            detach_params=True, detach_buffers=True,
-            force_param_dtype=self._fo_dtype,
-            force_buffer_dtype=(self._fo_dtype if cast_buffers else None)
+            detach_params=True,          # do not backprop through base params
+            detach_buffers=True,         # snapshot buffers but do not override in default path
+            force_param_dtype=force_dtype,
+            force_buffer_dtype=None
         )
-
-        if cast_buffers:
-            merged = dict(bufs); merged.update(params)
-            return merged
-        else:
-            return params
-        
+        return params_dict
 
 
-
+   
     @torch.no_grad()
     def _fc_logits_noautocast(self, input_ids, attention_mask, params_mapping: dict[str, torch.Tensor]):
         """
@@ -1487,13 +1499,14 @@ class SequenceProcessor:
         m = sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(device)
 
         # Build params-only mapping; preserve dtype if caller hands one in.
-        if params_override is None:
-            if self._params_zero is None:
-                self._params_zero = self._build_params_override(v_named=None, eta=0.0)
-            mapping = self._params_zero
-        else:
-            mapping = params_override
-        logits_full = self._fc_logits_noautocast(x, m, mapping)[0]  # [L, V]
+
+        mapping = params_override if params_override is not None else self._build_params_override(None, 0.0)
+
+        logits_full = self._fc_logits_noautocast(x, m, mapping)
+        logits_full = logits_full[0] 
+
+
+
 
         gen_start = pl
         gen_end   = pl + Tgen
