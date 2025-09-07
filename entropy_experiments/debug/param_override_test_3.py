@@ -295,6 +295,66 @@ def main():
 
 
 
+
+    # --- SP LOGITS CONTINUITY (full vocab) ---
+    proc = probe._sequence_processor
+    mdl  = proc._mdl_target  # same module SP uses
+    dev  = next(mdl.parameters()).device
+
+    b, g = 0, 0
+    seq = E_sequences.sequences[b, g]
+    pl  = int(E_sequences.prompt_lens[b])
+    Tg  = min(int(E_sequences.gen_lens[b][g]), 64)
+    L   = int(seq.size(0)); Luse = min(pl + Tg, L)
+    ids = seq[:Luse].unsqueeze(0).to(dev)
+    msk = E_sequences.attention_masks[b, g, :Luse].unsqueeze(0).to(dev)
+
+    def map_for_eta(e):
+        # Use SP's builder so keyspace/dtypes match exactly
+        return proc._build_params_override(v_named=v_named, eta=float(e))
+
+    # Baseline (fc-vs-fc)
+    logits0 = proc._fc_logits_noautocast(ids, msk, map_for_eta(0.0))[0]  # [L,V]
+    gen_slice = slice(pl-1, pl-1 + Tg)  # next-token slice for T steps
+    lo0 = logits0[gen_slice]  # [T,V]
+
+    for eta in [1e-8, 3e-8, 1e-7, 3e-7, 1e-6]:
+        loe = proc._fc_logits_noautocast(ids, msk, map_for_eta(eta))[0][gen_slice]
+        d = (loe - lo0)
+        linf = float(d.abs().max().item())
+        l2   = float(d.pow(2).sum().sqrt().item())
+        print(f"[SP full-V] eta={eta:>8g}  ||Δlogits||∞={linf:.3e}  ||Δlogits||₂={l2:.3e}")
+
+
+
+
+
+
+
+    # --- SP NAIVE ENTROPY CONTINUITY on the same (b,g) ---
+    import torch.nn.functional as F
+
+    def H_naive_for_eta(e):
+        lo = proc._fc_logits_noautocast(ids, msk, map_for_eta(e))[0][gen_slice]  # [T,V]
+        logp = F.log_softmax(lo, dim=-1)
+        p = logp.exp()
+        H = (-(p * logp).sum(dim=-1)).sum()   # sum over T
+        return float(H.item())
+
+    H0 = H_naive_for_eta(0.0)
+    for eta in [1e-8, 3e-8, 1e-7, 3e-7, 1e-6]:
+        dH = H_naive_for_eta(eta) - H0
+        print(f"[SP naive H] eta={eta:>8g}  ΔH={dH:.6e}")
+
+
+
+
+
+
+
+
+
+
     # If you don't already have sequences, create a quick E-batch:
     #prompts = ["Compute: 37+58 = </think>", "Factor: 84 = </think>"]  # examples
     #E_sequences = processor.generate_batched(prompts, G=1)
