@@ -326,7 +326,7 @@ def main():
     prec.setdefault('tf_nograd', {}).update({
         'autocast': False,
         'dtype': 'float64',
-        'cast_logits_fp32': True
+        'cast_logits_fp32': False
     })
 
     # Do NOT replace SequenceProcessor.config (a GenerationConfig) with a dict.
