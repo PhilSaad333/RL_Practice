@@ -321,7 +321,7 @@ def main():
         'dtype': 'float64',
         'cast_params': True,
         'cast_buffers': False,    # important: params-only
-        'fallback_on_nan': False  # do not silently change dtype path
+        'fallback_on_nan': 'float64'  # do not silently change dtype path
     })
     prec.setdefault('tf_nograd', {}).update({
         'autocast': False,
