@@ -339,19 +339,19 @@ def main():
         return processor._build_params_override(v_named=v_named, eta=float(eta))
 
 
-    # 4) Evaluate entropy on the same E-batch across an η grid and check linearity.
     eta_grid = [0.0, 1e-8, 3e-8, 1e-7, 3e-7, 1e-6]
-    H_vals = []
 
+    # 2) RB-entropy continuity (all through the *same* functional_call path)
+    H_vals = []
     for eta in eta_grid:
-        params_override = mapping_for_eta(eta)
-        logprob_res, diag_res = processor.teacher_force_logprobs(
+        params_override = mapping_for_eta(eta)   # NOTE: even for eta=0
+        logprob_res, _ = processor.teacher_force_logprobs(
             E_sequences,
             with_grad=False,
             tf_batch_size=processor.config.tf_batch_size,
-            compute_rb=True,                      # use RB entropies
-            params_override=params_override,      # params-only mapping or baseline path
-            buffers_override=None,                # keep buffers live/identical
+            compute_rb=True,
+            params_override=params_override,
+            buffers_override=None,
         )
         # Aggregate RB entropy over all sequences/tokens in E
         H_sum = 0.0
@@ -362,21 +362,39 @@ def main():
                     H_sum += float(rb.sum())
         H_vals.append(H_sum)
 
-    # 5) Report continuity and small-η linearity.
     import numpy as np
     H_vals = np.array(H_vals, dtype=np.float64)
-    H0 = H_vals[0]
-    dH = H_vals - H0
-    print("\n[SP continuity]")
+    H0, dH = H_vals[0], H_vals - H_vals[0]
+    print("\n[SP continuity — RB entropy]")
     for eta, val, diff in zip(eta_grid, H_vals, dH):
         print(f"eta={eta:>8g}  H={val:.6f}  ΔH={diff:.6e}")
 
-    # crude slope checks between consecutive etas (skip eta=0 -> small positive)
     print("\n[small-η ratios]")
     for i in range(2, len(eta_grid)):
         r_eta = (eta_grid[i] - eta_grid[0]) / (eta_grid[1] - eta_grid[0]) if eta_grid[1] != 0 else np.nan
         r_dH  = (dH[i]) / (dH[1] if dH[1] != 0 else np.nan)
         print(f"η/η_small ≈ {r_eta:>9.3g}  |  ΔH/ΔH_small ≈ {r_dH:>9.3g}")
+
+    # 3) Optional: logits-level probe on one (b,g), short T (matches SP path exactly)
+    b_idx, g_idx = 0, 0
+    def get_gen_logits_for_eta(eta, max_T=64):
+        pack = processor.teacher_force_debug_probe(
+            E_sequences, b_idx=b_idx, g_idx=g_idx,
+            params_override=mapping_for_eta(eta),  # η=0 included
+            max_T=max_T, topk=1
+        )
+        # returns gen logits only indirectly; reconstruct from topk? Instead compute Δ using on-token logprobs/logits
+        return pack  # compact per-token views in pack
+
+    base = get_gen_logits_for_eta(0.0)
+    for eta in [1e-8, 3e-8, 1e-7]:
+        probe = get_gen_logits_for_eta(eta)
+        # Use the “logit at realized token” channel which is stable and 1-D
+        d_logit = (probe["logit_on_tok"] - base["logit_on_tok"]).abs()
+        d_logp  = (probe["logprob_on_tok"] - base["logprob_on_tok"]).abs()
+        linf_L  = float(d_logit.max() if d_logit.numel() else 0.0)
+        linf_P  = float(d_logp.max()  if d_logp.numel()  else 0.0)
+        print(f"[logits probe] eta={eta:>8g}  ||Δlogit_on_tok||∞={linf_L:.3e}  ||Δlogp_on_tok||∞={linf_P:.3e}")
 
 
 
