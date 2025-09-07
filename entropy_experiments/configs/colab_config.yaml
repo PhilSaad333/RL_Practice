@@ -97,8 +97,8 @@ precision:
     autocast: false
     dtype: float64        # try fp64 first
     cast_buffers: true    # critical: include/cast buffers for SP path
-    fallback_on_nan: true
-    fallback_dtype: float64
+    fallback_on_nan: false
+    fallback_dtype: float32
 
   # update-vector builder (rl_loss microbatched on U)
   update_vector:

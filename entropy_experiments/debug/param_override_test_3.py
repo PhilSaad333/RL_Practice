@@ -321,12 +321,12 @@ def main():
         'dtype': 'float64',
         'cast_params': True,
         'cast_buffers': False,    # important: params-only
-        'fallback_on_nan': 'float64'  # do not silently change dtype path
+        'fallback_on_nan': 'float32'  # do not silently change dtype path
     })
     prec.setdefault('tf_nograd', {}).update({
         'autocast': False,
-        'dtype': 'float64',
-        'cast_logits_fp32': False
+        'dtype': 'float32',
+        'cast_logits_fp32': True
     })
 
     # Do NOT replace SequenceProcessor.config (a GenerationConfig) with a dict.
