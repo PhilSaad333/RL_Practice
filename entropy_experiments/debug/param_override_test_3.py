@@ -336,8 +336,8 @@ def main():
 
     def mapping_for_eta(eta: float) -> dict[str, torch.Tensor]:
         # Use the processor's own builder to ensure keyspace alignment and upcasting.
-        return processor._build_params_override(v_named=(v_named if eta != 0.0 else None),
-                                        eta=float(eta))
+        return processor._build_params_override(v_named=v_named, eta=float(eta))
+
 
     # 4) Evaluate entropy on the same E-batch across an η grid and check linearity.
     eta_grid = [0.0, 1e-8, 3e-8, 1e-7, 3e-7, 1e-6]
