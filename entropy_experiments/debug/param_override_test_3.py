@@ -386,21 +386,41 @@ def main():
 
 
 
-    # One (b,g) slice
-    dbg = sp.teacher_force_debug_probe(E_sequences, b_idx=0, g_idx=0,
-                                    params_override=sp._build_params_override(None, 0.0))
-    print("[dbg] logits dtype:", dbg["topk_vals"].dtype)
+    # pick one sequence (b,g) and build the same left-pad-aware slice as SP
+    b, g = 0, 0
+    seq = E_sequences.sequences[b, g]                        # [L_tot]
+    pl  = int(E_sequences.prompt_lens[b])
+    Tg  = int(E_sequences.gen_lens[b][g])
+    Ltot= int(seq.size(0))
+    assert Tg > 0 and Ltot > pl, "Chosen (b,g) has no generated tokens."
 
-    for eta in [1e-8, 3e-8, 1e-7]:
-        m_eta = sp._build_params_override(v_named, eta)
-        d = sp._fc_logits_noautocast(x.unsqueeze(0), m.unsqueeze(0), m_eta) \
-            - sp._fc_logits_noautocast(x.unsqueeze(0), m.unsqueeze(0), sp._build_params_override(None, 0.0))
-        linf = d.abs().amax().item()
-        print(f"[SP full-V] eta={eta: .0e} ||Δlogits||∞={linf:.3e}")
+    Luse = min(pl + min(Tg, 64), Ltot)                       # cap T for speed/debug
+    ids  = seq[:Luse].unsqueeze(0).to(mdl_target.device)            # [1, Luse]
+    msk  = E_sequences.attention_masks[b, g, :Luse].unsqueeze(0).to(mdl_target.device)
 
+    # convenience: build the params-only mapping using SP's builder (keyspace/dtype match)
+    def map_for_eta(eta: float):
+        return sp._build_params_override(
+            v_named=v_named,  # use cached zero-map when eta==0
+            eta=float(eta)
+        )
 
+    # sanity: what dtype are we in?
+    dbg = sp.teacher_force_debug_probe(E_sequences, b_idx=b, g_idx=g,
+                                    params_override=map_for_eta(0.0))
+    print("[dbg] logits dtype (from SP debug probe):", dbg["topk_vals"].dtype)
 
+    # baseline via functional_call (η=0), next-token slice
+    logits0 = sp._fc_logits_noautocast(ids, msk, map_for_eta(0.0))[0]         # [Luse, V]
+    gen_slice = slice(pl-1, pl-1 + min(Tg, 64))                                # [T,V]
+    lo0 = logits0[gen_slice]
 
+    for eta in [1e-8, 3e-8, 1e-7, 3e-7, 1e-6]:
+        loe = sp._fc_logits_noautocast(ids, msk, map_for_eta(eta))[0][gen_slice]
+        d = loe - lo0
+        linf = float(d.abs().amax().item())
+        l2   = float(d.pow(2).sum().sqrt().item())
+        print(f"[SP full-V] eta={eta:>8g}  ||Δlogits||∞={linf:.3e}  ||Δlogits||₂={l2:.3e}")
 
 
 
