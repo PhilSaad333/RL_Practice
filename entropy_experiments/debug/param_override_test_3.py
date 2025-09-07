@@ -386,7 +386,7 @@ def main():
     print("[dbg] logits dtype:", logits0.dtype)
 
     # Small-η probe — PARAMS-ONLY, identical path as test_4
-    etas = [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3]
+    etas = [(2**k)*1e-5 for k in range(8)]
     for eta in etas:
         m_eta = sp._build_params_override(v_named, eta)
         logits_eta = sp._fc_logits_noautocast(ids, mask, m_eta).detach().cpu()
@@ -419,7 +419,7 @@ def main():
     gen_slice = slice(pl-1, pl-1 + Tg)  # next-token slice for T steps
     lo0 = logits0[gen_slice]  # [T,V]
 
-    for eta in [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3]:
+    for eta in [(2**k)*1e-5 for k in range(8)]:
         loe = sp._fc_logits_noautocast(ids, msk, map_for_eta(eta))[0][gen_slice]
         d = (loe - lo0)
         linf = float(d.abs().max().item())
@@ -443,7 +443,7 @@ def main():
         return float(H.item())
 
     H0 = H_naive_for_eta(0.0)
-    for eta in [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3]:
+    for eta in [(2**k)*1e-5 for k in range(8)]:
         dH = H_naive_for_eta(eta) - H0
         print(f"[SP naive H] eta={eta:>8g}  ΔH={dH:.6e}")
 
@@ -524,7 +524,7 @@ def main():
     gen_slice = slice(pl-1, pl-1 + min(Tg, 64))                                # [T,V]
     lo0 = logits0[gen_slice]
 
-    for eta in [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3]:
+    for eta in [(2**k)*1e-5 for k in range(8)]:
         loe = sp._fc_logits_noautocast(ids, msk, map_for_eta(eta))[0][gen_slice]
         d = loe - lo0
         linf = float(d.abs().amax().item())
@@ -545,7 +545,7 @@ def main():
         return sp._build_params_override(v_named=v_named, eta=float(eta))
 
 
-    eta_grid = [0.0, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3]
+    eta_grid = [0.0] + [(2**k)*1e-5 for k in range(8)]:
 
     # 2) RB-entropy continuity (all through the *same* functional_call path)
     H_vals = []
@@ -593,7 +593,7 @@ def main():
         return pack  # compact per-token views in pack
 
     base = get_gen_logits_for_eta(0.0)
-    for eta in [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3]:
+    for eta in [(2**k)*1e-5 for k in range(8)]:
         probe = get_gen_logits_for_eta(eta)
         # Use the “logit at realized token” channel which is stable and 1-D
         d_logit = (probe["logit_on_tok"] - base["logit_on_tok"]).abs()
