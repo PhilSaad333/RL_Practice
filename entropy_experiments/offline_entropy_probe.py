@@ -22,7 +22,7 @@ from entropy_experiments.utils.model_loader import load_peft_for_probe, load_ada
 
 import torch
 import torch.distributed as dist
-from sequence_processing.sequence_processor import (
+from entropy_experiments.utils.sequence_processor import (
     SequenceProcessor, GenerationConfig, BatchedSequences,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP

@@ -28,7 +28,7 @@ import logging
 from collections import defaultdict
 import time
 import math
-from sequence_processing.sequence_processor import SequenceProcessor, GenerationConfig, BatchedSequences
+from entropy_experiments.utils.sequence_processor import SequenceProcessor, GenerationConfig, BatchedSequences
 
 
 class BaselineState:

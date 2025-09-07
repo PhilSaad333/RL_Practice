@@ -20,7 +20,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from .utils import distributed_helpers
-from sequence_processing.sequence_processor import BatchedSequences
+from entropy_experiments.utils.sequence_processor import BatchedSequences
 from .utils.param_overrides import build_functional_params_named
 from .utils.precision_utils import str_to_dtype
 

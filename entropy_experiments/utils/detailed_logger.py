@@ -17,7 +17,7 @@ import logging
 
 import torch
 import numpy as np
-from sequence_processing.sequence_processor import BatchedSequences
+from entropy_experiments.utils.sequence_processor import BatchedSequences
 
 
 class DetailedLogger:
