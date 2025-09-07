@@ -202,7 +202,7 @@ class SequenceProcessor:
         self._tf_cfg = prec_cfg.get("tf_nograd", {})
         self._allow_tf32 = bool(prec_cfg.get("allow_tf32", False))
         self._matmul_precision = prec_cfg.get("matmul_precision", "high")
-        apply_global_precision(self._allow_tf32, self._matmul_precision)
+        #apply_global_precision(self._allow_tf32, self._matmul_precision)
 
         # Optional determinism (probe‑only)
         det = bool(prec_cfg.get("deterministic_probe", False))
