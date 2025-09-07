@@ -22,6 +22,9 @@ datasets/raw/
 data/
 !data/README.md
 
+# Large checkpoint folders (keep locally but don't commit)
+checkpoints/step_40_2025-09-03/
+
 # Claude Code specific files
 .claude/
 
