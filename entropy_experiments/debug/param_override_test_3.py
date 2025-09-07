@@ -233,21 +233,24 @@ def main():
 
 
 
-    tok = AutoTokenizer.from_pretrained(args.tokenizer_id, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    #tok = AutoTokenizer.from_pretrained(args.tokenizer_id, use_fast=True)
+    #if tok.pad_token is None:
+    #    tok.pad_token = tok.eos_token
 
     # 1) Build a tiny E-batch of sequences.
     #    If you already created sequences with your generator, re-use them.
     #    Otherwise, use the SequenceProcessor to generate quickly.
-    processor_cfg = GenerationConfig()
-    processor = SequenceProcessor(model, tok, logger=None, config={"precision": {
-        "allow_tf32": False,            # strict math
-        "matmul_precision": "high",
-        "deterministic_probe": True,
-        "func_override": {"autocast": False, "cast_params": True, "dtype": "float32"},
-        "tf_nograd":    {"autocast": False, "cast_logits_fp32": True},
-    }})
+    #processor_cfg = GenerationConfig()
+    #processor = SequenceProcessor(model, tok, logger=None, config={"precision": {
+    #    "allow_tf32": False,            # strict math
+    #    "matmul_precision": "high",
+    #    "deterministic_probe": True,
+    #    "func_override": {"autocast": False, "cast_params": True, "dtype": "float32"},
+    #    "tf_nograd":    {"autocast": False, "cast_logits_fp32": True},
+    #}})
+
+
+    processor = probe._sequence_processor
 
     # If you don't already have sequences, create a quick E-batch:
     prompts = ["Compute: 37+58 = </think>", "Factor: 84 = </think>"]  # examples
