@@ -325,7 +325,7 @@ def main():
     })
     prec.setdefault('tf_nograd', {}).update({
         'autocast': False,
-        'dtype': 'float32',
+        'dtype': 'float64',
         'cast_logits_fp32': True
     })
 
