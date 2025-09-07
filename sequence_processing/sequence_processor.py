@@ -13,6 +13,8 @@ from typing import List, Optional, Union, Tuple, Dict, Any
 import random
 import numpy as np
 
+import contextlib
+
 
 
 
@@ -24,8 +26,14 @@ except ImportError:
 from transformers import LogitsProcessor
 from entropy_experiments.utils.param_registry import get_trainable_named, get_named_buffers
 from entropy_experiments.utils.precision_utils import (
-    forward_precision_ctx, str_to_dtype, maybe_cast_logits_fp32
+    forward_precision_ctx, str_to_dtype, maybe_cast_logits_fp32, apply_global_precision
 )
+from entropy_experiments.utils.param_overrides import build_functional_params_named
+from entropy_experiments.utils.param_overrides import _unwrap_module as _unwrap
+
+
+
+
 
 class StopAfterAnswer(LogitsProcessor):
     """Stop generation after seeing '</answer>' tag - correct logic from collect_rollouts.py"""
@@ -57,7 +65,7 @@ class GenerationConfig:
     
     # Batch sizes (optimized for H100 80GB)
     gen_batch_size: int = 32  # Conservative default, can go higher
-    tf_batch_size: int = 64   # Teacher forcing can handle larger batches
+    tf_batch_size: int = 8   # Teacher forcing can handle larger batches
     
     # Phase 2: Enable differentiable RB entropies for gradient computation
     rb_requires_grad: bool = False
@@ -158,7 +166,7 @@ class DiagnosticsPack:
 class SequenceProcessor:
     """Master class for unified sequence generation and logprob computation."""
     
-    def __init__(self, model, tokenizer, config: Optional[GenerationConfig] = None):
+    def __init__(self, model, tokenizer, logger, config: Optional[GenerationConfig] = None):
         """Initialize SequenceProcessor.
         
         Args:
@@ -168,14 +176,83 @@ class SequenceProcessor:
         """
         self.model = model
         self.tokenizer = tokenizer
+        self.logger = logger
         self.config = config or GenerationConfig()
+
+
+        # One canonical module for mappings *and* forward
+        self._mdl_target = _unwrap(model) if callable(_unwrap) else model
+
+        # Precision / determinism profiles
+        prec_cfg = (config or {}).get("precision", {})
+        self._fo_cfg = prec_cfg.get("func_override", {})   # {"autocast": False, "cast_params": True, "dtype": "float32"}
+        self._tf_cfg = prec_cfg.get("tf_nograd", {})       # logits/logprobs precision for TF no‑grad
+        self._allow_tf32 = bool(prec_cfg.get("allow_tf32", False))
+        self._matmul_precision = prec_cfg.get("matmul_precision", "high")  # or "highest" for FP64 probes
+        apply_global_precision(self._allow_tf32, self._matmul_precision)
+
+        # Optional determinism (probe‑only)
+        det = bool(prec_cfg.get("deterministic_probe", False))
+        if det:
+            try: torch.use_deterministic_algorithms(True)
+            except Exception: pass
+
+        # Cache for η=0 mapping (avoids rebuilding per call)
+        self._params_zero = None
+
         self.is_ddp = hasattr(model, 'module')
         self.diag_results = []
         
     def _unwrap(self, model):
         """Unwrap DDP model if needed."""
         return model.module if self.is_ddp else model
-        
+
+
+    # --------------- Functional override helpers ---------------
+    
+    def _build_params_override(self, v_named: dict|None, eta: float) -> dict[str, torch.Tensor]:
+        """
+        Build a *parameters‑only* mapping for self._mdl_target with upcast before base + η·v.
+        Buffers are detached and *not* overridden. This mirrors the working probe.
+        """
+        cast_params = bool(self._fo_cfg.get("cast_params", True))
+        force_dtype = str_to_dtype(self._fo_cfg.get("dtype", "float32")) if cast_params else None
+
+        params_dict, _ = build_functional_params_named(
+            self._mdl_target, v_named, eta,
+            detach_params=True,          # do not backprop through base params
+            detach_buffers=True,         # snapshot buffers but do not override in default path
+            force_param_dtype=force_dtype,
+            force_buffer_dtype=None
+        )
+        return params_dict
+
+    @torch.no_grad()
+    def _fc_logits_noautocast(self, input_ids, attention_mask, params_mapping: dict[str, torch.Tensor]):
+        """
+        Run a forward on self._mdl_target using torch.func.functional_call with autocast disabled,
+        eval mode, and use_cache=False. Returns logits tensor in compute precision.
+        """
+        m = self._mdl_target
+        was_training = m.training
+        m.eval()
+        try:
+            with torch.autocast(device_type="cuda", enabled=False):
+                out = torch.func.functional_call(
+                    m, params_mapping, (input_ids,),
+                    {"attention_mask": attention_mask, "use_cache": False}
+                )
+            logits = out.logits if hasattr(out, "logits") else out[0]
+            return logits
+        finally:
+            if was_training:
+                m.train()
+
+
+
+    # --------------- Batched generation and related stuff (no logprobs) ---------------
+
+
     def _compute_rewards(self, prompts: List[str], sequences: BatchedSequences, examples: Optional[List] = None) -> List[List[float]]:
         """
         Compute rewards for generated sequences using the tag_pref reward function.
@@ -426,6 +503,15 @@ class SequenceProcessor:
             responses_text=responses_text
         )
     
+
+
+
+
+
+    #--------------- Logprob computations with teacher forcing ---------------
+
+
+
     def teacher_force_logprobs(self, sequences: BatchedSequences, 
                               with_grad: bool = False,
                               tf_batch_size: Optional[int] = None,
@@ -490,6 +576,10 @@ class SequenceProcessor:
         else:
             return self._teacher_force_no_grad(sequences, tf_batch_size, compute_rb, return_baseline_features, params_override, buffers_override)
     
+
+
+
+
     def _teacher_force_no_grad(self, sequences: BatchedSequences, 
                                tf_batch_size: int, 
                                compute_rb: bool, 
@@ -571,14 +661,18 @@ class SequenceProcessor:
                         attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(model_device, non_blocking=True)
 
 
-                        outputs = self._call_model_tf(
-                            input_seq, attn,
-                            params_override=params_override,
-                        )
+                        # --- Unified, precision-stable forward (params-only, no autocast) ---
+                        # Build baseline/override mapping once per call:
+                        if params_override is None:
+                            if self._params_zero is None:
+                                self._params_zero = self._build_params_override(v_named=None, eta=0.0)
+                            mapping = self._params_zero
+                        else:
+                            mapping = params_override  # already a params-only mapping dict
 
-                        # Extract logits and (optionally) cast to fp32 for entropy/log-prob math
-                        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-                        logits = logits[0]  # [actual_len, V]
+                        logits_full = self._fc_logits_noautocast(input_seq, attn, mapping)
+                        logits = logits_full[0]  # [actual_len, V]
+
 
                         # Optional logits upcast per config: precision.tf_nograd.cast_logits_fp32 (default True)
                         prec_root = getattr(self, "config", None)
@@ -918,6 +1012,8 @@ class SequenceProcessor:
         
         return logprob_results, diagnostics_results
     
+
+
     def generate_with_logprobs(self, prompts: Optional[List[str]] = None, G: int = 8,
                               dataset_name: Optional[str] = None, split: str = "train",
                               num_prompts: Optional[int] = None, seed: Optional[int] = None,
@@ -1188,6 +1284,12 @@ class SequenceProcessor:
         # If any realized token falls outside the nucleus, its log-q = -inf (correct for IS)
         return token_logq
 
+
+
+    # ---------------- DEPRECATED? -------------------------
+
+
+
     def _call_model_tf(
         self,
         input_ids,
@@ -1242,6 +1344,8 @@ class SequenceProcessor:
             if was_training:
                 mdl.train()
 
+
+    # ----------------------- DEBUG --------------------------
 
     @torch.no_grad()
     def teacher_force_debug_probe(
@@ -1319,6 +1423,21 @@ class SequenceProcessor:
         }
 
 
+    @torch.no_grad()
+    def debug_zero_check(self, ids, mask, atol=1e-7):
+        # direct forward (same precision context)
+        with torch.autocast(device_type="cuda", enabled=False):
+            out_dir = self._mdl_target(ids, attention_mask=mask, use_cache=False)
+        logits_dir = out_dir.logits if hasattr(out_dir, "logits") else out_dir[0]
+
+        # functional_call with η=0 mapping
+        m0 = self._params_zero or self._build_params_override(v_named=None, eta=0.0)
+        logits_fc = self._fc_logits_noautocast(ids, mask, m0)
+
+        delta = (logits_dir - logits_fc).abs().max().item()
+        self.logger.info(f"[SP-η=0] max|direct - fc(η=0)| = {delta:.3e}")
+        if delta > atol:
+            raise RuntimeError("Baseline vs functional_call(η=0) mismatch; check precision or module identity.")
 
 
 

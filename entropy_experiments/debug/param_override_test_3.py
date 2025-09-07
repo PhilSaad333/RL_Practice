@@ -19,6 +19,8 @@ import torch
 import yaml
 import numpy as np
 from transformers import AutoTokenizer
+from sequence_processing.sequence_processor import SequenceProcessor, GenerationConfig
+
 
 # --- BEGIN: self-locating import bootstrap -----------------------------------
 def _infer_project_root_from_argv():
@@ -230,126 +232,85 @@ def main():
 
 
 
-    # --- Fixed sequence & baseline logits ------------------------------------
+
     tok = AutoTokenizer.from_pretrained(args.tokenizer_id, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    enc = tok(args.text, return_tensors="pt", add_special_tokens=True, padding=False)
-    input_ids = enc["input_ids"].to(dev); attention_mask = enc["attention_mask"].to(dev)
 
-    # Vocab guard
-    vocab_size = None
-    for n, p in mdl_target.named_parameters():
-        if n.endswith("model.embed_tokens.weight"):
-            vocab_size = p.shape[0]; break
-    if vocab_size is None:
-        for n, p in mdl_target.named_parameters():
-            if n.endswith("lm_head.weight"):
-                vocab_size = p.shape[0]; break
-    if vocab_size is not None and int(input_ids.max()) >= vocab_size:
-        raise RuntimeError("Tokenizer/model vocab mismatch (token id exceeds vocab size).")
+    # 1) Build a tiny E-batch of sequences.
+    #    If you already created sequences with your generator, re-use them.
+    #    Otherwise, use the SequenceProcessor to generate quickly.
+    processor_cfg = GenerationConfig()
+    processor = SequenceProcessor(model, tok, logger=None, config={"precision": {
+        "allow_tf32": False,            # strict math
+        "matmul_precision": "high",
+        "deterministic_probe": True,
+        "func_override": {"autocast": False, "cast_params": True, "dtype": "float32"},
+        "tf_nograd":    {"autocast": False, "cast_logits_fp32": True},
+    }})
 
-    # Baseline logits via functional_call with PARAMS-ONLY mapping, autocast off
-    float_dtype = (torch.float64 if args.fp64 else torch.float32)
+    # If you don't already have sequences, create a quick E-batch:
+    prompts = ["Compute: 37+58 = </think>", "Factor: 84 = </think>"]  # examples
+    E_sequences = processor.generate_batched(prompts, G=1)
+    # Otherwise, re-use your existing generated 'sequences' object:
+    #E_sequences = sequences  # re-use if available
 
-    params0 = build_functional_params_named(mdl_target, None, 0.0,
-                                            force_param_dtype=torch.float32,
-                                            detach_params=True, detach_buffers=True)[0]
+    # 2) (Optional) Zero-check: direct vs functional_call(η=0)
+    b0, g0 = 0, 0
+    seq = E_sequences.sequences[b0, g0]
+    pl  = int(E_sequences.prompt_lens[b0])
+    Tg  = int(E_sequences.gen_lens[b0][g0])
+    L   = int(seq.size(0))
+    if Tg > 0 and L > pl:
+        ids = seq[:pl+Tg].unsqueeze(0).to(model.device)
+        mask= E_sequences.attention_masks[b0, g0, :pl+Tg].unsqueeze(0).to(model.device)
+        processor.debug_zero_check(ids, mask, atol=1e-7)   # raises if mismatch
 
-    # Baseline mapping at eta=0 (params only) against mdl_target
-    map0 = _params_only_fp(mdl_target, v_named=None, eta=0.0, dtype=fp_dtype)
-    logits0 = _fc_logits_noautocast(mdl_target, input_ids, attention_mask, map0).detach().cpu()
+    # 3) Prepare the params-only mapping function.
+    #    We’ll use the *same* update_vector you computed from the U-batch.
 
-    # (optional) hard zero-check vs direct forward in the SAME precision
-    with torch.no_grad():
-        with torch.autocast(device_type="cuda", enabled=False):
-            out_dir = mdl_target(input_ids, attention_mask=attention_mask, use_cache=False)
-    logits_dir = (out_dir.logits if hasattr(out_dir, "logits") else out_dir[0]).detach().cpu()
-    print(f"[zero-check] max|direct - fc(eta=0)| = {(logits_dir - logits0).abs().max().item():.3e}")
+    def mapping_for_eta(eta: float) -> dict[str, torch.Tensor]:
+        # Use the processor's own builder to ensure keyspace alignment and upcasting.
+        return processor._build_params_override(v_named=v_named, eta=float(eta))
 
-    logits0_cpu = logits0  # already cpu
-    T = logits0_cpu.shape[1]
-    toks = tok.convert_ids_to_tokens(input_ids.squeeze(0).tolist())
-    print(f"\nFixed-sequence functional_call probe …")
-    print(f"Sequence length T={T}, vocab={logits0_cpu.shape[-1]}")
+    # 4) Evaluate entropy on the same E-batch across an η grid and check linearity.
+    eta_grid = [0.0, 1e-8, 3e-8, 1e-7, 3e-7, 1e-6]
+    H_vals = []
 
+    for eta in eta_grid:
+        params_override = mapping_for_eta(eta) if eta != 0.0 else None
+        logprob_res, diag_res = processor.teacher_force_logprobs(
+            E_sequences,
+            with_grad=False,
+            tf_batch_size=processor.config.tf_batch_size,
+            compute_rb=True,                      # use RB entropies
+            params_override=params_override,      # params-only mapping or baseline path
+            buffers_override=None,                # keep buffers live/identical
+        )
+        # Aggregate RB entropy over all sequences/tokens in E
+        H_sum = 0.0
+        for b in range(len(logprob_res.rb_entropies)):
+            for g in range(len(logprob_res.rb_entropies[b])):
+                rb = logprob_res.rb_entropies[b][g]
+                if rb is not None and len(rb) > 0:
+                    H_sum += float(rb.sum())
+        H_vals.append(H_sum)
 
-    p_main  = build_functional_params_named(mdl_target, v_named, 1e-5,
-                                            force_param_dtype=torch.float32,
-                                            detach_params=True, detach_buffers=True)[0]
-    p_tiny  = build_functional_params_named(mdl_target, v_named, 1e-10,
-                                            force_param_dtype=torch.float32,
-                                            detach_params=True, detach_buffers=True)[0]
+    # 5) Report continuity and small-η linearity.
+    import numpy as np
+    H_vals = np.array(H_vals, dtype=np.float64)
+    H0 = H_vals[0]
+    dH = H_vals - H0
+    print("\n[SP continuity]")
+    for eta, val, diff in zip(eta_grid, H_vals, dH):
+        print(f"eta={eta:>8g}  H={val:.6f}  ΔH={diff:.6e}")
 
-    # L2(Δθ) should scale with η
-    def l2_of_delta(pa, pb):
-        s = 0.0
-        for k in pa:
-            a, b = pa[k], pb[k]
-            if torch.is_floating_point(a):
-                s += (a - b).float().pow(2).sum().item()
-        return s ** 0.5
-
-    r = l2_of_delta(p_tiny, params0) / l2_of_delta(p_main, params0)
-    print(f"||Δθ|| ratio (tiny/main): {r:.3e}  (expected ≈ 1e-5)")
-
-
-
-
-
-
-    # --- PROBE A: PARAMS-ONLY mapping (recommended) --------------------------
-
-    print("\n[PROBE A] PARAMS-ONLY mapping (recommended)")
-    records_A = []
-    for eta in args.eta_grid:
-        m_eta = _params_only_fp(mdl_target, v_named, eta, dtype=fp_dtype)
-        logits_eta = _fc_logits_noautocast(mdl_target, input_ids, attention_mask, m_eta).detach().cpu()
-        d = logits_eta - logits0
-        linf = float(d.abs().max().item()); l2 = float(d.pow(2).sum().sqrt().item())
-        records_A.append((eta, linf, l2))
-        linf_tok, _ = tokenwise_norms(d)
-        idx_top = torch.topk(linf_tok, k=min(args.print_topk, T)).indices.tolist()
-        preview = ", ".join([f"(t={i}, tok='{toks[i]}', Δ∞={linf_tok[i].item():.2e})" for i in idx_top])
-        print(f"η={eta: .1e}  ||Δlogits||∞={linf:.3e}  ||Δlogits||₂={l2:.3e}")
-        print("   top Δ∞ tokens:", preview)
-        del logits_eta, d
-        torch.cuda.empty_cache()
-
-    nzA = [(e, L, N) for (e, L, N) in records_A if e > 0]
-    if len(nzA) >= 2:
-        a, b = nzA[0], nzA[1]
-        print(f"Linearity sanity (A): (η={a[0]:.1e} vs {b[0]:.1e}) "
-              f"Δ∞ ratio≈{safe_ratio(a[1], b[1]):.3f}, Δ₂ ratio≈{safe_ratio(a[2], b[2]):.3f}, "
-              f"expected≈{a[0]/b[0]:.3f}")
-
-    # --- PROBE B: PARAMS+BUFFERS mapping (diagnostic) ------------------------
-    from entropy_experiments.utils.param_overrides import build_functional_params_named as _build_full
-
-
-    print("\n[PROBE B] PARAMS+BUFFERS mapping (diagnostic; often unstable)")
-    records_B = []
-    for eta in args.eta_grid:
-        mapping = _params_plus_buffers_fp(mdl_target, v_named, eta, dtype=fp_dtype)
-        logits_eta = _fc_logits_noautocast(mdl_target, input_ids, attention_mask, mapping).detach().cpu()
-        d = logits_eta - logits0
-        linf = float(d.abs().max().item()); l2 = float(d.pow(2).sum().sqrt().item())
-        records_B.append((eta, linf, l2))
-        linf_tok, _ = tokenwise_norms(d)
-        idx_top = torch.topk(linf_tok, k=min(args.print_topk, T)).indices.tolist()
-        preview = ", ".join([f"(t={i}, tok='{toks[i]}', Δ∞={linf_tok[i].item():.2e})" for i in idx_top])
-        print(f"η={eta: .1e}  ||Δlogits||∞={linf:.3e}  ||Δlogits||₂={l2:.3e}")
-        print("   top Δ∞ tokens:", preview)
-        del mapping, logits_eta, d
-        torch.cuda.empty_cache()
-
-    nzB = [(e, L, N) for (e, L, N) in records_B if e > 0]
-    if len(nzB) >= 2:
-        a, b = nzB[0], nzB[1]
-        print(f"Linearity sanity (B): (η={a[0]:.1e} vs {b[0]:.1e}) "
-              f"Δ∞ ratio≈{safe_ratio(a[1], b[1]):.3f}, Δ₂ ratio≈{safe_ratio(a[2], b[2]):.3f}, "
-              f"expected≈{a[0]/b[0]:.3f}")
-
+    # crude slope checks between consecutive etas (skip eta=0 -> small positive)
+    print("\n[small-η ratios]")
+    for i in range(2, len(eta_grid)):
+        r_eta = (eta_grid[i] - eta_grid[0]) / (eta_grid[1] - eta_grid[0]) if eta_grid[1] != 0 else np.nan
+        r_dH  = (dH[i]) / (dH[1] if dH[1] != 0 else np.nan)
+        print(f"η/η_small ≈ {r_eta:>9.3g}  |  ΔH/ΔH_small ≈ {r_dH:>9.3g}")
 
 
 
@@ -357,7 +318,6 @@ def main():
 
 
     report_mem("after probes")
-    del logits0, logits0_cpu
     gc.collect(); torch.cuda.empty_cache()
 
 
