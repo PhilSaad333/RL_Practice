@@ -732,7 +732,6 @@ class SequenceProcessor:
                             mapping_pb = self._build_params_override(
                                 v_named=None if params_override is None else {},  # keep same η path
                                 eta=0.0 if params_override is None else 0.0,     # η path for TF is 0 here
-                                cast_buffers=True
                             )
                             logits_full = self._fc_logits_noautocast(input_seq, attn, mapping_pb)
                             if not torch.isfinite(logits_full).all():
@@ -745,7 +744,6 @@ class SequenceProcessor:
                                 mapping_pb32 = self._build_params_override(
                                     v_named=None if params_override is None else {},
                                     eta=0.0,
-                                    cast_buffers=True
                                 )
                                 logits_full = self._fc_logits_noautocast(input_seq, attn, mapping_pb32)
                                 self._fo_dtype = old_dtype
