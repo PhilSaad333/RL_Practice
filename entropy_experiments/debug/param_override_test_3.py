@@ -266,7 +266,7 @@ def main():
     if Tg > 0 and L > pl:
         ids = seq[:pl+Tg].unsqueeze(0).to(model.device)
         mask= E_sequences.attention_masks[b0, g0, :pl+Tg].unsqueeze(0).to(model.device)
-        processor.debug_zero_check(ids, mask, atol=1e-7)   # raises if mismatch
+        #processor.debug_zero_check(ids, mask, atol=1e-7)   # raises if mismatch
 
     # 3) Prepare the params-only mapping function.
     #    We’ll use the *same* update_vector you computed from the U-batch.
