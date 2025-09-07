@@ -251,9 +251,24 @@ def main():
 
     processor = probe._sequence_processor
 
+
+
+    # Generate E batch for entropy evaluation  
+    print("Generating E batch for entropy evaluation...")
+    E_sequences, _E_logprobs, _E_diag = probe._sequence_processor.generate_with_replacement_sampling(
+        total_sequences=B_E_SIZE,
+        dataset_name=dataset_name,
+        split=E_split,
+        G=1,  # E batch uses G=1 (single generation per prompt)
+        compute_rb=True,
+    )
+    E_batch = probe._pack_E_from_sequences(E_sequences)
+
+
+
     # If you don't already have sequences, create a quick E-batch:
-    prompts = ["Compute: 37+58 = </think>", "Factor: 84 = </think>"]  # examples
-    E_sequences = processor.generate_batched(prompts, G=1)
+    #prompts = ["Compute: 37+58 = </think>", "Factor: 84 = </think>"]  # examples
+    #E_sequences = processor.generate_batched(prompts, G=1)
     # Otherwise, re-use your existing generated 'sequences' object:
     #E_sequences = sequences  # re-use if available
 
