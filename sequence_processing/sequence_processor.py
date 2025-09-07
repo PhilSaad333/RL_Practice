@@ -261,7 +261,7 @@ class SequenceProcessor:
             # Disable autocast so the forward runs in the params' actual dtype (fp64 if mapped)
             with torch.autocast(device_type="cuda", enabled=False):
                 out = torch.func.functional_call(
-                    m, mapping, (input_ids,),
+                    m, params_mapping, (input_ids,),
                     {'attention_mask': attention_mask, 'use_cache': False}
                 )
             return out.logits if hasattr(out, "logits") else out[0]
