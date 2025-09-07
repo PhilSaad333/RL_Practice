@@ -194,12 +194,12 @@ def main():
         raise ValueError("Config missing checkpoint.checkpoint_path")
     print("Loading LoRA checkpoint …")
     probe.load_checkpoint(adapter_path, optimizer_path if optimizer_path else None)
-    model = probe.model
-    dev = device_of(model)
-    print(f"✓ Model on {dev}: {type(unwrap(model)).__name__}")
+    probe._ensure_sequence_processor()
+    sp = probe._sequence_processor
+    mdl_target = sp._mdl_target
 
+    dev = device_of(mdl_target)
 
-    mdl_target = unwrap(model)  # use this EVERYWHERE
     fp_dtype = torch.float64 if args.fp64 else torch.float32
 
 
@@ -207,11 +207,10 @@ def main():
 
 
     # --- Compute update vector v_named from a tiny U-batch --------------------
-    probe._ensure_sequence_processor()
     dataset = cfg["batch_config"]["dataset_name"]
     _, U_split = probe._get_splits()
 
-    U_sequences, U_logprobs, _ = probe._sequence_processor.generate_with_logprobs(
+    U_sequences, U_logprobs, _ = sp.generate_with_logprobs(
         prompts=None, G=args.u_G, dataset_name=dataset, split=U_split,
         num_prompts=args.u_batch, compute_rb=False
     )
@@ -261,7 +260,6 @@ def main():
     # Do NOT replace SequenceProcessor.config (a GenerationConfig) with a dict.
     # Instead, update precision profiles in-place so attribute access (e.g., gen_batch_size)
     # continues to work.
-    sp = probe._sequence_processor
     prec = cfg['precision']
     try:
         sp._fo_cfg.update(prec.get('func_override', {}))
@@ -276,15 +274,12 @@ def main():
         pass
 
 
-    processor = probe._sequence_processor
-
-
 
     # Generate E batch for entropy evaluation  
     print("Generating E batch for entropy evaluation...")
 
 
-    E_sequences, _E_logprobs, _E_diag = probe._sequence_processor.generate_with_replacement_sampling(
+    E_sequences, _E_logprobs, _E_diag = sp.generate_with_replacement_sampling(
         total_sequences=16,
         dataset_name=dataset,
         split='test',
@@ -297,9 +292,6 @@ def main():
 
 
     # --- SP LOGITS CONTINUITY (full vocab) ---
-    proc = probe._sequence_processor
-    mdl  = proc._mdl_target  # same module SP uses
-    dev  = next(mdl.parameters()).device
 
     b, g = 0, 0
     seq = E_sequences.sequences[b, g]
@@ -311,15 +303,15 @@ def main():
 
     def map_for_eta(e):
         # Use SP's builder so keyspace/dtypes match exactly
-        return proc._build_params_override(v_named=v_named, eta=float(e))
+        return sp._build_params_override(v_named=v_named, eta=float(e))
 
     # Baseline (fc-vs-fc)
-    logits0 = proc._fc_logits_noautocast(ids, msk, map_for_eta(0.0))[0]  # [L,V]
+    logits0 = sp._fc_logits_noautocast(ids, msk, map_for_eta(0.0))[0]  # [L,V]
     gen_slice = slice(pl-1, pl-1 + Tg)  # next-token slice for T steps
     lo0 = logits0[gen_slice]  # [T,V]
 
     for eta in [1e-8, 3e-8, 1e-7, 3e-7, 1e-6]:
-        loe = proc._fc_logits_noautocast(ids, msk, map_for_eta(eta))[0][gen_slice]
+        loe = sp._fc_logits_noautocast(ids, msk, map_for_eta(eta))[0][gen_slice]
         d = (loe - lo0)
         linf = float(d.abs().max().item())
         l2   = float(d.pow(2).sum().sqrt().item())
@@ -335,7 +327,7 @@ def main():
     import torch.nn.functional as F
 
     def H_naive_for_eta(e):
-        lo = proc._fc_logits_noautocast(ids, msk, map_for_eta(e))[0][gen_slice]  # [T,V]
+        lo = sp._fc_logits_noautocast(ids, msk, map_for_eta(e))[0][gen_slice]  # [T,V]
         logp = F.log_softmax(lo, dim=-1)
         p = logp.exp()
         H = (-(p * logp).sum(dim=-1)).sum()   # sum over T
@@ -371,17 +363,17 @@ def main():
     Tg  = int(E_sequences.gen_lens[b0][g0])
     L   = int(seq.size(0))
     assert Tg > 0 and L > pl
-    ids  = seq[:pl+Tg].unsqueeze(0).to(next(processor._mdl_target.parameters()).device)
+    ids  = seq[:pl+Tg].unsqueeze(0).to(next(mdl_target.parameters()).device)
     mask = E_sequences.attention_masks[b0, g0, :pl+Tg].unsqueeze(0).to(ids.device)
 
     # Build η=0 mapping (params-only, baseline dtype preserved by patch (B))
-    m0 = processor._build_params_override(v_named=None, eta=0.0)
+    m0 = sp._build_params_override(v_named=None, eta=0.0)
 
     with torch.no_grad():
         with torch.autocast(device_type="cuda", enabled=False):
-            out_dir = processor._mdl_target(ids, attention_mask=mask, use_cache=False)
+            out_dir = mdl_target(ids, attention_mask=mask, use_cache=False)
     logits_dir = out_dir.logits if hasattr(out_dir, "logits") else out_dir[0]
-    logits_fc  = processor._fc_logits_noautocast(ids, mask, m0)
+    logits_fc  = sp._fc_logits_noautocast(ids, mask, m0)
 
     print("[sanity] direct finite:", bool(torch.isfinite(logits_dir).all().item()),
         " fc finite:", bool(torch.isfinite(logits_fc).all().item()))
@@ -396,7 +388,7 @@ def main():
 
     def mapping_for_eta(eta: float) -> dict[str, torch.Tensor]:
         # Use the processor's own builder to ensure keyspace alignment and upcasting.
-        return processor._build_params_override(v_named=v_named, eta=float(eta))
+        return sp._build_params_override(v_named=v_named, eta=float(eta))
 
 
     eta_grid = [0.0, 1e-8, 3e-8, 1e-7, 3e-7, 1e-6]
@@ -405,10 +397,10 @@ def main():
     H_vals = []
     for eta in eta_grid:
         params_override = mapping_for_eta(eta)   # NOTE: even for eta=0
-        logprob_res, _ = processor.teacher_force_logprobs(
+        logprob_res, _ = sp.teacher_force_logprobs(
             E_sequences,
             with_grad=False,
-            tf_batch_size=processor.config.tf_batch_size,
+            tf_batch_size=sp.config.tf_batch_size,
             compute_rb=True,
             params_override=params_override,
             buffers_override=None,
@@ -438,7 +430,7 @@ def main():
     # 3) Optional: logits-level probe on one (b,g), short T (matches SP path exactly)
     b_idx, g_idx = 0, 0
     def get_gen_logits_for_eta(eta, max_T=64):
-        pack = processor.teacher_force_debug_probe(
+        pack = sp.teacher_force_debug_probe(
             E_sequences, b_idx=b_idx, g_idx=g_idx,
             params_override=mapping_for_eta(eta),  # η=0 included
             max_T=max_T, topk=1

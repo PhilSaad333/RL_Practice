@@ -1448,9 +1448,14 @@ class SequenceProcessor:
         x = seq[:actual_len].unsqueeze(0).to(device)
         m = sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(device)
 
-        out = self._call_model_tf(x, m, params_override=params_override)
-        logits_full = out.logits if hasattr(out, "logits") else out[0]
-        logits_full = logits_full[0]  # [L, V]
+        # Build params-only mapping; preserve dtype if caller hands one in.
+        if params_override is None:
+            if self._params_zero is None:
+                self._params_zero = self._build_params_override(v_named=None, eta=0.0)
+            mapping = self._params_zero
+        else:
+            mapping = params_override
+        logits_full = self._fc_logits_noautocast(x, m, mapping)[0]  # [L, V]
 
         gen_start = pl
         gen_end   = pl + Tgen
