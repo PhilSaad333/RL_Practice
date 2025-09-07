@@ -329,7 +329,7 @@ class OfflineEntropyProbe:
         est_mode = est_cfg.get('x_estimator_mode', 'naive')
         if force_simple and est_mode != 'naive':
             self.logger.info(
-                f"Overriding x_estimator_mode='{est_mode}' ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 'naive' (use_simple_entropy_for_x=true)"
+                f"Overriding x_estimator_mode='{est_mode}' "
             )
             est_mode = 'naive'
         rb_rg_cfg = gen_cfg.get('rb_requires_grad', False)
@@ -337,11 +337,15 @@ class OfflineEntropyProbe:
         
         if est_mode == 'rb_residual' and not rb_rg_cfg:
             self.logger.warning(
-                f"OVERRIDING rb_requires_grad: {rb_rg_cfg} ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ True (required for x_estimator_mode=rb_residual)"
+                f"OVERRIDING rb_requires_grad: {rb_rg_cfg} "
             )
         
         self.logger.info(f"SequenceProcessor config: x_estimator_mode={est_mode}, rb_requires_grad={rb_rg_final}")
         
+
+
+
+
         # Enforce full-support proposal across entropy_experiments runs
         forced_top_p = 1.0
         sp_cfg = GenerationConfig(
@@ -354,7 +358,22 @@ class OfflineEntropyProbe:
             tf_batch_size=gen_cfg.get('tf_batch_size', 64),
             rb_requires_grad=rb_rg_final,
         )
-        self._sequence_processor = SequenceProcessor(self.model, tok, self.logger, sp_cfg)
+
+        sp_cfg_full = {
+            "generation": {
+                "temperature": sp_cfg.temperature,
+                "top_p": 1.0,
+                "max_new_tokens": sp_cfg.max_new_tokens,
+                "do_sample": True,
+                "num_return_sequences": self.config['batch_config']['G'],
+                "gen_batch_size": sp_cfg.gen_batch_size,
+                "tf_batch_size": sp_cfg.tf_batch_size,
+                "rb_requires_grad": sp_cfg.rb_requires_grad,
+            },
+            "precision": (self.config.get("precision", {}) or {}),
+        }
+        self._sequence_processor = SequenceProcessor(self.model, tok, self.logger, sp_cfg_full)
+
         try:
             self.logger.info(
                 f"[IS] Generation config enforced: top_p=1.0; temperature={sp_cfg.temperature}"

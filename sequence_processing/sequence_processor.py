@@ -177,18 +177,27 @@ class SequenceProcessor:
         self.model = model
         self.tokenizer = tokenizer
         self.logger = logger
-        self.config = config or GenerationConfig()
+        # Accept either:
+        #   (i) dict-like probe config: {"generation": {...}, "precision": {...}}
+        #  (ii) GenerationConfig instance
+        if isinstance(config, dict):
+            gen_cfg = (config.get("generation", {}) or {})
+            self.config = GenerationConfig(**gen_cfg)
+            prec_cfg = (config.get("precision", {}) or {})
+        else:
+            self.config = config or GenerationConfig()
+            # If an object-like config ever carries a .precision attribute, honor it; else fall back to {}
+            prec_cfg = getattr(config, "precision", {}) or {}
 
 
         # One canonical module for mappings *and* forward
         self._mdl_target = _unwrap(model) if callable(_unwrap) else model
 
-        # Precision / determinism profiles
-        prec_cfg = (config or {}).get("precision", {})
-        self._fo_cfg = prec_cfg.get("func_override", {})   # {"autocast": False, "cast_params": True, "dtype": "float32"}
-        self._tf_cfg = prec_cfg.get("tf_nograd", {})       # logits/logprobs precision for TF no‑grad
+        # Precision / determinism profiles (already resolved above as dict)
+        self._fo_cfg = prec_cfg.get("func_override", {})
+        self._tf_cfg = prec_cfg.get("tf_nograd", {})
         self._allow_tf32 = bool(prec_cfg.get("allow_tf32", False))
-        self._matmul_precision = prec_cfg.get("matmul_precision", "high")  # or "highest" for FP64 probes
+        self._matmul_precision = prec_cfg.get("matmul_precision", "high")
         apply_global_precision(self._allow_tf32, self._matmul_precision)
 
         # Optional determinism (probe‑only)
