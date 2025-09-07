@@ -1463,23 +1463,24 @@ class SequenceProcessor:
             gen_end    = gen_start + int(max_T)
 
         import torch.nn.functional as F
-        log_probs = F.log_softmax(gen_logits.float(), dim=-1).cpu()   # [T,V]
+        # Compute in-place on the model device and in the forward dtype (fp64 if configured)
+        log_probs = F.log_softmax(gen_logits, dim=-1)                 # [T,V], device=dtype=forward
         probs     = log_probs.exp()
-        entropy   = (-(probs * log_probs).sum(dim=-1))                # [T]
-        tok_ix    = gen_tokens.view(-1,1).cpu()
-        logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)            # [T]
-        logit_on_t= gen_logits.float().cpu().gather(1, tok_ix).squeeze(1)
+        entropy   = (-(probs * log_probs).sum(dim=-1))                # [T], forward dtype
+        tok_ix    = gen_tokens.view(-1, 1)                            # keep on device for gather
+        logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)            # [T], forward dtype
+        logit_on_t= gen_logits.gather(1, tok_ix).squeeze(1)           # [T], forward dtype
 
         K = min(topk, gen_logits.size(1))
-        topv, topi = gen_logits.float().cpu().topk(k=K, dim=-1)
-
+        topv, topi = gen_logits.topk(k=K, dim=-1)                     # [T,K], [T,K]
+        # Move to CPU at the end without downcasting; keep forward dtype
         return {
-            "tokens": gen_tokens.cpu(),
-            "logit_on_tok": logit_on_t.contiguous(),
-            "logprob_on_tok": logp_on_t.contiguous(),
-            "entropy_naive": entropy.contiguous(),
-            "topk_vals": topv.contiguous(),
-            "topk_idx": topi.contiguous(),
+            "tokens":        gen_tokens.detach().cpu(),
+            "logit_on_tok":  logit_on_t.detach().cpu().contiguous(),
+            "logprob_on_tok":logp_on_t.detach().cpu().contiguous(),
+            "entropy_naive": entropy.detach().cpu().contiguous(),
+            "topk_vals":     topv.detach().cpu().contiguous(),
+            "topk_idx":      topi.detach().cpu().contiguous(),
             "gen_start": gen_start, "gen_end": gen_end, "T": gen_end - gen_start,
         }
 

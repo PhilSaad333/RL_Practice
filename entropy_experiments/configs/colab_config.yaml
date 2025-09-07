@@ -96,7 +96,7 @@ precision:
   func_override:
     autocast: false
     dtype: float64           # do this path in fp32 to keep tiny η effects visible
-    cast_params: true       # if true, explicitly cast effective params to this dtype
+    cast_params: false       # if true, explicitly cast effective params to this dtype
 
   # update-vector builder (rl_loss microbatched on U)
   update_vector:
