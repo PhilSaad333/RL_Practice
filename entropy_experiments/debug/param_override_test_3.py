@@ -202,6 +202,10 @@ def main():
 
     fp_dtype = torch.float64 if args.fp64 else torch.float32
 
+    print("fo dtype:", sp._fo_cfg.get("dtype"))
+    print("tf dtype:", sp._tf_cfg.get("dtype"))
+    print("example LoRA A dtype:",
+        next(p for n,p in sp._mdl_target.named_parameters() if "lora_A" in n).dtype)
 
 
 
