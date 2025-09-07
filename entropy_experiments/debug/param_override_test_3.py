@@ -286,22 +286,42 @@ def main():
     #E_sequences = sequences  # re-use if available
 
     # 2) (Optional) Zero-check: direct vs functional_call(η=0)
+
+
+    # After constructing 'processor' and building a minimal 1-sequence batch 'E_sequences'
     b0, g0 = 0, 0
     seq = E_sequences.sequences[b0, g0]
     pl  = int(E_sequences.prompt_lens[b0])
     Tg  = int(E_sequences.gen_lens[b0][g0])
     L   = int(seq.size(0))
-    if Tg > 0 and L > pl:
-        ids = seq[:pl+Tg].unsqueeze(0).to(model.device)
-        mask= E_sequences.attention_masks[b0, g0, :pl+Tg].unsqueeze(0).to(model.device)
-        #processor.debug_zero_check(ids, mask, atol=1e-7)   # raises if mismatch
+    assert Tg > 0 and L > pl
+    ids  = seq[:pl+Tg].unsqueeze(0).to(next(processor._mdl_target.parameters()).device)
+    mask = E_sequences.attention_masks[b0, g0, :pl+Tg].unsqueeze(0).to(ids.device)
+
+    # Build η=0 mapping (params-only, baseline dtype preserved by patch (B))
+    m0 = processor._build_params_override(v_named=None, eta=0.0)
+
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda", enabled=False):
+            out_dir = processor._mdl_target(ids, attention_mask=mask, use_cache=False)
+    logits_dir = out_dir.logits if hasattr(out_dir, "logits") else out_dir[0]
+    logits_fc  = processor._fc_logits_noautocast(ids, mask, m0)
+
+    print("[sanity] direct finite:", bool(torch.isfinite(logits_dir).all().item()),
+        " fc finite:", bool(torch.isfinite(logits_fc).all().item()))
+    print("[sanity] max|direct - fc(η=0)| =",
+        float((logits_dir - logits_fc).abs().max().item()))
+
+
+
 
     # 3) Prepare the params-only mapping function.
     #    We’ll use the *same* update_vector you computed from the U-batch.
 
     def mapping_for_eta(eta: float) -> dict[str, torch.Tensor]:
         # Use the processor's own builder to ensure keyspace alignment and upcasting.
-        return processor._build_params_override(v_named=v_named, eta=float(eta))
+        return processor._build_params_override(v_named=(v_named if eta != 0.0 else None),
+                                        eta=float(eta))
 
     # 4) Evaluate entropy on the same E-batch across an η grid and check linearity.
     eta_grid = [0.0, 1e-8, 3e-8, 1e-7, 3e-7, 1e-6]

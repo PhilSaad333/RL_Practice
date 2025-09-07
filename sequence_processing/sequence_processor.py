@@ -191,7 +191,11 @@ class SequenceProcessor:
 
 
         # One canonical module for mappings *and* forward
-        self._mdl_target = _unwrap(model) if callable(_unwrap) else model
+        # One canonical module for mappings *and* forward:
+        # unwrap DDP only; KEEP the PEFT/LoRA wrapper intact.
+        self.is_ddp = hasattr(model, "module")
+        self._mdl_target = self._unwrap(self.model)  # DDP-only unwrap
+
 
         # Precision / determinism profiles (already resolved above as dict)
         self._fo_cfg = prec_cfg.get("func_override", {})
@@ -225,7 +229,11 @@ class SequenceProcessor:
         Buffers are detached and *not* overridden. This mirrors the working probe.
         """
         cast_params = bool(self._fo_cfg.get("cast_params", True))
-        force_dtype = str_to_dtype(self._fo_cfg.get("dtype", "float32")) if cast_params else None
+        # Preserve live dtypes when there is no actual perturbation.
+        if (eta == 0.0) and (v_named is None):
+            force_dtype = None
+        else:
+            force_dtype = str_to_dtype(self._fo_cfg.get("dtype", "float32")) if cast_params else None
 
         params_dict, _ = build_functional_params_named(
             self._mdl_target, v_named, eta,
