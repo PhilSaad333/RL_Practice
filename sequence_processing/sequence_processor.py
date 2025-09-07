@@ -166,7 +166,7 @@ class DiagnosticsPack:
 class SequenceProcessor:
     """Master class for unified sequence generation and logprob computation."""
     
-    def __init__(self, model, tokenizer, logger, config: Optional[GenerationConfig] = None):
+    def __init__(self, model, tokenizer, logger = None, config: Optional[GenerationConfig] = None):
         """Initialize SequenceProcessor.
         
         Args:

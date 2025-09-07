@@ -354,7 +354,7 @@ class OfflineEntropyProbe:
             tf_batch_size=gen_cfg.get('tf_batch_size', 64),
             rb_requires_grad=rb_rg_final,
         )
-        self._sequence_processor = SequenceProcessor(self.model, tok, sp_cfg)
+        self._sequence_processor = SequenceProcessor(self.model, tok, self.logger, sp_cfg)
         try:
             self.logger.info(
                 f"[IS] Generation config enforced: top_p=1.0; temperature={sp_cfg.temperature}"
