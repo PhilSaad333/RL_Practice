@@ -383,6 +383,31 @@ def main():
 
 
 
+
+
+
+    # One (b,g) slice
+    dbg = sp.teacher_force_debug_probe(E_sequences, b_idx=0, g_idx=0,
+                                    params_override=sp._build_params_override(None, 0.0))
+    print("[dbg] logits dtype:", dbg["topk_vals"].dtype)
+
+    for eta in [1e-8, 3e-8, 1e-7]:
+        m_eta = sp._build_params_override(v_named, eta)
+        d = sp._fc_logits_noautocast(x.unsqueeze(0), m.unsqueeze(0), m_eta) \
+            - sp._fc_logits_noautocast(x.unsqueeze(0), m.unsqueeze(0), sp._build_params_override(None, 0.0))
+        linf = d.abs().amax().item()
+        print(f"[SP full-V] eta={eta: .0e} ||Δlogits||∞={linf:.3e}")
+
+
+
+
+
+
+
+
+
+
+
     # 3) Prepare the params-only mapping function.
     #    We’ll use the *same* update_vector you computed from the U-batch.
 
