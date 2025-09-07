@@ -163,20 +163,23 @@ def forward_under_mapping_noautocast(mdl, input_ids, attention_mask, mapping: Di
 def main():
     args = parse_args()
 
-    # Precision defaults for the probe
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_default_dtype(torch.float64 if args.fp64 else torch.float32)
+    # Precision defaults for the probe (strict)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+
+
 
     # Load config
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
     print(f"✓ Loaded config: {args.config}")
 
-    # Optional global precision
+    # Avoid re-enabling TF32 through our helper
     try:
         from entropy_experiments.utils.precision_utils import apply_global_precision
-        apply_global_precision(allow_tf32=True, matmul_precision="high")
+        apply_global_precision(allow_tf32=False, matmul_precision="highest")
     except Exception:
         pass
 
@@ -207,11 +210,12 @@ def main():
 
     # --- Compute update vector v_named from a tiny U-batch --------------------
     probe._ensure_sequence_processor()
+    
     dataset = cfg["batch_config"]["dataset_name"]
     _, U_split = probe._get_splits()
     U_sequences, U_logprobs, _ = probe._sequence_processor.generate_with_logprobs(
         prompts=None, G=args.u_G, dataset_name=dataset, split=U_split,
-        num_prompts=args.u_batch, compute_rb=True
+        num_prompts=args.u_batch, compute_rb=False
     )
     U_batch = probe._pack_U_from_sequences(U_sequences, U_logprobs.rewards)
 
@@ -256,8 +260,12 @@ def main():
                                             force_param_dtype=torch.float32,
                                             detach_params=True, detach_buffers=True)[0]
 
+
     # Baseline mapping at eta=0 (params only) against mdl_target
-    map0 = _params_only_fp(mdl_target, v_named=None, eta=0.0, dtype=fp_dtype)
+    # Preserve dtype so the "direct vs fc(η=0)" diagnostic is fair
+    map0 = _params_only_fp(mdl_target, v_named=None, eta=0.0, dtype=None)
+
+
     logits0 = _fc_logits_noautocast(mdl_target, input_ids, attention_mask, map0).detach().cpu()
 
     # (optional) hard zero-check vs direct forward in the SAME precision
