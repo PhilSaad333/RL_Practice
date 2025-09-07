@@ -545,7 +545,7 @@ def main():
         return sp._build_params_override(v_named=v_named, eta=float(eta))
 
 
-    eta_grid = [0.0] + [(2**k)*1e-5 for k in range(8)]:
+    eta_grid = [0.0] + [(2**k)*1e-5 for k in range(8)]
 
     # 2) RB-entropy continuity (all through the *same* functional_call path)
     H_vals = []
