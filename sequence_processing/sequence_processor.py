@@ -263,7 +263,34 @@ class SequenceProcessor:
         return params_dict
 
 
-   
+   # NEW: params+buffers override builder
+    def _build_state_override(
+        self,
+        v_named: dict | None,
+        eta: float,
+        *,
+        param_dtype: torch.dtype | None,
+        include_buffers: bool,
+        buffer_dtype: torch.dtype | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Build a mapping for torch.func.functional_call.
+        - Always detaches params/buffers from the live module.
+        - Optionally casts params/buffers to requested dtypes.
+        - When include_buffers=False, returns params-only (like the working probe).
+        """
+        params_dict, buffers_dict = build_functional_params_named(
+            self._mdl_target, v_named, eta,
+            detach_params=True, detach_buffers=True,
+            force_param_dtype=param_dtype,
+            force_buffer_dtype=(buffer_dtype if include_buffers else None),
+        )
+        return (params_dict if not include_buffers else {**params_dict, **buffers_dict})
+
+
+
+
+
     @torch.no_grad()
     def _fc_logits_noautocast(self, input_ids, attention_mask, params_mapping: dict[str, torch.Tensor]):
         """
@@ -707,51 +734,93 @@ class SequenceProcessor:
                         attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(model_device, non_blocking=True)
 
 
-                        # --- Unified, precision-stable forward (params-only, no autocast) ---
+
+
+
+                        # --- Unified, precision-stable forward (functional_call; no autocast) ---
                         # Build baseline/override mapping once per call:
                         if params_override is None:
+                            # Default: params-only in requested FO dtype (or preserve if no cast requested)
                             if self._params_zero is None:
-                                self._params_zero = self._build_params_override(v_named=None, eta=0.0)
+                                force_param_dtype = (
+                                    str_to_dtype(self._fo_cfg.get("dtype", "float32"))
+                                    if bool(self._fo_cfg.get("cast_params", True)) else None
+                                )
+                                self._params_zero = self._build_state_override(
+                                    v_named=None, eta=0.0,
+                                    param_dtype=force_param_dtype,
+                                    include_buffers=False,           # mirror the working probe
+                                    buffer_dtype=None,
+                                )
                             mapping = self._params_zero
                         else:
-                            mapping = params_override  # already a params-only mapping dict
+                            # Caller-provided (e.g., for η>0 scans)
+                            mapping = params_override
 
+                        # Sanity: mapping must be finite
                         if any(not torch.isfinite(v).all() for v in mapping.values()):
-                            bads = [k for k,v in mapping.items() if not torch.isfinite(v).all()]
+                            bads = [k for k, v in mapping.items() if not torch.isfinite(v).all()]
                             raise RuntimeError(f"Non-finite values inside params_override at η=0: e.g. {bads[:3]}")
 
-
-
+                        # First attempt (params-only)
                         logits_full = self._fc_logits_noautocast(input_seq, attn, mapping)
-                        # --- non-finite guard + auto-fallback ---
-                        if not torch.isfinite(logits_full).all() and self._fo_fallback_on_nan:
-                            self.logger.warning("[TF no-grad] Non-finite logits with params-only mapping at %s; "
-                                                "retrying with buffers cast to %s.",
-                                                str(self._fo_dtype), str(self._fo_dtype))
-                            # retry: params+buffers at self._fo_dtype
-                            mapping_pb = self._build_params_override(
-                                v_named=None if params_override is None else {},  # keep same η path
-                                eta=0.0 if params_override is None else 0.0,     # η path for TF is 0 here
+                        logits = logits_full[0]
+
+                        # ---- Guard: retry ladder on non-finite ----
+                        if not torch.isfinite(logits).all():
+                            self._log_once(
+                                "tf_nonfinite_retry_pb64",
+                                "[TF no-grad] Non-finite logits with params-only mapping; retrying with params+buffers."
+                            )
+                            # Retry 1: params+buffers in FO dtype
+                            fo_dtype = (
+                                str_to_dtype(self._fo_cfg.get("dtype", "float32"))
+                                if bool(self._fo_cfg.get("cast_params", True)) else None
+                            )
+                            mapping_pb = self._build_state_override(
+                                v_named=None, eta=0.0,
+                                param_dtype=fo_dtype,
+                                include_buffers=True,
+                                buffer_dtype=fo_dtype,
                             )
                             logits_full = self._fc_logits_noautocast(input_seq, attn, mapping_pb)
-                            if not torch.isfinite(logits_full).all():
-                                self.logger.warning("[TF no-grad] Still non-finite with params+buffers at %s; "
-                                                    "retrying with params+buffers at %s.",
-                                                    str(self._fo_dtype), str(self._fo_fallback_dtype))
-                                # final retry at fp32
-                                old_dtype = self._fo_dtype
-                                self._fo_dtype = self._fo_fallback_dtype
-                                mapping_pb32 = self._build_params_override(
-                                    v_named=None if params_override is None else {},
-                                    eta=0.0,
+                            logits = logits_full[0]
+
+                            if not torch.isfinite(logits).all():
+                                self._log_once(
+                                    "tf_nonfinite_retry_pb32",
+                                    "[TF no-grad] Still non-finite with params+buffers; retrying in pure float32."
+                                )
+                                # Retry 2: params+buffers in safe fp32
+                                mapping_pb32 = self._build_state_override(
+                                    v_named=None, eta=0.0,
+                                    param_dtype=torch.float32,
+                                    include_buffers=True,
+                                    buffer_dtype=torch.float32,
                                 )
                                 logits_full = self._fc_logits_noautocast(input_seq, attn, mapping_pb32)
-                                self._fo_dtype = old_dtype
-                                if not torch.isfinite(logits_full).all():
-                                    raise RuntimeError("TF no-grad still non-finite after dtype fallback.")
+                                logits = logits_full[0]
 
+                                if not torch.isfinite(logits).all():
+                                    self._log_once(
+                                        "tf_nonfinite_retry_preserve",
+                                        "[TF no-grad] Still non-finite after dtype fallback; retrying with "
+                                        "params-only, preserve live dtypes (η=0 equals direct forward)."
+                                    )
+                                    # Retry 3: last resort — preserve live dtypes (exactly the direct model state)
+                                    mapping_preserve = self._build_state_override(
+                                        v_named=None, eta=0.0,
+                                        param_dtype=None,       # no cast
+                                        include_buffers=False,  # params-only, like the working probe
+                                        buffer_dtype=None,
+                                    )
+                                    logits_full = self._fc_logits_noautocast(input_seq, attn, mapping_preserve)
+                                    logits = logits_full[0]
 
-                        logits = logits_full[0]  # [actual_len, V]
+                                    if not torch.isfinite(logits).all():
+                                        # Give up — something else is wrong with inputs/kernels
+                                        raise RuntimeError("TF no-grad still non-finite after dtype fallback.")
+
 
 
                         # Optional logits upcast per config: precision.tf_nograd.cast_logits_fp32 (default True)
