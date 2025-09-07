@@ -315,12 +315,19 @@ def main():
     #}})
 
 
-    # force identical precision profiles for this probe
-    cfg.setdefault('precision', {})
-    cfg['precision'].setdefault('tf_nograd', {}).update(
-        {'autocast': False, 'dtype': 'float32', 'cast_logits_fp32': True})
-    cfg['precision'].setdefault('func_override', {}).update(
-        {'autocast': False, 'dtype': 'float32', 'cast_params': False})
+    prec = cfg['precision']
+    prec.setdefault('func_override', {}).update({
+        'autocast': False,
+        'dtype': 'float64',
+        'cast_params': True,
+        'cast_buffers': False,    # important: params-only
+        'fallback_on_nan': False  # do not silently change dtype path
+    })
+    prec.setdefault('tf_nograd', {}).update({
+        'autocast': False,
+        'dtype': 'float64',
+        'cast_logits_fp32': False
+    })
 
     # Do NOT replace SequenceProcessor.config (a GenerationConfig) with a dict.
     # Instead, update precision profiles in-place so attribute access (e.g., gen_batch_size)

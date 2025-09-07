@@ -1587,23 +1587,24 @@ class SequenceProcessor:
 
         import torch.nn.functional as F
         # Compute in-place on the model device and in the forward dtype (fp64 if configured)
-        log_probs = F.log_softmax(gen_logits, dim=-1)                 # [T,V], device=dtype=forward
+        logits64  = gen_logits.float().to(torch.float64)
+        log_probs = torch.log_softmax(logits64, dim=-1)
         probs     = log_probs.exp()
-        entropy   = (-(probs * log_probs).sum(dim=-1))                # [T], forward dtype
-        tok_ix    = gen_tokens.view(-1, 1)                            # keep on device for gather
-        logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)            # [T], forward dtype
-        logit_on_t= gen_logits.gather(1, tok_ix).squeeze(1)           # [T], forward dtype
+        entropy   = (-(probs * log_probs).sum(dim=-1))
+        tok_ix    = gen_tokens.view(-1, 1).to(log_probs.device)
+        logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)
+        logit_on_t= logits64.gather(1, tok_ix).squeeze(1)
 
         K = min(topk, gen_logits.size(1))
         topv, topi = gen_logits.topk(k=K, dim=-1)                     # [T,K], [T,K]
         # Move to CPU at the end without downcasting; keep forward dtype
         return {
-            "tokens":        gen_tokens.detach().cpu(),
-            "logit_on_tok":  logit_on_t.detach().cpu().contiguous(),
-            "logprob_on_tok":logp_on_t.detach().cpu().contiguous(),
-            "entropy_naive": entropy.detach().cpu().contiguous(),
-            "topk_vals":     topv.detach().cpu().contiguous(),
-            "topk_idx":      topi.detach().cpu().contiguous(),
+            "tokens": gen_tokens.cpu(),
+            "logit_on_tok": logit_on_t.cpu().contiguous(),
+            "logprob_on_tok": logp_on_t.cpu().contiguous(),
+            "entropy_naive": entropy.cpu().contiguous(),
+            "topk_vals": logits64.topk(k=K, dim=-1)[0].cpu().contiguous(),
+            "topk_idx": logits64.topk(k=K, dim=-1)[1].cpu().contiguous(),
             "gen_start": gen_start, "gen_end": gen_end, "T": gen_end - gen_start,
         }
 
