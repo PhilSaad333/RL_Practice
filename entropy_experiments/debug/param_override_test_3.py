@@ -318,10 +318,10 @@ def main():
     prec = cfg['precision']
     prec.setdefault('func_override', {}).update({
         'autocast': False,
-        'dtype': 'float64',
+        'dtype': 'float32',
         'cast_params': True,
         'cast_buffers': False,    # important: params-only
-        'fallback_on_nan': 'float32'  # do not silently change dtype path
+        'fallback_on_nan': False  # do not silently change dtype path
     })
     prec.setdefault('tf_nograd', {}).update({
         'autocast': False,
