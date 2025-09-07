@@ -161,20 +161,15 @@ def build_functional_params_named(
 
         params_out[name] = eff
 
-    # Buffers dict (pass-through; some backbones carry critical buffers)
-    buffers_out: Dict[str, torch.Tensor] = {}
-    for name, b in buffers_named.items():
-        if isinstance(b, torch.Tensor) and torch.is_floating_point(b):
-            if force_buffer_dtype is not None:
-                b = b.to(dtype=force_buffer_dtype)
-            elif detach_buffers:
-                b = b.detach()
-        elif detach_buffers and isinstance(b, torch.Tensor):
-            b = b.detach()
-        buffers_out[name] = b
+    # --- buffers ---
+    bufs_out: Dict[str, torch.Tensor] = {}
+    for bname, b in m.named_buffers():
+        b_base = b.detach() if detach_buffers else b
+        b_dtype = force_buffer_dtype if force_buffer_dtype is not None else b_base.dtype
+        bufs_out[bname] = b_base.to(dtype=b_dtype)
 
 
-    return params_out, buffers_out
+    return params_out, bufs_out
 
 
 def merge_params_and_buffers(

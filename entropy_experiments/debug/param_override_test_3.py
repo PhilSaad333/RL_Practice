@@ -293,9 +293,11 @@ def main():
     )
     E_batch = probe._pack_E_from_sequences(E_sequences)
 
+    print("fo dtype:", sp._fo_dtype, "tf dtype:", sp._tf_dtype)
     dbg = sp.teacher_force_debug_probe(E_sequences, b_idx=0, g_idx=0,
                                     params_override=sp._build_params_override(None, 0.0))
     print("[dbg] logits dtype:", dbg["topk_vals"].dtype)
+
 
 
     # --- SP LOGITS CONTINUITY (full vocab) ---
