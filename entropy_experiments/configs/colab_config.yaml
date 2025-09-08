@@ -4,7 +4,6 @@ checkpoint:
   checkpoint_path: "/content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_40/model"
   optimizer_path: "/content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_40/optimizer.pt"
   backbone: "qwen2_5_15"
-  dtype: "bfloat16"
   device_map: "cuda"
 
 # === BATCH CONFIGURATION ===

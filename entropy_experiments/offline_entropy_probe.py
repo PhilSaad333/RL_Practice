@@ -21,11 +21,11 @@ Usage:
 from entropy_experiments.utils.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
 
 import torch
-#import torch.distributed as dist
+# import torch.distributed as dist
 from entropy_experiments.utils.sequence_processor import (
     SequenceProcessor, GenerationConfig, BatchedSequences,
 )
-#from torch.nn.parallel import DistributedDataParallel as DDP
+# from torch.nn.parallel import DistributedDataParallel as DDP
 import logging
 import time
 import math
@@ -42,19 +42,19 @@ from entropy_experiments.delta_entropy_is import DeltaEntropyIS
 from entropy_experiments.update_vector import compute_update_vector
 from entropy_experiments.utils.param_overrides import build_functional_params_named
 from entropy_experiments.utils.precision_utils import apply_global_precision, str_to_dtype
-#import entropy_experiments.utils.distributed_helpers as distributed_helpers
-#from entropy_experiments.utils.distributed_helpers import DistributedHelpers
+# import entropy_experiments.utils.distributed_helpers as distributed_helpers
+# from entropy_experiments.utils.distributed_helpers import DistributedHelpers
 from entropy_experiments.utils.detailed_logger import DetailedLogger
 
 
-class OfflineEntropyProbe:
+class EntropyMeasurements:
     """
     Offline entropy probe for analyzing entropy changes in RL training.
     
     This implements the complete pipeline for measuring ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â´HÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â (predicted entropy change)
     and ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂH (actual entropy change) given a training checkpoint.
 
-    Main method is run_mixed_probe.
+    Main method is run_mixed_probe, at the end of the class.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -532,34 +532,8 @@ class OfflineEntropyProbe:
     #----------------------------------------------------------------------------------------------
     #----------------------------------------------------------------------------------------------
 
-    def run_offline_analysis(self, checkpoint_path: str) -> Dict[str, Any]:
-        """
-        Run complete offline entropy analysis.
-        
-        Args:
-            checkpoint_path: Path to checkpoint to analyze
-            
-        Returns:
-            Dictionary with analysis results matching the interface specified
-            in offline_entropy_probe_strategy.txt section "Appendix: Minimal interfaces"
-        """
-        if not self.checkpoint_loaded:
-            # Get optimizer path from config if available
-            optimizer_path = self.config['checkpoint'].get('optimizer_path')
-            self.load_checkpoint(checkpoint_path, optimizer_path)
-                    
-        try:
-            # Delegate to the cleaner run_mixed_probe implementation
-            self.logger.info("Delegating to run_mixed_probe for unified analysis")
-            return self.run_mixed_probe()
-            
-        except Exception as e:
-            self.logger.error(f"Error during analysis: {e}")
-            raise
 
-
-
-    def run_mixed_probe(self) -> Dict[str, Any]:
+    def run_all_experiments(self) -> Dict[str, Any]:
         """
         Unified, single-GPU mixed probe:
         1) Sample U and E batches via SequenceProcessor (no DDP).
@@ -569,7 +543,6 @@ class OfflineEntropyProbe:
             - First-order ΔH1 ≈ X̄ · Δη using the same Δη = η v.
 
         Assumptions / conventions:
-        - Model/tokenizer/optimizer were loaded via `load_checkpoint` before this call.
         - SequenceProcessor enforces runtime fp32, with optional fp64 for entropy/log-softmax
             controlled by `config["precision"]["entropy_dtype"] in {float32,float64}`.
         - Top-p is forced to 1.0 in SP to keep the policy simple/consistent during probing.
@@ -582,8 +555,13 @@ class OfflineEntropyProbe:
             - E/U batch sizes and precision summary
             - aggregate timing
         """
+        
         if not self.checkpoint_loaded:
-            raise RuntimeError("Call `load_checkpoint(...)` first (model/tokenizer/optimizer must be ready).")
+            # Get optimizer path from config if available
+            checkpoint_path = self.config['checkpoint'].get('checkpoint_path')
+            optimizer_path = self.config['checkpoint'].get('optimizer_path')
+            self.load_checkpoint(checkpoint_path, optimizer_path)
+
 
         t0 = time.time()
         self.logger.info("=== Mixed Probe: start ===")
