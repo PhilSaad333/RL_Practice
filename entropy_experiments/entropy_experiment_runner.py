@@ -1,9 +1,5 @@
 """
-Offline Entropy Probe
-
-Main orchestrator class for the offline entropy probe analysis.
-Implements the strategy outlined in offline_entropy_probe_strategy.txt
-based on the theory from RL_studies.pdf.
+Main orchestrator class for the offline entropy experiments.
 
 Key functionality:
 - Load LoRA/QLoRA adapter and Adam optimizer state
