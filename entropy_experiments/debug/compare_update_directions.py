@@ -16,7 +16,7 @@ from typing import Dict
 
 import torch
 
-from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
+from entropy_experiments.entropy_experiment_runner import OfflineEntropyProbe
 from entropy_experiments.update_vector import compute_update_vector_step, compute_update_vector_adamw_manual
 from entropy_experiments.param_registry import flatten_named
 

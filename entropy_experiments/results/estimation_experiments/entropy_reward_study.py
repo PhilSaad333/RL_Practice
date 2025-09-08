@@ -33,7 +33,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from sequence_processing import SequenceProcessor, GenerationConfig
-from entropy_experiments.offline_entropy_probe import load_peft_for_probe
+from entropy_experiments.entropy_experiment_runner import load_peft_for_probe
 
 
 def clear_gpu_memory():

@@ -68,7 +68,7 @@ def test_parameter_override_pipeline():
     cfg = load_config(CONFIG_PATH)
     
     # Import after environment setup
-    from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
+    from entropy_experiments.entropy_experiment_runner import OfflineEntropyProbe
     from entropy_experiments.update_vector import compute_update_vector
     from entropy_experiments.utils.param_overrides import build_functional_params_named
     from entropy_experiments.utils.precision_utils import str_to_dtype

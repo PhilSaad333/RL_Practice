@@ -237,7 +237,7 @@ def main():
         pass
 
     # Project imports
-    from entropy_experiments.offline_entropy_probe import OfflineEntropyProbe
+    from entropy_experiments.entropy_experiment_runner import OfflineEntropyProbe
     from entropy_experiments.update_vector import compute_update_vector
 
     # Build probe & load checkpoint

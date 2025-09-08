@@ -13,7 +13,7 @@ Main components:
 - DistributedHelpers: Multi-GPU scalar communication helpers
 """
 
-from .offline_entropy_probe import OfflineEntropyProbe
+from .entropy_experiment_runner import OfflineEntropyProbe
 from .delta_entropy_approx import DeltaEntropyApprox
 from .utils.adam_preconditioner import AdamPreconditioner
 from .delta_entropy_is import DeltaEntropyIS

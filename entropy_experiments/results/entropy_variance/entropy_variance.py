@@ -61,7 +61,7 @@ import torch
 from transformers import GenerationConfig, LogitsProcessorList
 
 # Project imports (local package paths)
-from entropy_experiments.offline_entropy_probe import load_peft_for_probe
+from entropy_experiments.entropy_experiment_runner import load_peft_for_probe
 from rlp_datasets import DATASET_REGISTRY
 from evals.utils_io import StopAfterAnswer, generate_with_logprobs
 

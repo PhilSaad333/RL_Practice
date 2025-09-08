@@ -8,13 +8,12 @@ based on the theory from RL_studies.pdf.
 Key functionality:
 - Load LoRA/QLoRA adapter and Adam optimizer state
 - Sample batches of prompts and responses - E batch for "evaluation" or "entropy", U batch for "update"  
-- Compute first-order entropy change prediction ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â´HÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â after updating with U batch, using E batch to estimate entropy gradient
-- Compute estimators of the variance of ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â´HÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â (optional, config-driven) to get a sense of uncertainty
-- Measure actual entropy change ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂH via importance sampling (entropy estimated on E batch before/after update with U batch)
+- Compute first-order entropy change prediction after updating with U batch, using E batch to estimate entropy gradient
+- Measure actual entropy change via importance sampling (entropy estimated on E batch before/after update with U batch)
 
 Usage:
-    probe = OfflineEntropyProbe(config)
-    results = probe.run_offline_analysis(checkpoint_path)
+    probe = EntropyMeasurements(config)
+    results = probe.run_experiments()
 """
 
 # === Model and optimizer loading ===
@@ -533,7 +532,7 @@ class EntropyMeasurements:
     #----------------------------------------------------------------------------------------------
 
 
-    def run_all_experiments(self) -> Dict[str, Any]:
+    def run_experiments(self) -> Dict[str, Any]:
         """
         Unified, single-GPU mixed probe:
         1) Sample U and E batches via SequenceProcessor (no DDP).
@@ -555,7 +554,7 @@ class EntropyMeasurements:
             - E/U batch sizes and precision summary
             - aggregate timing
         """
-        
+
         if not self.checkpoint_loaded:
             # Get optimizer path from config if available
             checkpoint_path = self.config['checkpoint'].get('checkpoint_path')
