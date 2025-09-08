@@ -1,0 +1,76 @@
+
+# === MODEL AND CHECKPOINT ===
+checkpoint:
+  checkpoint_path: "/content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_40/model"
+  optimizer_path: "/content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_40/optimizer.pt"
+  backbone: "qwen2_5_15"
+  device_map: "cuda"
+
+# === BATCH CONFIGURATION ===
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  E_split: "test"
+  U_split: "train"
+  B_E: 512          # Smaller batch for debugging
+  B_U: 64
+  G: 8
+
+# === COMPUTATION OPTIONS ===
+estimator:
+  use_simple_entropy_for_x: false
+  eta_sweep: false
+  single_eta: 2e-5
+  eta_list: [1e-5, 2e-5, 4e-5, 8e-5, 1.6e-4, 3.2e-4, 6.4e-4, 1.28e-3]
+
+# === GROUND TRUTH ENTROPY CHANGE ===  
+true_delta_h:
+  microbatch_size: 4
+  is_mode: "snis"
+  clip_c: 10.0
+  report_per_token: false
+  snapshot_device: "cpu"  # offload to CPU if needed
+
+# === APPROXIMATE ENTROPY CHANGE ===
+approx_delta_h:
+  microbatch_size: 4
+  report_per_token: false
+
+
+# === GENERATION SETTINGS ===  
+generation:
+  temperature: 1.0
+  top_p: 1.0      # DON'T CHANGE
+  max_new_tokens: 150
+  gen_batch_size: 64
+  tf_batch_size: 8
+
+
+# === DETAILED LOGGING ===
+detailed_logging:
+  enabled: true
+  level: "standard"
+  log_sequences: false
+  log_tokens: false
+  log_raw_tensors: false
+  output_directory: "entropy_experiments/logs"
+  compress: true
+  max_files: 50
+
+# === OUTPUT CONFIGURATION ===
+output:
+  log_level: "INFO"
+  results_path: ""
+
+# NEW === NUMERICAL PRECISION SETTINGS ===
+# master precision settings for different compute paths
+precision:
+  # global math (optional)
+  allow_tf32: false         # or true on A100/H100 if you want speed
+  matmul_precision: high    # "high" or "highest"
+
+  # runtime model compute
+  runtime_dtype: float32    # enforced end-to-end (params + buffers, no AMP)
+
+  # entropy / log-softmax
+  entropy_dtype: float32    # set to float64 only if you need extra stability
+

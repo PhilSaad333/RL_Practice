@@ -45,20 +45,13 @@ from entropy_experiments.utils.detailed_logger import DetailedLogger
 
 class EntropyMeasurements:
     """
-    Offline entropy probe for analyzing entropy changes in RL training.
-    
-    This implements the complete pipeline for measuring ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â´HÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â (predicted entropy change)
-    and ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂH (actual entropy change) given a training checkpoint.
-
     Main method is run_mixed_probe, at the end of the class.
     """
     
     def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the offline entropy probe.
-        
         Args:
-            config: Configuration dictionary matching probe_config_template.yaml
+            config: Configuration dictionary matching configs/config_template.yaml
         """
         self.config = config
         
