@@ -2,10 +2,11 @@
 Main orchestrator class for the offline entropy experiments.
 
 Key functionality:
-- Load LoRA/QLoRA adapter and Adam optimizer state
-- Sample batches of prompts and responses - E batch for "evaluation" or "entropy", U batch for "update"  
-- Compute first-order entropy change prediction after updating with U batch, using E batch to estimate entropy gradient
-- Measure actual entropy change via importance sampling (entropy estimated on E batch before/after update with U batch)
+- Sample batches of prompts and responses - E batch for "evaluation" or "entropy", U batch for "update"
+- Compute the normalized update vector - the parameter updates from doing an RL update with the U batch, normalized by learning rate
+- For various learning rates eta:  
+    - Compute first-order entropy change prediction after updating with eta*update_vector, using E batch to estimate entropy gradient
+    - Measure actual entropy change via importance sampling (entropy estimated on E batch before/after update with)
 
 Usage:
     probe = EntropyMeasurements(config)
