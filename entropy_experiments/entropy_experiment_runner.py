@@ -17,10 +17,7 @@ Usage:
 from entropy_experiments.utils.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
 
 import torch
-# import torch.distributed as dist
-from entropy_experiments.utils.sequence_processor import (
-    SequenceProcessor, GenerationConfig, BatchedSequences,
-)
+
 # from torch.nn.parallel import DistributedDataParallel as DDP
 import logging
 import time
@@ -32,8 +29,11 @@ from pathlib import Path
 import yaml
 import json
 
+# import torch.distributed as dist
+from entropy_experiments.utils.sequence_processor import (
+    SequenceProcessor, GenerationConfig, BatchedSequences,
+)
 from entropy_experiments.delta_entropy_approx import DeltaEntropyApprox
-from entropy_experiments.utils.adam_preconditioner import AdamPreconditioner  
 from entropy_experiments.delta_entropy_is import DeltaEntropyIS
 from entropy_experiments.update_vector import compute_update_vector
 from entropy_experiments.utils.param_overrides import build_functional_params_named
