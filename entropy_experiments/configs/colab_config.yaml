@@ -1,5 +1,3 @@
-# 🧪 Lambda Test with top_p=1.0
-# Testing full distribution (no truncation)
 
 # === MODEL AND CHECKPOINT ===
 checkpoint:
@@ -19,43 +17,34 @@ batch_config:
   G: 8
 
 # === COMPUTATION OPTIONS ===
-computation_options:
-  compute_delta_h1: true
-  master_seed: none
-  mb_size_prompts: 4
-  weighting_mode: "dr_grpo"
-
 estimator:
   use_simple_entropy_for_x: false
+  eta_sweep: false
+  single_eta: 2e-5
+  eta_list: [1e-5, 2e-5, 4e-5, 8e-5, 1.6e-4, 3.2e-4, 6.4e-4, 1.28e-3]
 
 # === GROUND TRUTH ENTROPY CHANGE ===  
 true_delta_h:
-  enabled: true
-  training_loss: "rl"
   microbatch_size: 4
+  is_mode: "snis"
   clip_c: 10.0
   report_per_token: false
-  measure: "p"  # Use p measure since top_p=1.0
+  snapshot_device: "cpu"  # offload to CPU if needed
 
-# === PROBE REUSE / LOGGING ===
-probe_reuse:
-  # Do not write the raw Δθ buffer to JSON results (kept in-memory only)
-  log_param_update_buf: false
+# === APPROXIMATE ENTROPY CHANGE ===
+approx_delta_h:
+  microbatch_size: 4
+  report_per_token: false
 
 
 # === GENERATION SETTINGS ===  
 generation:
   temperature: 1.0
-  top_p: 1.0      # Full distribution - no truncation
+  top_p: 1.0      # DON'T CHANGE
   max_new_tokens: 150
   gen_batch_size: 64
   tf_batch_size: 8
 
-# === MEMORY CONFIGURATION ===
-memory_config:
-  amp: true
-  dtype: "bfloat16" 
-  microbatch_size: 4
 
 # === DETAILED LOGGING ===
 detailed_logging:
@@ -76,32 +65,13 @@ output:
 # NEW === NUMERICAL PRECISION SETTINGS ===
 # master precision settings for different compute paths
 precision:
-  # global GPU math toggles (once, at process init)
-  allow_tf32: false           # A100: tf32 on matmul/conv for fp32 ops
-  matmul_precision: high     # torch.set_float32_matmul_precision('high'|'medium'|'highest')
+  # global math (optional)
+  allow_tf32: false         # or true on A100/H100 if you want speed
+  matmul_precision: high    # "high" or "highest"
 
-  # forward-only (generation, teacher-forcing without grads)
-  tf_nograd:
-    autocast: false
-    dtype: float64           # for accurate entropy, use true fp32 math
-    cast_logits_fp32: false   # upcast logits to fp32 before entropy/logprob math
+  # runtime model compute
+  runtime_dtype: float32    # enforced end-to-end (params + buffers, no AMP)
 
-  # forward with grads (used by ΔH1, RB-with-grad, update-vector loss)
-  tf_withgrad:
-    autocast: false          # turn off autocast here by default
-    dtype: float64           # compute in true fp32 for stability
-    grad_to_fp32: true       # force-accum grads to fp32 if mixed modes leak in
+  # entropy / log-softmax
+  entropy_dtype: float32    # set to float64 only if you need extra stability
 
-  # functional_call with param overrides θ' = θ + η v
-  func_override:
-    autocast: false
-    dtype: float64        # try fp64 first
-    cast_buffers: true    # critical: include/cast buffers for SP path
-    fallback_on_nan: false
-    fallback_dtype: float32
-
-  # update-vector builder (rl_loss microbatched on U)
-  update_vector:
-    use_amp: false            # keep as you have today if stable
-    amp_dtype: float64      # use bf16 autocast in the microbatched forward
-    grads_fp32: true         # ensure grads stored/used in fp32

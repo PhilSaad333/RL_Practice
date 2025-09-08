@@ -10,14 +10,41 @@ from pathlib import Path
 import torch
 
 
+
+
+# --- runtime-precision helpers (local to loader) ---
+def _force_model_fp32_runtime(m: torch.nn.Module) -> torch.nn.Module:
+    """Upcast all parameters and buffers to fp32 and mark config dtype accordingly.
+    No-op for int/quantized tensors. Safe for LoRA; do not call on 4-bit base weights."""
+    # Cast parameters
+    for p in m.parameters(recurse=True):
+        if p.is_floating_point() and p.dtype is not torch.float32:
+            p.data = p.data.float()
+    # Cast buffers (e.g., layernorm stats, rotary caches, logits processors)
+    for mod in m.modules():
+        for name, buf in list(mod._buffers.items()):
+            if buf is not None and buf.is_floating_point() and buf.dtype is not torch.float32:
+                mod._buffers[name] = buf.float()
+    # Best-effort config annotation
+    if hasattr(m, "config") and getattr(m.config, "torch_dtype", None) != torch.float32:
+        try:
+            m.config.torch_dtype = torch.float32
+        except Exception:
+            pass
+    return m
+
+
+
+
 def load_peft_for_probe(
     base_id: str,
     adapter_path: str,
     *,
     use_qlora: bool = False,
-    dtype: str = "bf16",         # "bf16" or "fp16"
+    dtype: str = "fp32",         # "fp32" strongly recommended for your experiments
     device_map: str = "cuda",
     use_checkpointing: bool = False,
+    force_fp32_runtime: bool = True,   # <— new: upcast after PEFT attach
 ):
     """Load a PEFT (LoRA/QLoRA) model ready for probe computations.
 
@@ -28,10 +55,10 @@ def load_peft_for_probe(
     from peft import PeftModel
 
     torch_dtype = {
-        "bf16": torch.bfloat16, 
-        "bfloat16": torch.bfloat16,
-        "fp16": torch.float16, 
-        "float16": torch.float16
+        "fp32": torch.float32, "float32": torch.float32,
+        "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,  "float16": torch.float16,
+        "fp64": torch.float64,  "float64": torch.float64,  # rarely used at load
     }[dtype]
 
     if not use_qlora:
@@ -39,18 +66,18 @@ def load_peft_for_probe(
         base = AutoModelForCausalLM.from_pretrained(
             base_id,
             device_map=device_map,
-            torch_dtype=torch_dtype,
-            attn_implementation="eager",
+            torch_dtype=torch_dtype,              # caller can still pass bf16/fp16 if desired
+            attn_implementation="eager",          # required for stable VJP/functional_call
             trust_remote_code=True,
         )
-        if hasattr(base, "gradient_checkpointing_disable"):
-            base.gradient_checkpointing_disable()
-        if hasattr(base.config, "use_cache"):
-            base.config.use_cache = True
-
         peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
         if hasattr(peft, "enable_input_require_grads"):
             peft.enable_input_require_grads()
+
+        # Harden runtime precision as fp32 unless overridden explicitly
+        if force_fp32_runtime:
+            peft = _force_model_fp32_runtime(peft)
+
         return peft
 
     # QLoRA path
@@ -79,7 +106,12 @@ def load_peft_for_probe(
     peft = PeftModel.from_pretrained(base, adapter_path, is_trainable=True)
     if hasattr(peft, "enable_input_require_grads"):
         peft.enable_input_require_grads()
-    return peft
+        
+    # Do NOT upcast quantized weights. If you need full-fp32 runtime, load non-quantized LoRA instead.
+    if force_fp32_runtime and any(getattr(p, "is_quantized", False) for p in peft.parameters()):
+        # no-op but leave a breadcrumb via attribute for downstream logs
+        setattr(peft, "_probe_quantized_runtime", True)
+    return peft`
 
 
 def _remap_optimizer_state_ids(saved_state_dict: Dict[str, Any], optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
