@@ -425,85 +425,6 @@ def compute_update_vector_step(
     return delta_over_lr, stats
 
 
-def compute_update_vector_adamw(
-    *,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    U_batch: Dict[str, Any],
-    config: Dict[str, Any],
-    logger=None,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-    """Option A: Build update_vector using AdamW math from current grads and optimizer state.
-
-    Matches _rl_update slicing/masking/normalization (minus PPO/KL):
-    - temperature scaling
-    - token logp clamp/sanitize
-    - generation-only slice per prompt (prompt_len − 1, masked by attention)
-    - per-prompt loss: − sum_t,g (A_g * mask * logp) / (G * L_max_b)
-    - microbatch scaling: (B_mb/B_U) before backward
-    - optional grad clipping via config['max_grad_norm']
-    """
-    device = next(model.parameters()).device
-    sequences = U_batch["sequences"]          # [B, G, L]
-    attention_masks = U_batch["attention_masks"]
-    advantages = U_batch["advantages"].to(device)  # [B, G]
-    prompt_lens = U_batch["prompt_lens"]          # [B]
-    max_lengths = U_batch["max_lengths"]          # [B]
-    B, G, Lmax = sequences.shape
-
-    # Zero grads
-    model.zero_grad(set_to_none=True)
-
-    # Use same knobs as training/update
-    temp = float(config.get("generation", {}).get("temperature", 1.0))
-    importance_mb_size = int(config.get("true_delta_h", {}).get("microbatch_size", 1))
-
-    # Ensure train mode for grad path
-    was_training = model.training
-    model.train()
-    
-    if torch.cuda.is_available():
-        print(f"  [AdamW] Before forward pass: GPU alloc={torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
-    
-    try:
-        total_loss_val = rl_loss(
-            U_batch,
-            model,
-            temp=temp,
-            mb_size=importance_mb_size,
-            amp_dtype=_resolve_amp_dtype(config),
-            use_amp=bool(config.get("memory_config", {}).get("amp", False)),
-            backward_per_microbatch=True,
-        )
-        num_microbatches = (B + importance_mb_size - 1) // importance_mb_size
-    finally:
-        model.train(was_training)
-
-    # Optional grad clipping
-    max_norm = float(config.get("max_grad_norm", 0.0))
-    if max_norm and max_norm > 0.0:
-        # Clip over exactly the params the optimizer will step
-        params_to_clip = []
-        for g in optimizer.param_groups:
-            params_to_clip.extend([p for p in g.get("params", []) if p is not None])
-        if params_to_clip:
-            torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm)
-
-    # Build direction using AdamW math (per unit lr)
-    dir_named = _adamw_direction_from_grads(model, optimizer, only_optimizer_params=True)
-
-    # Clear grads to be polite
-    model.zero_grad(set_to_none=True)
-
-    vec_norm = torch.sqrt(sum((v.to(torch.float64) ** 2).sum() for v in dir_named.values())).item()
-    stats = {
-        "method": "adamw_from_grads",
-        "vec_norm": vec_norm,
-        "num_params": len(dir_named),
-        "avg_mb_loss": (total_loss_val / B) if B > 0 else 0.0,
-        "num_microbatches": num_microbatches,
-    }
-    return dir_named, stats
 
 
 def compute_update_vector_adamw_manual(
@@ -536,7 +457,7 @@ def compute_update_vector_adamw_manual(
             model,
             temp=temp,
             mb_size=importance_mb_size,
-            amp_dtype=_resolve_amp_dtype(config),
+            amp_dtype=_resolve_amp_dtype_from_cfg(config),
             use_amp=bool(config.get("memory_config", {}).get("amp", False)),
             backward_per_microbatch=True,
         )
