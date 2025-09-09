@@ -34,12 +34,13 @@ from entropy_experiments.utils.sequence_processor import (
     SequenceProcessor, GenerationConfig, BatchedSequences,
 )
 from entropy_experiments.delta_entropy_approx import DeltaEntropyApprox
-from entropy_experiments.delta_entropy_is import DeltaEntropyIS
+from entropy_experiments.delta_entropy_true import DeltaEntropyTrue
+
 from entropy_experiments.update_vector import compute_update_vector
 from entropy_experiments.utils.param_overrides import build_functional_params_named
+
 from entropy_experiments.utils.precision_utils import apply_global_precision, str_to_dtype
-# import entropy_experiments.utils.distributed_helpers as distributed_helpers
-# from entropy_experiments.utils.distributed_helpers import DistributedHelpers
+
 from entropy_experiments.utils.detailed_logger import DetailedLogger
 
 
@@ -605,12 +606,12 @@ class EntropyMeasurements:
         # 3) Prepare components for the two ΔH estimates
         # ---------------------------------------------------------------------
         # 3A) ΔH_true via importance sampling + functional param overrides
-        if self.delta_entropy_is is None:
-            self.delta_entropy_is = DeltaEntropyIS(
+        if self.delta_entropy_true is None:
+            self.delta_entropy_true = DeltaEntropyTrue(
                 model=self.model,
+                sequence_processor=self._sequence_processor,
                 config=self.config,
                 logger=self.logger,
-                sequence_processor=self._sequence_processor,
             )
 
         # Base IS config; we’ll override lr/eta per sweep item
@@ -673,7 +674,7 @@ class EntropyMeasurements:
             # If we’re on the fallback path, we must pass lr_override in cfg
             true_cfg = dict(true_cfg_base)
 
-            deltaH_true = self.delta_entropy_is.compute_delta_h_true(
+            deltaH_true = self.delta_entropy_true.compute_delta_h_true(
                 E_batch, 
                 v_named, 
                 float(eta), 
