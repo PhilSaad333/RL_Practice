@@ -24,6 +24,22 @@ from entropy_experiments.utils.precision_utils import force_grads_fp32, str_to_d
 
 
 
+
+def _resolve_amp_dtype_from_cfg(prec_section: dict, default: str = "bfloat16") -> torch.dtype:
+    """
+    Map a user-facing dtype string in `precision.update_vector.amp_dtype`
+    to a torch.dtype. Accepts synonyms and falls back to bf16.
+    """
+    name = str(prec_section.get("amp_dtype", default)).lower()
+    mapping = {
+        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+        "float16": torch.float16,   "fp16": torch.float16,
+        "float32": torch.float32,   "fp32": torch.float32,
+    }
+    return mapping.get(name, torch.bfloat16)
+
+
+
 def compute_update_vector(*, model, optimizer, U_batch, config, logger=None):
     """Preferred entry point: AdamW-from-grads update vector (per-unit-LR)."""
     return compute_update_vector_adamw(
