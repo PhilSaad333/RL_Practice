@@ -264,7 +264,7 @@ class EntropyMeasurements:
 
         # Generation config — keep it minimal & explicit
         gen_cfg = (self.config.get("generation", {}) or {}).copy()
-        gen_cfg.setdefault("max_length", 256)
+        gen_cfg.setdefault("max_new_tokens", 256)
         gen_cfg.setdefault("temperature", 1.0)
         gen_cfg.setdefault("top_p", 1.0)  # force deterministic tail unless you really need otherwise
 
