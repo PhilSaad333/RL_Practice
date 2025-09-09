@@ -144,7 +144,7 @@ class EntropyMeasurements:
     def load_checkpoint(self, adapter_path: str, optimizer_path: Optional[str] = None):
         # 1) Load PEFT model (fp32) and tokenizer
         self.model, self.tokenizer = load_peft_for_probe(
-            base_model_name=self.config['checkpoint']['backbone'],
+            base_id=self.config['checkpoint']['backbone'],
             adapter_path=adapter_path,
             device=self.config.get('device', 'cuda'),
             force_runtime_fp32=True,  # your model_loader already does this
