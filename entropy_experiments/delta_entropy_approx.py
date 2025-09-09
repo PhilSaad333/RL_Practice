@@ -1,3 +1,8 @@
+# Just a skeleton so far
+
+
+
+
 class DeltaEntropyApprox:
     def __init__(self, model, sequence_processor, config, logger):
         self.model = model

@@ -1,5 +1,5 @@
 """
-Main orchestrator class for the offline entropy experiments.
+Main orchestrator class for the entropy experiments.
 
 Key functionality:
 - Sample batches of prompts and responses - E batch for "evaluation" or "entropy", U batch for "update"
