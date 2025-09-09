@@ -606,11 +606,11 @@ class EntropyMeasurements:
         # 4) Eta sweep
         # ---------------------------------------------------------------------
 
-        comp_cfg = self.config.get("computation_options", {})
+        comp_cfg = self.config.get("estimator", {})
         if comp_cfg.get("eta_sweep", False):
             eta_list = comp_cfg.get("eta_list", [2e-5])
         else:
-            eta_list = comp_cfg.get("single_eta", [2e-5])
+            eta_list = [comp_cfg.get("single_eta", 2e-5)]
 
         self.logger.info(f"[sweep] η values: {eta_list}")
 
