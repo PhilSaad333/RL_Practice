@@ -39,7 +39,7 @@ approx_delta_h:
 # === GENERATION SETTINGS ===  
 generation:
   temperature: 1.0
-  top_p: 1.0      # DON'T CHANGE
+  top_p: 1.0      # DON'T CHANGE!!!!!!!
   max_new_tokens: 150
   gen_batch_size: 64
   tf_batch_size: 8
