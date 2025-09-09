@@ -597,20 +597,9 @@ class EntropyMeasurements:
             logger=self.logger,
         )
         t_v = time.time() - t_v
+        v_norm = float(v_stats.get("vec_norm", 0.0))
         self.logger.info(f"[update-vector] ||v||₂ ≈ {v_stats.get('vec_norm', 0.0):.3e}  ({t_v:.2f}s)")
 
-        # Helper: build a param-ID keyed Δη buffer from v_named and a scalar η
-        name_to_param = dict(self.model.named_parameters())
-        def build_param_update_buf_from_v(eta: float) -> Dict[int, torch.Tensor]:
-            buf: Dict[int, torch.Tensor] = {}
-            for n, dv in v_named.items():
-                p = name_to_param.get(n, None)
-                if p is None:
-                    continue
-                # Keep on CPU/fp32 for portability; downstream code can move to device if needed
-                dtheta = (eta * dv).detach().to("cpu", torch.float32).contiguous()
-                buf[id(p)] = dtheta
-            return buf
 
         # ---------------------------------------------------------------------
         # 3) Prepare components for the two ΔH estimates
@@ -640,6 +629,14 @@ class EntropyMeasurements:
                 model=self.model, config=self.config, logger=self.logger
             )
         
+
+        trainable_names = {n for n, _ in self.model.named_parameters() if _.requires_grad}
+        extra = [k for k in v_named if k not in trainable_names]
+        if extra:
+            self.logger.warning(f"[update-vector] v_named contains non-trainable keys (ignored by LoRA path): {extra[:5]}")
+
+
+
         # ---------------------------------------------------------------------
         # 4) Eta sweep
         # ---------------------------------------------------------------------

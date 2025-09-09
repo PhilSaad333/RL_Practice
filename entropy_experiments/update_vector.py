@@ -40,83 +40,83 @@ def compute_update_vector_adamw(
     config: Dict[str, Any],
     logger=None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-    """Build update_vector using AdamW math from current grads and optimizer state.
+    """
+    Build update_vector using AdamW math from current grads and optimizer state.
+    Output is name→tensor (CPU, fp32), normalized per-unit LR (Δθ / lr).
 
-    Matches _rl_update slicing/masking/normalization (minus PPO/KL):
-    - temperature scaling
-    - token logp clamp/sanitize
-    - generation-only slice per prompt (prompt_len − 1, masked by attention)
-    - per-prompt loss: − sum_t,g (A_g * mask * logp) / (G * L_max_b)
-    - microbatch scaling: (B_mb/B_U) before backward
-    - optional grad clipping via config['max_grad_norm']
+    Precision policy:
+      - Default: pure fp32 forward+backward (no autocast).
+      - If precision.update_vector.use_amp=True, uses autocast with dtype=precision.update_vector.amp_dtype
+        ONLY for the forward; grads still accumulate into fp32 params. You can additionally force
+        fp32 grad storage via precision.update_vector.grads_fp32.
     """
     device = next(model.parameters()).device
-    sequences = U_batch["sequences"]          # [B, G, L]
-    attention_masks = U_batch["attention_masks"]
-    advantages = U_batch["advantages"].to(device)  # [B, G]
-    prompt_lens = U_batch["prompt_lens"]          # [B]
-    max_lengths = U_batch["max_lengths"]          # [B]
-    B, G, Lmax = sequences.shape
+    B = int(U_batch["sequences"].shape[0])
+
+    # Precision knobs (opt-in AMP, default OFF)
+    uv_prec = (config.get("precision", {}) or {}).get("update_vector", {}) or {}
+    use_amp: bool = bool(uv_prec.get("use_amp", False))
+    amp_dtype: torch.dtype = _resolve_amp_dtype_from_cfg(uv_prec)
 
     # Zero grads
     model.zero_grad(set_to_none=True)
-
-    # Use same knobs as training/update
-    temp = float(config.get("generation", {}).get("temperature", 1.0))
-    importance_mb_size = int(config.get("true_delta_h", {}).get("microbatch_size", 1))
 
     # Ensure train mode for grad path
     was_training = model.training
     model.train()
 
-
     if torch.cuda.is_available():
         print(f"  [AdamW] Before forward pass: GPU alloc={torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
-    
-    uv_cfg = config.get('precision', {}).get('update_vector', {})
 
+    # Loss / backward accumulates across microbatches
     try:
         total_loss_val = rl_loss(
             U_batch,
             model,
-            temp=temp,
-            mb_size=importance_mb_size,
-            amp_dtype=uv_cfg.get("amp_dtype", False),
-            use_amp=bool(uv_cfg.get("use_amp", False)),
+            temp=float(config.get("generation", {}).get("temperature", 1.0)),
+            mb_size=int(config.get("true_delta_h", {}).get("microbatch_size", 1)),
+            amp_dtype=amp_dtype,
+            use_amp=use_amp,
             backward_per_microbatch=True,
         )
-        num_microbatches = (B + importance_mb_size - 1) // importance_mb_size
+        num_microbatches = (B + int(config.get("true_delta_h", {}).get("microbatch_size", 1)) - 1) // int(
+            config.get("true_delta_h", {}).get("microbatch_size", 1)
+        )
     finally:
         model.train(was_training)
 
-    if uv_cfg.get('grads_fp32', True):
+    # (Optional) force grads to fp32 storage if anything leaked in mixed modes
+    if bool(uv_prec.get("grads_fp32", True)):
         force_grads_fp32(model)
-
 
     # Optional grad clipping
     max_norm = float(config.get("max_grad_norm", 0.0))
-    if max_norm and max_norm > 0.0:
-        # Clip over exactly the params the optimizer will step
+    if max_norm > 0.0:
         params_to_clip = []
         for g in optimizer.param_groups:
             params_to_clip.extend([p for p in g.get("params", []) if p is not None])
         if params_to_clip:
             torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm)
 
-    # Build direction using AdamW math (per unit lr)
+    # Build per-unit-LR direction using AdamW math over optimizer params (LoRA trainables)
     dir_named = _adamw_direction_from_grads(model, optimizer, only_optimizer_params=True)
 
-    # Clear grads to be polite
+    # Clear grads
     model.zero_grad(set_to_none=True)
 
-    vec_norm = torch.sqrt(sum((v.to(torch.float64) ** 2).sum() for v in dir_named.values())).item()
+    vnorm64 = torch.sqrt(sum((v.to(torch.float64) ** 2).sum() for v in dir_named.values()))
+    vec_norm = float(vnorm64.item()) if vnorm64.numel() else 0.0
+
     stats = {
         "method": "adamw_from_grads",
         "vec_norm": vec_norm,
         "num_params": len(dir_named),
-        "avg_mb_loss": (total_loss_val / B) if B > 0 else 0.0,
+        "avg_mb_loss": (total_loss_val / max(B, 1)),
         "num_microbatches": num_microbatches,
+        "amp": {"enabled": use_amp, "dtype": str(amp_dtype).split(".")[-1]},
     }
+    if logger:
+        logger.info(f"[update-vector] built over {len(dir_named)} params; ||v||₂ ≈ {vec_norm:.3e}; AMP={use_amp}")
     return dir_named, stats
 
 
@@ -181,17 +181,21 @@ def _adamw_direction_from_grads(
     return dir_named
 
 
-def _resolve_amp_dtype(config: Dict[str, Any]) -> torch.dtype:
-    name = str(config.get("memory_config", {}).get("dtype", "bfloat16")).lower()
-    mapping = {
+def _resolve_amp_dtype_from_cfg(cfg: Dict[str, Any]) -> torch.dtype:
+    """
+    Map config string to torch dtype for autocast when precision.update_vector.use_amp=True.
+    Accepts: {"amp_dtype": "bfloat16"|"bf16"|"float16"|"fp16"|"float32"|"fp32"} (case-insensitive).
+    """
+    name = str(cfg.get("amp_dtype", "bfloat16")).lower()
+    return {
         "bfloat16": torch.bfloat16,
         "bf16": torch.bfloat16,
         "float16": torch.float16,
         "fp16": torch.float16,
         "float32": torch.float32,
         "fp32": torch.float32,
-    }
-    return mapping.get(name, torch.bfloat16)
+    }.get(name, torch.bfloat16)
+
 
 def rl_loss(
     U_batch: Dict[str, Any],
@@ -203,40 +207,57 @@ def rl_loss(
     use_amp: bool = False,
     backward_per_microbatch: bool = True,
 ) -> torch.Tensor | float:
-    """Compute RL-aligned naive loss over U with exact slicing/masking/normalization.
+    """
+    Compute RL-aligned naive loss over U with exact slicing/masking/normalization.
 
-    Loss per prompt b: - sum_{g,t in gen} A_{b,g} * logp_{b,g,t} / (G * L_max_b)
-    Returns a scalar tensor on the model device. Does not zero or step optimizer.
+    Precision policy:
+      - If use_amp=False (default): run in pure fp32.
+      - If use_amp=True: wrap *forward* in autocast(dtype=amp_dtype); logits are then cast to fp32
+        before log_softmax. Gradients still accumulate into param dtype (fp32 if you've forced the model).
     """
     device = next(model.parameters()).device
-    sequences = U_batch['sequences']          # [B_U, G, L]
-    prompt_lens = U_batch['prompt_lens']      # [B_U]
-    attention_masks = U_batch['attention_masks']  # [B_U, G, L]
-    advantages = U_batch['advantages'].to(device)        # [B_U, G]
-    max_lengths = U_batch['max_lengths']      # [B_U]
+    sequences = U_batch["sequences"]          # [B_U, G, L]
+    prompt_lens = U_batch["prompt_lens"]      # [B_U]
+    attention_masks = U_batch["attention_masks"]  # [B_U, G, L]
+    advantages = U_batch["advantages"].to(device)        # [B_U, G]
+    max_lengths = U_batch["max_lengths"]      # [B_U]
     B_U, G, Lmax = sequences.shape
 
     total_loss = torch.zeros((), device=device, dtype=torch.float32)
     total_loss_val: float = 0.0
+
     for start_b in range(0, B_U, mb_size):
         end_b = min(start_b + mb_size, B_U)
         B_mb = end_b - start_b
 
-        mb_seqs = sequences[start_b:end_b].to(device)
-        mb_masks = attention_masks[start_b:end_b].to(device)
-        mb_adv = advantages[start_b:end_b]
-        mb_Lmax = max_lengths[start_b:end_b]
-        mb_prompt = prompt_lens[start_b:end_b]
+        mb_seqs = sequences[start_b:end_b].to(device, non_blocking=True)
+        mb_masks = attention_masks[start_b:end_b].to(device, non_blocking=True)
+        mb_adv = advantages[start_b:end_b]                       # [B_mb, G]
+        mb_Lmax = max_lengths[start_b:end_b]                     # [B_mb]
+        mb_prompt = prompt_lens[start_b:end_b]                   # [B_mb]
 
         flat_seqs = mb_seqs.view(-1, Lmax)
         flat_masks = mb_masks.view(-1, Lmax)
 
-        with torch.amp.autocast("cuda", dtype=amp_dtype or torch.bfloat16, enabled=use_amp):
-            logits = model(flat_seqs, attention_mask=flat_masks).logits
-        logits = (logits / max(float(temp), 1e-8)).float()
+        # Forward in desired precision
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=amp_dtype or torch.bfloat16):
+                out = model(flat_seqs, attention_mask=flat_masks)
+                logits = out.logits if hasattr(out, "logits") else out[0]
+        else:
+            # Explicitly disable autocast to guarantee pure fp32 math
+            with torch.amp.autocast("cuda", enabled=False):
+                out = model(flat_seqs, attention_mask=flat_masks)
+                logits = out.logits if hasattr(out, "logits") else out[0]
+
+        # Normalize temperature and upcast to fp32 for stable log_softmax
+        logits = (logits / max(float(temp), 1e-8)).to(torch.float32)
+
         logp_all = torch.nn.functional.log_softmax(logits, dim=-1)
         targets = flat_seqs[:, 1:].unsqueeze(-1)
         new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)  # [B_mb*G, L-1]
+
+        # sanitize numerics (consistent with your downstream expectations)
         new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
         new_logp = new_logp.view(B_mb, G, -1)
 
@@ -258,18 +279,14 @@ def rl_loss(
             loss_b = -weighted_logp.sum() / (G * L_max_b + 1e-8)
             mb_loss_terms.append(loss_b)
 
-        mb_loss = (
-            torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=device)
-        )
+        mb_loss = torch.stack(mb_loss_terms).mean() if mb_loss_terms else torch.tensor(0.0, device=device)
         if backward_per_microbatch:
             (mb_loss * (B_mb / max(B_U, 1))).backward()
             total_loss_val += float(mb_loss.item()) * B_mb
         else:
             total_loss += (mb_loss * (B_mb / max(B_U, 1))).to(total_loss.dtype)
 
-    if backward_per_microbatch:
-        return (total_loss_val / max(B_U, 1))
-    return total_loss
+    return (total_loss_val / max(B_U, 1)) if backward_per_microbatch else total_loss
 
 
 
