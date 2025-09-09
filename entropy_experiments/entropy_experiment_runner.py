@@ -166,9 +166,7 @@ class EntropyMeasurements:
         if optimizer_path:
             self.optimizer = load_adam_optimizer_from_path(
                 self.model,
-                optimizer_path=optimizer_path,
-                device=self.config.get('device', 'cuda'),
-                logger=self.logger
+                optimizer_path=optimizer_path
             )
 
         self.checkpoint_loaded = True
