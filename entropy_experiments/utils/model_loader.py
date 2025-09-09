@@ -86,6 +86,7 @@ def load_peft_for_probe(
         # Load tokenizer
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(base_id, trust_remote_code=True)
+        tokenizer.padding_side = 'left'  # Critical for decoder-only models
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
@@ -126,6 +127,7 @@ def load_peft_for_probe(
     # Load tokenizer
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(base_id, trust_remote_code=True)
+    tokenizer.padding_side = 'left'  # Critical for decoder-only models
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
