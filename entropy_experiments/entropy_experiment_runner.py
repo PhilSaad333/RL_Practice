@@ -82,7 +82,7 @@ class EntropyMeasurements:
         # Initialize components
         self._sequence_processor = None
         self.delta_entropy_approx = None
-        self.delta_entropy_is = None
+        self.delta_entropy_true = None
         self.distributed_helpers = None
         
         # Model and data
@@ -174,40 +174,6 @@ class EntropyMeasurements:
             
           
         
-    def _initialize_components(self) -> None:
-        """Initialize all probe components after model/optimizer are loaded."""
-        self.delta_entropy_approx = DeltaEntropyApprox(
-            model=self.model,
-            config=self.config,
-            logger=self.logger
-        )
-        
-        self.adam_preconditioner = AdamPreconditioner(
-            optimizer=self.optimizer,
-            config=self.config,
-            logger=self.logger
-        )
-        
-        # Only initialize DeltaEntropyIS if importance sampling is enabled
-        if self.config['true_delta_h']['enabled']:
-            self.delta_entropy_is = DeltaEntropyIS(
-                model=self.model,
-                config=self.config,
-                logger=self.logger,
-                sequence_processor=getattr(self, '_sequence_processor', None),
-            )
-        else:
-            self.delta_entropy_is = None
-            self.logger.info("Importance sampling disabled (true_delta_h.enabled: false)")
-    
-        
-        if self.distributed:
-            self.distributed_helpers = DistributedHelpers(
-                world_size=self.world_size,
-                rank=self.rank,
-                config=self.config,
-                logger=self.logger
-            )
     
     # --- SequenceProcessor setup and sampling helpers ---
     def _sp_precision_config(self) -> dict:
