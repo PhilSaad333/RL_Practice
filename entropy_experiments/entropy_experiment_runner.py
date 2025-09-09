@@ -588,10 +588,10 @@ class EntropyMeasurements:
         }
 
         # 3B) ΔH1 ≈ X̄ · Δη (first-order approx on E)
-        if self.delta_entropy_approx is None:
-            self.delta_entropy_approx = DeltaEntropyApprox(
-                model=self.model, config=self.config, logger=self.logger
-            )
+        #if self.delta_entropy_approx is None:
+        #    self.delta_entropy_approx = DeltaEntropyApprox(
+        #        model=self.model, config=self.config, logger=self.logger
+        #    )
         
 
         trainable_names = {n for n, _ in self.model.named_parameters() if _.requires_grad}
