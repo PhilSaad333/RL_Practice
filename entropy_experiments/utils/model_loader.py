@@ -111,7 +111,7 @@ def load_peft_for_probe(
     if force_fp32_runtime and any(getattr(p, "is_quantized", False) for p in peft.parameters()):
         # no-op but leave a breadcrumb via attribute for downstream logs
         setattr(peft, "_probe_quantized_runtime", True)
-    return peft`
+    return peft
 
 
 def _remap_optimizer_state_ids(saved_state_dict: Dict[str, Any], optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
