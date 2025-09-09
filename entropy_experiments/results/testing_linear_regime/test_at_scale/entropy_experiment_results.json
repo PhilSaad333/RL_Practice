@@ -1,0 +1,58 @@
+{
+  "sweep": [
+    {
+      "eta": 1e-06,
+      "deltaH_true": -0.0009309771451945226,
+      "deltaH_approx": 0.0
+    },
+    {
+      "eta": 2e-06,
+      "deltaH_true": -0.0016511258613566282,
+      "deltaH_approx": 0.0
+    },
+    {
+      "eta": 4e-06,
+      "deltaH_true": -0.003232993715814536,
+      "deltaH_approx": 0.0
+    },
+    {
+      "eta": 8e-06,
+      "deltaH_true": -0.0063837339474155375,
+      "deltaH_approx": 0.0
+    },
+    {
+      "eta": 1.6e-05,
+      "deltaH_true": -0.013032179940397182,
+      "deltaH_approx": 0.0
+    },
+    {
+      "eta": 3.2e-05,
+      "deltaH_true": -0.027140359603044062,
+      "deltaH_approx": 0.0
+    },
+    {
+      "eta": 6.4e-05,
+      "deltaH_true": -0.05440298818794925,
+      "deltaH_approx": 0.0
+    },
+    {
+      "eta": 0.000128,
+      "deltaH_true": -0.1134667014976839,
+      "deltaH_approx": 0.0
+    }
+  ],
+  "B_E": 512,
+  "B_U": 64,
+  "G_U": 8,
+  "precision": {
+    "runtime_dtype": "float32",
+    "entropy_dtype": "float64"
+  },
+  "timing": {
+    "total": 811.7580173015594,
+    "sampling": 308.432505607605,
+    "update_vector": 21.220951318740845,
+    "true_total": 482.09482979774475,
+    "h_approx": 2.384185791015625e-07
+  }
+}

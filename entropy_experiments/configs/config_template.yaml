@@ -78,3 +78,7 @@ precision:
     use_amp: false         # default OFF = pure fp32 forward/backward here
     amp_dtype: bfloat16    # ignored unless use_amp: true
     grads_fp32: true       # force fp32 storage if mixed modes ever creep in
+  
+  tf_withgrad:
+    autocast: false
+    dtype: float32

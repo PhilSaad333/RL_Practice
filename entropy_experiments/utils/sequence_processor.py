@@ -97,6 +97,12 @@ class LogprobResults:
     token_logqs: Optional[List[List[torch.Tensor]]] = None    # [B][G] per-token log-q values
     sequence_logqs: Optional[List[List[float]]] = None        # [B][G] total sequence log-q
 
+    # Per-sequence scalar tensors that you can sum to build a single objective:
+    #   reinforce_terms[b][g] = Σ_k (G_k - b_k).detach() * log π(y_k | …)
+    #   rb_entropy_sums[b][g] = Σ_k H_RB,k   (kept with grad)
+    reinforce_terms: Optional[List[List[torch.Tensor]]] = None
+    rb_entropy_sums: Optional[List[List[torch.Tensor]]] = None
+
 
 @dataclass
 class DiagnosticsResults:
@@ -936,237 +942,338 @@ class SequenceProcessor:
         return logprob_results, diagnostics_results
     
     def _teacher_force_with_grad(
-        self, sequences: BatchedSequences, tf_batch_size: int, compute_rb: bool, return_baseline_features: bool = False
-    ) -> Tuple[LogprobResults, DiagnosticsResults]:
+            self,
+            sequences: BatchedSequences,
+            tf_batch_size: int,
+            compute_rb: bool,
+            return_baseline_features: bool = False,
+        ) -> Tuple[LogprobResults, DiagnosticsResults]:
         """
-        Gradient-enabled version
+        Teacher-forced evaluation WITH gradients, in a precision-stable configuration.
+
+        Purpose
+        -------
+        This path mirrors `_teacher_force_no_grad` but keeps the forward graph so that you can:
+        • form REINFORCE-style surrogate losses of the form  Σ_k (G_k − b_k).detach() * log π(t_k | t_{<k}, p),
+        • optionally add a differentiable Rao–Blackwell (RB) entropy term Σ_k H_k^{RB}(q_k) (if `config.rb_requires_grad`),
+        • subsequently take ∇_θ and Hessian–vector products outside this routine.
+
+        Design
+        ------
+        • Precision is controlled by `config.precision.tf_withgrad`:
+            - autocast (default: False) and dtype (default: float32) are respected via `forward_precision_ctx`.
+            - logits can be force-cast to fp32 via `precision.tf_withgrad.cast_logits_fp32` (default: True).
+        • We never use KV cache (teacher forcing).
+        • We do not mutate model parameters. This method evaluates the *live* module at θ.
+        (Use your existing param-override utilities at the call site if you need θ′ = θ + ηv.)
+        • Returned tensors intended to participate in gradients are left as `torch.Tensor`:
+            - per-token `logprobs` (graph-carrying),
+            - (optionally) per-token `rb_entropies_torch`.
+        Diagnostics and convenience scalars are returned as CPU numpy / Python numbers.
+
+        Returned structure
+        ------------------
+        Tuple[LogprobResults, DiagnosticsResults] where:
+        LogprobResults.logprobs[b][g]             -> torch.Tensor [T]   log π on realized tokens (graph-carrying)
+        LogprobResults.entropies[b][g]            -> np.ndarray [T]     naive surprisal −log π(t_k) (diagnostic)
+        LogprobResults.rb_entropies[b][g]         -> np.ndarray [T]     RB H(q_k) (always numpy copy for logging)
+        LogprobResults.rb_entropies_torch[b][g]   -> torch.Tensor [T]   RB H(q_k) if `rb_requires_grad=True` else empty
+        LogprobResults.token_logqs[b][g]          -> torch.Tensor [T]   log q_k(t_k) under sampling policy (temp+top-p)
+        LogprobResults.sequence_logprobs[b][g]    -> float              Σ_k log π(t_k)
+        LogprobResults.sequence_logqs[b][g]       -> float              Σ_k log q_k(t_k)
+        LogprobResults.baseline_feats_torch[b][g] -> torch.Tensor [T,7] (detached) optional φ_j features useful for
+            baselines/control-variates in entropy-gradient estimation:
+            columns = [H(q_k), top1_prob, margin(a_{(1)}−a_{(2)}), head_mass s_k, H([s_k,1−s_k]),
+                        Var_q[a], position_fraction j/L].
+
+        Notes on use
+        ------------
+        • To build your surrogate loss outside:
+            loss_sur = sum_over_b,g( (G_minus_b.detach() * logprobs[b][g]).sum() )
+                    + sum_over_b,g( rb_entropies_torch[b][g].sum() )   # if you want RB term in-graph
+        Then call `torch.autograd.grad(loss_sur, trainable_params, ...)` or `.backward()`.
+
         """
-        model = self._unwrap(self.model)
+        import numpy as np
+        import torch.nn.functional as F
+
+        mdl = self._unwrap(self.model)
+        device = next(mdl.parameters()).device
+
         B, G = sequences.sequences.shape[:2]
 
+        # Book-keeping
         all_logprobs = [[] for _ in range(B)]
         all_entropies = [[] for _ in range(B)]
         all_rb_entropies = [[] for _ in range(B)]
         all_sequence_logprobs = [[] for _ in range(B)]
-        all_token_logqs = [[] for _ in range(B)]  # Stage 2: log-q values
-        all_sequence_logqs = [[] for _ in range(B)]  # Stage 2: sequence log-q
-        rb_entropies_torch = [[] for _ in range(B)] if compute_rb and self.config.rb_requires_grad else None
-        baseline_feats_torch = [[] for _ in range(B)] if return_baseline_features else None
+        all_token_logqs = [[] for _ in range(B)]
+        all_sequence_logqs = [[] for _ in range(B)]
+        all_diagnostics = [[] for _ in range(B)]
+
+        # Optional outputs
+        rb_entropies_torch = (
+            [[] for _ in range(B)] if (compute_rb and bool(getattr(self.config, "rb_requires_grad", False))) else None
+        )
+        baseline_feats_torch = (
+            [[] for _ in range(B)] if return_baseline_features else None
+        )
+
+        # Precision profile for with-grad TF
+        prec_root = getattr(self, "config", None)
+        if hasattr(prec_root, "get"):  # dict-like config
+            tfwg = (prec_root.get("precision", {}) or {}).get("tf_withgrad", {}) or {}
+        else:                           # object-like config
+            prec = getattr(prec_root, "precision", None)
+            tfwg = getattr(prec, "tf_withgrad", {}) if prec is not None else {}
+
+        use_autocast = bool(tfwg.get("autocast", False))          # default: False (pure fp32)
+        ac_dtype     = str_to_dtype(tfwg.get("dtype", "float32")) # default: fp32
+        cast_logits  = bool(tfwg.get("cast_logits_fp32", True))
+
+        # Diagnostics helper (matches sampling policy)
+        top_p = float(getattr(self.config, "top_p", 1.0))
+        temperature = float(getattr(self.config, "temperature", 1.0))
+        diag = DistributionDiagnostics(
+            top_p=top_p,
+            temperature=temperature,
+            eos_token_id=getattr(self.tokenizer, "eos_token_id", None),
+        )
 
         for b in range(B):
             for g in range(G):
-                seq = sequences.sequences[b, g]          # [total_len]
-                prompt_len_padded = sequences.prompt_lens[b]    # this is the batch's padded prompt length
-                gen_len = sequences.gen_lens[b][g]
-                seq_len_total = seq.size(0)
+                seq = sequences.sequences[b, g]               # [total_len]
+                prompt_len_padded = int(sequences.prompt_lens[b])
+                gen_len = int(sequences.gen_lens[b][g])
 
-                if gen_len > 0 and seq_len_total > prompt_len_padded:
-                    # Take prompt + exactly gen_len tokens (prefix used for TF)
-                    actual_len = min(prompt_len_padded + gen_len, seq_len_total)
-                    input_seq = seq[:actual_len].unsqueeze(0)  # [1, actual_len]
+                # Slice actual prefix+gen and build masks
+                actual_len = prompt_len_padded + gen_len
+                if actual_len <= 0:
+                    # Keep structure; everything empty
+                    all_logprobs[b].append(torch.tensor([], device=device))
+                    all_entropies[b].append(np.array([]))
+                    all_rb_entropies[b].append(np.array([]))
+                    all_sequence_logprobs[b].append(0.0)
+                    all_token_logqs[b].append(torch.tensor([], device=device))
+                    all_sequence_logqs[b].append(0.0)
+                    if rb_entropies_torch is not None:
+                        rb_entropies_torch[b].append(torch.tensor([], device=device))
+                    if baseline_feats_torch is not None:
+                        baseline_feats_torch[b].append(torch.empty(0, 7))
+                    # Empty diagnostics pack
+                    all_diagnostics[b].append(DiagnosticsPack(
+                        step=TokenStepDiagnostics(
+                            rb_entropy=np.array([]),
+                            head_mass=np.array([]),
+                            tail_mass=np.array([]),
+                            two_point_entropy=np.array([]),
+                            top1_prob=np.array([]),
+                            margin=np.array([]),
+                            collision=np.array([]),
+                            renyi2=np.array([]),
+                            eff_support=np.array([]),
+                            logit_mean=np.array([]),
+                            logit_var=np.array([]),
+                            eos_prob=None,
+                        ),
+                        seq=SequenceDiagnostics(
+                            T=0,
+                            rb_entropy_sum=0.0,
+                            rb_entropy_mean=0.0,
+                            rb_entropy_max=0.0,
+                            rb_entropy_min=0.0,
+                            early_rb_entropy_mean=0.0,
+                            late_rb_entropy_mean=0.0,
+                            naive_surprisal_sum=0.0,
+                            naive_surprisal_mean=0.0,
+                            margin_mean=0.0,
+                            margin_sum=0.0,
+                            top1_prob_mean=0.0,
+                            collision_mean=0.0,
+                            renyi2_mean=0.0,
+                            eff_support_mean=0.0,
+                            eos_prob_mean=None,
+                        ),
+                    ))
+                    continue
 
-                    # ATTENTION: use the attention mask so left pads are ignored correctly
-                    attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(input_seq.device)
+                input_seq = seq[:actual_len].unsqueeze(0).to(device, non_blocking=True)      # [1, L]
+                attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(device, non_blocking=True)
 
-                    # Select precision profile for with-grad TF
-                    prec_root = getattr(self, "config", None)
-                    if hasattr(prec_root, "get"):  # dict-like config
-                        tfwg = (prec_root.get("precision", {}) or {}).get("tf_withgrad", {}) or {}
-                    else:                           # object-like config
-                        prec = getattr(prec_root, "precision", None)
-                        tfwg = getattr(prec, "tf_withgrad", {}) if prec is not None else {}
+                # Forward with gradients (no cache)
+                with forward_precision_ctx(autocast=use_autocast, dtype=ac_dtype):
+                    outputs = mdl(input_seq, attention_mask=attn, use_cache=False)
 
-                    use_autocast = bool(tfwg.get("autocast", False))          # default: False (pure fp32)
-                    ac_dtype     = str_to_dtype(tfwg.get("dtype", "float32")) # default: fp32
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]        # [1, L, V]
+                logits = logits[0]                                                           # [L, V]
+                if cast_logits and logits.dtype != torch.float32:
+                    logits = logits.float()
 
-                    # Forward pass with gradients enabled, teacher forcing never needs KV cache
-                    with forward_precision_ctx(autocast=use_autocast, dtype=ac_dtype):
-                        outputs = model(input_seq, attention_mask=attn, use_cache=False)
+                # Align generated region
+                gen_start = prompt_len_padded
+                gen_end   = prompt_len_padded + gen_len
 
-                    # Extract logits (HF-style or tuple) and keep them in graph
-                    logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-                    logits = logits[0]  # [actual_len, V]
+                gen_logits = logits[gen_start - 1 : gen_end - 1]      # [T, V]
+                gen_tokens = seq[gen_start : gen_end].to(device)      # [T]
+                T = gen_tokens.size(0)
 
-                    # (Optional) if you want logits arithmetic in fp32 even when autocast=True
-                    if bool(tfwg.get("cast_logits_fp32", False)) and logits.dtype != torch.float32:
-                        logits = logits.float()
+                if gen_logits.size(0) != T or T == 0:
+                    # Keep structure with empties
+                    all_logprobs[b].append(torch.tensor([], device=device))
+                    all_entropies[b].append(np.array([]))
+                    all_rb_entropies[b].append(np.array([]))
+                    all_sequence_logprobs[b].append(0.0)
+                    all_token_logqs[b].append(torch.tensor([], device=device))
+                    all_sequence_logqs[b].append(0.0)
+                    if rb_entropies_torch is not None:
+                        rb_entropies_torch[b].append(torch.tensor([], device=device))
+                    if baseline_feats_torch is not None:
+                        baseline_feats_torch[b].append(torch.empty(0, 7))
+                    all_diagnostics[b].append(DiagnosticsPack(
+                        step=TokenStepDiagnostics(
+                            rb_entropy=np.array([]),
+                            head_mass=np.array([]),
+                            tail_mass=np.array([]),
+                            two_point_entropy=np.array([]),
+                            top1_prob=np.array([]),
+                            margin=np.array([]),
+                            collision=np.array([]),
+                            renyi2=np.array([]),
+                            eff_support=np.array([]),
+                            logit_mean=np.array([]),
+                            logit_var=np.array([]),
+                            eos_prob=None,
+                        ),
+                        seq=SequenceDiagnostics(
+                            T=0,
+                            rb_entropy_sum=0.0,
+                            rb_entropy_mean=0.0,
+                            rb_entropy_max=0.0,
+                            rb_entropy_min=0.0,
+                            early_rb_entropy_mean=0.0,
+                            late_rb_entropy_mean=0.0,
+                            naive_surprisal_sum=0.0,
+                            naive_surprisal_mean=0.0,
+                            margin_mean=0.0,
+                            margin_sum=0.0,
+                            top1_prob_mean=0.0,
+                            collision_mean=0.0,
+                            renyi2_mean=0.0,
+                            eff_support_mean=0.0,
+                            eos_prob_mean=None,
+                        ),
+                    ))
+                    continue
 
+                # Per-token log π on realized tokens (graph-carrying)
+                log_probs = torch.log_softmax(gen_logits, dim=-1)                 # [T, V]
+                token_logprobs = log_probs.gather(1, gen_tokens.view(-1,1)).squeeze(1)  # [T]
 
-                    gen_start = prompt_len_padded
-                    gen_end   = prompt_len_padded + gen_len
+                # Per-token log q under sampling policy (temp+top-p) — used for IS/diagnostics
+                token_logqs = self._compute_logq_top_p(gen_logits, gen_tokens, top_p=top_p, temperature=temperature)  # [T]
 
-                    # Logits aligned to next-token targets for the generated tokens:
-                    # token t at position i uses logits at i-1
-                    gen_logits = logits[gen_start-1 : gen_end-1]   # [T = gen_len, V]
-                    gen_tokens = seq[gen_start : gen_end]          # [T]
+                # Naive surprisal (diagnostic only)
+                entropies_naive = (-token_logprobs).detach().float().cpu().numpy()
 
-                    if gen_logits.size(0) == gen_tokens.size(0) and gen_logits.size(0) > 0:
-                        # Naive per-token logprobs (p measure)
-                        log_probs = torch.log_softmax(gen_logits, dim=-1)
-                        token_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)   # [T]
-                        
-                        # Stage 2: Compute log-q values (sampling measure)
-                        token_logqs = self._compute_logq_top_p(
-                            gen_logits, gen_tokens, self.config.top_p, self.config.temperature
-                        )  # [T]
-
-                        # naive surprisal as numpy for now (diagnostic); keep torch if you want grads
-                        entropies_naive = (-token_logprobs).detach().float().cpu().numpy()
-
-                        # --- RB entropy path (config-gated) ---
-                        rb_np = np.array([])
-                        rb_t = None
-                        if compute_rb:
-                            if self.config.rb_requires_grad:
-                                # DIFFERENTIABLE RB: do NOT wrap in torch.no_grad()
-                                rb_t = self._rb_entropies_top_p(gen_logits, self.config.top_p, self.config.temperature)  # [T], torch
-                                rb_np = rb_t.detach().float().cpu().numpy()
-                            else:
-                                # Diagnostics-only RB: no grad
-                                with torch.no_grad():
-                                    rb_H = self._rb_entropies_top_p(gen_logits, self.config.top_p, self.config.temperature)
-                                    rb_np = rb_H.float().cpu().numpy()
-
-                        seq_logprob = float(token_logprobs.detach().sum().item())
-                        seq_logq = float(token_logqs.detach().sum().item())  # Stage 2
-                        
-                        # --- Baseline features (For diagonstics but also for regression baseline
-                        #  in RB entropy gradient, as well as candidates for control variates) ---
-                        phi = None
-                        if return_baseline_features:
-                            with torch.no_grad():
-                                # Derive masked logits a_masked and q exactly as in RB computation
-                                a = gen_logits / self.config.temperature  # [T, V]
-                                if self.config.top_p < 1.0:
-                                    p_full = torch.softmax(a, dim=-1)  # [T,V]
-                                    p_sorted, idx_sorted = p_full.sort(dim=-1, descending=True)
-                                    cumsum = p_sorted.cumsum(dim=-1)
-                                    keep_sorted = (cumsum - p_sorted) <= self.config.top_p
-                                    keep_sorted[..., 0] = True
-                                    keep = torch.zeros_like(p_full, dtype=torch.bool)
-                                    keep.scatter_(dim=-1, index=idx_sorted, src=keep_sorted)
-                                    a_masked = a.masked_fill(~keep, float('-inf'))
-                                    q = torch.softmax(a_masked, dim=-1)  # [T,V]
-                                    s = (p_full * keep).sum(dim=-1)  # [T] head mass
-                                    eps = (1.0 - s).clamp_min(0.0)
-                                    Z_S = torch.logsumexp(a_masked, dim=-1)  # [T]
-                                else:
-                                    a_masked = a
-                                    q = torch.softmax(a_masked, dim=-1)
-                                    s = torch.ones(a.size(0), device=a.device)
-                                    eps = torch.zeros_like(s)
-                                    Z_S = torch.logsumexp(a_masked, dim=-1)
-                                
-                                # H (RB entropy) on q
-                                H = Z_S - (q * a).sum(dim=-1)  # [T]
-                                
-                                # top1 prob and margin
-                                q_sorted, _ = q.sort(dim=-1, descending=True)
-                                top1 = q_sorted[..., 0]  # [T]
-                                a_sorted, _ = a_masked.sort(dim=-1, descending=True)
-                                a1 = a_sorted[..., 0]
-                                if a_sorted.shape[-1] > 1:
-                                    a2 = a_sorted[..., 1]
-                                else:
-                                    a2 = torch.full_like(a1, -float('inf'))
-                                margin = (a1 - a2).masked_fill(~torch.isfinite(a2), 0.0)  # [T]
-                                
-                                # two-point entropy H([s,eps])
-                                def _slog(x): 
-                                    return torch.log(x.clamp_min(1e-38))
-                                H2pt = -(s * _slog(s) + eps * _slog(eps))  # [T]
-                                
-                                # logit moments under q
-                                Ea = (q * a).sum(dim=-1)
-                                Ea2 = (q * (a * a)).sum(dim=-1)
-                                var_a = (Ea2 - Ea * Ea).clamp_min(0.0)  # [T]
-                                
-                                # position fraction j/L
-                                T = a.size(0)
-                                pos_frac = torch.arange(T, device=a.device, dtype=torch.float32) / max(T, 1)
-                                
-                                # Stack features in order: ["H", "top1", "margin", "head_mass", "two_point_entropy", "logit_var", "pos_frac"]
-                                feats = [H, top1, margin, s, H2pt, var_a, pos_frac]  # list of [T]
-                                phi = torch.stack(feats, dim=-1).detach()  # [T, d]
-                        
-                        # store torch tensors with grad
-                        all_logprobs[b].append(token_logprobs)
-                        all_entropies[b].append(entropies_naive)
-                        all_rb_entropies[b].append(rb_np)
-                        all_sequence_logprobs[b].append(seq_logprob)
-                        all_token_logqs[b].append(token_logqs)  # Stage 2
-                        all_sequence_logqs[b].append(seq_logq)  # Stage 2
-                        
-                        # Store torch RB if available
-                        if rb_entropies_torch is not None:
-                            if rb_t is not None:
-                                rb_entropies_torch[b].append(rb_t)
-                            else:
-                                rb_entropies_torch[b].append(torch.tensor([], device=gen_logits.device))
-                        
-                        # Store baseline features if available
-                        if baseline_feats_torch is not None:
-                            if phi is not None:
-                                baseline_feats_torch[b].append(phi)
-                            else:
-                                baseline_feats_torch[b].append(torch.tensor([]).view(0, 7))  # empty [0, 7] tensor
+                # RB entropy term
+                rb_np = np.array([])
+                rb_t = None
+                if compute_rb:
+                    if bool(getattr(self.config, "rb_requires_grad", False)):
+                        # Differentiable RB (kept in graph)
+                        rb_t = self._rb_entropies_top_p(gen_logits, top_p=top_p, temperature=temperature)   # [T]
+                        rb_np = rb_t.detach().float().cpu().numpy()
                     else:
-                        # Size mismatch or zero generation length
-                        all_logprobs[b].append(torch.tensor([], requires_grad=True))
-                        all_entropies[b].append(np.array([]))
-                        all_rb_entropies[b].append(np.array([]))
-                        all_sequence_logprobs[b].append(0.0)
-                        all_token_logqs[b].append(torch.tensor([], requires_grad=True))  # Stage 2
-                        all_sequence_logqs[b].append(0.0)  # Stage 2
-                        
-                        # Store empty torch RB if needed
-                        if rb_entropies_torch is not None:
-                            rb_entropies_torch[b].append(torch.tensor([], device=next(model.parameters()).device))
-                        
-                        # Store empty baseline features if needed
-                        if baseline_feats_torch is not None:
-                            baseline_feats_torch[b].append(torch.tensor([]).view(0, 7))
+                        with torch.no_grad():
+                            rb_tmp = self._rb_entropies_top_p(gen_logits, top_p=top_p, temperature=temperature)
+                        rb_np = rb_tmp.float().cpu().numpy()
+
+                # Sequence aggregates (Python scalars)
+                seq_logprob = float(token_logprobs.detach().sum().item())
+                seq_logq    = float(token_logqs.detach().sum().item())
+
+                # Optional baseline / CV feature matrix φ_j ∈ R^{T×7} (detached)
+                if return_baseline_features:
+                    with torch.no_grad():
+                        a = gen_logits / max(temperature, 1e-8)                         # [T, V]
+                        if top_p < 1.0:
+                            p_full = torch.softmax(a, dim=-1)                            # [T, V]
+                            p_sorted, idx_sorted = p_full.sort(dim=-1, descending=True)  # [T, V]
+                            cumsum = p_sorted.cumsum(dim=-1)
+                            keep_sorted = (cumsum - p_sorted) <= top_p
+                            keep_sorted[..., 0] = True
+                            keep = torch.zeros_like(p_full, dtype=torch.bool)
+                            keep.scatter_(dim=-1, index=idx_sorted, src=keep_sorted)
+                            a_masked = a.masked_fill(~keep, float('-inf'))               # [T, V]
+                            q = torch.softmax(a_masked, dim=-1)                          # [T, V]
+                            s = (p_full * keep).sum(dim=-1)                               # [T]
+                            eps = 1.0 - s
+                            Z_S = torch.logsumexp(a_masked, dim=-1)                       # [T]
+                        else:
+                            a_masked = a
+                            q = torch.softmax(a, dim=-1)
+                            s = torch.ones(a.size(0), device=a.device)
+                            eps = torch.zeros_like(s)
+                            Z_S = torch.logsumexp(a, dim=-1)
+
+                        # RB entropy H(q_k)
+                        H = Z_S - (q * a).sum(dim=-1)                                     # [T]
+
+                        # Top-1 prob and margin between top-2 logits (masked)
+                        q_sorted, _ = q.sort(dim=-1, descending=True)
+                        top1 = q_sorted[..., 0]
+                        a_sorted, _ = a_masked.sort(dim=-1, descending=True)
+                        a1 = a_sorted[..., 0]
+                        a2 = a_sorted[..., 1] if a_sorted.shape[-1] > 1 else torch.full_like(a1, -float('inf'))
+                        margin = (a1 - a2).masked_fill(~torch.isfinite(a2), 0.0)
+
+                        # Two-point entropy H([s_k, 1−s_k])
+                        def _slog(x: torch.Tensor) -> torch.Tensor:
+                            return torch.log(x.clamp_min(1e-38))
+                        H2pt = -(s * _slog(s) + eps * _slog(eps))
+
+                        # Logit variance under q
+                        Ea  = (q * a).sum(dim=-1)
+                        Ea2 = (q * (a * a)).sum(dim=-1)
+                        var_a = (Ea2 - Ea * Ea).clamp_min(0.0)
+
+                        # Position fraction j/L
+                        pos_frac = torch.arange(T, device=a.device, dtype=torch.float32) / max(T, 1)
+
+                        feats = [H, top1, margin, s, H2pt, var_a, pos_frac]              # list of [T]
+                        phi = torch.stack(feats, dim=-1).detach()                        # [T, 7]
+                else:
+                    phi = None
+
+                # Store
+                all_logprobs[b].append(token_logprobs)            # torch, carries graph
+                all_entropies[b].append(entropies_naive)          # numpy
+                all_rb_entropies[b].append(rb_np)                 # numpy
+                all_sequence_logprobs[b].append(seq_logprob)
+                all_token_logqs[b].append(token_logqs)            # torch
+                all_sequence_logqs[b].append(seq_logq)
+
+                if rb_entropies_torch is not None:
+                    rb_entropies_torch[b].append(rb_t if rb_t is not None else torch.tensor([], device=device))
+                if baseline_feats_torch is not None:
+                    baseline_feats_torch[b].append(phi if phi is not None else torch.empty(0, 7))
+
+                # Per-sequence diagnostics (computed with no-grad)
+                with torch.no_grad():
+                    all_diagnostics[b].append(diag.compute_from_logits(gen_logits, gen_tokens))
 
         logprob_results = LogprobResults(
             logprobs=all_logprobs,
             entropies=all_entropies,
             sequence_logprobs=all_sequence_logprobs,
             rb_entropies=all_rb_entropies,
-            rewards=[],  # Will be filled by generate_with_logprobs
-            rb_entropies_torch=rb_entropies_torch,  # Phase 2: torch RB tensors
-            baseline_feats_torch=baseline_feats_torch,  # Phase 3b: baseline features
-            token_logqs=all_token_logqs,  # Stage 2: per-token log-q
-            sequence_logqs=all_sequence_logqs,  # Stage 2: sequence log-q
+            rewards=[],                                   # filled elsewhere
+            rb_entropies_torch=rb_entropies_torch,        # torch RB tensors if requested
+            baseline_feats_torch=baseline_feats_torch,    # optional φ features (detached)
+            token_logqs=all_token_logqs,                  # per-token log-q (torch)
+            sequence_logqs=all_sequence_logqs,            # sequence log-q sums
         )
-        
-        # For now, return empty diagnostics for the with_grad version
-        # TODO: Add full diagnostics support if needed
-        B, G = len(all_logprobs), len(all_logprobs[0]) if all_logprobs else 0
-        empty_diagnostics = [[DiagnosticsPack(
-            step=TokenStepDiagnostics(
-                rb_entropy=np.array([]),
-                head_mass=np.array([]),
-                tail_mass=np.array([]),
-                two_point_entropy=np.array([]),
-                top1_prob=np.array([]),
-                margin=np.array([]),
-                collision=np.array([]),
-                renyi2=np.array([]),
-                eff_support=np.array([]),
-                logit_mean=np.array([]),
-                logit_var=np.array([]),
-                eos_prob=None
-            ),
-            seq=SequenceDiagnostics(
-                T=0, rb_entropy_sum=0.0, rb_entropy_mean=0.0, rb_entropy_max=0.0, rb_entropy_min=0.0,
-                early_rb_entropy_mean=0.0, late_rb_entropy_mean=0.0, naive_surprisal_sum=0.0, 
-                naive_surprisal_mean=0.0, margin_mean=0.0, margin_sum=0.0, top1_prob_mean=0.0,
-                collision_mean=0.0, renyi2_mean=0.0, eff_support_mean=0.0, eos_prob_mean=None
-            )
-        ) for g in range(G)] for b in range(B)]
-        
-        diagnostics_results = DiagnosticsResults(diagnostics=empty_diagnostics)
-        
+        diagnostics_results = DiagnosticsResults(diagnostics=all_diagnostics)
         return logprob_results, diagnostics_results
     
 
@@ -1335,7 +1442,7 @@ class SequenceProcessor:
         return sequences, logprob_results, diagnostics_results
     
     
-    # === NEW: helper for RB entropies with top-p (vectorized over timesteps) ===
+    # === Helper for RB entropies with top-p (vectorized over timesteps) ===
     def _rb_entropies_top_p(
         self,
         gen_logits: torch.Tensor,   # [T, V] logits aligned to next-token positions
@@ -1443,149 +1550,73 @@ class SequenceProcessor:
 
 
 
-    # ---------------- DEPRECATED? -------------------------
 
 
 
-    def _call_model_tf(
-        self,
-        input_ids,
-        attention_mask,
-        *,
-        params_override: dict[str, torch.Tensor] | None = None,
-    ):
-        """
-        Functional teacher-forcing call with precision control.
-
-        - If params_override is None: run the live module in eval() (no dropout),
-        under 'precision.tf_nograd'.
-        - If params_override is given (PARAMS ONLY): DO NOT inject buffers; we call
-        torch.func.functional_call with just the parameter overrides, so the
-        *live* buffers are used in both baseline and override paths.
-
-        All branches use use_cache=False for teacher forcing.
-        """
-        mdl = self._unwrap(self.model)
-        was_training = mdl.training
-        mdl.eval()
-
-        # Precision profile selection
-        cfg = getattr(self, "config", None)
-        if hasattr(cfg, "get"):  # dict-like
-            prec_cfg = cfg.get("precision", {}) or {}
-        else:                    # object-like
-            prec_cfg = getattr(cfg, "precision", {}) or {}
-
-        profile = "func_override" if params_override is not None else "tf_nograd"
-        pcfg = prec_cfg.get(profile, {}) if isinstance(prec_cfg, dict) else {}
-
-        default_autocast = (profile == "tf_nograd")
-        default_dtype = "bfloat16" if default_autocast else "float32"
-        use_autocast = bool(pcfg.get("autocast", default_autocast))
-        ac_dtype = str_to_dtype(pcfg.get("dtype", default_dtype))
-
-        try:
-            with forward_precision_ctx(autocast=use_autocast, dtype=ac_dtype):
-                if params_override is None:
-                    return mdl(input_ids, attention_mask=attention_mask, use_cache=False)
-
-                # Guard: ensure only parameters are provided (no accidental buffers)
-                # If you prefer, assert that all keys exist in named_parameters()
-                return torch.func.functional_call(
-                    mdl,
-                    params_override,               # ← PARAMS ONLY
-                    (input_ids,),
-                    {'attention_mask': attention_mask, 'use_cache': False},
-                )
-        finally:
-            if was_training:
-                mdl.train()
 
 
-    # ----------------------- DEBUG --------------------------
+
+
+    # -----------------------------------------------------------------------
+    # -------------- Helpers for grad path ------------------------------------
+    # ------------------------------------------------------------------------
+
+    # -------- Baseline EMA (optional) ---------------------------------
+    def _ensure_ema_capacity(self, T: int, decay: float = 0.1):
+        """Ensure we have an EMA vector of length ≥ T, stored on CPU and detached."""
+        if not hasattr(self, "_rb_resid_ema"):
+            self._rb_resid_ema = torch.zeros(0, dtype=torch.float32)
+            self._rb_ema_decay = float(decay)
+        if self._rb_resid_ema.numel() < T:
+            pad = torch.zeros(T - self._rb_resid_ema.numel(), dtype=self._rb_resid_ema.dtype)
+            self._rb_resid_ema = torch.cat([self._rb_resid_ema, pad], dim=0)
 
     @torch.no_grad()
-    def teacher_force_debug_probe(
-        self,
-        sequences,
-        *,
-        b_idx: int = 0,
-        g_idx: int = 0,
-        params_override: dict[str, torch.Tensor] | None = None,
-        max_T: int = 64,
-        topk: int = 10,
-    ) -> Dict[str, Any]:
+    def _update_resid_ema(self, resid: torch.Tensor):
         """
-        Run the *same* TF path as production (via _call_model_tf) for one (b,g).
-        Returns compact per-token diagnostics on CPU (fp32):
-
-        tokens [T]               realized next tokens
-        logit_on_tok [T]         logits at realized token
-        logprob_on_tok [T]       log-probs at realized token
-        entropy_naive [T]        -∑ p log p per step
-        topk_vals [T,K], topk_idx [T,K]
-        gen_start, gen_end, T
+        resid: [T] detached tensor of (G_k - H_RB,k).
+        Applies EMA across calls: μ ← (1-α) μ + α resid  (elementwise).
         """
-        mdl = self._unwrap(self.model)
-        device = next(mdl.parameters()).device
+        T = int(resid.numel())
+        self._ensure_ema_capacity(T)
+        alpha = self._rb_ema_decay
+        self._rb_resid_ema[:T].mul_(1.0 - alpha).add_(alpha * resid.cpu())
 
-        seq = sequences.sequences[b_idx, g_idx]
-        pl  = int(sequences.prompt_lens[b_idx])
-        Tgen= int(sequences.gen_lens[b_idx][g_idx])
-        Ltot= int(seq.size(0))
-        if Tgen <= 0 or Ltot <= pl:
-            return {"tokens": torch.empty(0, dtype=torch.long),
-                    "logit_on_tok": torch.empty(0), "logprob_on_tok": torch.empty(0),
-                    "entropy_naive": torch.empty(0),
-                    "topk_vals": torch.empty(0, topk), "topk_idx": torch.empty(0, topk, dtype=torch.long),
-                    "gen_start": pl, "gen_end": pl, "T": 0}
-
-        actual_len = min(pl + Tgen, Ltot)
-        x = seq[:actual_len].unsqueeze(0).to(device)
-        m = sequences.attention_masks[b_idx, g_idx, :actual_len].unsqueeze(0).to(device)
-
-        # Build params-only mapping; preserve dtype if caller hands one in.
-
-        mapping = params_override if params_override is not None else self._build_params_override(None, 0.0)
-
-        logits_full = self._fc_logits_noautocast(x, m, mapping)
-        logits_full = logits_full[0] 
+    def _get_baseline(self, H_rb: torch.Tensor, mode: str = "Hk") -> torch.Tensor:
+        """
+        mode ∈ {"none", "Hk", "Hk_plus_ema"}.
+        Returns b_k as a [T] tensor (no grad).
+        """
+        T = H_rb.size(0)
+        if mode == "none":
+            return torch.zeros(T, dtype=H_rb.dtype, device=H_rb.device)
+        if mode == "Hk":
+            return H_rb.detach()
+        if mode == "Hk_plus_ema":
+            # ensure EMA exists; if not, this behaves like 'Hk' on first call
+            self._ensure_ema_capacity(T)
+            ema = self._rb_resid_ema[:T].to(H_rb.device, dtype=H_rb.dtype)
+            return (H_rb.detach() + ema)
+        raise ValueError(f"Unknown baseline mode: {mode}")
 
 
 
 
-        gen_start = pl
-        gen_end   = pl + Tgen
-        gen_logits = logits_full[gen_start-1:gen_end-1]  # [T,V]
-        gen_tokens = seq[gen_start:gen_end].to(device)
 
-        if max_T is not None and gen_logits.size(0) > max_T:
-            gen_logits = gen_logits[:max_T]
-            gen_tokens = gen_tokens[:max_T]
-            gen_end    = gen_start + int(max_T)
 
-        import torch.nn.functional as F
-        # Compute in-place on the model device and in the forward dtype (fp64 if configured)
-        logits64  = gen_logits.float().to(torch.float64)
-        log_probs = torch.log_softmax(logits64, dim=-1)
-        probs     = log_probs.exp()
-        entropy   = (-(probs * log_probs).sum(dim=-1))
-        tok_ix    = gen_tokens.view(-1, 1).to(log_probs.device)
-        logp_on_t = log_probs.gather(1, tok_ix).squeeze(1)
-        logit_on_t= logits64.gather(1, tok_ix).squeeze(1)
 
-        K = min(topk, gen_logits.size(1))
-        topv, topi = gen_logits.topk(k=K, dim=-1)                     # [T,K], [T,K]
-        # Move to CPU at the end without downcasting; keep forward dtype
-        return {
-            "tokens": gen_tokens.cpu(),
-            "logit_on_tok": logit_on_t.cpu().contiguous(),
-            "logprob_on_tok": logp_on_t.cpu().contiguous(),
-            "entropy_naive": entropy.cpu().contiguous(),
-            "topk_vals": logits64.topk(k=K, dim=-1)[0].cpu().contiguous(),
-            "topk_idx": logits64.topk(k=K, dim=-1)[1].cpu().contiguous(),
-            "gen_start": gen_start, "gen_end": gen_end, "T": gen_end - gen_start,
-        }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
