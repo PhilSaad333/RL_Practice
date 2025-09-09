@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import torch
 
-from entropy_experiments.sequence_processing.sequence_processor import SequenceProcessor
+from entropy_experiments.utils.sequence_processor import SequenceProcessor
 from entropy_experiments.utils.param_overrides import build_functional_params_named
 
 
