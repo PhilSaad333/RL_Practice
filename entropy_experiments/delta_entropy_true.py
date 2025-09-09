@@ -36,7 +36,7 @@ class DeltaEntropyTrue:
          lw_i = seq_logprob_new_i - seq_logprob_base_i
          w_i  = exp( clip(lw_i, -clip_c, +clip_c) - max_i(lw_i_clipped) )
 
-    - We cache the η=0 baseline per E-batch (keyed by id(E_batch['sequences_obj'])) to avoid recomputation
+    - We cache the η=0 baseline per E-batch (keyed by id(E_batch)) to avoid recomputation
       across η sweeps.
 
     Precision policy:
@@ -76,7 +76,7 @@ class DeltaEntropyTrue:
         Compute ΔH_true(η) on the given E-batch using sequence-level SNIS.
 
         Args:
-            E_batch: dict with at least "sequences_obj": BatchedSequences produced by SP sampling
+            E_batch: dict with BatchedSequences data (sequences, prompt_lens, gen_lens, attention_masks)
             v_named: named update direction (per-parameter tensors) such that Δθ(η) = η * v_named
             eta:     scalar step size
             cfg:     optional overrides, supports:
@@ -123,10 +123,9 @@ class DeltaEntropyTrue:
     def _batch_key(self, E_batch: Dict[str, Any]) -> int:
         """
         Lightweight identity key for caching within a single run. We assume the same
-        E_batch object (or same sequences_obj) is reused across η sweeps.
+        E_batch object is reused across η sweeps.
         """
-        seq_obj = E_batch.get("sequences_obj", None)
-        return id(seq_obj) if seq_obj is not None else id(E_batch)
+        return id(E_batch)
 
     @torch.no_grad()
     def _score_batch_base(self, E_batch: Dict[str, Any]) -> Tuple[_SeqStats, float]:
@@ -134,7 +133,15 @@ class DeltaEntropyTrue:
         One TF no-grad pass on θ to collect sequence logprobs and the integrand.
         Returns per-sequence stats and the mean baseline H across sequences.
         """
-        seqs = E_batch["sequences_obj"]
+        # Reconstruct BatchedSequences from E_batch data
+        from entropy_experiments.utils.sequence_processor import BatchedSequences
+        seqs = BatchedSequences(
+            sequences=E_batch["sequences"],
+            prompt_lens=E_batch["prompt_lens"], 
+            gen_lens=E_batch["gen_lens"],  # Use the original gen_lens
+            attention_masks=E_batch["attention_masks"],
+            responses_text=[]  # Not needed for teacher forcing
+        )
         use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
 
         # SP path (no params_override for baseline θ)
@@ -163,7 +170,15 @@ class DeltaEntropyTrue:
         """
         One TF no-grad pass on θ' = θ + η v using a *params-only* functional mapping in fp32.
         """
-        seqs = E_batch["sequences_obj"]
+        # Reconstruct BatchedSequences from E_batch data
+        from entropy_experiments.utils.sequence_processor import BatchedSequences
+        seqs = BatchedSequences(
+            sequences=E_batch["sequences"],
+            prompt_lens=E_batch["prompt_lens"],
+            gen_lens=E_batch["gen_lens"],  # Use the original gen_lens
+            attention_masks=E_batch["attention_masks"],
+            responses_text=[]  # Not needed for teacher forcing
+        )
         use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
 
         # Build params-only mapping (fp32) – single source of truth for overrides.

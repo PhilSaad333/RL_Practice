@@ -257,6 +257,7 @@ class EntropyMeasurements:
             'prompt_lens': seqs.prompt_lens,
             'advantages': advantages,
             'max_lengths': max_lengths,
+            'gen_lens': seqs.gen_lens,  # Store the original gen_lens for reconstruction
             'num_prompts': B,
             'num_responses_per_prompt': 1,
         }
