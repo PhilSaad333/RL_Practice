@@ -654,10 +654,14 @@ class EntropyMeasurements:
 
         # Compute normalized h_approx once
         t_approx = time.time()
-        h_approx_normalized = self.delta_entropy_approx.compute_delta_h_approx(
-                E_batch=E_batch,
-                v_named=v_named,
-            )
+
+        # temporary debug dummy result
+
+        h_approx_normalized = 0.0
+        #h_approx_normalized = self.delta_entropy_approx.compute_delta_h_approx(
+        #        E_batch=E_batch,
+        #        v_named=v_named,
+        #    )
         t_approx = time.time() - t_approx
         self.logger.info(f"[ΔHapprox] Computed h_approx_normalized in {t_approx:.2f}s")
 
