@@ -53,6 +53,11 @@ def load_peft_for_probe(
     """
     from transformers import AutoModelForCausalLM
     from peft import PeftModel
+    
+    # Resolve model registry shortcuts
+    from models import MODEL_REGISTRY
+    if base_id in MODEL_REGISTRY:
+        base_id = MODEL_REGISTRY[base_id]
 
     torch_dtype = {
         "fp32": torch.float32, "float32": torch.float32,
@@ -78,7 +83,13 @@ def load_peft_for_probe(
         if force_fp32_runtime:
             peft = _force_model_fp32_runtime(peft)
 
-        return peft
+        # Load tokenizer
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(base_id, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        return peft, tokenizer
 
     # QLoRA path
     from transformers import BitsAndBytesConfig
@@ -111,7 +122,14 @@ def load_peft_for_probe(
     if force_fp32_runtime and any(getattr(p, "is_quantized", False) for p in peft.parameters()):
         # no-op but leave a breadcrumb via attribute for downstream logs
         setattr(peft, "_probe_quantized_runtime", True)
-    return peft
+    
+    # Load tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(base_id, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    return peft, tokenizer
 
 
 def _remap_optimizer_state_ids(saved_state_dict: Dict[str, Any], optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
