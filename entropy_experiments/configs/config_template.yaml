@@ -11,14 +11,14 @@ batch_config:
   dataset_name: "gsm8k_r1_template"
   E_split: "test"
   U_split: "train"
-  B_E: 64          # Smaller batch for debugging
-  B_U: 8
+  B_E: 512          # Smaller batch for debugging
+  B_U: 64
   G: 8
 
 # === COMPUTATION OPTIONS ===
 estimator:
   use_simple_entropy_for_x: false
-  eta_sweep: false
+  eta_sweep: true
   single_eta: 2e-5
   eta_list: [1e-5, 2e-5, 4e-5, 8e-5, 1.6e-4, 3.2e-4, 6.4e-4, 1.28e-3]
 
@@ -72,7 +72,7 @@ precision:
   runtime_dtype: float32    # enforced end-to-end (params + buffers, no AMP)
 
   # entropy / log-softmax
-  entropy_dtype: float32    # set to float64 only if you need extra stability
+  entropy_dtype: float64    # set to float64 only if you need extra stability
 
   update_vector:
     use_amp: false         # default OFF = pure fp32 forward/backward here
