@@ -146,9 +146,8 @@ class EntropyMeasurements:
         self.model, self.tokenizer = load_peft_for_probe(
             base_id=self.config['checkpoint']['backbone'],
             adapter_path=adapter_path,
-            device=self.config.get('device', 'cuda'),
-            force_runtime_fp32=True,  # your model_loader already does this
-            logger=self.logger
+            device_map=self.config.get('device', 'cuda'),
+            force_pf32_runtime=True,  # your model_loader already does this
         )
 
         # (Optional) sanity log of example LoRA weight dtypes

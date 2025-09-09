@@ -43,7 +43,7 @@ def load_peft_for_probe(
     use_qlora: bool = False,
     dtype: str = "fp32",         # "fp32" strongly recommended for your experiments
     device_map: str = "cuda",
-    use_checkpointing: bool = False,
+    use_checkpointing: bool = True,
     force_fp32_runtime: bool = True,   # <— new: upcast after PEFT attach
 ):
     """Load a PEFT (LoRA/QLoRA) model ready for probe computations.
