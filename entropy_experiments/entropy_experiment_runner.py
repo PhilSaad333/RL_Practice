@@ -147,7 +147,7 @@ class EntropyMeasurements:
             base_id=self.config['checkpoint']['backbone'],
             adapter_path=adapter_path,
             device_map=self.config.get('device', 'cuda'),
-            force_pf32_runtime=True,  # your model_loader already does this
+            force_fp32_runtime=True,  # your model_loader already does this
         )
 
         # (Optional) sanity log of example LoRA weight dtypes
