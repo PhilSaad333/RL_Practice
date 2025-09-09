@@ -819,7 +819,7 @@ class SequenceProcessor:
 
                             # Stage 2: per-token log-q under the sampling policy
                             token_logqs = self._compute_logq_top_p(
-                                gen_logits, top_p=top_p, temperature=temperature
+                                gen_logits, gen_tokens, top_p=top_p, temperature=temperature
                             )  # [T]
 
                             # Convert to numpy / host
