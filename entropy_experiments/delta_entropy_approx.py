@@ -391,12 +391,6 @@ class DeltaEntropyApprox:
             (sur * float(scale)).backward()
 
 
-        # Optional hard check (comment out once stable)
-        if self.normalize == "per_sequence":
-            assert abs(scale_sum - 1.0) < 1e-6, f"scale_sum {scale_sum} != 1.0"
-
-
-
 
         # Collect grads on intersection (CPU/fp32) and contract with v
         grads_named = {}
