@@ -6,7 +6,7 @@ Script to run entropy experiments using the EntropyMeasurements class.
 import yaml
 import json
 from pathlib import Path
-from entropy_experiment_runner import EntropyMeasurements
+from entropy_experiments.entropy_experiment_runner import EntropyMeasurements
 
 def main():
     # Load config
