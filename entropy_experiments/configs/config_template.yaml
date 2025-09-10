@@ -38,7 +38,9 @@ approx_delta_h:
   microbatch_size: 8
   normalize: per_sequence          # <- requested
   baseline:
-    kind: Hk                       # subtract H_k as baseline in the score term
+    kind: Hk_ema           # H_k simplest
+    ema_beta: 0.95
+    pos_bins: 32      # bin by position fraction j/L
   report_per_token: false
   simple_baseline:
     kind: time_loo                  # 'time_loo' | 'time_mean' | 'none'

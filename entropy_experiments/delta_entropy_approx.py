@@ -168,6 +168,11 @@ class DeltaEntropyApprox:
         simple_baseline_cfg = (approx_cfg.get("simple_baseline", {}) or {})
         self.simple_baseline_kind = str(simple_baseline_cfg.get("kind", "time_loo")).lower()
 
+        self._ema_beta = float(baseline_cfg.get("ema_beta", 0.95))
+        self._pos_bins = int(baseline_cfg.get("pos_bins", 32))
+        self._ema_resid = torch.zeros(self._pos_bins, dtype=torch.float32)  # CPU ok
+        self._ema_cnt   = torch.zeros(self._pos_bins, dtype=torch.int64)
+
 
     # ---------------------------------------------------------------------------------------------
     # Public API
@@ -261,10 +266,6 @@ class DeltaEntropyApprox:
         baseline_means = []
         G_means = []
 
-        # for debug
-        scale_sum = 0.0
-        token_sum = 0
-
 
         for mb_E in self._iter_microbatches(E_batch, self.mb):
             # Teacher-forced with-grad forward
@@ -307,9 +308,20 @@ class DeltaEntropyApprox:
                     # Entropy-to-go G_k (detached weight)
                     G = torch.flip(torch.cumsum(torch.flip(H_rb.detach(), dims=[0]), dim=0), dims=[0])  # [T]
 
+
                     # Baseline b_k
                     if self.baseline_kind == "hk":
                         b_k = H_rb.detach()
+                    elif self.baseline_kind == "hk_ema"
+                        # bin by position fraction
+                        pos = torch.arange(T, device=H_rb.device, dtype=torch.float32) / max(T, 1)
+                        bins = torch.clamp((pos * self._pos_bins).long(), 0, self._pos_bins - 1)
+
+                        resid = (G - H_rb.detach())          # [T], detached
+                        # gather current EMA estimates
+                        mu_hat = self._ema_resid[bins.cpu()] # CPU tensor indexed by bins
+                        b_k = H_rb.detach() + mu_hat.to(H_rb.device)
+
                     elif self.baseline_kind == "none":
                         b_k = torch.zeros_like(G)
                     else:
@@ -352,6 +364,18 @@ class DeltaEntropyApprox:
                         # Surrogate: - Σ_t (logπ_t - b_t).detach() * logπ_t
                         sur = sur - ((lp_b - b_b).detach() * lp_b).sum()
 
+                        # Update EMA *after* using b_k, so the current weights don't depend on current residual
+                        if self.baseline_kind == "hk_ema":
+                            with torch.no_grad():
+                                for j in range(T):
+                                    b = int(bins[j].item())
+                                    self._ema_cnt[b] += 1
+                                    beta = self._ema_beta
+                                    self._ema_resid[b] = (
+                                        beta * self._ema_resid[b]
+                                        + (1.0 - beta) * resid[j].to(self._ema_resid.dtype).cpu()
+                                    )
+
                         # Diagnostics
                         b_vals.append(float(b_b.mean().item()))
                         # No meaningful "G" in this estimator; track mean logπ as a proxy
@@ -364,18 +388,8 @@ class DeltaEntropyApprox:
             baseline_means.append(float(sum(b_vals) / max(len(b_vals), 1)) if b_vals else 0.0)
             G_means.append(float(sum(G_vals) / max(len(G_vals), 1)) if G_vals else 0.0)
 
-            # for debug
-            scale_sum += float(scale)
-            token_sum += int(T_mb)
-
-
             (sur * float(scale)).backward()
 
-        # for debug
-        if self.logger:
-            self.logger.info(f"[delta-h approx][audit] scale_sum={scale_sum:.6f} "
-                            f"(target≈1.0 for normalize=per_sequence), total_tokens_used={total_tokens_used} "
-                            f"vs pre_count={T_total}")
 
         # Optional hard check (comment out once stable)
         if self.normalize == "per_sequence":
