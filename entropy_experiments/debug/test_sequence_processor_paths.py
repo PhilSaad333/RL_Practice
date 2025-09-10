@@ -59,20 +59,26 @@ def detach_logprob_results(results):
     The with-grad path returns tensors with gradients attached. We need to detach
     them and move to CPU for fair comparison with the no-grad path.
     """
-    detached_results = type(results)(
+    # Handle case where results might be a tuple (from teacher_force_logprobs_with_diagnostics)
+    if isinstance(results, tuple):
+        logprob_results = results[0]  # First element is LogprobResults
+    else:
+        logprob_results = results  # Direct LogprobResults
+    
+    detached_results = type(logprob_results)(
         logprobs=[],
-        entropies=results.entropies,  # These are numpy arrays, already detached
-        sequence_logprobs=results.sequence_logprobs,  # These are Python floats
-        rb_entropies=results.rb_entropies,  # These are numpy arrays  
-        rewards=getattr(results, 'rewards', []),  # Skip rewards as requested
+        entropies=logprob_results.entropies,  # These are numpy arrays, already detached
+        sequence_logprobs=logprob_results.sequence_logprobs,  # These are Python floats
+        rb_entropies=logprob_results.rb_entropies,  # These are numpy arrays  
+        rewards=getattr(logprob_results, 'rewards', []),  # Skip rewards as requested
         rb_entropies_torch=None,  # We don't compare the torch version
         baseline_feats_torch=None,
         token_logqs=None,  # We'll handle this separately if needed
-        sequence_logqs=getattr(results, 'sequence_logqs', [])
+        sequence_logqs=getattr(logprob_results, 'sequence_logqs', [])
     )
     
     # Detach logprobs: List[List[Tensor]] -> List[List[Tensor]] (detached, CPU)
-    for b_results in results.logprobs:
+    for b_results in logprob_results.logprobs:
         detached_b = []
         for g_tensor in b_results:
             if torch.is_tensor(g_tensor):
@@ -247,11 +253,9 @@ def verify_precision_settings(sp, logger):
     logger.info("=== Precision Settings Verification ===")
     
     # Check the precision configs that control the two paths
-    tf_cfg = sp._tf_cfg  # Controls no-grad path
-    fo_cfg = sp._fo_cfg  # Controls functional override (also no-grad)
-    
-    # The with-grad path uses precision.tf_withgrad, which should be in sp.config
-    tf_withgrad_cfg = getattr(sp, '_tf_withgrad_cfg', {})  # May not exist
+    # Use getattr with defaults to avoid AttributeError
+    tf_cfg = getattr(sp, '_tf_cfg', {})
+    fo_cfg = getattr(sp, '_fo_cfg', {})
     
     logger.info(f"No-grad TF config: autocast={tf_cfg.get('autocast', 'N/A')}, dtype={tf_cfg.get('dtype', 'N/A')}")
     logger.info(f"Functional override config: autocast={fo_cfg.get('autocast', 'N/A')}, dtype={fo_cfg.get('dtype', 'N/A')}")
@@ -260,10 +264,18 @@ def verify_precision_settings(sp, logger):
     entropy_fp64 = getattr(sp, '_entropy_fp64', False)
     logger.info(f"Entropy FP64: {entropy_fp64}")
     
+    # Check if there's a config object we can inspect
+    sp_config = getattr(sp, 'config', None)
+    if sp_config:
+        logger.info(f"SP config type: {type(sp_config)}")
+        if hasattr(sp_config, 'temperature'):
+            logger.info(f"SP generation config - temperature: {sp_config.temperature}, top_p: {getattr(sp_config, 'top_p', 'N/A')}")
+    
     return {
         'tf_cfg': tf_cfg,
         'fo_cfg': fo_cfg, 
-        'entropy_fp64': entropy_fp64
+        'entropy_fp64': entropy_fp64,
+        'sp_config_type': str(type(sp_config)) if sp_config else None
     }
 
 
@@ -309,7 +321,8 @@ def run_comparison_test(logger) -> Dict[str, Any]:
     torch.manual_seed(42)
     np.random.seed(42)
     
-    test_sequences, _, _ = sp.generate_with_logprobs(
+    # Generate test sequences - returns (BatchedSequences, LogprobResults, DiagnosticsResults)
+    test_sequences, test_logprobs, test_diagnostics = sp.generate_with_logprobs(
         prompts=None,  # Sample from dataset
         G=1,
         dataset_name="gsm8k_r1_template",
