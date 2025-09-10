@@ -78,4 +78,4 @@ class DeltaEntropyApprox:
         # Dot with v (uses float64 accumulation)
         delta_h_per_lr = float(dot_named(grads_named, v_named).item())  # ← your helper
         # add diagnostics...
-        return {'delta_h_per_lr': delta_h_per_lr, ...}
+        return {'delta_h_per_lr': delta_h_per_lr} #more
