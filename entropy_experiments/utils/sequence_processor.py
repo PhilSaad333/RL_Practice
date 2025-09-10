@@ -68,7 +68,7 @@ class GenerationConfig:
     tf_batch_size: int = 8   # Teacher forcing can handle larger batches
     
     # Phase 2: Enable differentiable RB entropies for gradient computation
-    rb_requires_grad: bool = False
+    rb_requires_grad: bool = True
 
 
 @dataclass
