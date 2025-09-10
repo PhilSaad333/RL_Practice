@@ -94,7 +94,7 @@ except Exception:
 
 # sequence processor dataclasses & API
 try:
-    from .sequence_processor import BatchedSequences, LogprobResults, DiagnosticsResults
+    from .utils.sequence_processor import BatchedSequences, LogprobResults, DiagnosticsResults
 except Exception:
     try:
         from sequence_processor import BatchedSequences, LogprobResults, DiagnosticsResults  # type: ignore
