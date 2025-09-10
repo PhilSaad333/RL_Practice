@@ -589,10 +589,13 @@ class EntropyMeasurements:
         }
 
         # 3B) ΔH1 ≈ X̄ · Δη (first-order approx on E)
-        #if self.delta_entropy_approx is None:
-        #    self.delta_entropy_approx = DeltaEntropyApprox(
-        #        model=self.model, config=self.config, logger=self.logger
-        #    )
+        if self.delta_entropy_approx is None:
+            self.delta_entropy_approx = DeltaEntropyApprox(
+                model=self.model,
+                sequence_processor=self._sequence_processor,
+                config=self.config,
+                logger=self.logger,
+            )
         
 
         trainable_names = {n for n, _ in self.model.named_parameters() if _.requires_grad}
@@ -622,10 +625,11 @@ class EntropyMeasurements:
         # temporary debug dummy result
 
         h_approx_normalized = 0.0
-        #h_approx_normalized = self.delta_entropy_approx.compute_delta_h_approx(
-        #        E_batch=E_batch,
-        #        v_named=v_named,
-        #    )
+        h_approx_normalized_dict = self.delta_entropy_approx.compute_delta_h_approx(
+                E_batch=E_batch,
+                v_named=v_named,
+            )
+        h_approx_normalized = h_approx_normalized_dict["delta_h_per_lr"]
         t_approx = time.time() - t_approx
         self.logger.info(f"[ΔHapprox] Computed h_approx_normalized in {t_approx:.2f}s")
 
