@@ -35,7 +35,7 @@ true_delta_h:
 # === APPROXIMATE ENTROPY CHANGE ===
 approx_delta_h:
   # You can keep 1, but 8 is a good default for better gradient statistics.
-  microbatch_size: 4
+  microbatch_size: 8
   normalize: per_sequence          # <- requested
   baseline:
     kind: Hk_ema           # H_k simplest
