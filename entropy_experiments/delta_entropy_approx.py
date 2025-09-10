@@ -312,7 +312,7 @@ class DeltaEntropyApprox:
                     # Baseline b_k
                     if self.baseline_kind == "hk":
                         b_k = H_rb.detach()
-                    elif self.baseline_kind == "hk_ema"
+                    elif self.baseline_kind == "hk_ema":
                         # bin by position fraction
                         pos = torch.arange(T, device=H_rb.device, dtype=torch.float32) / max(T, 1)
                         bins = torch.clamp((pos * self._pos_bins).long(), 0, self._pos_bins - 1)
