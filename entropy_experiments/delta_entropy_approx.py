@@ -165,6 +165,10 @@ class DeltaEntropyApprox:
 
         self.debug = bool(self.cfg.get("debug", False)) or bool(approx_cfg.get("debug", False))
 
+        simple_baseline_cfg = (approx_cfg.get("simple_baseline", {}) or {})
+        self.simple_baseline_kind = str(simple_baseline_cfg.get("kind", "time_loo")).lower()
+
+
     # ---------------------------------------------------------------------------------------------
     # Public API
     # ---------------------------------------------------------------------------------------------
@@ -315,21 +319,39 @@ class DeltaEntropyApprox:
                     sur = sur + ((G - b_k) * lp).sum() + H_rb.sum()
 
                 else:
-                    # Simple estimator: treat naive entropy as -logπ, no RB term
-                    # (kept as an option; rarely used)
-                    # Entropy-to-go over surprisal
-                    G = torch.flip(torch.cumsum(torch.flip((-lp).detach(), dims=[0]), dim=0), dims=[0])
-                    if self.baseline_kind == "hk":
-                        b_k = (-lp).detach()
-                    elif self.baseline_kind == "none":
-                        b_k = torch.zeros_like(G)
-                    else:
-                        b_k = (-lp).detach()
+                    # -------- Simple estimator for ∇ E[-log π]:
+                    # grad L = - (logπ - b).detach() * ∇ logπ
+                    # where b is action-independent (timewise batch baseline).
+                    # Gather ragged list first to build baselines jointly.
+                    lp_list: List[torch.Tensor] = []
+                    lengths: List[int] = []
+                    for b in range(len(res.logprobs)):
+                        lp_b: torch.Tensor = res.logprobs[b][0]  # [T_b], graph-carrying
+                        lengths.append(int(lp_b.numel()))
+                        if int(lp_b.numel()) > 0:
+                            lp_list.append(lp_b)
 
-                    b_vals.append(b_k.mean().item())
-                    G_vals.append(G.mean().item())
+                    # Build baselines for all sequences/time steps at once (detached)
+                    baselines = self._timewise_baseline_from_logps(lp_list, kind=self.simple_baseline_kind)
 
-                    sur = sur + ((G - b_k) * lp).sum()
+                    # Now accumulate the surrogate
+                    list_idx = 0
+                    for b in range(len(res.logprobs)):
+                        lp_b: torch.Tensor = res.logprobs[b][0]
+                        T_b = int(lp_b.numel())
+                        if T_b == 0:
+                            continue
+                        b_b = baselines[list_idx]  # same shape as lp_b
+                        list_idx += 1
+
+                        # Surrogate: - Σ_t (logπ_t - b_t).detach() * logπ_t
+                        sur = sur - ((lp_b - b_b).detach() * lp_b).sum()
+
+                        # Diagnostics
+                        b_vals.append(float(b_b.mean().item()))
+                        # No meaningful "G" in this estimator; track mean logπ as a proxy
+                        G_vals.append(float(lp_b.detach().mean().item()))
+
 
             # Normalize this microbatch contribution
             scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
@@ -493,3 +515,54 @@ class DeltaEntropyApprox:
                 attention_masks=s_atts,
                 responses_text=s_text,
             )
+
+    def _timewise_baseline_from_logps(
+        self,
+        logprob_list: List[torch.Tensor],
+        kind: str,
+    ) -> List[torch.Tensor]:
+        """
+        Build per-sequence, per-time baselines b[b][t] from a ragged list of logπ tensors.
+        kind:
+        - 'time_mean': b_t = mean_b(logπ_b[t]) across sequences with t valid
+        - 'time_loo' : b_t = mean over other sequences (leave-one-out)
+        - 'none'     : zeros
+        Returns a list of tensors with the same shapes/devices as logprob_list, detached.
+        """
+        if kind == "none" or len(logprob_list) == 0:
+            return [torch.zeros_like(lp) for lp in logprob_list]
+
+        max_T = max((int(lp.numel()) for lp in logprob_list), default=0)
+        device = logprob_list[0].device if logprob_list else torch.device("cpu")
+
+        # For each time j, collect sums and counts across sequences with T_b > j
+        sums = [torch.zeros((), device=device, dtype=logprob_list[0].dtype) for _ in range(max_T)]
+        cnts = [0 for _ in range(max_T)]
+        for lp in logprob_list:
+            T = int(lp.numel())
+            for j in range(T):
+                sums[j] = sums[j] + lp[j]
+                cnts[j] += 1
+
+        baselines: List[torch.Tensor] = []
+        for idx_b, lp in enumerate(logprob_list):
+            T = int(lp.numel())
+            if kind == "time_mean":
+                b = torch.empty_like(lp)
+                for j in range(T):
+                    c = max(cnts[j], 1)
+                    b[j] = sums[j] / c
+                baselines.append(b.detach())
+            elif kind == "time_loo":
+                b = torch.empty_like(lp)
+                for j in range(T):
+                    c = cnts[j]
+                    if c <= 1:
+                        b[j] = 0.0  # no alternative sample to leave out
+                    else:
+                        b[j] = (sums[j] - lp[j]) / (c - 1)
+                baselines.append(b.detach())
+            else:
+                # Fallback to no baseline
+                baselines.append(torch.zeros_like(lp))
+        return baselines
