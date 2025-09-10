@@ -261,6 +261,11 @@ class DeltaEntropyApprox:
         baseline_means = []
         G_means = []
 
+        # for debug
+        scale_sum = 0.0
+        token_sum = 0
+
+
         for mb_E in self._iter_microbatches(E_batch, self.mb):
             # Teacher-forced with-grad forward
             # Note: tf_batch_size can be ≤ microbatch size; cap by current B_mb
@@ -359,7 +364,25 @@ class DeltaEntropyApprox:
             baseline_means.append(float(sum(b_vals) / max(len(b_vals), 1)) if b_vals else 0.0)
             G_means.append(float(sum(G_vals) / max(len(G_vals), 1)) if G_vals else 0.0)
 
+            # for debug
+            scale_sum += float(scale)
+            token_sum += int(T_mb)
+
+
             (sur * float(scale)).backward()
+
+        # for debug
+        if self.logger:
+            self.logger.info(f"[delta-h approx][audit] scale_sum={scale_sum:.6f} "
+                            f"(target≈1.0 for normalize=per_sequence), total_tokens_used={total_tokens_used} "
+                            f"vs pre_count={T_total}")
+
+        # Optional hard check (comment out once stable)
+        if self.normalize == "per_sequence":
+            assert abs(scale_sum - 1.0) < 1e-6, f"scale_sum {scale_sum} != 1.0"
+
+
+
 
         # Collect grads on intersection (CPU/fp32) and contract with v
         grads_named = {}
