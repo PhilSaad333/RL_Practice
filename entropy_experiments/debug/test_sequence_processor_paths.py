@@ -52,19 +52,16 @@ def load_test_config() -> Dict[str, Any]:
     return config
 
 
-def detach_logprob_results(results):
+def detach_logprob_results(logprob_results):
     """
     Detach tensors from LogprobResults for numerical comparison.
     
     The with-grad path returns tensors with gradients attached. We need to detach
     them and move to CPU for fair comparison with the no-grad path.
-    """
-    # Handle case where results might be a tuple (from teacher_force_logprobs_with_diagnostics)
-    if isinstance(results, tuple):
-        logprob_results = results[0]  # First element is LogprobResults
-    else:
-        logprob_results = results  # Direct LogprobResults
     
+    Args:
+        logprob_results: LogprobResults object (not a tuple)
+    """
     detached_results = type(logprob_results)(
         logprobs=[],
         entropies=logprob_results.entropies,  # These are numpy arrays, already detached
@@ -344,20 +341,36 @@ def run_comparison_test(logger) -> Dict[str, Any]:
     
     # Path 1: No-grad (functional_call)
     logger.info("3a. Running no-grad path...")
-    logprob_results_no_grad = sp.teacher_force_logprobs(
+    no_grad_result = sp.teacher_force_logprobs(
         sequences=test_sequences,
         with_grad=False,
         compute_rb=True,
         params_override=None  # Use default cached zero-eta mapping
     )
     
+    # Extract LogprobResults from tuple if needed
+    if isinstance(no_grad_result, tuple):
+        logprob_results_no_grad = no_grad_result[0]
+        logger.info("3a. No-grad path returned tuple, extracted LogprobResults")
+    else:
+        logprob_results_no_grad = no_grad_result
+        logger.info("3a. No-grad path returned LogprobResults directly")
+    
     # Path 2: With-grad (live module)
     logger.info("3b. Running with-grad path...")
-    logprob_results_with_grad = sp.teacher_force_logprobs(
+    with_grad_result = sp.teacher_force_logprobs(
         sequences=test_sequences,
         with_grad=True,
         compute_rb=True
     )
+    
+    # Extract LogprobResults from tuple if needed
+    if isinstance(with_grad_result, tuple):
+        logprob_results_with_grad = with_grad_result[0]
+        logger.info("3b. With-grad path returned tuple, extracted LogprobResults")
+    else:
+        logprob_results_with_grad = with_grad_result
+        logger.info("3b. With-grad path returned LogprobResults directly")
     
     # Detach the with-grad results for comparison
     logger.info("3c. Detaching with-grad results...")
