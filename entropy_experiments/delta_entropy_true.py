@@ -18,7 +18,7 @@ class _SeqStats:
     All arrays are 1-D and aligned by sequence index.
     """
     seq_logprob: np.ndarray          # sum of token log-probs under the *current* model [N_seq]
-    integrand_seq: np.ndarray        # sequence integrand for entropy estimate (mean per-token) [N_seq]
+    integrand_seq: np.ndarray        # sequence integrand for entropy estimate (SUM over generated tokens) [N_seq]
     T_tokens: np.ndarray             # token count per sequence [N_seq]
 
 
@@ -230,7 +230,7 @@ class DeltaEntropyTrue:
         entropies_list   = _flatten_nested(lp_res.entropies)          # per-seq np.ndarray
         rb_list          = _flatten_nested(lp_res.rb_entropies)       # per-seq np.ndarray (or [])
 
-        # Sequence integrand: mean per-token entropy according to estimator choice
+        # Sequence integrand: per-sequence SUM of chosen tokenwise entropy
         integrand_vals = []
         T_tokens = []
         for i in range(len(seq_logprob_list)):
@@ -241,7 +241,7 @@ class DeltaEntropyTrue:
             arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
             T = int(arr.size)
             T_tokens.append(T)
-            integrand_vals.append(float(arr.mean()) if T > 0 else 0.0)
+            integrand_vals.append(float(arr.sum()) if T > 0 else 0.0)
 
         seq_lp_np = np.asarray(seq_logprob_list, dtype=np.float64)
         integ_np  = np.asarray(integrand_vals, dtype=np.float64)
