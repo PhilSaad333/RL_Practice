@@ -137,6 +137,36 @@ def compute_update_vector_adamw(
 
 
 
+def _infer_group_hparams(optimizer: torch.optim.Optimizer) -> Dict[int, Dict[str, Any]]:
+    """Map param_id to group hyperparams and per-param step.
+
+    Returns a dict mapping id(param) -> {
+        'betas', 'eps', 'weight_decay', 'lr', 'amsgrad', 'step'
+    } using the optimizer's param_groups and state.
+    """
+    param_hparams: Dict[int, Dict[str, Any]] = {}
+    for group in optimizer.param_groups:
+        betas = group.get("betas", (0.9, 0.999))
+        eps = float(group.get("eps", 1e-8))
+        weight_decay = float(group.get("weight_decay", 0.0))
+        lr = float(group.get("lr", 1.0))
+        amsgrad = bool(group.get("amsgrad", False))
+        for p in group["params"]:
+            if p is None:
+                continue
+            st = optimizer.state.get(p, {})
+            step = int(st.get("step", 0))
+            param_hparams[id(p)] = {
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": weight_decay,
+                "lr": lr,
+                "amsgrad": amsgrad,
+                "step": step,
+            }
+    return param_hparams
+
+
 def _adamw_direction_from_grads(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
