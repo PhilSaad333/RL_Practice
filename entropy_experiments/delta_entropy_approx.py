@@ -330,7 +330,20 @@ class DeltaEntropyApprox:
                             G = G[:T_eff]
                         beta = self._fit_regression_beta(phi, G)
                         if beta.numel() > 0:
-                            b_k = (phi.to(beta.dtype) @ beta).to(G.device, dtype=G.dtype).detach()
+                            # Predict on CPU with the same preprocessing used in fitting
+                            dtype = beta.dtype
+                            phi_cpu = phi.detach().to("cpu", dtype)
+                            if self.baseline_reg_normalize and phi_cpu.shape[1] > 0:
+                                mean = phi_cpu.mean(dim=0, keepdim=True)
+                                std = phi_cpu.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
+                                phi_n = (phi_cpu - mean) / std
+                            else:
+                                phi_n = phi_cpu
+                            if self.baseline_reg_intercept:
+                                ones = torch.ones((phi_n.shape[0], 1), dtype=dtype)
+                                phi_n = torch.cat([phi_n, ones], dim=1)
+                            pred_cpu = phi_n @ beta  # [T]
+                            b_k = pred_cpu.to(G.device, dtype=G.dtype).detach()
                         else:
                             b_k = H_rb.detach()  # fallback
                     elif self.baseline_kind == "hk":
