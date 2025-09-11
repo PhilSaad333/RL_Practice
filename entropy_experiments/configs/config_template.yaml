@@ -10,7 +10,7 @@ batch_config:
   dataset_name: "gsm8k_r1_template"
   E_split: "test"
   U_split: "train"
-  B_E: 32
+  B_E: 512
   B_U: 32
   G: 8
 
@@ -46,7 +46,7 @@ approx_delta_h:
   # Baseline settings for RB estimator paths (both methods use this 'kind')
   baseline:
     # 'hk' | 'hk_ema' | 'regression' | 'hk_ridge' | 'none'
-    kind: regression
+    kind: hk_ridge
 
     # hk_ema controls (used when kind == 'hk_ema')
     ema_beta: 0.95
