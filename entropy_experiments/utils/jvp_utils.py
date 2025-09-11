@@ -84,11 +84,44 @@ def make_seq_outputs_closure(
         params_map = dict(base_map)
         for n, t in zip(names, params_tuple):
             params_map[n] = t
-        out = functional_call(
-            mdl, params_map,
-            (input_ids.unsqueeze(0),),
-            {"attention_mask": attention_mask.unsqueeze(0), "use_cache": False}
-        )
+
+        # Some HF models register a forward hook (make_inputs_require_grads) when
+        # gradient checkpointing is enabled. That hook calls requires_grad_ inside
+        # the transformed function, which is incompatible with functorch.jvp.
+        # Temporarily disable gradient checkpointing / input-requires-grad hook.
+        restore_ckpt = False
+        restore_input_req = False
+        try:
+            if getattr(mdl, "is_gradient_checkpointing", False):
+                try:
+                    mdl.gradient_checkpointing_disable()
+                    restore_ckpt = True
+                except Exception:
+                    pass
+            if hasattr(mdl, "disable_input_require_grads"):
+                try:
+                    mdl.disable_input_require_grads()
+                    restore_input_req = True
+                except Exception:
+                    pass
+
+            out = functional_call(
+                mdl, params_map,
+                (input_ids.unsqueeze(0),),
+                {"attention_mask": attention_mask.unsqueeze(0), "use_cache": False}
+            )
+        finally:
+            # Restore model hooks/state if we disabled them
+            if restore_input_req and hasattr(mdl, "enable_input_require_grads"):
+                try:
+                    mdl.enable_input_require_grads()
+                except Exception:
+                    pass
+            if restore_ckpt:
+                try:
+                    mdl.gradient_checkpointing_enable()
+                except Exception:
+                    pass
         logits = out.logits
         start = max(int(prompt_len) - 1, 0)
         end = start + int(T)
@@ -102,4 +135,3 @@ def make_seq_outputs_closure(
         return logp_vec, H_sum
 
     return _f
-
