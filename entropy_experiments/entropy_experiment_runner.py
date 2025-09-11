@@ -619,17 +619,24 @@ class EntropyMeasurements:
 
         sweep_results = []
 
-        # Compute normalized h_approx once
+        # Compute normalized h_approx once (choose method per config)
         t_approx = time.time()
 
-        # temporary debug dummy result
-
-        h_approx_normalized = 0.0
-        h_approx_normalized_dict = self.delta_entropy_approx.compute_delta_h_approx(
+        approx_cfg = (self.config.get("approx_delta_h", {}) or {})
+        method = str(approx_cfg.get("method", "grad_dot")).lower()
+        if method in {"jvp", "forward", "jvp_rb"}:
+            self.logger.info("[h_approx] Using JVP method")
+            h_approx_normalized_dict = self.delta_entropy_approx.compute_delta_h_approx_jvp(
                 E_batch=E_batch,
                 v_named=v_named,
             )
-        h_approx_normalized = h_approx_normalized_dict["delta_h_per_lr"]
+        else:
+            self.logger.info("[h_approx] Using grad·dot method")
+            h_approx_normalized_dict = self.delta_entropy_approx.compute_delta_h_approx(
+                E_batch=E_batch,
+                v_named=v_named,
+            )
+        h_approx_normalized = float(h_approx_normalized_dict["delta_h_per_lr"])
         t_approx = time.time() - t_approx
         self.logger.info(f"[ΔHapprox] Computed h_approx_normalized in {t_approx:.2f}s")
 

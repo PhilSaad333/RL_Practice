@@ -34,19 +34,49 @@ true_delta_h:
 
 # === APPROXIMATE ENTROPY CHANGE ===
 approx_delta_h:
-  # You can keep 1, but 8 is a good default for better gradient statistics.
+  # Method to compute approximate delta-H:
+  #  - 'jvp'     (forward-mode JVP; full-softmax closure; hk/hk_ema/hk_ridge baselines)
+  #  - 'grad_dot' (backprop on surrogate; hk/hk_ema/regression baselines)
+  method: jvp
+
+  # Microbatching and normalization of the surrogate across E-batch
   microbatch_size: 8
-  normalize: per_sequence          # <- requested
+  normalize: per_sequence   # 'per_sequence' | 'per_token' | 'none'
+
+  # Baseline settings for RB estimator paths (both methods use this 'kind')
   baseline:
-    kind: regression           # H_k simplest, or Hk_ema, or regression
+    # 'hk' | 'hk_ema' | 'regression' | 'hk_ridge' | 'none'
+    kind: regression
+
+    # hk_ema controls (used when kind == 'hk_ema')
     ema_beta: 0.95
-    pos_bins: 32      # bin by position fraction j/L
-  report_per_token: false
+    pos_bins: 32
+
+    # regression controls (used when kind in {'regression','reg','reg_ridge','regression_ridge'})
+    # Per-sequence linear baseline b_k = phi_k^T beta; optional L2 via regression_l2
+    regression_l2: 0.0           # set >0 to add ridge penalty to regression baseline
+    include_intercept: true
+    fit_dtype: float64           # 'float64' | 'float32'
+    normalize: false             # standardize features before fitting/predicting
+    clip_min: null               # clamp predictions if desired
+    clip_max: null
+
+  # Ridge fit settings used by JVP hk_ridge baseline (microbatch-pooled)
+  ridge:
+    lambda: 1.0e-3
+    eps: 1.0e-8
+
+  # Simple-estimator timewise baseline (only used when estimator.use_simple_entropy_for_x == true)
   simple_baseline:
-    kind: time_loo                  # 'time_loo' | 'time_mean' | 'none'
+    kind: time_loo               # 'time_loo' | 'time_mean' | 'none'
+
+  # Optional variance diagnostics aggregation across microbatches
   variance:
     enabled: true
     jackknife: true
+
+  report_per_token: false
+
 
 # === GENERATION SETTINGS ===  
 generation:

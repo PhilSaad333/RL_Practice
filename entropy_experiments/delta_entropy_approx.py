@@ -60,15 +60,22 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Ordere
 
 import math
 import torch
+from torch.func import jvp
 from entropy_experiments.utils.param_registry import (
     dot_named,
     flatten_named,
+
 )
 from entropy_experiments.utils.sequence_processor import (
     BatchedSequences,
     LogprobResults,
     DiagnosticsResults,
 )
+
+
+from entropy_experiments.utils.jvp_utils import (snapshot_base_functional_state, intersect_jvp_primals_tangents, make_seq_outputs_closure)
+from entropy_experiments.baselines import get_strategy, EmaState, build_weights_base, get_timewise_strategy
+from entropy_experiments.baselines.strategies import RidgeConfig
 
 
 @dataclass
@@ -153,148 +160,12 @@ class DeltaEntropyApprox:
         self.var_enabled = bool(var_cfg.get("enabled", False))
         self.var_jackknife = bool(var_cfg.get("jackknife", True))
 
+        # Ridge baseline (JVP helper) knobs
+        ridge_cfg = (approx_cfg.get("ridge", {}) or {})
+        self.ridge_lambda = float(ridge_cfg.get("lambda", 1e-3))
+        self.ridge_eps = float(ridge_cfg.get("eps", 1e-8))
 
-    # ---------------------------------------------------------------------------------------------
-    # Internal helpers (logic lifted out of compute_delta_h_approx)
-    # ---------------------------------------------------------------------------------------------
-    def _gather_named_grads(self, name_to_param: "TOrderedDict[str, torch.nn.Parameter]") -> Dict[str, torch.Tensor]:
-        grads_named: Dict[str, torch.Tensor] = {}
-        for n, p in name_to_param.items():
-            if p.grad is None:
-                grads_named[n] = torch.zeros_like(p.detach()).to("cpu", torch.float32)
-            else:
-                grads_named[n] = p.grad.detach().to("cpu", torch.float32).clone()
-        return grads_named
 
-    def _variance_record_mb(
-        self,
-        name_to_param: "TOrderedDict[str, torch.nn.Parameter]",
-        v_named_cpu: Dict[str, torch.Tensor],
-        contribs: List[float],
-        last_dot_val: float,
-    ) -> float:
-        grads_named_mb = self._gather_named_grads(name_to_param)
-        dot_now = float(dot_named(grads_named_mb, v_named_cpu).item())
-        contribs.append(dot_now - last_dot_val)
-        return dot_now
-
-    def _surrogate_from_results(
-        self,
-        res: "LogprobResults",
-        *,
-        baseline_kind: str,
-        use_rb: bool,
-    ) -> Tuple[torch.Tensor, int, float, float]:
-        """
-        Build the scalar surrogate for one microbatch, with EMA update if selected.
-        Returns: (sur_scalar, T_mb, mean_b, mean_G)
-        """
-        device = next(self.model.parameters()).device
-        sur = torch.zeros((), device=device, dtype=torch.float32)
-        T_mb = 0
-        b_vals: List[float] = []
-        G_vals: List[float] = []
-
-        for b in range(len(res.logprobs)):
-            lp: torch.Tensor = res.logprobs[b][0]  # [T]
-            T = int(lp.numel())
-            if T == 0:
-                continue
-            T_mb += T
-
-            if use_rb:
-                if res.rb_entropies_torch is None or len(res.rb_entropies_torch[b]) == 0:
-                    raise RuntimeError("[delta-h approx] RB estimator active but rb_entropies_torch is missing.")
-                H_rb = res.rb_entropies_torch[b][0]  # [T]
-                if H_rb is None or H_rb.numel() != T:
-                    raise RuntimeError("[delta-h approx] RB tensor shape mismatch.")
-                # G_k = reverse cumsum of H_rb (detached)
-                G = torch.flip(torch.cumsum(torch.flip(H_rb.detach(), dims=[0]), dim=0), dims=[0])  # [T]
-
-                # Baseline b_k
-                if baseline_kind in {"regression", "reg", "reg_ridge", "regression_ridge"} \
-                   and (res.baseline_feats_torch is not None) and (len(res.baseline_feats_torch[b]) > 0):
-                    phi = res.baseline_feats_torch[b][0]
-                    if phi.dim() == 2 and int(phi.shape[0]) != T:
-                        T_eff = min(T, int(phi.shape[0]))
-                        phi = phi[:T_eff]
-                        lp = lp[:T_eff]
-                        H_rb = H_rb[:T_eff]
-                        G = G[:T_eff]
-                    beta = self._fit_regression_beta(phi, G)
-                    if beta.numel() > 0:
-                        dtype = beta.dtype
-                        phi_cpu = phi.detach().to("cpu", dtype)
-                        if self.baseline_reg_normalize and phi_cpu.shape[1] > 0:
-                            mean = phi_cpu.mean(dim=0, keepdim=True)
-                            std = phi_cpu.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
-                            phi_n = (phi_cpu - mean) / std
-                        else:
-                            phi_n = phi_cpu
-                        if self.baseline_reg_intercept:
-                            ones = torch.ones((phi_n.shape[0], 1), dtype=dtype)
-                            phi_n = torch.cat([phi_n, ones], dim=1)
-                        pred_cpu = phi_n @ beta
-                        b_k = pred_cpu.to(G.device, dtype=G.dtype).detach()
-                    else:
-                        b_k = H_rb.detach()
-                    bins = resid = None
-                elif baseline_kind == "hk":
-                    b_k = H_rb.detach()
-                    bins = resid = None
-                elif baseline_kind == "hk_ema":
-                    pos = torch.arange(T, device=H_rb.device, dtype=torch.float32) / max(T, 1)
-                    bins = torch.clamp((pos * self._pos_bins).long(), 0, self._pos_bins - 1)
-                    resid = (G - H_rb.detach())
-                    mu_hat = self._ema_resid[bins.cpu()]
-                    b_k = H_rb.detach() + mu_hat.to(H_rb.device)
-                elif baseline_kind in {"none"}:
-                    b_k = torch.zeros_like(G)
-                    bins = resid = None
-                else:
-                    # fallback: Hk
-                    b_k = H_rb.detach()
-                    bins = resid = None
-
-                b_vals.append(b_k.mean().item())
-                G_vals.append(G.mean().item())
-                sur = sur + ((G - b_k) * lp).sum() + H_rb.sum()
-
-                if baseline_kind == "hk_ema" and bins is not None and resid is not None:
-                    with torch.no_grad():
-                        for j in range(T):
-                            bb = int(bins[j].item())
-                            self._ema_cnt[bb] += 1
-                            beta = self._ema_beta
-                            self._ema_resid[bb] = (
-                                beta * self._ema_resid[bb]
-                                + (1.0 - beta) * resid[j].to(self._ema_resid.dtype).cpu()
-                            )
-            else:
-                # Simple estimator: - sum (logp - b).detach() * logp
-                lp_list: List[torch.Tensor] = []
-                lengths: List[int] = []
-                for bb in range(len(res.logprobs)):
-                    lp_b = res.logprobs[bb][0]
-                    lengths.append(int(lp_b.numel()))
-                    if int(lp_b.numel()) > 0:
-                        lp_list.append(lp_b)
-                baselines = self._timewise_baseline_from_logps(lp_list, kind=self.simple_baseline_kind)
-                list_idx = 0
-                for bb in range(len(res.logprobs)):
-                    lp_b: torch.Tensor = res.logprobs[bb][0]
-                    T_b = int(lp_b.numel())
-                    if T_b == 0:
-                        continue
-                    b_b = baselines[list_idx]
-                    list_idx += 1
-                    sur = sur - ((lp_b - b_b).detach() * lp_b).sum()
-                    b_vals.append(float(b_b.mean().item()))
-                    G_vals.append(float(lp_b.detach().mean().item()))
-
-        mean_b = float(sum(b_vals) / max(len(b_vals), 1)) if b_vals else 0.0
-        mean_G = float(sum(G_vals) / max(len(G_vals), 1)) if G_vals else 0.0
-        return sur, T_mb, mean_b, mean_G
 
     # ---------------------------------------------------------------------------------------------
     # Public API
@@ -439,9 +310,35 @@ class DeltaEntropyApprox:
 
 
                     # Baseline b_k
-                    if self.baseline_kind in {"regression", "reg", "reg_ridge", "regression_ridge"} \
-                       and (res.baseline_feats_torch is not None) and (len(res.baseline_feats_torch[b]) > 0):
-                        # Per-sequence regression baseline using distribution features phi[t, d]
+                    # Create strategy once per microbatch (EMA state is persistent)
+                    baseline_kind = str(self.baseline_kind).lower()
+                    if baseline_kind == "hk_ema":
+                        ema_state = EmaState(
+                            pos_bins=self._pos_bins,
+                            ema_beta=self._ema_beta,
+                            ema_resid=self._ema_resid,
+                            ema_cnt=self._ema_cnt,
+                        )
+                        strat = get_strategy("hk_ema", ema=ema_state)
+                    elif baseline_kind in {"regression", "reg", "reg_ridge", "regression_ridge"}:
+                        strat = get_strategy(
+                            baseline_kind,
+                            l2=self.baseline_reg_l2,
+                            include_intercept=self.baseline_reg_intercept,
+                            fit_dtype=self.baseline_reg_fit_dtype,
+                            normalize=self.baseline_reg_normalize,
+                            clip_min=self.baseline_reg_clip_min,
+                            clip_max=self.baseline_reg_clip_max,
+                        )
+                    elif baseline_kind == "hk":
+                        strat = get_strategy("hk")
+                    elif baseline_kind == "none":
+                        strat = None
+                    else:
+                        strat = get_strategy("hk")
+
+                    phi = None
+                    if strat is not None and (hasattr(res, "baseline_feats_torch") and res.baseline_feats_torch is not None) and len(res.baseline_feats_torch[b]) > 0:
                         phi = res.baseline_feats_torch[b][0]
                         if phi.dim() == 2 and int(phi.shape[0]) != T:
                             T_eff = min(T, int(phi.shape[0]))
@@ -449,41 +346,11 @@ class DeltaEntropyApprox:
                             lp = lp[:T_eff]
                             H_rb = H_rb[:T_eff]
                             G = G[:T_eff]
-                        beta = self._fit_regression_beta(phi, G)
-                        if beta.numel() > 0:
-                            # Predict on CPU with the same preprocessing used in fitting
-                            dtype = beta.dtype
-                            phi_cpu = phi.detach().to("cpu", dtype)
-                            if self.baseline_reg_normalize and phi_cpu.shape[1] > 0:
-                                mean = phi_cpu.mean(dim=0, keepdim=True)
-                                std = phi_cpu.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
-                                phi_n = (phi_cpu - mean) / std
-                            else:
-                                phi_n = phi_cpu
-                            if self.baseline_reg_intercept:
-                                ones = torch.ones((phi_n.shape[0], 1), dtype=dtype)
-                                phi_n = torch.cat([phi_n, ones], dim=1)
-                            pred_cpu = phi_n @ beta  # [T]
-                            b_k = pred_cpu.to(G.device, dtype=G.dtype).detach()
-                        else:
-                            b_k = H_rb.detach()  # fallback
-                    elif self.baseline_kind == "hk":
-                        b_k = H_rb.detach()
-                    elif self.baseline_kind == "hk_ema":
-                        # bin by position fraction
-                        pos = torch.arange(T, device=H_rb.device, dtype=torch.float32) / max(T, 1)
-                        bins = torch.clamp((pos * self._pos_bins).long(), 0, self._pos_bins - 1)
 
-                        resid = (G - H_rb.detach())          # [T], detached
-                        # gather current EMA estimates
-                        mu_hat = self._ema_resid[bins.cpu()] # CPU tensor indexed by bins
-                        b_k = H_rb.detach() + mu_hat.to(H_rb.device)
-
-                    elif self.baseline_kind == "none":
+                    if strat is None:
                         b_k = torch.zeros_like(G)
                     else:
-                        # fallback: Hk
-                        b_k = H_rb.detach()
+                        b_k = strat.compute_bk_rb(H_rb=H_rb, G=G, phi=phi, update_state=(baseline_kind == "hk_ema"))
 
                     # Accumulate statistics for diagnostics
                     b_vals.append(b_k.mean().item())
@@ -506,7 +373,8 @@ class DeltaEntropyApprox:
                             lp_list.append(lp_b)
 
                     # Build baselines for all sequences/time steps at once (detached)
-                    baselines = self._timewise_baseline_from_logps(lp_list, kind=self.simple_baseline_kind)
+                    tw_strat = get_timewise_strategy(self.simple_baseline_kind)
+                    baselines = tw_strat.compute_timewise_baselines(lp_list)
 
                     # Now accumulate the surrogate
                     list_idx = 0
@@ -520,19 +388,6 @@ class DeltaEntropyApprox:
 
                         # Surrogate: - Σ_t (logπ_t - b_t).detach() * logπ_t
                         sur = sur - ((lp_b - b_b).detach() * lp_b).sum()
-
-                        # Update EMA *after* using b_k, so the current weights don't depend on current residual
-                        if self.baseline_kind == "hk_ema":
-                            with torch.no_grad():
-                                for j in range(T):
-                                    b = int(bins[j].item())
-                                    self._ema_cnt[b] += 1
-                                    beta = self._ema_beta
-                                    self._ema_resid[b] = (
-                                        beta * self._ema_resid[b]
-                                        + (1.0 - beta) * resid[j].to(self._ema_resid.dtype).cpu()
-                                    )
-
                         # Diagnostics
                         b_vals.append(float(b_b.mean().item()))
                         # No meaningful "G" in this estimator; track mean logπ as a proxy
@@ -549,34 +404,13 @@ class DeltaEntropyApprox:
 
             # --- Variance: record this microbatch's contribution to g·v (optional)
             if self.var_enabled:
-                # Gather grads for intersecting params (CPU/fp32)
-                grads_named_mb = {}
-                for n, p in name_to_param.items():
-                    if p.grad is None:
-                        grads_named_mb[n] = torch.zeros_like(p.detach()).to("cpu", torch.float32)
-                    else:
-                        grads_named_mb[n] = p.grad.detach().to("cpu", torch.float32)
-                # Current cumulative dot
-                dot_now = float(dot_named(grads_named_mb, v_named_cpu).item())
-                # Incremental contribution from this microbatch
-                contribs.append(dot_now - last_dot_val)
-                last_dot_val = dot_now
-
-
-
-
-
-
-
+                from entropy_experiments.utils.variance import update_shard_contrib
+                last_dot_val = update_shard_contrib(name_to_param, v_named_cpu, contribs, last_dot_val)
 
 
         # Collect grads on intersection (CPU/fp32) and contract with v
-        grads_named = {}
-        for n, p in name_to_param.items():
-            if p.grad is None:
-                grads_named[n] = torch.zeros_like(p.detach()).to("cpu", torch.float32)
-            else:
-                grads_named[n] = p.grad.detach().to("cpu", torch.float32).clone()
+        from entropy_experiments.utils.variance import gather_named_grads, compute_variance_info
+        grads_named = gather_named_grads(name_to_param)
 
         # Ensure v_named is CPU/fp32 as well
         v_named_cpu = {k: (v.detach().to("cpu", torch.float32) if isinstance(v, torch.Tensor) else v)
@@ -611,24 +445,9 @@ class DeltaEntropyApprox:
             },
         }
 
-        # Variance diagnostics (SE across microbatches and jackknife)
-        if self.var_enabled and len(contribs) > 0:
-            M = len(contribs)
-            mean_c = sum(contribs) / M
-            var_c = sum((x - mean_c) ** 2 for x in contribs) / max(M - 1, 1)
-            se_shard = (var_c ** 0.5) / (M ** 0.5)
-            out["variance"] = {"num_shards": M, "se_shard": se_shard}
-            if self.var_jackknife and M > 1:
-                jack = []
-                S = sum(contribs)
-                for i in range(M):
-                    jack.append((S - contribs[i]) / (M - 1))
-                jack_mean = sum(jack) / M
-                jack_var = (M - 1) * sum((m - jack_mean) ** 2 for m in jack) / M
-                out["variance"]["se_jackknife"] = jack_var ** 0.5
-                out["variance"]["contribs"] = contribs if self.debug else None
-        elif self.var_enabled:
-            out["variance"] = {"num_shards": 0, "se_shard": 0.0}
+        # Variance diagnostics
+        if self.var_enabled:
+            out["variance"] = compute_variance_info(contribs, debug=self.debug, use_jackknife=self.var_jackknife)
 
 
 
@@ -758,105 +577,119 @@ class DeltaEntropyApprox:
                 responses_text=s_text,
             )
 
-    def _timewise_baseline_from_logps(
+
+    # -----------------------------------------------------------
+    # ---------- For JVP approach -----------------------------
+    # -----------------------------------------------------------
+
+
+    def compute_delta_h_approx_jvp(
         self,
-        logprob_list: List[torch.Tensor],
-        kind: str,
-    ) -> List[torch.Tensor]:
+        *,
+        E_batch: Dict[str, Any],
+        v_named: Dict[str, torch.Tensor],
+    ) -> Dict[str, Any]:
         """
-        Build per-sequence, per-time baselines b[b][t] from a ragged list of logπ tensors.
-        kind:
-        - 'time_mean': b_t = mean_b(logπ_b[t]) across sequences with t valid
-        - 'time_loo' : b_t = mean over other sequences (leave-one-out)
-        - 'none'     : zeros
-        Returns a list of tensors with the same shapes/devices as logprob_list, detached.
+        Directional derivative using forward-mode JVP with a vectorized closure.
+        Assumes top_p=1.0 (full-softmax for RB entropies).
+        Baselines supported: 'hk' and 'none' (extendable: add EMA/ridge weights as detached terms).
         """
-        if kind == "none" or len(logprob_list) == 0:
-            return [torch.zeros_like(lp) for lp in logprob_list]
+        device = next(self.model.parameters()).device
+        mdl = self.model; mdl.eval()
 
-        max_T = max((int(lp.numel()) for lp in logprob_list), default=0)
-        device = logprob_list[0].device if logprob_list else torch.device("cpu")
+        base_map = snapshot_base_functional_state(self.model)
+        names, primals, tangents = intersect_jvp_primals_tangents(self.model, base_map, v_named)
 
-        # For each time j, collect sums and counts across sequences with T_b > j
-        sums = [torch.zeros((), device=device, dtype=logprob_list[0].dtype) for _ in range(max_T)]
-        cnts = [0 for _ in range(max_T)]
-        for lp in logprob_list:
-            T = int(lp.numel())
-            for j in range(T):
-                sums[j] = sums[j] + lp[j]
-                cnts[j] += 1
+        # Count totals for normalization
+        B_total = int(E_batch["sequences"].shape[0])
+        T_total = self._count_total_gen_tokens(E_batch)
 
-        baselines: List[torch.Tensor] = []
-        for idx_b, lp in enumerate(logprob_list):
-            T = int(lp.numel())
-            if kind == "time_mean":
-                b = torch.empty_like(lp)
-                for j in range(T):
-                    c = max(cnts[j], 1)
-                    b[j] = sums[j] / c
-                baselines.append(b.detach())
-            elif kind == "time_loo":
-                b = torch.empty_like(lp)
-                for j in range(T):
-                    c = cnts[j]
-                    if c <= 1:
-                        b[j] = 0.0  # no alternative sample to leave out
-                    else:
-                        b[j] = (sums[j] - lp[j]) / (c - 1)
-                baselines.append(b.detach())
-            else:
-                # Fallback to no baseline
-                baselines.append(torch.zeros_like(lp))
-        return baselines
+        contribs_mb: List[float] = []
+        total_tokens_used = 0
+        scale_sum = 0.0
 
-    # ---------------------------------------------------------------------------------------------
-    # Regression baseline fitter
-    # ---------------------------------------------------------------------------------------------
-    def _fit_regression_beta(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        Fit a linear regression baseline b = X @ beta to predict targets y.
-        - X: [N, d] features (detached)
-        - y: [N] targets (detached)
-        Returns beta of shape [d (+1 if intercept)], computed on CPU in float64/float32
-          per configuration, with optional ridge regularization.
-        """
-        if X is None or X.numel() == 0 or y is None or y.numel() == 0:
-            return torch.tensor([], dtype=torch.float32)
 
-        # Ensure 2D features
-        if X.dim() == 1:
-            X = X.view(-1, 1)
+        for mb_E in self._iter_microbatches(E_batch, self.mb):
+            B_mb = int(mb_E.sequences.shape[0])
+            mb_contrib = 0.0
+            T_mb = 0
+            tf_bs = min(self.mb, B_mb)
+            # Build detached weights w_t = (G - b_t) using baseline strategies
+            baseline_kind = str(self.baseline_kind).lower()
+            ema_state = None
+            if baseline_kind == "hk_ema":
+                ema_state = EmaState(
+                    pos_bins=self._pos_bins,
+                    ema_beta=self._ema_beta,
+                    ema_resid=self._ema_resid,
+                    ema_cnt=self._ema_cnt,
+                )
+            ridge_cfg = RidgeConfig(lambda_=self.ridge_lambda, eps=self.ridge_eps)
+            w_list = build_weights_base(
+                kind=baseline_kind,
+                model=self.model,
+                sp=self.sp,
+                mb_E=mb_E,
+                tf_bs=tf_bs,
+                ema=ema_state,
+                ridge=ridge_cfg,
+            )
+            for b in range(B_mb):
+                input_ids = mb_E.sequences[b, 0].to(device=device)
+                attention_mask = mb_E.attention_masks[b, 0].to(device=device)
+                prompt_len = int(mb_E.prompt_lens[b])
+                T = int(mb_E.gen_lens[b][0])
+                if T <= 0:
+                    continue
+                T_mb += T
+                w_t = w_list[b]
 
-        # Move to CPU for numerical stability and use requested dtype
-        dtype = torch.float64 if self.baseline_reg_fit_dtype == "float64" else torch.float32
-        Xc = X.detach().to("cpu", dtype)
-        yc = y.detach().to("cpu", dtype).view(-1, 1)
+                f_seq = make_seq_outputs_closure(
+                    model=self.model,
+                    base_map=base_map,
+                    names=names,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    prompt_len=prompt_len,
+                    T=T,
+                )
+                (logp_vec, H_sum), (j_logp_vec, j_H_sum) = jvp(f_seq, (primals,), (tangents,))
+                seq_dir = (w_t * j_logp_vec).sum() + j_H_sum
+                mb_contrib += float(seq_dir.item())
 
-        # Optional normalization (standardize columns except the intercept)
-        if self.baseline_reg_normalize and Xc.shape[1] > 0:
-            mean = Xc.mean(dim=0, keepdim=True)
-            std = Xc.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
-            Xn = (Xc - mean) / std
-        else:
-            Xn = Xc
+            scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
+            total_tokens_used += T_mb
+            scale_sum += float(scale)
+            contribs_mb.append(mb_contrib * float(scale))
 
-        # Append intercept if requested
-        if self.baseline_reg_intercept:
-            ones = torch.ones((Xn.shape[0], 1), dtype=dtype)
-            Xn = torch.cat([Xn, ones], dim=1)
+        delta_h_per_lr = float(sum(contribs_mb))
+        out = {
+            "delta_h_per_lr": delta_h_per_lr,
+            "num_sequences": int(E_batch["sequences"].shape[0]),
+            "num_tokens": int(T_total),
+            "estimator": "rb",
+            "baseline": {"kind": self.baseline_kind},
+            "method": "jvp",
+            "audit": {"scale_sum": scale_sum, "total_tokens_used": total_tokens_used},
+        }
+        if len(contribs_mb) > 0:
+            M = len(contribs_mb)
+            mean_c = sum(contribs_mb) / M
+            var_c = sum((x - mean_c) ** 2 for x in contribs_mb) / max(M - 1, 1)
+            out["variance"] = {"num_shards": M, "se_shard": (var_c ** 0.5) / (M ** 0.5)}
+        if self.logger:
+            self.logger.info(
+                f"[delta-h approx JVP] ⟨∇H, v⟩={out['delta_h_per_lr']:.6e} | "
+                f"B={out['num_sequences']} T={out['num_tokens']} | baseline={self.baseline_kind}"
+            )
+            self.logger.info(
+                f"[delta-h approx JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for per_sequence), "
+                f"total_tokens_used={total_tokens_used} vs pre_count={T_total}"
+            )
+        return out
 
-        # Ridge-regularized normal equation
-        l2 = float(self.baseline_reg_l2)
-        XtX = Xn.T @ Xn
-        if l2 > 0.0:
-            I = torch.eye(XtX.shape[0], dtype=dtype)
-            XtX = XtX + l2 * I
-        Xty = Xn.T @ yc
-        try:
-            beta = torch.linalg.solve(XtX, Xty)
-        except RuntimeError:
-            # Fallback to least-squares in case of singularity
-            beta = torch.linalg.lstsq(Xn, yc).solution
 
-        beta = beta.view(-1)
-        return beta
+
+
+
+
