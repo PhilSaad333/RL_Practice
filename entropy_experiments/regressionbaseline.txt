@@ -1,0 +1,44 @@
+Summary
+Adds a regression baseline option to the approximate entropy-change estimator (DeltaEntropyApprox) that predicts the entropy-to-go G_k from action-independent distribution features phi_k. This reduces variance of the REINFORCE term while keeping defaults unchanged and backward compatible.
+
+Rationale
+- Existing baselines: H_k, H_k_ema, and simple timewise baselines. These are coarse; a learned control variate that uses rich per-step distribution features improves variance reduction.
+- SequenceProcessor already exposes per-step features phi_k = [H(q_k), top1_prob, margin, head_mass s_k, H([s_k,1-s_k]), Var_q[a], position_fraction]. This enables a stable linear baseline.
+
+Minimal Diffs
+- File: entropy_experiments/delta_entropy_approx.py
+  - Add config keys under approx_delta_h.baseline:
+    - kind: 'regression' | 'reg' | 'regression_ridge' | 'reg_ridge'
+    - regression_l2: float (default 0.0)
+    - include_intercept: bool (default True)
+    - fit_dtype: 'float64' | 'float32' (default 'float64')
+    - normalize: bool (default False)
+    - clip_min/clip_max: optional float to clamp predictions
+  - When baseline.kind is regression*, call SequenceProcessor.teacher_force_logprobs_with_diagnostics(..., with_grad=True, compute_rb=True, return_baseline_features=True) and compute per-sequence baseline b_k = phi_k^T beta where beta is fit by ridge-regularized least squares.
+  - Add helper _fit_regression_beta(X, y) to solve (X^T X + λI) beta = X^T y in CPU float64 with a least-squares fallback.
+
+Implementation Notes
+- RB estimator path only: baseline predicts entropy-to-go G_k (sum of RB entropies from k..T). If regression is not selected, existing baselines are unchanged.
+- Simple estimator path remains unchanged (uses time_loo/time_mean/no baseline). We can extend regression to this path later if desired.
+- Per-sequence fitting: Each sequence fits its own beta from its [T,d] features and G; this is minimal-diff and avoids larger refactors. A future enhancement can pool tokens across the microbatch before fitting.
+
+Config/Flags
+- approx_delta_h.baseline.kind: 'Hk' (default), 'Hk_ema', 'none', 'regression'
+- approx_delta_h.baseline.regression_l2: 1e-4 is a good starting value
+- approx_delta_h.baseline.include_intercept: true
+- approx_delta_h.baseline.fit_dtype: 'float64'
+- approx_delta_h.baseline.normalize: false (set true if features differ in scale)
+
+Validation
+1) Dry run with baseline.kind='Hk' to confirm behavior unchanged.
+2) Switch to baseline.kind='regression' and estimator.use_simple_entropy_for_x=false.
+   - Expect logs to show est=rb baseline=regression and a similar or lower variance in delta_h_per_lr across repeats.
+3) Stress test on small batches where T varies; predictions should align with T and not raise shape errors.
+
+Acceptance Criteria
+- Code runs without exceptions across both baseline kinds.
+- For identical seeds, regression baseline produces finite delta_h_per_lr and comparable mean with lower variability across repeats.
+
+Rollback
+- Set approx_delta_h.baseline.kind back to 'Hk' or 'Hk_ema'.
+- No state migrations required. Helper is isolated to DeltaEntropyApprox.

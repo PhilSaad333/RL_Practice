@@ -159,6 +159,13 @@ class DeltaEntropyApprox:
         self.normalize = str(approx_cfg.get("normalize", "per_sequence")).lower()
         baseline_cfg = (approx_cfg.get("baseline", {}) or {})
         self.baseline_kind = str(baseline_cfg.get("kind", "Hk")).lower()
+        # Regression baseline configuration (guarded; defaults keep behavior unchanged)
+        self.baseline_reg_l2 = float(baseline_cfg.get("regression_l2", 0.0))
+        self.baseline_reg_intercept = bool(baseline_cfg.get("include_intercept", True))
+        self.baseline_reg_fit_dtype = str(baseline_cfg.get("fit_dtype", "float64")).lower()
+        self.baseline_reg_normalize = bool(baseline_cfg.get("normalize", False))
+        self.baseline_reg_clip_min = baseline_cfg.get("clip_min", None)
+        self.baseline_reg_clip_max = baseline_cfg.get("clip_max", None)
 
         est_cfg = (self.cfg.get("estimator", {}) or {})
         self.use_rb = not bool(est_cfg.get("use_simple_entropy_for_x", False))
@@ -273,12 +280,13 @@ class DeltaEntropyApprox:
             B_mb = int(mb_E.sequences.shape[0])
             tf_bs = min(self.mb, B_mb)
 
+            want_feats = self.use_rb and (self.baseline_kind in {"regression", "reg", "reg_ridge", "regression_ridge"})
             res, _diag = self.sp.teacher_force_logprobs_with_diagnostics(
                 sequences=mb_E,
                 tf_batch_size=tf_bs,
                 compute_rb=True,
                 with_grad=True,
-                return_baseline_features=False,
+                return_baseline_features=want_feats,
             )
 
             # Build surrogate for this microbatch
@@ -310,7 +318,22 @@ class DeltaEntropyApprox:
 
 
                     # Baseline b_k
-                    if self.baseline_kind == "hk":
+                    if self.baseline_kind in {"regression", "reg", "reg_ridge", "regression_ridge"} \
+                       and (res.baseline_feats_torch is not None) and (len(res.baseline_feats_torch[b]) > 0):
+                        # Per-sequence regression baseline using distribution features phi[t, d]
+                        phi = res.baseline_feats_torch[b][0]
+                        if phi.dim() == 2 and int(phi.shape[0]) != T:
+                            T_eff = min(T, int(phi.shape[0]))
+                            phi = phi[:T_eff]
+                            lp = lp[:T_eff]
+                            H_rb = H_rb[:T_eff]
+                            G = G[:T_eff]
+                        beta = self._fit_regression_beta(phi, G)
+                        if beta.numel() > 0:
+                            b_k = (phi.to(beta.dtype) @ beta).to(G.device, dtype=G.dtype).detach()
+                        else:
+                            b_k = H_rb.detach()  # fallback
+                    elif self.baseline_kind == "hk":
                         b_k = H_rb.detach()
                     elif self.baseline_kind == "hk_ema":
                         # bin by position fraction
@@ -597,3 +620,55 @@ class DeltaEntropyApprox:
                 # Fallback to no baseline
                 baselines.append(torch.zeros_like(lp))
         return baselines
+
+    # ---------------------------------------------------------------------------------------------
+    # Regression baseline fitter
+    # ---------------------------------------------------------------------------------------------
+    def _fit_regression_beta(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Fit a linear regression baseline b = X @ beta to predict targets y.
+        - X: [N, d] features (detached)
+        - y: [N] targets (detached)
+        Returns beta of shape [d (+1 if intercept)], computed on CPU in float64/float32
+          per configuration, with optional ridge regularization.
+        """
+        if X is None or X.numel() == 0 or y is None or y.numel() == 0:
+            return torch.tensor([], dtype=torch.float32)
+
+        # Ensure 2D features
+        if X.dim() == 1:
+            X = X.view(-1, 1)
+
+        # Move to CPU for numerical stability and use requested dtype
+        dtype = torch.float64 if self.baseline_reg_fit_dtype == "float64" else torch.float32
+        Xc = X.detach().to("cpu", dtype)
+        yc = y.detach().to("cpu", dtype).view(-1, 1)
+
+        # Optional normalization (standardize columns except the intercept)
+        if self.baseline_reg_normalize and Xc.shape[1] > 0:
+            mean = Xc.mean(dim=0, keepdim=True)
+            std = Xc.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
+            Xn = (Xc - mean) / std
+        else:
+            Xn = Xc
+
+        # Append intercept if requested
+        if self.baseline_reg_intercept:
+            ones = torch.ones((Xn.shape[0], 1), dtype=dtype)
+            Xn = torch.cat([Xn, ones], dim=1)
+
+        # Ridge-regularized normal equation
+        l2 = float(self.baseline_reg_l2)
+        XtX = Xn.T @ Xn
+        if l2 > 0.0:
+            I = torch.eye(XtX.shape[0], dtype=dtype)
+            XtX = XtX + l2 * I
+        Xty = Xn.T @ yc
+        try:
+            beta = torch.linalg.solve(XtX, Xty)
+        except RuntimeError:
+            # Fallback to least-squares in case of singularity
+            beta = torch.linalg.lstsq(Xn, yc).solution
+
+        beta = beta.view(-1)
+        return beta

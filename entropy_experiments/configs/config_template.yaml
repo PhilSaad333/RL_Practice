@@ -18,7 +18,7 @@ batch_config:
 estimator:
   use_simple_entropy_for_x: false
   eta_sweep: false
-  single_eta: 2e-6
+  single_eta: 4e-6
   eta_list: [1e-06, 2e-06, 4e-06, 8e-06, 1.6e-05, 3.2e-05, 6.4e-05, 0.000128]
 
 # Make RB entropies differentiable in the with-grad path
@@ -38,7 +38,7 @@ approx_delta_h:
   microbatch_size: 8
   normalize: per_sequence          # <- requested
   baseline:
-    kind: Hk_ema           # H_k simplest
+    kind: regression           # H_k simplest, or Hk_ema, or regression
     ema_beta: 0.95
     pos_bins: 32      # bin by position fraction j/L
   report_per_token: false
