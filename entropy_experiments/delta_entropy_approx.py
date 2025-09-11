@@ -672,16 +672,21 @@ class DeltaEntropyApprox:
             "method": "jvp",
             "audit": {"scale_sum": scale_sum, "total_tokens_used": total_tokens_used},
         }
-        if len(contribs_mb) > 0:
-            M = len(contribs_mb)
-            mean_c = sum(contribs_mb) / M
-            var_c = sum((x - mean_c) ** 2 for x in contribs_mb) / max(M - 1, 1)
-            out["variance"] = {"num_shards": M, "se_shard": (var_c ** 0.5) / (M ** 0.5)}
+        if self.var_enabled:
+            from entropy_experiments.utils.variance import compute_variance_info
+            out["variance"] = compute_variance_info(contribs_mb, debug=self.debug, use_jackknife=self.var_jackknife)
         if self.logger:
             self.logger.info(
                 f"[delta-h approx JVP] ⟨∇H, v⟩={out['delta_h_per_lr']:.6e} | "
                 f"B={out['num_sequences']} T={out['num_tokens']} | baseline={self.baseline_kind}"
             )
+            if self.var_enabled:
+                vinfo = out.get("variance", {})
+                self.logger.info(
+                    f"[delta-h approx JVP][variance] shards={vinfo.get('num_shards', 0)} "
+                    f"SE(shard)={vinfo.get('se_shard', 0.0):.3e} "
+                    f"SE(jack)={vinfo.get('se_jackknife', 0.0):.3e}"
+                )
             self.logger.info(
                 f"[delta-h approx JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for per_sequence), "
                 f"total_tokens_used={total_tokens_used} vs pre_count={T_total}"
