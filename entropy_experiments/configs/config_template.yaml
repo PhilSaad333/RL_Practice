@@ -10,8 +10,8 @@ batch_config:
   dataset_name: "gsm8k_r1_template"
   E_split: "test"
   U_split: "train"
-  B_E: 512
-  B_U: 64
+  B_E: 32
+  B_U: 32
   G: 8
 
 # === COMPUTATION OPTIONS ===
