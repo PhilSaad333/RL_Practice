@@ -60,48 +60,15 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Ordere
 
 import math
 import torch
-
-# --- Tolerant imports for registry & sequence types ----------------------------------------------
-# param registry helpers (name alignment, stable dot, etc.)
-try:
-    # project-local typical layout
-    from .param_registry import (
-        get_trainable_named,
-        get_optimizer_named_params,
-        to_cpu_fp32_named,
-        dot_named,
-        flatten_named,
-    )
-except Exception:
-    try:
-        # alternative layout used elsewhere in the repo
-        from .utils.param_registry import (
-            get_trainable_named,
-            get_optimizer_named_params,
-            to_cpu_fp32_named,
-            dot_named,
-            flatten_named,
-        )
-    except Exception:
-        # flat import fallback (useful in notebooks / ad-hoc runs)
-        from param_registry import (  # type: ignore
-            get_trainable_named,
-            get_optimizer_named_params,
-            to_cpu_fp32_named,
-            dot_named,
-            flatten_named,
-        )
-
-# sequence processor dataclasses & API
-try:
-    from .utils.sequence_processor import BatchedSequences, LogprobResults, DiagnosticsResults
-except Exception:
-    try:
-        from sequence_processor import BatchedSequences, LogprobResults, DiagnosticsResults  # type: ignore
-    except Exception:
-        BatchedSequences = None  # type: ignore
-        LogprobResults = None  # type: ignore
-        DiagnosticsResults = None  # type: ignore
+from entropy_experiments.utils.param_registry import (
+    dot_named,
+    flatten_named,
+)
+from entropy_experiments.utils.sequence_processor import (
+    BatchedSequences,
+    LogprobResults,
+    DiagnosticsResults,
+)
 
 
 @dataclass
@@ -180,6 +147,154 @@ class DeltaEntropyApprox:
         self._ema_resid = torch.zeros(self._pos_bins, dtype=torch.float32)  # CPU ok
         self._ema_cnt   = torch.zeros(self._pos_bins, dtype=torch.int64)
 
+
+        # Variance diagnostics
+        var_cfg = (approx_cfg.get("variance", {}) or {})
+        self.var_enabled = bool(var_cfg.get("enabled", False))
+        self.var_jackknife = bool(var_cfg.get("jackknife", True))
+
+
+    # ---------------------------------------------------------------------------------------------
+    # Internal helpers (logic lifted out of compute_delta_h_approx)
+    # ---------------------------------------------------------------------------------------------
+    def _gather_named_grads(self, name_to_param: "TOrderedDict[str, torch.nn.Parameter]") -> Dict[str, torch.Tensor]:
+        grads_named: Dict[str, torch.Tensor] = {}
+        for n, p in name_to_param.items():
+            if p.grad is None:
+                grads_named[n] = torch.zeros_like(p.detach()).to("cpu", torch.float32)
+            else:
+                grads_named[n] = p.grad.detach().to("cpu", torch.float32).clone()
+        return grads_named
+
+    def _variance_record_mb(
+        self,
+        name_to_param: "TOrderedDict[str, torch.nn.Parameter]",
+        v_named_cpu: Dict[str, torch.Tensor],
+        contribs: List[float],
+        last_dot_val: float,
+    ) -> float:
+        grads_named_mb = self._gather_named_grads(name_to_param)
+        dot_now = float(dot_named(grads_named_mb, v_named_cpu).item())
+        contribs.append(dot_now - last_dot_val)
+        return dot_now
+
+    def _surrogate_from_results(
+        self,
+        res: "LogprobResults",
+        *,
+        baseline_kind: str,
+        use_rb: bool,
+    ) -> Tuple[torch.Tensor, int, float, float]:
+        """
+        Build the scalar surrogate for one microbatch, with EMA update if selected.
+        Returns: (sur_scalar, T_mb, mean_b, mean_G)
+        """
+        device = next(self.model.parameters()).device
+        sur = torch.zeros((), device=device, dtype=torch.float32)
+        T_mb = 0
+        b_vals: List[float] = []
+        G_vals: List[float] = []
+
+        for b in range(len(res.logprobs)):
+            lp: torch.Tensor = res.logprobs[b][0]  # [T]
+            T = int(lp.numel())
+            if T == 0:
+                continue
+            T_mb += T
+
+            if use_rb:
+                if res.rb_entropies_torch is None or len(res.rb_entropies_torch[b]) == 0:
+                    raise RuntimeError("[delta-h approx] RB estimator active but rb_entropies_torch is missing.")
+                H_rb = res.rb_entropies_torch[b][0]  # [T]
+                if H_rb is None or H_rb.numel() != T:
+                    raise RuntimeError("[delta-h approx] RB tensor shape mismatch.")
+                # G_k = reverse cumsum of H_rb (detached)
+                G = torch.flip(torch.cumsum(torch.flip(H_rb.detach(), dims=[0]), dim=0), dims=[0])  # [T]
+
+                # Baseline b_k
+                if baseline_kind in {"regression", "reg", "reg_ridge", "regression_ridge"} \
+                   and (res.baseline_feats_torch is not None) and (len(res.baseline_feats_torch[b]) > 0):
+                    phi = res.baseline_feats_torch[b][0]
+                    if phi.dim() == 2 and int(phi.shape[0]) != T:
+                        T_eff = min(T, int(phi.shape[0]))
+                        phi = phi[:T_eff]
+                        lp = lp[:T_eff]
+                        H_rb = H_rb[:T_eff]
+                        G = G[:T_eff]
+                    beta = self._fit_regression_beta(phi, G)
+                    if beta.numel() > 0:
+                        dtype = beta.dtype
+                        phi_cpu = phi.detach().to("cpu", dtype)
+                        if self.baseline_reg_normalize and phi_cpu.shape[1] > 0:
+                            mean = phi_cpu.mean(dim=0, keepdim=True)
+                            std = phi_cpu.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
+                            phi_n = (phi_cpu - mean) / std
+                        else:
+                            phi_n = phi_cpu
+                        if self.baseline_reg_intercept:
+                            ones = torch.ones((phi_n.shape[0], 1), dtype=dtype)
+                            phi_n = torch.cat([phi_n, ones], dim=1)
+                        pred_cpu = phi_n @ beta
+                        b_k = pred_cpu.to(G.device, dtype=G.dtype).detach()
+                    else:
+                        b_k = H_rb.detach()
+                    bins = resid = None
+                elif baseline_kind == "hk":
+                    b_k = H_rb.detach()
+                    bins = resid = None
+                elif baseline_kind == "hk_ema":
+                    pos = torch.arange(T, device=H_rb.device, dtype=torch.float32) / max(T, 1)
+                    bins = torch.clamp((pos * self._pos_bins).long(), 0, self._pos_bins - 1)
+                    resid = (G - H_rb.detach())
+                    mu_hat = self._ema_resid[bins.cpu()]
+                    b_k = H_rb.detach() + mu_hat.to(H_rb.device)
+                elif baseline_kind in {"none"}:
+                    b_k = torch.zeros_like(G)
+                    bins = resid = None
+                else:
+                    # fallback: Hk
+                    b_k = H_rb.detach()
+                    bins = resid = None
+
+                b_vals.append(b_k.mean().item())
+                G_vals.append(G.mean().item())
+                sur = sur + ((G - b_k) * lp).sum() + H_rb.sum()
+
+                if baseline_kind == "hk_ema" and bins is not None and resid is not None:
+                    with torch.no_grad():
+                        for j in range(T):
+                            bb = int(bins[j].item())
+                            self._ema_cnt[bb] += 1
+                            beta = self._ema_beta
+                            self._ema_resid[bb] = (
+                                beta * self._ema_resid[bb]
+                                + (1.0 - beta) * resid[j].to(self._ema_resid.dtype).cpu()
+                            )
+            else:
+                # Simple estimator: - sum (logp - b).detach() * logp
+                lp_list: List[torch.Tensor] = []
+                lengths: List[int] = []
+                for bb in range(len(res.logprobs)):
+                    lp_b = res.logprobs[bb][0]
+                    lengths.append(int(lp_b.numel()))
+                    if int(lp_b.numel()) > 0:
+                        lp_list.append(lp_b)
+                baselines = self._timewise_baseline_from_logps(lp_list, kind=self.simple_baseline_kind)
+                list_idx = 0
+                for bb in range(len(res.logprobs)):
+                    lp_b: torch.Tensor = res.logprobs[bb][0]
+                    T_b = int(lp_b.numel())
+                    if T_b == 0:
+                        continue
+                    b_b = baselines[list_idx]
+                    list_idx += 1
+                    sur = sur - ((lp_b - b_b).detach() * lp_b).sum()
+                    b_vals.append(float(b_b.mean().item()))
+                    G_vals.append(float(lp_b.detach().mean().item()))
+
+        mean_b = float(sum(b_vals) / max(len(b_vals), 1)) if b_vals else 0.0
+        mean_G = float(sum(G_vals) / max(len(G_vals), 1)) if G_vals else 0.0
+        return sur, T_mb, mean_b, mean_G
 
     # ---------------------------------------------------------------------------------------------
     # Public API
@@ -273,6 +388,12 @@ class DeltaEntropyApprox:
         baseline_means = []
         G_means = []
 
+        # For variance diagnostics (microbatch-level directional contributions)
+        contribs: List[float] = []
+        last_dot_val = 0.0
+        # Prepare v on CPU/fp32 up-front (used inside the loop if variance enabled)
+        v_named_cpu = {k: (v.detach().to("cpu", torch.float32) if isinstance(v, torch.Tensor) else v)
+                       for k, v in v_named.items()}
 
         for mb_E in self._iter_microbatches(E_batch, self.mb):
             # Teacher-forced with-grad forward
@@ -426,6 +547,27 @@ class DeltaEntropyApprox:
 
             (sur * float(scale)).backward()
 
+            # --- Variance: record this microbatch's contribution to g·v (optional)
+            if self.var_enabled:
+                # Gather grads for intersecting params (CPU/fp32)
+                grads_named_mb = {}
+                for n, p in name_to_param.items():
+                    if p.grad is None:
+                        grads_named_mb[n] = torch.zeros_like(p.detach()).to("cpu", torch.float32)
+                    else:
+                        grads_named_mb[n] = p.grad.detach().to("cpu", torch.float32)
+                # Current cumulative dot
+                dot_now = float(dot_named(grads_named_mb, v_named_cpu).item())
+                # Incremental contribution from this microbatch
+                contribs.append(dot_now - last_dot_val)
+                last_dot_val = dot_now
+
+
+
+
+
+
+
 
 
         # Collect grads on intersection (CPU/fp32) and contract with v
@@ -468,6 +610,29 @@ class DeltaEntropyApprox:
                 "mean_G": float(sum(G_means) / max(len(G_means), 1)) if G_means else 0.0,
             },
         }
+
+        # Variance diagnostics (SE across microbatches and jackknife)
+        if self.var_enabled and len(contribs) > 0:
+            M = len(contribs)
+            mean_c = sum(contribs) / M
+            var_c = sum((x - mean_c) ** 2 for x in contribs) / max(M - 1, 1)
+            se_shard = (var_c ** 0.5) / (M ** 0.5)
+            out["variance"] = {"num_shards": M, "se_shard": se_shard}
+            if self.var_jackknife and M > 1:
+                jack = []
+                S = sum(contribs)
+                for i in range(M):
+                    jack.append((S - contribs[i]) / (M - 1))
+                jack_mean = sum(jack) / M
+                jack_var = (M - 1) * sum((m - jack_mean) ** 2 for m in jack) / M
+                out["variance"]["se_jackknife"] = jack_var ** 0.5
+                out["variance"]["contribs"] = contribs if self.debug else None
+        elif self.var_enabled:
+            out["variance"] = {"num_shards": 0, "se_shard": 0.0}
+
+
+
+
         if self.logger:
             self.logger.info(
                 f"[delta-h approx] ⟨∇H, v⟩={out['delta_h_per_lr']:.6e} | "
@@ -475,6 +640,16 @@ class DeltaEntropyApprox:
                 f"||g||={grad_l2:.3e} ||v||={v_l2:.3e} cos={cosine:.3f} | "
                 f"est={out['estimator']} baseline={self.baseline_kind}"
             )
+
+            if self.var_enabled:
+                vinfo = out.get("variance", {})
+                self.logger.info(
+                    f"[delta-h approx][variance] shards={vinfo.get('num_shards', 0)} "
+                    f"SE(shard)={vinfo.get('se_shard', 0.0):.3e} "
+                    f"SE(jack)={vinfo.get('se_jackknife', 0.0):.3e}"
+                )
+
+
         return out
 
     # ---------------------------------------------------------------------------------------------

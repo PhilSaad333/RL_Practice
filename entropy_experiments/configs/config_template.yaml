@@ -44,7 +44,9 @@ approx_delta_h:
   report_per_token: false
   simple_baseline:
     kind: time_loo                  # 'time_loo' | 'time_mean' | 'none'
-
+  variance:
+    enabled: true
+    jackknife: true
 
 # === GENERATION SETTINGS ===  
 generation:
