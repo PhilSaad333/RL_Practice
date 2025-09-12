@@ -851,7 +851,8 @@ class DeltaEntropyApprox:
             (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(f_mb, (primals,), (tangents,))
             mb_contrib = float(((w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum).item())
 
-            scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
+            # Derivative averaging (NOT value averaging):
+            scale = self._scale_for_derivative(B_total, T_total)
             total_tokens_used += T_mb
             scale_sum += float(scale)
             contribs_mb.append(mb_contrib * float(scale))
@@ -882,7 +883,7 @@ class DeltaEntropyApprox:
                     f"SE(jack)={vinfo.get('se_jackknife', 0.0):.3e}"
                 )
             self.logger.info(
-                f"[dir JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
+                f"[delta-h approx JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
                 f"sum_deriv_scales={scale_sum:.6e} "
                 f"(per_token ⇒ ≈ #microbatches/T_total), total_tokens_used={total_tokens_used}, pre_count={T_total}"
             )

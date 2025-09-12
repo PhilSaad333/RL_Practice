@@ -624,7 +624,13 @@ class EntropyMeasurements:
 
         approx_cfg = (self.config.get("approx_delta_h", {}) or {})
         method = str(approx_cfg.get("method", "grad_dot")).lower()
-        if method in {"jvp", "forward", "jvp_rb"}:
+
+        curv_cfg = (approx_cfg.get("curvature", {}) or {})
+
+
+        if method in {"jvp", "forward", "jvp_rb"} and bool(curv_cfg.get("enabled", False)):
+            self.logger.info("[h_approx] Using JVP method incl quadratic")
+        elif method in {"jvp", "forward", "jvp_rb"}:
             self.logger.info("[h_approx] Using JVP method")
             h_approx_normalized_dict = self.delta_entropy_approx.compute_delta_h_approx_jvp(
                 E_batch=E_batch,
@@ -646,7 +652,6 @@ class EntropyMeasurements:
 
         # Optional curvature (nested JVP) on the same E-batch (time not included in h_approx)
         curvature_info = None
-        curv_cfg = (approx_cfg.get("curvature", {}) or {})
         if bool(curv_cfg.get("enabled", False)):
             try:
                 curvature_info = self.delta_entropy_approx.compute_dir_linear_and_quadratic_jvp(
