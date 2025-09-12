@@ -867,7 +867,7 @@ class DeltaEntropyApprox:
                     f"SE(jack)={vinfo.get('se_jackknife', 0.0):.3e}"
                 )
             self.logger.info(
-                f"[delta-h approx JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for per_sequence), "
+                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for {self.normalize}), "
                 f"total_tokens_used={total_tokens_used} vs pre_count={T_total}"
             )
         return out
