@@ -637,8 +637,28 @@ class EntropyMeasurements:
                 v_named=v_named,
             )
         h_approx_normalized = float(h_approx_normalized_dict["delta_h_per_lr"])
+        approx_variance = h_approx_normalized_dict.get("variance", {})
+        approx_meta = {"method": h_approx_normalized_dict.get("method"),
+                       "baseline": h_approx_normalized_dict.get("baseline", {})}
         t_approx = time.time() - t_approx
         self.logger.info(f"[ΔHapprox] Computed h_approx_normalized in {t_approx:.2f}s")
+
+
+        # Optional curvature (nested JVP) on the same E-batch (time not included in h_approx)
+        curvature_info = None
+        curv_cfg = (approx_cfg.get("curvature", {}) or {})
+        if bool(curv_cfg.get("enabled", False)):
+            try:
+                curvature_info = self.delta_entropy_approx.compute_dir_linear_and_quadratic_jvp(
+                    E_batch=E_batch,
+                    v_named=v_named,
+                )
+                self.logger.info(
+                    f"[curvature] g·v={curvature_info.get('gdotv'):.3e} vHv={curvature_info.get('vHvv'):.3e} "
+                    f"eta*={curvature_info.get('eta_star'):.3e}"
+                )
+            except Exception as e:
+                self.logger.warning(f"[curvature] Failed to compute nested JVP: {e}")
 
 
         # Then sweep over eta to compue true deltaH, using h_approx = eta*h_approx_normalized
@@ -664,6 +684,15 @@ class EntropyMeasurements:
 
             # 4B) Approximate ΔH ≈ X̄ · Δ\theta on E
             deltaH_approx = float(eta) * h_approx_normalized
+            # Quadratic correction if curvature was computed
+            deltaH_approx_linquad = None
+            if 'curvature_info' in locals() and curvature_info is not None:
+                try:
+                    gdotv = float(curvature_info.get('gdotv', 0.0))
+                    vHvv = float(curvature_info.get('vHvv', 0.0))
+                    deltaH_approx_linquad = float(eta) * gdotv + 0.5 * (float(eta) ** 2) * vHvv
+                except Exception:
+                    deltaH_approx_linquad = None
 
             self.logger.info(
                 f"[η={eta:g}] ΔH_true={deltaH_true:.6e}   ΔH1={deltaH_approx:.6e}   "
@@ -676,6 +705,9 @@ class EntropyMeasurements:
                 "deltaH_true": deltaH_true,
                 "deltaH_approx": deltaH_approx,
             })
+            if deltaH_approx_linquad is not None:
+                sweep_results[-1]["deltaH_approx_linear"] = deltaH_approx
+                sweep_results[-1]["deltaH_approx_linquad"] = deltaH_approx_linquad
 
         # ---------------------------------------------------------------------
         # 5) Package results
@@ -697,6 +729,9 @@ class EntropyMeasurements:
                 "true_total": t_true_total,
                 "h_approx": t_approx,
             },
+            "variance": approx_variance,
+            "approx": {"h_approx_normalized": h_approx_normalized, **approx_meta},
+            "curvature": curvature_info,
         }
 
         self.logger.info(

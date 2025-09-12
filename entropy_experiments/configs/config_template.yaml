@@ -76,6 +76,9 @@ approx_delta_h:
     jackknife: true
 
   report_per_token: false
+  
+  curvature:
+    enabled: true
 
 
 # === GENERATION SETTINGS ===  

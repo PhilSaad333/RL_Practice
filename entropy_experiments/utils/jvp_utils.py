@@ -135,3 +135,91 @@ def make_seq_outputs_closure(
         return logp_vec, H_sum
 
     return _f
+
+
+def make_mb_outputs_closure(
+    *,
+    model: torch.nn.Module,
+    base_map: Dict[str, torch.Tensor],
+    names: List[str],
+    input_ids_mb: torch.Tensor,          # [B, L]
+    attention_mask_mb: torch.Tensor,     # [B, L]
+    prompt_lens: List[int],              # [B]
+    gen_lens: List[int],                 # [B] (T per sequence)
+):
+    """
+    Build a microbatch closure F_mb(params_tuple) -> (logp_cat[T_mb], H_sum[scalar]) where:
+      - logp_cat concatenates per-token log p on realized tokens across all sequences in the
+        microbatch (skips sequences with T_b == 0), in order b=0..B-1.
+      - H_sum is the sum of full-softmax entropies across all tokens in the microbatch.
+
+    Returns a closure suitable for use with torch.func.jvp.
+    """
+    mdl = model
+
+    def _F(params_tuple):
+        # Merge params
+        params_map = dict(base_map)
+        for n, t in zip(names, params_tuple):
+            params_map[n] = t
+
+        # Disable gradient checkpoint hooks that may call requires_grad_()
+        restore_ckpt = False
+        restore_input_req = False
+        try:
+            if getattr(mdl, "is_gradient_checkpointing", False):
+                try:
+                    mdl.gradient_checkpointing_disable()
+                    restore_ckpt = True
+                except Exception:
+                    pass
+            if hasattr(mdl, "disable_input_require_grads"):
+                try:
+                    mdl.disable_input_require_grads()
+                    restore_input_req = True
+                except Exception:
+                    pass
+
+            logp_list = []
+            H_sum_total = torch.zeros((), dtype=torch.float32, device=input_ids_mb.device)
+
+            B = int(input_ids_mb.shape[0])
+            for b in range(B):
+                T = int(gen_lens[b])
+                if T <= 0:
+                    continue
+                input_ids = input_ids_mb[b]
+                attention_mask = attention_mask_mb[b]
+                out = functional_call(
+                    mdl, params_map,
+                    (input_ids.unsqueeze(0),),
+                    {"attention_mask": attention_mask.unsqueeze(0), "use_cache": False}
+                )
+                logits = out.logits  # [1, L, V]
+                start = max(int(prompt_lens[b]) - 1, 0)
+                end = start + T
+                logits_slice = logits[:, start:end, :]    # [1, T, V]
+                targets = input_ids[prompt_lens[b]: prompt_lens[b] + T]
+                logp_full = torch.log_softmax(logits_slice.to(torch.float32), dim=-1)
+                tok_logp = logp_full.gather(-1, targets.view(1, T, 1)).squeeze(-1).squeeze(0)  # [T]
+                logp_list.append(tok_logp)
+
+                p = torch.exp(logp_full)
+                H_t = -(p * logp_full).sum(dim=-1).squeeze(0)  # [T]
+                H_sum_total = H_sum_total + H_t.sum()
+
+            logp_cat = torch.cat(logp_list, dim=0) if len(logp_list) > 0 else torch.zeros(0, device=input_ids_mb.device)
+            return logp_cat, H_sum_total
+        finally:
+            if restore_input_req and hasattr(mdl, "enable_input_require_grads"):
+                try:
+                    mdl.enable_input_require_grads()
+                except Exception:
+                    pass
+            if restore_ckpt:
+                try:
+                    mdl.gradient_checkpointing_enable()
+                except Exception:
+                    pass
+
+    return _F

@@ -73,9 +73,16 @@ from entropy_experiments.utils.sequence_processor import (
 )
 
 
-from entropy_experiments.utils.jvp_utils import (snapshot_base_functional_state, intersect_jvp_primals_tangents, make_seq_outputs_closure)
+from entropy_experiments.utils.jvp_utils import (
+    snapshot_base_functional_state, intersect_jvp_primals_tangents,
+    make_seq_outputs_closure, make_mb_outputs_closure,
+)
 from entropy_experiments.baselines import get_strategy, EmaState, build_weights_base, get_timewise_strategy
 from entropy_experiments.baselines.strategies import RidgeConfig
+from entropy_experiments.utils.param_overrides import (
+    build_functional_params_named,
+    merge_params_and_buffers,
+)
 
 
 @dataclass
@@ -472,6 +479,177 @@ class DeltaEntropyApprox:
         return out
 
     # ---------------------------------------------------------------------------------------------
+    # Phase 1: linear + quadratic directional terms via nested JVP (LoRA-only, microbatched)
+    # ---------------------------------------------------------------------------------------------
+    def compute_dir_linear_and_quadratic_jvp(
+        self,
+        *,
+        E_batch: Dict[str, Any],
+        v_named: Dict[str, torch.Tensor],
+        etas: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute the linear term g·v and the quadratic curvature term v^T H v for the RB surrogate on E-batch
+        using nested forward-mode JVP:
+            g·v     = jvp(f, θ; v)
+            v^T H v = jvp( θ ↦ jvp(f, θ; v), θ; v )
+        where f aggregates over the microbatch with detached weights w_t = (G_t - b_t).
+        """
+        device = next(self.model.parameters()).device
+        mdl = self.model; mdl.eval()
+
+        # Eta list only for reporting predicted ratio
+        est_cfg = (self.cfg.get("estimator", {}) or {})
+        if etas is None:
+            if bool(est_cfg.get("eta_sweep", False)) and est_cfg.get("eta_list"):
+                etas = [float(x) for x in est_cfg.get("eta_list")]
+            else:
+                etas = [float(est_cfg.get("single_eta", 2e-6))]
+
+        # Base functional state (params+buffers), LoRA-only intersection
+        p_dict, b_dict = build_functional_params_named(
+            self.model,
+            v_named=None,
+            eta=0.0,
+            strict=True,
+            allow_frozen_updates=False,
+            detach_params=True,
+            detach_buffers=True,
+            force_param_dtype=torch.float32,
+            force_buffer_dtype=None,
+        )
+        base_map = merge_params_and_buffers(p_dict, b_dict)
+        names: List[str] = []
+        primals: List[torch.Tensor] = []
+        tangents: List[torch.Tensor] = []
+        for n, p in self.model.named_parameters():
+            if (not p.requires_grad) or (n not in v_named):
+                continue
+            names.append(n)
+            primals.append(base_map[n].to(device=device))
+            tangents.append(v_named[n].to(device=device, dtype=base_map[n].dtype))
+        if len(names) == 0:
+            raise ValueError("[Phase1 JVP] No intersecting trainables for JVP.")
+        primals = tuple(primals); tangents = tuple(tangents)
+
+        B_total = int(E_batch["sequences"].shape[0])
+        T_total = self._count_total_gen_tokens(E_batch)
+
+        gdotv_total = 0.0
+        vHvv_total = 0.0
+        scale_sum = 0.0
+        total_tokens_used = 0
+        g_contribs_mb: List[float] = []
+        h_contribs_mb: List[float] = []
+
+        for mb_E in self._iter_microbatches(E_batch, self.mb):
+            B_mb = int(mb_E.sequences.shape[0])
+            tf_bs = min(self.mb, B_mb)
+
+            baseline_kind = str(self.baseline_kind).lower()
+            ema_state = None
+            if baseline_kind == "hk_ema":
+                ema_state = EmaState(
+                    pos_bins=self._pos_bins,
+                    ema_beta=self._ema_beta,
+                    ema_resid=self._ema_resid,
+                    ema_cnt=self._ema_cnt,
+                )
+            ridge_cfg = RidgeConfig(lambda_=getattr(self, "ridge_lambda", 1e-3),
+                                    eps=getattr(self, "ridge_eps", 1e-8))
+            w_list = build_weights_base(
+                kind=baseline_kind,
+                model=self.model,
+                sp=self.sp,
+                mb_E=mb_E,
+                tf_bs=tf_bs,
+                ema=ema_state,
+                ridge=ridge_cfg,
+            )
+
+            input_ids_mb = mb_E.sequences[:, 0].to(device=device)
+            attention_mask_mb = mb_E.attention_masks[:, 0].to(device=device)
+            prompt_lens = [int(x) for x in mb_E.prompt_lens]
+            T_list = [int(mb_E.gen_lens[b][0]) for b in range(B_mb)]
+            T_mb = sum(t for t in T_list if t > 0)
+            if T_mb == 0:
+                continue
+            total_tokens_used += T_mb
+            w_cat = torch.cat([w_list[b] for b in range(B_mb) if T_list[b] > 0], dim=0)
+
+            F_mb = make_mb_outputs_closure(
+                model=self.model,
+                base_map=base_map,
+                names=names,
+                input_ids_mb=input_ids_mb,
+                attention_mask_mb=attention_mask_mb,
+                prompt_lens=prompt_lens,
+                gen_lens=T_list,
+            )
+
+            def f_scalar(params_tuple):
+                logp_cat, H_sum = F_mb(params_tuple)
+                return (w_cat.to(logp_cat) * logp_cat).sum() + H_sum
+
+            # First JVP: g·v
+            _, gdotv_mb = jvp(f_scalar, (primals,), (tangents,))
+
+            # Nested: v^T H v
+            def gdot_fn(params_tuple):
+                return jvp(f_scalar, (params_tuple,), (tangents,))[1]
+            _, vHvv_mb = jvp(gdot_fn, (primals,), (tangents,))
+
+            scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
+            scale_sum += float(scale)
+            g_contribs_mb.append(float(gdotv_mb.item()) * float(scale))
+            h_contribs_mb.append(float(vHvv_mb.item()) * float(scale))
+            gdotv_total += g_contribs_mb[-1]
+            vHvv_total += h_contribs_mb[-1]
+
+        eps = 1e-30
+        eta_star = (2.0 * abs(gdotv_total) / max(abs(vHvv_total), eps)) if abs(vHvv_total) > 0 else float("inf")
+        kappa = (vHvv_total / max(gdotv_total, eps)) if abs(gdotv_total) > 0 else float("nan")
+        ratio_pred = {float(eta): 1.0 / (1.0 + 0.5 * float(eta) * kappa) for eta in etas}
+
+        out = {
+            "gdotv": gdotv_total,
+            "vHvv": vHvv_total,
+            "eta_star": eta_star,
+            "ratio_pred": ratio_pred,
+            "num_sequences": int(E_batch["sequences"].shape[0]),
+            "num_tokens": int(T_total),
+            "method": "jvp_nested",
+            "baseline": {"kind": str(self.baseline_kind)},
+            "audit": {"scale_sum": scale_sum, "total_tokens_used": total_tokens_used},
+        }
+        M = len(g_contribs_mb)
+        if M > 1:
+            mean_g = sum(g_contribs_mb) / M
+            var_g = sum((x - mean_g) ** 2 for x in g_contribs_mb) / (M - 1)
+            mean_h = sum(h_contribs_mb) / M
+            var_h = sum((x - mean_h) ** 2 for x in h_contribs_mb) / (M - 1)
+            out["variance"] = {
+                "num_shards": M,
+                "se_gdotv": (var_g ** 0.5) / (M ** 0.5),
+                "se_vHvv": (var_h ** 0.5) / (M ** 0.5),
+            }
+        if self.logger:
+            self.logger.info(
+                f"[dir JVP] g·v={gdotv_total:.6e}  vHv={vHvv_total:.6e}  eta*={eta_star:.3e}  "
+                f"B={out['num_sequences']} T={out['num_tokens']} baseline={self.baseline_kind}"
+            )
+            self.logger.info(
+                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for per_sequence), "
+                f"tokens_used={total_tokens_used} vs pre_count={T_total}"
+            )
+            try:
+                rs = ", ".join([f"η={eta:.1e}→R_pred={ratio_pred[eta]:.3f}" for eta in ratio_pred])
+                self.logger.info(f"[dir JVP] ratio_pred: {rs}")
+            except Exception:
+                pass
+        return out
+
+    # ---------------------------------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------------------------------
     def _select_params_intersecting(self, v_named: Dict[str, torch.Tensor]) -> "TOrderedDict[str, torch.nn.Parameter]":
@@ -611,10 +789,8 @@ class DeltaEntropyApprox:
 
         for mb_E in self._iter_microbatches(E_batch, self.mb):
             B_mb = int(mb_E.sequences.shape[0])
-            mb_contrib = 0.0
-            T_mb = 0
             tf_bs = min(self.mb, B_mb)
-            # Build detached weights w_t = (G - b_t) using baseline strategies
+            # Build detached per-seq weights w_t = (G - b_t) using baseline strategies
             baseline_kind = str(self.baseline_kind).lower()
             ema_state = None
             if baseline_kind == "hk_ema":
@@ -634,28 +810,28 @@ class DeltaEntropyApprox:
                 ema=ema_state,
                 ridge=ridge_cfg,
             )
-            for b in range(B_mb):
-                input_ids = mb_E.sequences[b, 0].to(device=device)
-                attention_mask = mb_E.attention_masks[b, 0].to(device=device)
-                prompt_len = int(mb_E.prompt_lens[b])
-                T = int(mb_E.gen_lens[b][0])
-                if T <= 0:
-                    continue
-                T_mb += T
-                w_t = w_list[b]
+            # Build one microbatch closure and one concatenated weight vector
+            input_ids_mb = mb_E.sequences[:, 0].to(device=device)          # [B_mb, L]
+            attention_mask_mb = mb_E.attention_masks[:, 0].to(device=device)
+            prompt_lens = [int(x) for x in mb_E.prompt_lens]
+            T_list = [int(mb_E.gen_lens[b][0]) for b in range(B_mb)]
+            T_mb = sum(t for t in T_list if t > 0)
+            if T_mb == 0:
+                continue
+            # Concatenate weights in the same order we will concatenate logp vectors
+            w_cat = torch.cat([w_list[b] for b in range(B_mb) if T_list[b] > 0], dim=0)  # [T_mb]
 
-                f_seq = make_seq_outputs_closure(
-                    model=self.model,
-                    base_map=base_map,
-                    names=names,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    prompt_len=prompt_len,
-                    T=T,
-                )
-                (logp_vec, H_sum), (j_logp_vec, j_H_sum) = jvp(f_seq, (primals,), (tangents,))
-                seq_dir = (w_t * j_logp_vec).sum() + j_H_sum
-                mb_contrib += float(seq_dir.item())
+            f_mb = make_mb_outputs_closure(
+                model=self.model,
+                base_map=base_map,
+                names=names,
+                input_ids_mb=input_ids_mb,
+                attention_mask_mb=attention_mask_mb,
+                prompt_lens=prompt_lens,
+                gen_lens=T_list,
+            )
+            (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(f_mb, (primals,), (tangents,))
+            mb_contrib = float(((w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum).item())
 
             scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
             total_tokens_used += T_mb
