@@ -626,10 +626,11 @@ class EntropyMeasurements:
         method = str(approx_cfg.get("method", "grad_dot")).lower()
 
         curv_cfg = (approx_cfg.get("curvature", {}) or {})
-
-
-        if method in {"jvp", "forward", "jvp_rb"} and bool(curv_cfg.get("enabled", False)):
+        use_quad = bool(curv_cfg.get("enabled", False))
+        used_quad=False
+        if method in {"jvp", "forward", "jvp_rb"} and use_quad:
             self.logger.info("[h_approx] Using JVP method incl quadratic")
+            used_quad = True
         elif method in {"jvp", "forward", "jvp_rb"}:
             self.logger.info("[h_approx] Using JVP method")
             h_approx_normalized_dict = self.delta_entropy_approx.compute_delta_h_approx_jvp(
@@ -642,17 +643,25 @@ class EntropyMeasurements:
                 E_batch=E_batch,
                 v_named=v_named,
             )
-        h_approx_normalized = float(h_approx_normalized_dict["delta_h_per_lr"])
-        approx_variance = h_approx_normalized_dict.get("variance", {})
-        approx_meta = {"method": h_approx_normalized_dict.get("method"),
-                       "baseline": h_approx_normalized_dict.get("baseline", {})}
+
+        if not used_quad:
+            h_approx_normalized = float(h_approx_normalized_dict["delta_h_per_lr"])
+            approx_variance = h_approx_normalized_dict.get("variance", {})
+            approx_meta = {"method": h_approx_normalized_dict.get("method"),
+                        "baseline": h_approx_normalized_dict.get("baseline", {})}
+        else:
+            h_approx_normalized = 0.0
+            approx_meta = {}
+            approx_variance = 0.0            
+
+
         t_approx = time.time() - t_approx
         self.logger.info(f"[ΔHapprox] Computed h_approx_normalized in {t_approx:.2f}s")
 
 
         # Optional curvature (nested JVP) on the same E-batch (time not included in h_approx)
         curvature_info = None
-        if bool(curv_cfg.get("enabled", False)):
+        if use_quad:
             try:
                 curvature_info = self.delta_entropy_approx.compute_dir_linear_and_quadratic_jvp(
                     E_batch=E_batch,
@@ -688,7 +697,7 @@ class EntropyMeasurements:
             t_true_total += t_true
 
             # 4B) Approximate ΔH ≈ X̄ · Δ\theta on E
-            deltaH_approx = float(eta) * h_approx_normalized
+            deltaH_approx = float(eta) * h_approx_normalized if not used_quad else 0.0
             # Quadratic correction if curvature was computed
             deltaH_approx_linquad = None
             if 'curvature_info' in locals() and curvature_info is not None:
@@ -696,6 +705,7 @@ class EntropyMeasurements:
                     gdotv = float(curvature_info.get('gdotv', 0.0))
                     vHvv = float(curvature_info.get('vHvv', 0.0))
                     deltaH_approx_linquad = float(eta) * gdotv + 0.5 * (float(eta) ** 2) * vHvv
+                    deltaH_approx = float(eta)* gdotv
                 except Exception:
                     deltaH_approx_linquad = None
 
