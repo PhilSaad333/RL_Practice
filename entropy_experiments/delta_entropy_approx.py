@@ -599,7 +599,8 @@ class DeltaEntropyApprox:
                 return jvp(f_scalar, (params_tuple,), (tangents,))[1]
             _, vHvv_mb = jvp(gdot_fn, (primals,), (tangents,))
 
-            scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
+            # Derivative averaging: constant scale per microbatch
+            scale = self._scale_for_derivative(B_total, T_total)
             scale_sum += float(scale)
             g_contribs_mb.append(float(gdotv_mb.item()) * float(scale))
             h_contribs_mb.append(float(vHvv_mb.item()) * float(scale))
@@ -639,8 +640,9 @@ class DeltaEntropyApprox:
                 f"B={out['num_sequences']} T={out['num_tokens']} baseline={self.baseline_kind}"
             )
             self.logger.info(
-                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for {self.normalize}), "
-                f"tokens_used={total_tokens_used} vs pre_count={T_total}"
+                f"[dir JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
+                f"sum_deriv_scales={scale_sum:.6e} "
+                f"(per_token ⇒ ≈ #microbatches/T_total), tokens_used={total_tokens_used}, pre_count={T_total}"
             )
             assert T_total == int(sum(t[0] for t in E_batch["gen_lens"])), "Token count mismatch."
 
@@ -706,6 +708,19 @@ class DeltaEntropyApprox:
             return float(B_mb) / max(B_total, 1)
         elif self.normalize == "per_token":
             return float(T_mb) / max(T_total, 1)
+        else:
+            return 1.0
+
+    def _scale_for_derivative(self, B_total: int, T_total: int) -> float:
+        """
+        Scale to average **directional derivatives** over the E-batch.
+        For per-token mean:  (1 / T_total) * Σ_mb D_v L_mb
+        For per-sequence mean: (1 / B_total) * Σ_mb D_v L_mb
+        """
+        if self.normalize == "per_token":
+            return 1.0 / max(T_total, 1)
+        elif self.normalize == "per_sequence":
+            return 1.0 / max(B_total, 1)
         else:
             return 1.0
 
@@ -867,8 +882,9 @@ class DeltaEntropyApprox:
                     f"SE(jack)={vinfo.get('se_jackknife', 0.0):.3e}"
                 )
             self.logger.info(
-                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for {self.normalize}), "
-                f"total_tokens_used={total_tokens_used} vs pre_count={T_total}"
+                f"[dir JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
+                f"sum_deriv_scales={scale_sum:.6e} "
+                f"(per_token ⇒ ≈ #microbatches/T_total), total_tokens_used={total_tokens_used}, pre_count={T_total}"
             )
         return out
 

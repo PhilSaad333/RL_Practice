@@ -1,104 +1,82 @@
---- a/delta_entropy_true.py
-+++ b/delta_entropy_true.py
+--- a/delta_entropy_approx.py
++++ b/delta_entropy_approx.py
 @@
-     def compute_delta_h_true(
-         self,
-         E_batch: Dict[str, Any],
-         v_named: Dict[str, torch.Tensor],
-         eta: float,
-         cfg: Optional[Dict[str, Any]] = None,
-     ) -> float:
-@@
--        clip_c = float(cfg.get("clip_c", 10.0))
-+        clip_c = float(cfg.get("clip_c", 10.0))
-+        report_per_token = bool(cfg.get("report_per_token", False))
-@@
--            base_stats, H_base_mean = self._score_batch_base(E_batch)
-+            base_stats, H_base_mean = self._score_batch_base(E_batch, report_per_token=report_per_token)
-@@
--        new_stats = self._score_batch_new(E_batch, v_named, eta)
-+        new_stats = self._score_batch_new(E_batch, v_named, eta)
-@@
--        H_new_snis, ess, lw_stats = self._snis_reduce(
--            base=base_stats, new=new_stats, clip_c=clip_c
--        )
-+        H_new_snis, ess, lw_stats = self._snis_reduce(
-+            base=base_stats, new=new_stats, clip_c=clip_c, report_per_token=report_per_token
-+        )
-@@
--        if self.logger:
--            self.logger.info(
--                f"[SNIS] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
--                f"ΔH_true={H_new_snis - H_base_mean:.6e}  ESS={ess:.1f}/{len(base_stats.seq_logprob)}  "
--                f"lw[min/med/max]={lw_stats}"
--            )
-+        if self.logger:
-+            lab = "per-token" if report_per_token else "per-sequence"
-+            self.logger.info(
-+                f"[SNIS:{lab}] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
-+                f"ΔH_true={H_new_snis - H_base_mean:.6e}  ESS={ess:.1f}/{len(base_stats.seq_logprob)}  "
-+                f"lw[min/med/max]={lw_stats}"
-+            )
-@@
--    def _score_batch_base(self, E_batch: Dict[str, Any]) -> Tuple[_SeqStats, float]:
-+    def _score_batch_base(self, E_batch: Dict[str, Any], *, report_per_token: bool) -> Tuple[_SeqStats, float]:
-@@
--        stats = self._extract_seq_stats(lp, diag, use_simple=use_simple)
--        H_base_mean = float(np.mean(stats.integrand_seq)) if stats.integrand_seq.size else 0.0
-+        stats = self._extract_seq_stats(lp, diag, use_simple=use_simple)
-+        if report_per_token:
-+            num = float(stats.integrand_seq.sum()) if stats.integrand_seq.size else 0.0
-+            den = float(stats.T_tokens.sum()) if stats.T_tokens.size else 1.0
-+            H_base_mean = (num / max(den, 1.0))
+     def _scale_for_average(self, B_total: int, T_total: int, B_mb: int, T_mb: int) -> float:
+         """
+         Compute the scale factor so that Σ_mb scale_mb * L_sur_mb
+         produces the desired expectation over the E-batch.
+ 
+         - 'per_sequence': average over sequences ⇒ scale_mb = B_mb / B_total
+         - 'per_token'   : average over tokens    ⇒ scale_mb = T_mb / T_total
+         - 'none'        : leave as sum
+         """
+         if self.normalize == "per_sequence":
+             return float(B_mb) / max(B_total, 1)
+         elif self.normalize == "per_token":
+             return float(T_mb) / max(T_total, 1)
+         else:
+             return 1.0
++
++    def _scale_for_derivative(self, B_total: int, T_total: int) -> float:
++        """
++        Scale to average **directional derivatives** over the E-batch.
++        For per-token mean:  (1 / T_total) * Σ_mb D_v L_mb
++        For per-sequence mean: (1 / B_total) * Σ_mb D_v L_mb
++        """
++        if self.normalize == "per_token":
++            return 1.0 / max(T_total, 1)
++        elif self.normalize == "per_sequence":
++            return 1.0 / max(B_total, 1)
 +        else:
-+            H_base_mean = float(np.mean(stats.integrand_seq)) if stats.integrand_seq.size else 0.0
-         return stats, H_base_mean
++            return 1.0
 @@
--    def _snis_reduce(
--        self,
--        *,
--        base: _SeqStats,
--        new: _SeqStats,
--        clip_c: float,
--    ) -> Tuple[float, float, Tuple[float, float, float]]:
-+    def _snis_reduce(
-+        self,
-+        *,
-+        base: _SeqStats,
-+        new: _SeqStats,
-+        clip_c: float,
-+        report_per_token: bool,
-+    ) -> Tuple[float, float, Tuple[float, float, float]]:
+     def compute_dir_linear_and_quadratic_jvp(
 @@
--        # stability shift
-+        # stability shift
-         m = float(lw.max()) if lw.size else 0.0
-         w = np.exp(lw - m, dtype=np.float64)
+-            scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
+-            scale_sum += float(scale)
++            # Derivative averaging: constant scale per microbatch
++            scale = self._scale_for_derivative(B_total, T_total)
++            scale_sum += float(scale)
+             g_contribs_mb.append(float(gdotv_mb.item()) * float(scale))
+             h_contribs_mb.append(float(vHvv_mb.item()) * float(scale))
+             gdotv_total += g_contribs_mb[-1]
+             vHvv_total += h_contribs_mb[-1]
 @@
--        Z = float(w.sum()) if w.size else 1.0
--        if Z <= 0.0 or not np.isfinite(Z):
--            # Degenerate weights => fall back to simple mean (rare with top_p=1.0)
--            H_new = float(np.mean(new.integrand_seq)) if new.integrand_seq.size else 0.0
--            ess = 0.0
--        else:
--            H_new = float(np.dot(new.integrand_seq, w) / Z)
--            ess = float((Z ** 2) / float(np.dot(w, w))) if w.size else 0.0
-+        Z = float(w.sum()) if w.size else 1.0
-+        if Z <= 0.0 or not np.isfinite(Z):
-+            # Degenerate weights => fall back to unweighted averages
-+            if report_per_token:
-+                num = float(new.integrand_seq.sum()) if new.integrand_seq.size else 0.0
-+                den = float(new.T_tokens.sum()) if new.T_tokens.size else 1.0
-+                H_new = (num / max(den, 1.0))
-+            else:
-+                H_new = float(np.mean(new.integrand_seq)) if new.integrand_seq.size else 0.0
-+            ess = 0.0
-+        else:
-+            if report_per_token:
-+                num = float(np.dot(new.integrand_seq, w))
-+                den = float(np.dot(new.T_tokens.astype(np.float64, copy=False), w))
-+                den = den if np.isfinite(den) and den > 0.0 else 1.0
-+                H_new = (num / den)
-+            else:
-+                H_new = float(np.dot(new.integrand_seq, w) / Z)
-+            ess = float((Z ** 2) / float(np.dot(w, w))) if w.size else 0.0
+         if self.logger:
+             self.logger.info(
+                 f"[dir JVP] g·v={gdotv_total:.6e}  vHv={vHvv_total:.6e}  eta*={eta_star:.3e}  "
+                 f"B={out['num_sequences']} T={out['num_tokens']} baseline={self.baseline_kind}"
+             )
+             self.logger.info(
+-                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for {self.normalize}), "
+-                f"tokens_used={total_tokens_used} vs pre_count={T_total}"
++                f"[dir JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
++                f"sum_deriv_scales={scale_sum:.6e} "
++                f"(per_token ⇒ ≈ #microbatches/T_total), tokens_used={total_tokens_used}, pre_count={T_total}"
+             )
+@@
+     def compute_delta_h_approx_jvp(
+@@
+-            scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
+-            total_tokens_used += T_mb
+-            scale_sum += float(scale)
+-            contribs_mb.append(mb_contrib * float(scale))
++            # Derivative averaging: constant scale per microbatch
++            scale = self._scale_for_derivative(B_total, T_total)
++            total_tokens_used += T_mb
++            scale_sum += float(scale)
++            contribs_mb.append(mb_contrib * float(scale))
+@@
+         if self.logger:
+             self.logger.info(
+                 f"[delta-h approx JVP] ⟨∇H, v⟩={out['delta_h_per_lr']:.6e} | "
+                 f"B={out['num_sequences']} T={out['num_tokens']} | baseline={self.baseline_kind}"
+             )
+@@
+             self.logger.info(
+-                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for {self.normalize}), "
+-                f"total_tokens_used={total_tokens_used} vs pre_count={T_total}"
++                f"[dir JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
++                f"sum_deriv_scales={scale_sum:.6e} "
++                f"(per_token ⇒ ≈ #microbatches/T_total), total_tokens_used={total_tokens_used}, pre_count={T_total}"
+             )
