@@ -99,14 +99,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Base YAML config path")
     p.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT, help="Output root directory")
     p.add_argument("--label", type=str, default="overnight_runs", help="Label name for the run folder")
-    p.add_argument("--n_runs", type=int, default=16, help="Number of runs")
+    p.add_argument("--n_runs", type=int, default=8, help="Number of runs")
 
     # Overrides
     p.add_argument("--baseline_kind", type=str, default="hk_ema", help="Baseline kind (hk|hk_ema|hk_ridge|regression|none)")
     p.add_argument("--ema_beta", type=float, default=0.9, help="hk_ema beta")
-    p.add_argument("--eta", type=float, default=1e-6, help="Single eta")
-    p.add_argument("--BE", type=int, default=256, help="B_E")
-    p.add_argument("--BU", type=int, default=32, help="B_U")
+    p.add_argument("--eta", type=float, default=4e-6, help="Single eta")
+    p.add_argument("--BE", type=int, default=512, help="B_E")
+    p.add_argument("--BU", type=int, default=64, help="B_U")
     p.add_argument("--method", type=str, default=None, help="Approx method (jvp|grad_dot)")
     p.add_argument("--enable_variance", action="store_true", default=True, help="Ensure variance is enabled")
     p.add_argument("--jackknife", action="store_true", default=True, help="Enable jackknife in variance")
