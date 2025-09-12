@@ -89,12 +89,13 @@ class DeltaEntropyTrue:
         """
         cfg = cfg or {}
         clip_c = float(cfg.get("clip_c", 10.0))
+        report_per_token = bool(cfg.get("report_per_token", False))
 
         key = self._batch_key(E_batch)
         base_info = self._base_cache.get(key, None)
         if base_info is None:
             # --- Baseline pass (η = 0) ---
-            base_stats, H_base_mean = self._score_batch_base(E_batch)
+            base_stats, H_base_mean = self._score_batch_base(E_batch, report_per_token=report_per_token)
             base_info = {"seq_stats": base_stats, "H_base_mean": float(H_base_mean)}
             self._base_cache[key] = base_info
 
@@ -106,12 +107,13 @@ class DeltaEntropyTrue:
 
         # --- SNIS reducer over sequences ---
         H_new_snis, ess, lw_stats = self._snis_reduce(
-            base=base_stats, new=new_stats, clip_c=clip_c
+            base=base_stats, new=new_stats, clip_c=clip_c, report_per_token=report_per_token
         )
 
         if self.logger:
+            lab = "per-token" if report_per_token else "per-sequence"
             self.logger.info(
-                f"[SNIS] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
+                f"[SNIS:{lab}] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
                 f"ΔH_true={H_new_snis - H_base_mean:.6e}  ESS={ess:.1f}/{len(base_stats.seq_logprob)}  "
                 f"lw[min/med/max]={lw_stats}"
             )
@@ -128,7 +130,7 @@ class DeltaEntropyTrue:
         return id(E_batch)
 
     @torch.no_grad()
-    def _score_batch_base(self, E_batch: Dict[str, Any]) -> Tuple[_SeqStats, float]:
+    def _score_batch_base(self, E_batch: Dict[str, Any], *, report_per_token: bool = False) -> Tuple[_SeqStats, float]:
         """
         One TF no-grad pass on θ to collect sequence logprobs and the integrand.
         Returns per-sequence stats and the mean baseline H across sequences.
@@ -157,7 +159,12 @@ class DeltaEntropyTrue:
         )
 
         stats = self._extract_seq_stats(lp, diag, use_simple=use_simple)
-        H_base_mean = float(np.mean(stats.integrand_seq)) if stats.integrand_seq.size else 0.0
+        if report_per_token:
+            num = float(stats.integrand_seq.sum()) if stats.integrand_seq.size else 0.0
+            den = float(stats.T_tokens.sum()) if stats.T_tokens.size else 1.0
+            H_base_mean = (num / max(den, 1.0))
+        else:
+            H_base_mean = float(np.mean(stats.integrand_seq)) if stats.integrand_seq.size else 0.0
         return stats, H_base_mean
 
     @torch.no_grad()
@@ -254,6 +261,7 @@ class DeltaEntropyTrue:
         base: _SeqStats,
         new: _SeqStats,
         clip_c: float,
+        report_per_token: bool = False,
     ) -> Tuple[float, float, Tuple[float, float, float]]:
         """
         Self-normalized IS at sequence level.
@@ -275,11 +283,22 @@ class DeltaEntropyTrue:
 
         Z = float(w.sum()) if w.size else 1.0
         if Z <= 0.0 or not np.isfinite(Z):
-            # Degenerate weights => fall back to simple mean (rare with top_p=1.0)
-            H_new = float(np.mean(new.integrand_seq)) if new.integrand_seq.size else 0.0
+            # Degenerate weights => fall back to unweighted averages
+            if report_per_token:
+                num = float(new.integrand_seq.sum()) if new.integrand_seq.size else 0.0
+                den = float(new.T_tokens.sum()) if new.T_tokens.size else 1.0
+                H_new = (num / max(den, 1.0))
+            else:
+                H_new = float(np.mean(new.integrand_seq)) if new.integrand_seq.size else 0.0
             ess = 0.0
         else:
-            H_new = float(np.dot(new.integrand_seq, w) / Z)
+            if report_per_token:
+                num = float(np.dot(new.integrand_seq, w))
+                den = float(np.dot(new.T_tokens.astype(np.float64, copy=False), w))
+                den = den if np.isfinite(den) and den > 0.0 else 1.0
+                H_new = (num / den)
+            else:
+                H_new = float(np.dot(new.integrand_seq, w) / Z)
             ess = float((Z ** 2) / float(np.dot(w, w))) if w.size else 0.0
 
         # lw diagnostics

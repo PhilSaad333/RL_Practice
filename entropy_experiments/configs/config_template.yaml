@@ -18,7 +18,7 @@ batch_config:
 estimator:
   use_simple_entropy_for_x: false
   eta_sweep: false
-  single_eta: 4e-6
+  single_eta: 1e-6
   eta_list: [1e-06, 2e-06, 4e-06, 8e-06, 1.6e-05, 3.2e-05, 6.4e-05, 0.000128]
 
 # Make RB entropies differentiable in the with-grad path
@@ -29,7 +29,7 @@ true_delta_h:
   microbatch_size: 1
   is_mode: "snis"
   clip_c: 10.0
-  report_per_token: false
+  report_per_token: true
   snapshot_device: "cpu"
 
 # === APPROXIMATE ENTROPY CHANGE ===
@@ -41,15 +41,15 @@ approx_delta_h:
 
   # Microbatching and normalization of the surrogate across E-batch
   microbatch_size: 8
-  normalize: per_sequence   # 'per_sequence' | 'per_token' | 'none'
+  normalize: per_token   # 'per_sequence' | 'per_token' | 'none'
 
   # Baseline settings for RB estimator paths (both methods use this 'kind')
   baseline:
     # 'hk' | 'hk_ema' | 'regression' | 'hk_ridge' | 'none'
-    kind: hk_ridge
+    kind: hk_ema
 
     # hk_ema controls (used when kind == 'hk_ema')
-    ema_beta: 0.95
+    ema_beta: 0.9
     pos_bins: 32
 
     # regression controls (used when kind in {'regression','reg','reg_ridge','regression_ridge'})

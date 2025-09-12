@@ -639,9 +639,12 @@ class DeltaEntropyApprox:
                 f"B={out['num_sequences']} T={out['num_tokens']} baseline={self.baseline_kind}"
             )
             self.logger.info(
-                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for per_sequence), "
+                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for {self.normalize}), "
                 f"tokens_used={total_tokens_used} vs pre_count={T_total}"
             )
+            assert T_total == int(sum(t[0] for t in E_batch["gen_lens"])), "Token count mismatch."
+
+
             try:
                 rs = ", ".join([f"η={eta:.1e}→R_pred={ratio_pred[eta]:.3f}" for eta in ratio_pred])
                 self.logger.info(f"[dir JVP] ratio_pred: {rs}")
