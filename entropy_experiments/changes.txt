@@ -1,41 +1,149 @@
---- a/delta_entropy_true.py
-+++ b/delta_entropy_true.py
+--- a/delta_entropy_approx.py
++++ b/delta_entropy_approx.py
+@@ def compute_dir_linear_and_quadratic_jvp(self, *, E_batch, v_named, etas=None) -> Dict[str, Any]:
+-        device = next(self.model.parameters()).device
+-        mdl = self.model; mdl.eval()
++        device = next(self.model.parameters()).device
++        mdl = self.model; mdl.eval()
++
++        # --- IMPORTANT: Disable any model mutations that might call .requires_grad_() in forward ---
++        restore_ckpt = False
++        restore_inputreq = False
++        try:
++            if getattr(mdl, "is_gradient_checkpointing", False):
++                try:
++                    mdl.gradient_checkpointing_disable()
++                    restore_ckpt = True
++                except Exception:
++                    pass
++            if hasattr(mdl, "disable_input_require_grads"):
++                try:
++                    # Prevent forward hooks that do x.requires_grad_() on inputs
++                    mdl.disable_input_require_grads()
++                    restore_inputreq = True
++                except Exception:
++                    pass
 @@
--        cfg = cfg or {}
--        clip_c = float(cfg.get("clip_c", 10.0))
--        report_per_token = bool(cfg.get("report_per_token", False))
-+        cfg = cfg or {}
-+        clip_c = float(cfg.get("clip_c", 10.0))
-+        report_per_token = bool(cfg.get("report_per_token", False))
-+        use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
- 
--        key = self._batch_key(E_batch)
-+        # Cache key must reflect objective (per-token vs per-sequence) and integrand kind
-+        key = (id(E_batch), int(report_per_token), int(use_simple))
-         base_info = self._base_cache.get(key, None)
-         if base_info is None:
-             # --- Baseline pass (η = 0) ---
--            base_stats, H_base_mean = self._score_batch_base(E_batch, report_per_token=report_per_token)
-+            base_stats, H_base_mean = self._score_batch_base(
-+                E_batch, report_per_token=report_per_token
-+            )
-             base_info = {"seq_stats": base_stats, "H_base_mean": float(H_base_mean)}
-             self._base_cache[key] = base_info
+-            # Microbatch vectorized closure: returns (logp_cat[T_mb], H_sum[scalar])
+-            F_mb = make_mb_outputs_closure(
+-                model=self.model,
+-                base_map=base_map,
+-                names=names,
+-                input_ids_mb=input_ids_mb,
+-                attention_mask_mb=attention_mask_mb,
+-                prompt_lens=prompt_lens,
+-                gen_lens=T_list,
+-            )
++            # Microbatch closures WITHOUT any toggling inside (safe for nested JVP):
++            # F_mb: returns (logp_cat[T_mb], H_sum[scalar]) for the linear term
++            def F_mb(params_tuple):
++                params_map = dict(base_map)
++                for n, t in zip(names, params_tuple):
++                    params_map[n] = t
++                out = functional_call(
++                    mdl, params_map, (input_ids_mb,),
++                    {"attention_mask": attention_mask_mb, "use_cache": False}
++                )
++                logits = out.logits  # [B_mb, L, V]
++                logp_pieces = []
++                H_sum = torch.zeros((), dtype=torch.float32, device=logits.device)
++                for b in range(B_mb):
++                    T_b = int(T_list[b])
++                    if T_b <= 0:
++                        continue
++                    start = max(int(prompt_lens[b]) - 1, 0)
++                    end = start + T_b
++                    logits_slice = logits[b:b+1, start:end, :]                # [1,T_b,V]
++                    logp_full = torch.log_softmax(logits_slice.to(torch.float32), dim=-1)
++                    p = torch.exp(logp_full)
++                    H_t = -(p * logp_full).sum(dim=-1).squeeze(0)             # [T_b]
++                    H_sum = H_sum + H_t.sum()
++                    targets = input_ids_mb[b, prompt_lens[b]: prompt_lens[b] + T_b]
++                    logp_vec_b = logp_full.gather(-1, targets.view(1, T_b, 1)).squeeze(-1).squeeze(0)
++                    logp_pieces.append(logp_vec_b)
++                logp_cat = torch.cat(logp_pieces, dim=0) if logp_pieces else torch.empty(0, device=logits.device)
++                return logp_cat, H_sum
 @@
--        H_new_snis, ess, lw_stats = self._snis_reduce(
-+        H_new_snis, ess, lw_stats = self._snis_reduce(
-             base=base_stats, new=new_stats, clip_c=clip_c, report_per_token=report_per_token
-         )
+-            # JVP of the pair to obtain per-seq f (sum entropies) and per-seq L (sum logprobs)
++            # F_pair: per-seq scalars f_vec (sum entropies) and L_vec (sum realized logprobs)
+             eff_idx = [b for b in range(B_mb) if T_list[b] > 0]
+             eff_prompt = [prompt_lens[b] for b in eff_idx]
+             eff_T      = [T_list[b]      for b in eff_idx]
  
-         if self.logger:
--            lab = "per-token" if report_per_token else "per-sequence"
-+            lab = "per-token" if report_per_token else "per-sequence"
-+            # Audit: token counts and (when per-token) the weighted denominator used by SNIS
-+            total_T_base = int(base_stats.T_tokens.sum()) if base_stats.T_tokens.size else 0
-+            total_T_new  = int(new_stats.T_tokens.sum())  if new_stats.T_tokens.size  else 0
+-            def F_pair(params_tuple):
+-                params_map = dict(base_map)
+-                for n, t in zip(names, params_tuple):
+-                    params_map[n] = t
+-                out = functional_call(
+-                    mdl, params_map,
+-                    (input_ids_mb,),
+-                    {"attention_mask": attention_mask_mb, "use_cache": False}
+-                )
+-                logits = out.logits
+-                f_list, L_list = [], []
+-                for i, b in enumerate(eff_idx):
+-                    start = max(int(eff_prompt[i]) - 1, 0)
+-                    T_b   = int(eff_T[i]); end = start + T_b
+-                    logits_slice = logits[b:b+1, start:end, :]
+-                    logp_full = torch.log_softmax(logits_slice.to(torch.float32), dim=-1)
+-                    p = torch.exp(logp_full)
+-                    H_t = -(p * logp_full).sum(dim=-1).squeeze(0)      # [T_b]
+-                    f_b = H_t.sum()
+-                    targets = input_ids_mb[b, eff_prompt[i]: eff_prompt[i] + T_b]
+-                    logp_vec = logp_full.gather(-1, targets.view(1, T_b, 1)).squeeze(-1).squeeze(0)
+-                    L_b = logp_vec.sum()
+-                    f_list.append(f_b); L_list.append(L_b)
+-                return torch.stack(f_list, 0), torch.stack(L_list, 0)   # f_vec, L_vec  [B_eff]
++            def F_pair(params_tuple):
++                params_map = dict(base_map)
++                for n, t in zip(names, params_tuple):
++                    params_map[n] = t
++                out = functional_call(
++                    mdl, params_map, (input_ids_mb,),
++                    {"attention_mask": attention_mask_mb, "use_cache": False}
++                )
++                logits = out.logits  # [B_mb, L, V]
++                f_list, L_list = [], []
++                for i, b in enumerate(eff_idx):
++                    start = max(int(eff_prompt[i]) - 1, 0)
++                    T_b   = int(eff_T[i]); end = start + T_b
++                    logits_slice = logits[b:b+1, start:end, :]
++                    logp_full = torch.log_softmax(logits_slice.to(torch.float32), dim=-1)
++                    p = torch.exp(logp_full)
++                    H_t = -(p * logp_full).sum(dim=-1).squeeze(0)      # [T_b]
++                    f_b = H_t.sum()
++                    targets = input_ids_mb[b, eff_prompt[i]: eff_prompt[i] + T_b]
++                    logp_vec = logp_full.gather(-1, targets.view(1, T_b, 1)).squeeze(-1).squeeze(0)
++                    L_b = logp_vec.sum()
++                    f_list.append(f_b); L_list.append(L_b)
++                return torch.stack(f_list, 0), torch.stack(L_list, 0)   # [B_eff],[B_eff]
+@@
+             (f_vec, L_vec), (j_f_vec, j_L_vec) = jvp(F_pair, (primals,), (tangents,))
+             def Jf(params_tuple):
+                 return jvp(F_pair, (params_tuple,), (tangents,))[1][0]
+             def JL(params_tuple):
+                 return jvp(F_pair, (params_tuple,), (tangents,))[1][1]
+             _, vHessH_vec = jvp(Jf, (primals,), (tangents,))
+             _, DvSv_vec   = jvp(JL, (primals,), (tangents,))
+@@
+-        if self.logger:
++        if self.logger:
              self.logger.info(
-                 f"[SNIS:{lab}] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
-                 f"ΔH_true={H_new_snis - H_base_mean:.6e}  ESS={ess:.1f}/{len(base_stats.seq_logprob)}  "
--                f"lw[min/med/max]={lw_stats}"
-+                f"lw[min/med/max]={lw_stats}  T_base={total_T_base} T_new={total_T_new}"
+                 f"[dir JVP] g·v={gdotv_total:.6e}  vHv={vHvv_total:.6e}  eta*={eta_star:.3e}  "
+                 f"B={out['num_sequences']} T={out['num_tokens']} baseline={self.baseline_kind}"
              )
+@@
+-        return out
++        return out
++        # --- Restore model states outside transformed regions ---
++        finally:
++            if restore_inputreq and hasattr(mdl, "enable_input_require_grads"):
++                try:
++                    mdl.enable_input_require_grads()
++                except Exception:
++                    pass
++            if restore_ckpt:
++                try:
++                    mdl.gradient_checkpointing_enable()
++                except Exception:
++                    pass

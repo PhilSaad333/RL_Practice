@@ -498,16 +498,34 @@ class DeltaEntropyApprox:
         device = next(self.model.parameters()).device
         mdl = self.model; mdl.eval()
 
-        # Eta list only for reporting predicted ratio
-        est_cfg = (self.cfg.get("estimator", {}) or {})
-        if etas is None:
-            if bool(est_cfg.get("eta_sweep", False)) and est_cfg.get("eta_list"):
-                etas = [float(x) for x in est_cfg.get("eta_list")]
-            else:
-                etas = [float(est_cfg.get("single_eta", 2e-6))]
+        # --- IMPORTANT: Disable any model mutations that might call .requires_grad_() in forward ---
+        restore_ckpt = False
+        restore_inputreq = False
+        try:
+            if getattr(mdl, "is_gradient_checkpointing", False):
+                try:
+                    mdl.gradient_checkpointing_disable()
+                    restore_ckpt = True
+                except Exception:
+                    pass
+            if hasattr(mdl, "disable_input_require_grads"):
+                try:
+                    # Prevent forward hooks that do x.requires_grad_() on inputs
+                    mdl.disable_input_require_grads()
+                    restore_inputreq = True
+                except Exception:
+                    pass
 
-        # Base functional state (params+buffers), LoRA-only intersection
-        p_dict, b_dict = build_functional_params_named(
+            # Eta list only for reporting predicted ratio
+            est_cfg = (self.cfg.get("estimator", {}) or {})
+            if etas is None:
+                if bool(est_cfg.get("eta_sweep", False)) and est_cfg.get("eta_list"):
+                    etas = [float(x) for x in est_cfg.get("eta_list")]
+                else:
+                    etas = [float(est_cfg.get("single_eta", 2e-6))]
+
+            # Base functional state (params+buffers), LoRA-only intersection
+            p_dict, b_dict = build_functional_params_named(
             self.model,
             v_named=None,
             eta=0.0,
@@ -578,18 +596,37 @@ class DeltaEntropyApprox:
             total_tokens_used += T_mb
             w_cat = torch.cat([w_list[b] for b in range(B_mb) if T_list[b] > 0], dim=0)
 
-            # Microbatch vectorized closure: returns (logp_cat[T_mb], H_sum[scalar])
-            F_mb = make_mb_outputs_closure(
-                model=self.model,
-                base_map=base_map,
-                names=names,
-                input_ids_mb=input_ids_mb,
-                attention_mask_mb=attention_mask_mb,
-                prompt_lens=prompt_lens,
-                gen_lens=T_list,
-            )
+            # Microbatch closures WITHOUT any toggling inside (safe for nested JVP):
+            # F_mb: returns (logp_cat[T_mb], H_sum[scalar]) for the linear term
+            def F_mb(params_tuple):
+                params_map = dict(base_map)
+                for n, t in zip(names, params_tuple):
+                    params_map[n] = t
+                out = functional_call(
+                    mdl, params_map, (input_ids_mb,),
+                    {"attention_mask": attention_mask_mb, "use_cache": False}
+                )
+                logits = out.logits  # [B_mb, L, V]
+                logp_pieces = []
+                H_sum = torch.zeros((), dtype=torch.float32, device=logits.device)
+                for b in range(B_mb):
+                    T_b = int(T_list[b])
+                    if T_b <= 0:
+                        continue
+                    start = max(int(prompt_lens[b]) - 1, 0)
+                    end = start + T_b
+                    logits_slice = logits[b:b+1, start:end, :]                # [1,T_b,V]
+                    logp_full = torch.log_softmax(logits_slice.to(torch.float32), dim=-1)
+                    p = torch.exp(logp_full)
+                    H_t = -(p * logp_full).sum(dim=-1).squeeze(0)             # [T_b]
+                    H_sum = H_sum + H_t.sum()
+                    targets = input_ids_mb[b, prompt_lens[b]: prompt_lens[b] + T_b]
+                    logp_vec_b = logp_full.gather(-1, targets.view(1, T_b, 1)).squeeze(-1).squeeze(0)
+                    logp_pieces.append(logp_vec_b)
+                logp_cat = torch.cat(logp_pieces, dim=0) if logp_pieces else torch.empty(0, device=logits.device)
+                return logp_cat, H_sum
 
-            # JVP of the pair to obtain per-seq f (sum entropies) and per-seq L (sum logprobs)
+            # F_pair: per-seq scalars f_vec (sum entropies) and L_vec (sum realized logprobs)
             eff_idx = [b for b in range(B_mb) if T_list[b] > 0]
             eff_prompt = [prompt_lens[b] for b in eff_idx]
             eff_T      = [T_list[b]      for b in eff_idx]
@@ -617,7 +654,7 @@ class DeltaEntropyApprox:
                     logp_vec = logp_full.gather(-1, targets.view(1, T_b, 1)).squeeze(-1).squeeze(0)
                     L_b = logp_vec.sum()
                     f_list.append(f_b); L_list.append(L_b)
-                return torch.stack(f_list, 0), torch.stack(L_list, 0)   # f_vec, L_vec  [B_eff]
+                return torch.stack(f_list, 0), torch.stack(L_list, 0)   # [B_eff],[B_eff]
 
             (f_vec, L_vec), (j_f_vec, j_L_vec) = jvp(F_pair, (primals,), (tangents,))
 
@@ -732,7 +769,19 @@ class DeltaEntropyApprox:
                 self.logger.info(f"[dir JVP] ratio_pred: {rs}")
             except Exception:
                 pass
-        return out
+            return out
+        # --- Restore model states outside transformed regions ---
+        finally:
+            if restore_inputreq and hasattr(mdl, "enable_input_require_grads"):
+                try:
+                    mdl.enable_input_require_grads()
+                except Exception:
+                    pass
+            if restore_ckpt:
+                try:
+                    mdl.gradient_checkpointing_enable()
+                except Exception:
+                    pass
 
     # ---------------------------------------------------------------------------------------------
     # Helpers
