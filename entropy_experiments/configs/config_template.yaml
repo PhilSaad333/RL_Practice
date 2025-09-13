@@ -41,7 +41,7 @@ approx_delta_h:
 
   # Microbatching and normalization of the surrogate across E-batch
   microbatch_size: 8
-  normalize: per_token   # 'per_seq_token_mean' | 'per_sequence' | 'per_token' | 'none'
+  normalize: per_seq_token_mean   # 'per_seq_token_mean' | 'per_sequence' | 'per_token' | 'none'
 
   # Baseline settings for RB estimator paths (both methods use this 'kind')
   baseline:
