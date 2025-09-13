@@ -2,12 +2,12 @@
 """
 Run EntropyMeasurements multiple times with small config overrides and save results to Drive.
 
-Defaults are chosen for an overnight batch:
+Defaults are chosen for a small batch:
   - approx_delta_h.baseline.kind = hk_ema
   - approx_delta_h.baseline.ema_beta = 0.9
-  - estimator.single_eta = 1e-6 (eta_sweep = false)
-  - batch_config.B_E = 256, B_U = 32
-  - n_runs = 16
+  - estimator.single_eta = 4e-6 (eta_sweep = false)
+  - batch_config.B_E = 512, B_U = 64
+  - n_runs = 8
 
 Usage examples:
   python run_entropy_experiments_batch.py
@@ -15,8 +15,12 @@ Usage examples:
   python run_entropy_experiments_batch.py --output_root \
       /content/drive/MyDrive/RL_Practice_Files/ --label hkema_overnight
 
+Enable eta sweeps (runner handles sweep per run):
+  python run_entropy_experiments_batch.py --eta_sweep --etas 1e-6 2e-6 4e-6
+  # If --etas omitted with --eta_sweep, defaults to [1e-6, 2e-6, 4e-6]
+
 You can also override knobs from CLI, e.g.:
-  --baseline_kind hk_ema --ema_beta 0.9 --eta 1e-6 --BE 256 --BU 32
+  --baseline_kind hk_ema --ema_beta 0.9 --eta 4e-6 --BE 512 --BU 64
 """
 
 from __future__ import annotations
@@ -55,11 +59,19 @@ def apply_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
     if args.BU is not None:
         bc["B_U"] = int(args.BU)
 
-    # Estimator
+    # Estimator / eta sweep controls
     est = cfg.setdefault("estimator", {})
-    est["eta_sweep"] = False
-    if args.eta is not None:
-        est["single_eta"] = float(args.eta)
+    if args.eta_sweep:
+        est["eta_sweep"] = True
+        # Use provided list or default sweep
+        if args.etas and len(args.etas) > 0:
+            est["eta_list"] = [float(x) for x in args.etas]
+        else:
+            est["eta_list"] = [1e-6, 2e-6, 4e-6]
+    else:
+        est["eta_sweep"] = False
+        if args.eta is not None:
+            est["single_eta"] = float(args.eta)
 
     # Approx settings
     approx = cfg.setdefault("approx_delta_h", {})
@@ -104,7 +116,16 @@ def parse_args() -> argparse.Namespace:
     # Overrides
     p.add_argument("--baseline_kind", type=str, default="hk_ema", help="Baseline kind (hk|hk_ema|hk_ridge|regression|none)")
     p.add_argument("--ema_beta", type=float, default=0.9, help="hk_ema beta")
-    p.add_argument("--eta", type=float, default=4e-6, help="Single eta")
+    # Eta controls: single or sweep
+    p.add_argument("--eta", type=float, default=4e-6, help="Single eta (used when --eta_sweep is not set)")
+    p.add_argument("--eta_sweep", action="store_true", help="Enable eta sweep; runner will iterate over eta_list per run")
+    p.add_argument(
+        "--etas",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Eta list for sweep (space separated). If omitted with --eta_sweep, defaults to [1e-6, 2e-6, 4e-6]",
+    )
     p.add_argument("--BE", type=int, default=512, help="B_E")
     p.add_argument("--BU", type=int, default=64, help="B_U")
     p.add_argument("--method", type=str, default=None, help="Approx method (jvp|grad_dot)")
@@ -149,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
