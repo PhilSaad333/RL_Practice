@@ -1,51 +1,41 @@
-Minimal diffs — delta_entropy_approx.py
-
-Ensure you have the helper (you likely already added it for Phase 1):
-
+--- a/delta_entropy_true.py
++++ b/delta_entropy_true.py
 @@
-     def _scale_for_derivative(self, B_total: int, T_total: int) -> float:
-         """
-         Scale to average **directional derivatives** over the E-batch.
-         For per-token mean:  (1 / T_total) * Σ_mb D_v L_mb
-         For per-sequence mean: (1 / B_total) * Σ_mb D_v L_mb
-         """
-         if self.normalize == "per_token":
-             return 1.0 / max(T_total, 1)
-         elif self.normalize == "per_sequence":
-             return 1.0 / max(B_total, 1)
-         else:
-             return 1.0
-
-
-In compute_delta_h_approx_jvp, replace the microbatch scaling block and audit:
-
-@@ def compute_delta_h_approx_jvp(...):
--            scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
--            total_tokens_used += T_mb
--            scale_sum += float(scale)
--            contribs_mb.append(mb_contrib * float(scale))
-+            # Derivative averaging (NOT value averaging):
-+            scale = self._scale_for_derivative(B_total, T_total)
-+            total_tokens_used += T_mb
-+            scale_sum += float(scale)
-+            contribs_mb.append(mb_contrib * float(scale))
+-        cfg = cfg or {}
+-        clip_c = float(cfg.get("clip_c", 10.0))
+-        report_per_token = bool(cfg.get("report_per_token", False))
++        cfg = cfg or {}
++        clip_c = float(cfg.get("clip_c", 10.0))
++        report_per_token = bool(cfg.get("report_per_token", False))
++        use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
+ 
+-        key = self._batch_key(E_batch)
++        # Cache key must reflect objective (per-token vs per-sequence) and integrand kind
++        key = (id(E_batch), int(report_per_token), int(use_simple))
+         base_info = self._base_cache.get(key, None)
+         if base_info is None:
+             # --- Baseline pass (η = 0) ---
+-            base_stats, H_base_mean = self._score_batch_base(E_batch, report_per_token=report_per_token)
++            base_stats, H_base_mean = self._score_batch_base(
++                E_batch, report_per_token=report_per_token
++            )
+             base_info = {"seq_stats": base_stats, "H_base_mean": float(H_base_mean)}
+             self._base_cache[key] = base_info
 @@
--        if self.logger:
--            self.logger.info(
--                f"[delta-h approx JVP] ⟨∇H, v⟩={out['delta_h_per_lr']:.6e} | "
--                f"B={out['num_sequences']} T={out['num_tokens']} | baseline={self.baseline_kind}"
--            )
--            self.logger.info(
--                f"[dir JVP][audit] scale_sum={scale_sum:.6f} (target≈1.0 for {self.normalize}), "
--                f"total_tokens_used={total_tokens_used} vs pre_count={T_total}"
--            )
-+        if self.logger:
-+            self.logger.info(
-+                f"[delta-h approx JVP] ⟨∇H, v⟩={out['delta_h_per_lr']:.6e} | "
-+                f"B={out['num_sequences']} T={out['num_tokens']} | baseline={self.baseline_kind}"
-+            )
-+            self.logger.info(
-+                f"[delta-h approx JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
-+                f"sum_deriv_scales={scale_sum:.6e} "
-+                f"(per_token ⇒ ≈ #microbatches/T_total), total_tokens_used={total_tokens_used}, pre_count={T_total}"
-+            )
+-        H_new_snis, ess, lw_stats = self._snis_reduce(
++        H_new_snis, ess, lw_stats = self._snis_reduce(
+             base=base_stats, new=new_stats, clip_c=clip_c, report_per_token=report_per_token
+         )
+ 
+         if self.logger:
+-            lab = "per-token" if report_per_token else "per-sequence"
++            lab = "per-token" if report_per_token else "per-sequence"
++            # Audit: token counts and (when per-token) the weighted denominator used by SNIS
++            total_T_base = int(base_stats.T_tokens.sum()) if base_stats.T_tokens.size else 0
++            total_T_new  = int(new_stats.T_tokens.sum())  if new_stats.T_tokens.size  else 0
+             self.logger.info(
+                 f"[SNIS:{lab}] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
+                 f"ΔH_true={H_new_snis - H_base_mean:.6e}  ESS={ess:.1f}/{len(base_stats.seq_logprob)}  "
+-                f"lw[min/med/max]={lw_stats}"
++                f"lw[min/med/max]={lw_stats}  T_base={total_T_base} T_new={total_T_new}"
+             )

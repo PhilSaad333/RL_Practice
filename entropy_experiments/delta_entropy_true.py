@@ -90,12 +90,16 @@ class DeltaEntropyTrue:
         cfg = cfg or {}
         clip_c = float(cfg.get("clip_c", 10.0))
         report_per_token = bool(cfg.get("report_per_token", False))
+        use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
 
-        key = self._batch_key(E_batch)
+        # Cache key must reflect objective (per-token vs per-sequence) and integrand kind
+        key = (id(E_batch), int(report_per_token), int(use_simple))
         base_info = self._base_cache.get(key, None)
         if base_info is None:
             # --- Baseline pass (η = 0) ---
-            base_stats, H_base_mean = self._score_batch_base(E_batch, report_per_token=report_per_token)
+            base_stats, H_base_mean = self._score_batch_base(
+                E_batch, report_per_token=report_per_token
+            )
             base_info = {"seq_stats": base_stats, "H_base_mean": float(H_base_mean)}
             self._base_cache[key] = base_info
 
@@ -112,10 +116,13 @@ class DeltaEntropyTrue:
 
         if self.logger:
             lab = "per-token" if report_per_token else "per-sequence"
+            # Audit: token counts and (when per-token) the weighted denominator used by SNIS
+            total_T_base = int(base_stats.T_tokens.sum()) if base_stats.T_tokens.size else 0
+            total_T_new  = int(new_stats.T_tokens.sum())  if new_stats.T_tokens.size  else 0
             self.logger.info(
                 f"[SNIS:{lab}] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
                 f"ΔH_true={H_new_snis - H_base_mean:.6e}  ESS={ess:.1f}/{len(base_stats.seq_logprob)}  "
-                f"lw[min/med/max]={lw_stats}"
+                f"lw[min/med/max]={lw_stats}  T_base={total_T_base} T_new={total_T_new}"
             )
 
         return float(H_new_snis - H_base_mean)

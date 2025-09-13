@@ -60,7 +60,7 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Ordere
 
 import math
 import torch
-from torch.func import jvp
+from torch.func import jvp, functional_call
 from entropy_experiments.utils.param_registry import (
     dot_named,
     flatten_named,
@@ -542,6 +542,7 @@ class DeltaEntropyApprox:
         g_contribs_mb: List[float] = []
         h_contribs_mb: List[float] = []
 
+        # ---- Microbatch loop: single forward + nested JVPs per microbatch ----
         for mb_E in self._iter_microbatches(E_batch, self.mb):
             B_mb = int(mb_E.sequences.shape[0])
             tf_bs = min(self.mb, B_mb)
@@ -567,7 +568,7 @@ class DeltaEntropyApprox:
                 ridge=ridge_cfg,
             )
 
-            input_ids_mb = mb_E.sequences[:, 0].to(device=device)
+            input_ids_mb = mb_E.sequences[:, 0].to(device=device)          # [B_mb, L]
             attention_mask_mb = mb_E.attention_masks[:, 0].to(device=device)
             prompt_lens = [int(x) for x in mb_E.prompt_lens]
             T_list = [int(mb_E.gen_lens[b][0]) for b in range(B_mb)]
@@ -577,6 +578,7 @@ class DeltaEntropyApprox:
             total_tokens_used += T_mb
             w_cat = torch.cat([w_list[b] for b in range(B_mb) if T_list[b] > 0], dim=0)
 
+            # Microbatch vectorized closure: returns (logp_cat[T_mb], H_sum[scalar])
             F_mb = make_mb_outputs_closure(
                 model=self.model,
                 base_map=base_map,
@@ -587,25 +589,103 @@ class DeltaEntropyApprox:
                 gen_lens=T_list,
             )
 
-            def f_scalar(params_tuple):
-                logp_cat, H_sum = F_mb(params_tuple)
-                return (w_cat.to(logp_cat) * logp_cat).sum() + H_sum
+            # JVP of the pair to obtain per-seq f (sum entropies) and per-seq L (sum logprobs)
+            eff_idx = [b for b in range(B_mb) if T_list[b] > 0]
+            eff_prompt = [prompt_lens[b] for b in eff_idx]
+            eff_T      = [T_list[b]      for b in eff_idx]
 
-            # First JVP: g·v
-            _, gdotv_mb = jvp(f_scalar, (primals,), (tangents,))
+            def F_pair(params_tuple):
+                params_map = dict(base_map)
+                for n, t in zip(names, params_tuple):
+                    params_map[n] = t
+                out = functional_call(
+                    mdl, params_map,
+                    (input_ids_mb,),
+                    {"attention_mask": attention_mask_mb, "use_cache": False}
+                )
+                logits = out.logits
+                f_list, L_list = [], []
+                for i, b in enumerate(eff_idx):
+                    start = max(int(eff_prompt[i]) - 1, 0)
+                    T_b   = int(eff_T[i]); end = start + T_b
+                    logits_slice = logits[b:b+1, start:end, :]
+                    logp_full = torch.log_softmax(logits_slice.to(torch.float32), dim=-1)
+                    p = torch.exp(logp_full)
+                    H_t = -(p * logp_full).sum(dim=-1).squeeze(0)      # [T_b]
+                    f_b = H_t.sum()
+                    targets = input_ids_mb[b, eff_prompt[i]: eff_prompt[i] + T_b]
+                    logp_vec = logp_full.gather(-1, targets.view(1, T_b, 1)).squeeze(-1).squeeze(0)
+                    L_b = logp_vec.sum()
+                    f_list.append(f_b); L_list.append(L_b)
+                return torch.stack(f_list, 0), torch.stack(L_list, 0)   # f_vec, L_vec  [B_eff]
 
-            # Nested: v^T H v
-            def gdot_fn(params_tuple):
-                return jvp(f_scalar, (params_tuple,), (tangents,))[1]
-            _, vHvv_mb = jvp(gdot_fn, (primals,), (tangents,))
+            (f_vec, L_vec), (j_f_vec, j_L_vec) = jvp(F_pair, (primals,), (tangents,))
 
-            # Derivative averaging: constant scale per microbatch
-            scale = self._scale_for_derivative(B_total, T_total)
+            # ===== Correct quadratic term via (A)+(B)+(C)+(D) per sequence =====
+            # Second (nested) JVPs: v^T(∇^2 f)v and D_v S_v, both per sequence
+            def Jf(params_tuple):
+                return jvp(F_pair, (params_tuple,), (tangents,))[1][0]        # j_f_vec
+            def JL(params_tuple):
+                return jvp(F_pair, (params_tuple,), (tangents,))[1][1]        # j_L_vec
+            _, vHessH_vec = jvp(Jf, (primals,), (tangents,))                  # [B_eff]
+            _, DvSv_vec   = jvp(JL, (primals,), (tangents,))                  # [B_eff]
+
+            # ----- Linear term g·v (three normalization modes) -----
+            # Also need per-token j_logp; reuse F_mb once:
+            (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(F_mb, (primals,), (tangents,))
+            # Offsets to split j_logp_cat back into per-seq segments
+            offsets = []
+            acc = 0
+            for b in range(B_mb):
+                if T_list[b] > 0:
+                    offsets.append((b, acc, acc + T_list[b]))
+                    acc += T_list[b]
+            # Per-seq dot(w, j_logp) + j_f (or j_H_sum/T_b) as required
+            gdotv_mb = 0.0
+            if self.normalize == "per_token":
+                # original global per-token objective: use unnormalized w_cat and scalar j_H_sum
+                gdotv_mb = (w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum
+            elif getattr(self, "normalize", "") == "per_seq_token_mean":
+                # mean per-token per sequence: divide both pieces by T_b, average by 1/B_total later
+                for i, (b, s, e) in enumerate(offsets):
+                    T_b = float(T_list[b])
+                    if T_b <= 0: 
+                        continue
+                    w_b = w_list[b] / T_b
+                    gdotv_mb = gdotv_mb + (w_b.to(j_logp_cat[s:e]) * j_logp_cat[s:e]).sum() + (j_f_vec[i] / T_b)
+            else:
+                # 'per_sequence' (sum per sequence): original surrogate linear piece
+                gdotv_mb = (w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum
+
+            # ----- Quadratic term v^T H v (three normalization modes) -----
+            if getattr(self, "normalize", "") == "per_seq_token_mean":
+                # divide per-seq contributions by T_b
+                vHvv_seq = []
+                ii = 0
+                for b in eff_idx:
+                    T_b = float(T_list[b])
+                    vHvv_b = (vHessH_vec[ii] + 2.0 * j_f_vec[ii] * j_L_vec[ii] + f_vec[ii] * (DvSv_vec[ii] + j_L_vec[ii] * j_L_vec[ii])) / max(T_b, 1.0)
+                    vHvv_seq.append(vHvv_b)
+                    ii += 1
+                vHvv_mb = torch.stack(vHvv_seq, 0).sum()
+            else:
+                # original (per_token or per_sequence): no per-seq 1/T_b division inside
+                vHvv_seq = vHessH_vec + 2.0 * j_f_vec * j_L_vec + f_vec * (DvSv_vec + j_L_vec * j_L_vec)
+                vHvv_mb = vHvv_seq.sum()
+
+            # Normalize this microbatch contribution
+            # derivative scaling constant depends on objective:
+            if getattr(self, "normalize", "") == "per_seq_token_mean":
+                # average over sequences of per-seq mean ⇒ constant 1/B_total
+                scale = 1.0 / max(B_total, 1)
+            else:
+                # 'per_token' ⇒ 1/T_total ; 'per_sequence' ⇒ 1/B_total (as before)
+                scale = self._scale_for_derivative(B_total, T_total)
             scale_sum += float(scale)
-            g_contribs_mb.append(float(gdotv_mb.item()) * float(scale))
-            h_contribs_mb.append(float(vHvv_mb.item()) * float(scale))
-            gdotv_total += g_contribs_mb[-1]
-            vHvv_total += h_contribs_mb[-1]
+            g_val = float(gdotv_mb.item()) * float(scale)
+            h_val = float(vHvv_mb.item()) * float(scale)
+            g_contribs_mb.append(g_val); gdotv_total += g_val
+            h_contribs_mb.append(h_val); vHvv_total  += h_val
 
         eps = 1e-30
         eta_star = (2.0 * abs(gdotv_total) / max(abs(vHvv_total), eps)) if abs(vHvv_total) > 0 else float("inf")
@@ -640,9 +720,9 @@ class DeltaEntropyApprox:
                 f"B={out['num_sequences']} T={out['num_tokens']} baseline={self.baseline_kind}"
             )
             self.logger.info(
-                f"[dir JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
-                f"sum_deriv_scales={scale_sum:.6e} "
-                f"(per_token ⇒ ≈ #microbatches/T_total), tokens_used={total_tokens_used}, pre_count={T_total}"
+                f"[dir JVP][audit] mode={self.normalize}, "
+                f"deriv_scale={(1.0/max(B_total,1) if self.normalize=='per_seq_token_mean' else self._scale_for_derivative(B_total,T_total)):.6e}, "
+                f"sum_deriv_scales={scale_sum:.6e}, tokens_used={total_tokens_used}, pre_count={T_total}"
             )
             assert T_total == int(sum(t[0] for t in E_batch["gen_lens"])), "Token count mismatch."
 
