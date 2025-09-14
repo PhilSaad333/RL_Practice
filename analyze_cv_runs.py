@@ -52,12 +52,23 @@ def main():
             "T_total": s.get("diagnostics", {}).get("meta", {}).get("T_total"),
         })
 
-    # Write CSV
+    # Write CSV (robust to no successful rows)
     out_csv = root / args.out_csv
-    with open(out_csv, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
+    if not rows:
+        # No successful summaries found; write an empty CSV with expected columns
+        default_fields = [
+            "run_dir", "gdotv_batch", "se_batch", "se_batch_after",
+            "VR_SE", "SNR", "SNR_after", "features", "B_total", "T_total",
+        ]
+        with open(out_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=default_fields)
+            w.writeheader()
+        print("[analyze_cv_runs] No successful runs found in index.json; wrote empty CSV header.")
+    else:
+        with open(out_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
 
     # Write JSON summary (means/medians)
     import statistics as st
