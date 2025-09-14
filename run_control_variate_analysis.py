@@ -74,7 +74,10 @@ def apply_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
     # Control-variates config (for reproducibility)
     cv_cfg = cfg.setdefault("control_variates", {})
     if args.features:
-        cv_cfg["features"] = list(args.features)
+        if len(args.features) == 1 and args.features[0].strip().lower() in {"all", "*"}:
+            cv_cfg["features"] = "all"          # store as a string
+        else:
+            cv_cfg["features"] = list(args.features)
     if args.ridge is not None:
         cv_cfg["ridge"] = float(args.ridge)
     if args.crossfit_folds is not None:
