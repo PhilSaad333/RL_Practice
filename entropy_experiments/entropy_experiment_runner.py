@@ -43,6 +43,10 @@ from entropy_experiments.utils.precision_utils import apply_global_precision, st
 
 from entropy_experiments.utils.detailed_logger import DetailedLogger
 
+from entropy_experiments.utils import control_variates as cv
+
+
+
 
 class EntropyMeasurements:
     """
@@ -754,3 +758,157 @@ class EntropyMeasurements:
             f"(sampling {t_samp:.2f}s, v {t_v:.2f}s, true Σ {t_true_total:.2f}s, h_approx Σ {t_approx:.2f}s) ==="
         )
         return out
+
+
+    def run_control_variate_analysis(
+        self,
+        *,
+        out_dir: str | None = None,
+        normalization: str | None = None,
+        features: list[str] | None = None,
+        ridge: float | None = None,
+        crossfit_folds: int | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Sample E and U, compute the normalized update vector v on U, then
+        run control-variates analysis for the first-order JVP estimator on E.
+
+        Artifacts (CSV, JSON, PNGs) are written under `out_dir` (or a timestamped
+        subdirectory if `out_dir` is a parent directory). Returns a dict with
+        paths and a JSON-serializable summary.
+
+        Args:
+            out_dir: Base directory to save outputs. If None, uses
+                    config['output']['cv_output_dir'] or 'entropy_experiments/cv_runs'.
+            normalization: 'per_token' (default) or 'per_sequence'. If None, uses
+                        config['approx_delta_h']['normalize'] (default 'per_token').
+            features: list of feature names to use as control variates; if None,
+                    uses config['control_variates']['features'] or
+                    ['length', 'mean_logp', 'var_logp'].
+            ridge: tiny ridge for OLS; if None, uses config['control_variates']['ridge'] or 1e-8.
+            crossfit_folds: K for K-fold cross-fitting (0 = in-sample OLS).
+                            If None, uses config['control_variates']['crossfit_folds'] or 0.
+
+        Returns:
+            Dict with keys: 'csv_path', 'summary_path', optional 'plot_*', and 'summary'.
+        """
+        t0 = time.time()
+        # ----------------------------
+        # Ensure model / optimizer / SP
+        # ----------------------------
+        if not getattr(self, "checkpoint_loaded", False):
+            ckpt = (self.config.get("checkpoint", {}) or {})
+            adapter_path = ckpt.get("checkpoint_path")
+            optimizer_path = ckpt.get("optimizer_path")
+            assert adapter_path, "Missing checkpoint_path in config['checkpoint']"
+            self.load_checkpoint(adapter_path, optimizer_path)
+
+        self._ensure_sequence_processor()
+
+        # Precision summary for logs (mirrors run_experiments)
+        pcfg = (self.config.get("precision", {}) or {})
+        runtime_dtype = str(pcfg.get("runtime_dtype", "float32")).lower()
+        entropy_dtype = str(pcfg.get("entropy_dtype", "float32")).lower()
+        self.logger.info(f"[precision] runtime={runtime_dtype}, entropy={entropy_dtype}")
+
+        # ----------------------------
+        # 1) Sample E and U
+        # ----------------------------
+        B_E = int(self.config["batch_config"]["B_E"])
+        B_U = int(self.config["batch_config"]["B_U"])
+        G_U = int(self.config["batch_config"]["G"])
+
+        self.logger.info(f"[CV] Sampling E(B={B_E}, G=1) and U(B={B_U}, G={G_U})")
+        t_samp = time.time()
+        E_batch = self._get_or_sample_E(B_E)
+        U_batch = self._get_or_sample_U(B_U, G_U)
+        t_samp = time.time() - t_samp
+        self.logger.info(f"[CV] Sampling done in {t_samp:.2f}s.")
+
+        # ----------------------------
+        # 2) Compute update vector v
+        # ----------------------------
+        self.logger.info("[CV] Computing v (normalized by LR) on U …")
+        t_v = time.time()
+        v_named, v_stats = compute_update_vector(
+            model=self.model,
+            optimizer=self.optimizer,
+            U_batch=U_batch,
+            config=self.config,
+            logger=self.logger,
+        )
+        t_v = time.time() - t_v
+        self.logger.info(f"[CV] v computed in {t_v:.2f}s. |v|₂ ≈ {v_stats.get('norm_l2','?')}")
+
+        # ----------------------------
+        # 3) Build (or reuse) DeltaEntropyApprox
+        # ----------------------------
+        if self.delta_entropy_approx is None:
+            self.delta_entropy_approx = DeltaEntropyApprox(
+                model=self.model,
+                sequence_processor=self._sequence_processor,
+                config=self.config,
+                logger=self.logger,
+            )
+
+        # Normalization / features / CV knobs
+        approx_cfg = (self.config.get("approx_delta_h", {}) or {})
+        norm_default = str(approx_cfg.get("normalize", "per_token")).lower()
+        normalization = (normalization or norm_default)
+        assert normalization in {"per_token", "per_sequence"}, \
+            f"normalization must be 'per_token' or 'per_sequence', got {normalization}"
+
+        cv_cfg = (self.config.get("control_variates", {}) or {})
+        features = features or cv_cfg.get("features", ["length", "mean_logp", "var_logp"])
+        ridge = float(ridge if ridge is not None else cv_cfg.get("ridge", 1e-8))
+        crossfit_folds = int(crossfit_folds if crossfit_folds is not None else cv_cfg.get("crossfit_folds", 0))
+
+        # Output directory
+        out_root = (self.config.get("output", {}) or {}).get("cv_output_dir", "entropy_experiments/cv_runs")
+        out_dir = out_dir or out_root
+        self.logger.info(f"[CV] Output directory: {out_dir}")
+
+        # ----------------------------
+        # 4) Run CV analysis
+        # ----------------------------
+        t_cv = time.time()
+        result = cv.run_control_variate_analysis(
+            delta_approx=self.delta_entropy_approx,
+            E_batch=E_batch,
+            v_named=v_named,
+            normalization=normalization,
+            out_dir=out_dir,
+            features=features,
+            ridge=ridge,
+            crossfit_folds=crossfit_folds,
+        )
+        t_cv = time.time() - t_cv
+
+        # Compose return payload
+        total = time.time() - t0
+        payload = {
+            "paths": {k: v for k, v in result.items() if k.endswith("_path") or k.startswith("plot_")},
+            "summary": result.get("summary", {}),
+            "v_stats": v_stats,
+            "timing_sec": {
+                "total": total,
+                "sampling": t_samp,
+                "update_vector": t_v,
+                "cv_analysis": t_cv,
+            },
+            "config_used": {
+                "normalization": normalization,
+                "features": features,
+                "ridge": ridge,
+                "crossfit_folds": crossfit_folds,
+                "out_dir": out_dir,
+            },
+        }
+        self.logger.info(
+            "[CV] Done. "
+            f"csv={payload['paths'].get('csv_path','?')}, "
+            f"summary={payload['paths'].get('summary_path','?')}, "
+            f"plots={[k for k in payload['paths'].keys() if k.startswith('plot_')]} "
+            f"(elapsed {total:.2f}s)"
+        )
+        return payload
