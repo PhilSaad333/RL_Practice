@@ -51,7 +51,7 @@ Notes
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Union
 import os
 import json
 import math
@@ -110,6 +110,18 @@ class CVSummary:
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+# Normalize the "features" argument so we can accept "all", "*",
+# ["all"], ["*"], or an explicit list of names.
+def _normalize_features_arg(features):
+    if isinstance(features, str):
+        return "all" if features.strip().lower() in {"all", "*"} else features
+    if isinstance(features, (list, tuple)):
+        if len(features) == 1 and str(features[0]).strip().lower() in {"all", "*"}:
+            return "all"
+        return list(features)
+    return features
 
 
 def _center_columns(y: np.ndarray, Z: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
@@ -691,7 +703,6 @@ def save_cv_artifacts(
 
     return paths
 
-
 def run_control_variate_analysis(
     *,
     delta_approx,
@@ -699,7 +710,7 @@ def run_control_variate_analysis(
     v_named: Dict[str, torch.Tensor],
     normalization: str = "per_token",
     out_dir: str = "entropy_experiments/cv_runs",
-    features: List[str] = ("length", "mean_logp", "var_logp"),
+    features: Union[List[str], str] = ("length", "mean_logp", "var_logp"),  # <- allow str
     ridge: float = 1e-8,
     crossfit_folds: int = 0,
 ) -> Dict[str, Any]:
@@ -722,9 +733,10 @@ def run_control_variate_analysis(
     )
 
     # 2) CV fitting
+    features_norm = _normalize_features_arg(features)        # <<< NEW
     summary = fit_control_variates(
         records=records,
-        features=list(features),
+        features=features_norm,                              # <<< pass through as-is
         ridge=float(ridge),
         crossfit_folds=int(crossfit_folds),
     )
