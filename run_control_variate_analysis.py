@@ -122,11 +122,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_runs", type=int, default=1, help="Optional number of independent runs")
 
     # Light overrides (keep parity with your batch script where helpful)
-    p.add_argument("--baseline_kind", type=str, default=None, help="Baseline kind (hk|hk_ema|hk_ridge|regression|none)")
-    p.add_argument("--ema_beta", type=float, default=None, help="hk_ema beta")
-    p.add_argument("--BE", type=int, default=None, help="B_E for E-batch")
-    p.add_argument("--BU", type=int, default=None, help="B_U for U-batch (for v computation)")
-    p.add_argument("--G", type=int, default=None, help="G for U-batch generations (for v computation)")
+    p.add_argument("--baseline_kind", type=str, default='hk_ema', help="Baseline kind (hk|hk_ema|hk_ridge|regression|none)")
+    p.add_argument("--ema_beta", type=float, default=0.9, help="hk_ema beta")
+    p.add_argument("--BE", type=int, default=512, help="B_E for E-batch")
+    p.add_argument("--BU", type=int, default=64, help="B_U for U-batch (for v computation)")
+    p.add_argument("--G", type=int, default=8, help="G for U-batch generations (for v computation)")
 
     # Control-variates knobs
     p.add_argument("--features", type=str, nargs="+", default=None,
