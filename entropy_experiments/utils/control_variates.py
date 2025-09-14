@@ -127,18 +127,26 @@ def _pearson(x: np.ndarray, y: np.ndarray) -> float:
 @torch.no_grad()
 def _make_single_seq_view(mb_E: BatchedSequences, idx: int) -> BatchedSequences:
     """
-    Slice a BatchedSequences microbatch to keep only sequence `idx`.
+    Slice a BatchedSequences microbatch to keep only sequence `idx`, with G=1.
     """
-    # Shapes: [B_mb, G=1, L] for sequences/masks; prompt_lens: list[int]; gen_lens: list[list[int]]
-    seq = mb_E.sequences[idx:idx+1]
-    att = mb_E.attention_masks[idx:idx+1]
-    prom = [int(mb_E.prompt_lens[idx])]
-    gen = [[int(mb_E.gen_lens[idx][0])]]
+    # Tensors keep [B, G, L] shape in the first two dims
+    seq = mb_E.sequences[idx:idx+1]             # [1, G, L]
+    att = mb_E.attention_masks[idx:idx+1]       # [1, G, L]
+
+    # Scalars/lists
+    prom = [int(mb_E.prompt_lens[idx])]         # [1]
+    gen  = [[int(mb_E.gen_lens[idx][0])]]       # [1][1]
+
+    # REQUIRED field: responses_text is List[List[str]] with shape [B][G]
+    # We take only the first generation to match G=1 logic above.
+    resp = [[mb_E.responses_text[idx][0]]]      # [1][1]
+
     return BatchedSequences(
         sequences=seq,
-        attention_masks=att,
         prompt_lens=prom,
         gen_lens=gen,
+        attention_masks=att,
+        responses_text=resp,
     )
 
 
