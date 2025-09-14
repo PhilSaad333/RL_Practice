@@ -96,7 +96,9 @@ def run_once(cfg: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
     out_root = str(run_dir)  # pass run_dir as base; method creates cv_<ts>/ under it
     normalization = (cfg.get("approx_delta_h", {}) or {}).get("normalize", "per_token")
     cv_cfg = (cfg.get("control_variates", {}) or {})
-    features = cv_cfg.get("features", ["length", "mean_logp", "var_logp"])
+    #features = cv_cfg.get("features", ["length", "mean_logp", "var_logp"])
+    features = cv_cfg.get("features", ["length", "mean_logp", "var_logp", "rb_entropy_sum", "sum_w", "sum_w2", "surprisal_mean"])
+
     ridge = float(cv_cfg.get("ridge", 1e-8))
     crossfit = int(cv_cfg.get("crossfit_folds", 0))
 
