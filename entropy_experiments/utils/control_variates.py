@@ -1,25 +1,52 @@
 # entropy_experiments/control_variates.py
 # -*- coding: utf-8 -*-
 """
-Control-variates study for the first-order estimator g·v on E-batches.
+Control-variates study for the first-order estimator ⟨∇H, v⟩ on E-batches.
 
-This module:
-  1) Recomputes ⟨∇H, v⟩ via the JVP path but exposes *per-sequence* contributions y_i
-     that add up to the batch estimator under your chosen normalization.
-  2) Collects per-sequence features (length, log-prob stats, etc.).
-  3) Fits control-variates (centered OLS; optional K-fold cross-fitting).
-  4) Saves a tidy table (CSV), a JSON summary, and diagnostic plots.
+What this module does
+---------------------
+1) Recomputes the first-order JVP estimator of ΔH (linear term) but returns a
+   *per-sequence* decomposition y_i that sums to the batch estimator under the
+   chosen normalization (e.g., "per_token").
+2) Collects per-sequence candidate control-variates (CV) features (length,
+   surprisal stats, RB entropy aggregates, baseline-weight stats, etc.).
+3) Fits centered OLS (optionally cross-fittable later) to estimate variance
+   reduction from CVs. Reports both *per-sequence variance ratios* and the
+   *batch-level* standard error (SE) before/after CV.
+4) Writes tidy artifacts: CSV (one row per sequence), JSON summary, and plots.
 
-Integration
------------
-- Pass in your existing DeltaEntropyApprox instance as `delta_approx`.
-- Use `run_control_variate_analysis(...)` from your runner after constructing E and v.
+How to add a new feature (two small steps)
+------------------------------------------
+A. Emit (record) the feature during per-sequence computation:
+   - In `compute_jvp_per_sequence(...)`, compute a scalar per-sequence value
+     and place it in `extras` (e.g., `extras["my_feat"] = value`).
+   - Prefer *primal*, detached features (no grads). Derivatives (like jH_sum)
+     are also acceptable for analysis; we center them in OLS so unbiasedness is
+     preserved for the batch-mean.
+
+B. Expose the feature to the fitter:
+   - In `fit_control_variates(...)`, extend `feature_map` with:
+       `"my_feat": np.array([r.extras.get("my_feat", 0.0) for r in records])`
+   - Then pass `--features my_feat ...` via your runner or put it in the config.
+
+Where to change the runner defaults
+-----------------------------------
+In your Colab driver (e.g., `run_control_variate_analysis.py`), the features
+used by default come from:
+    cfg["control_variates"]["features"]
+or, if missing, whatever default list the runner provides. To try the stronger
+set by default, set:
+    cfg["control_variates"]["features"] =
+        ["rb_entropy_sum", "sum_w", "sum_w2", "surprisal_mean"]
+You can also pass `--features ...` on the CLI.
 
 Notes
 -----
-- This analysis path is intentionally clear and *slightly redundant* (we JVP
-  one sequence at a time inside each microbatch) to guarantee a clean per-seq
-  decomposition without touching production code. It is fine for offline study.
+- We compute one JVP per sequence inside each microbatch. This is intentionally
+  redundant to guarantee a clean per-sequence split without touching production
+  estimator code paths.
+- Normalization is handled by the same internal scaling used in production
+  (`_scale_for_derivative`), so `sum_i y_i` equals the batch JVP estimate.
 """
 
 from __future__ import annotations
@@ -28,7 +55,6 @@ from typing import Dict, Any, List, Tuple, Optional
 import os
 import json
 import math
-import time
 from datetime import datetime
 
 import numpy as np
@@ -63,6 +89,7 @@ class CVBatchRecord:
     var_logp: float
     max_logp: float
     min_logp: float
+    # Arbitrary extra scalars keyed by name
     extras: Dict[str, float]
 
 
@@ -70,13 +97,13 @@ class CVBatchRecord:
 class CVSummary:
     n_seqs: int
     normalization: str           # "per_token" or "per_sequence"
-    mean_gdotv: float            # sample mean of y_i (equals batch estimator)
-    var_gdotv: float
+    mean_gdotv: float            # sample mean of y_i (equals batch estimator / B)
+    var_gdotv: float             # per-sequence variance (for diagnostics)
     corr: Dict[str, float]       # Pearson correlations with features
-    ols_beta: Dict[str, float]   # OLS coefficients (centered; small ridge)
-    var_after_cv: Dict[str, float]      # variance after single-feature CV
-    var_after_cv_joint: float           # variance after joint OLS over all features
-    diagnostics: Dict[str, Any]
+    ols_beta: Dict[str, float]   # OLS coefficients (centered; tiny ridge)
+    var_after_cv: Dict[str, float]      # per-seq variance ratio for each single CV
+    var_after_cv_joint: float           # per-seq variance ratio for joint OLS
+    diagnostics: Dict[str, Any]         # includes batch-level SEs and meta
 
 
 # ----------------------------- Small utilities ----------------------------- #
@@ -122,6 +149,70 @@ def _pearson(x: np.ndarray, y: np.ndarray) -> float:
     return float((xc @ yc) / math.sqrt(vx * vy) / (x.size - 1))
 
 
+def _feature_vector(records: List[CVBatchRecord], name: str) -> np.ndarray:
+    """
+    Resolve a feature name to a numpy vector over records.
+    Supports direct fields, derived features, and extras.
+    """
+    # Direct fields
+    if name in {"length", "sum_logp", "mean_logp", "var_logp", "max_logp", "min_logp"}:
+        return np.array([getattr(r, name) for r in records], dtype=np.float64)
+
+    # Derived from direct fields
+    if name == "surprisal_sum":
+        return -np.array([r.sum_logp for r in records], dtype=np.float64)
+    if name == "surprisal_mean":
+        return -np.array([r.mean_logp for r in records], dtype=np.float64)
+    if name == "length_inv":
+        return np.array([1.0 / max(r.length, 1) for r in records], dtype=np.float64)
+    if name == "length_log":
+        return np.array([math.log(max(r.length, 1.0)) for r in records], dtype=np.float64)
+
+    # Extras / analysis-time metrics
+    def ex(key: str, default: float = 0.0) -> np.ndarray:
+        return np.array([float(r.extras.get(key, default)) for r in records], dtype=np.float64)
+
+    if name in {
+        "rb_entropy_sum", "rb_entropy_mean",
+        "sum_w", "sum_w2", "sum_w_abs",
+        "wjlogp_sum", "jH_sum",
+        "sum_abs_jlogp", "mean_abs_jlogp",
+        "token_share",
+        "length_x_surprisal_mean", "length_x_rb_entropy_mean",
+    }:
+        # compose from primitives where needed
+        if name == "rb_entropy_sum":
+            return ex("H_sum", 0.0)
+        if name == "rb_entropy_mean":
+            H = ex("H_sum", 0.0)
+            L = np.array([max(r.length, 1) for r in records], dtype=np.float64)
+            return H / L
+        if name == "sum_w":
+            return ex("sum_w", 0.0)
+        if name == "sum_w2":
+            return ex("sum_w2", 0.0)
+        if name == "sum_w_abs":
+            return ex("sum_w_abs", 0.0)
+        if name == "wjlogp_sum":
+            return ex("wjlogp_sum", 0.0)
+        if name == "jH_sum":
+            return ex("jH_sum", 0.0)
+        if name == "sum_abs_jlogp":
+            return ex("sum_abs_jlogp", 0.0)
+        if name == "mean_abs_jlogp":
+            return ex("mean_abs_jlogp", 0.0)
+        if name == "token_share":
+            return ex("token_share", 0.0)
+        if name == "length_x_surprisal_mean":
+            return np.array([r.length * (-(r.mean_logp)) for r in records], dtype=np.float64)
+        if name == "length_x_rb_entropy_mean":
+            H = ex("H_sum", 0.0)
+            L = np.array([max(r.length, 1) for r in records], dtype=np.float64)
+            return (H / L) * L  # equals H, but keeps naming consistent
+
+    raise ValueError(f"Unknown feature '{name}'. See module docstring for how to add new features.")
+
+
 # ----------------------------- Core computation ----------------------------- #
 
 @torch.no_grad()
@@ -129,18 +220,11 @@ def _make_single_seq_view(mb_E: BatchedSequences, idx: int) -> BatchedSequences:
     """
     Slice a BatchedSequences microbatch to keep only sequence `idx`, with G=1.
     """
-    # Tensors keep [B, G, L] shape in the first two dims
     seq = mb_E.sequences[idx:idx+1]             # [1, G, L]
     att = mb_E.attention_masks[idx:idx+1]       # [1, G, L]
-
-    # Scalars/lists
     prom = [int(mb_E.prompt_lens[idx])]         # [1]
     gen  = [[int(mb_E.gen_lens[idx][0])]]       # [1][1]
-
-    # REQUIRED field: responses_text is List[List[str]] with shape [B][G]
-    # We take only the first generation to match G=1 logic above.
     resp = [[mb_E.responses_text[idx][0]]]      # [1][1]
-
     return BatchedSequences(
         sequences=seq,
         prompt_lens=prom,
@@ -159,9 +243,9 @@ def compute_jvp_per_sequence(
     device: Optional[torch.device] = None,
 ) -> Tuple[List[CVBatchRecord], Dict[str, Any]]:
     """
-    Compute per-sequence contributions y_i to g·v via the forward-mode JVP path.
-    The contributions are scaled by the *same* derivative averaging factor used in
-    production (_scale_for_derivative), so sum_i y_i == batch ⟨∇H, v⟩ estimator.
+    Compute per-sequence contributions y_i to ⟨∇H, v⟩ via the forward-mode JVP path.
+    Uses the same derivative scaling as production (_scale_for_derivative), so
+    sum_i y_i == batch estimator.
 
     Returns: (records, meta)
       - records: list[CVBatchRecord] of length B_total
@@ -176,7 +260,6 @@ def compute_jvp_per_sequence(
     if device is None:
         device = next(mdl.parameters()).device
 
-    # Functional snapshot for closures
     base_map = snapshot_base_functional_state(mdl)
 
     # Intersect primals/tangents with v_named
@@ -187,9 +270,7 @@ def compute_jvp_per_sequence(
         if (not p.requires_grad) or (n not in v_named):
             continue
         names.append(n)
-        # base_map[n] contains the "frozen" tensor we will use in functional call
         primals.append(base_map[n].to(device=device))
-        # v_named[n] is Δθ/η; cast to base dtype for JVP
         tangents.append(v_named[n].to(device=device, dtype=base_map[n].dtype))
     if not names:
         raise ValueError("[control_variates] No intersecting trainables for JVP.")
@@ -237,7 +318,6 @@ def compute_jvp_per_sequence(
         for b in range(B_mb):
             T_b = int(mb_E.gen_lens[b][0])
             if T_b <= 0:
-                # Keep a placeholder record to preserve indexing
                 records.append(CVBatchRecord(
                     gdotv_i=0.0, length=0,
                     sum_logp=0.0, mean_logp=0.0, var_logp=0.0,
@@ -246,12 +326,14 @@ def compute_jvp_per_sequence(
                 continue
 
             total_tokens_used += T_b
-            w_b = w_list[b]  # shape [T_b], detached
+            w_b = w_list[b]  # [T_b], detached
 
-            sum_w  = float(w_b.sum().item())
-            sum_w2 = float((w_b**2).sum().item())
+            # Per-seq weight stats (cheap and often useful)
+            sum_w   = float(w_b.sum().item())
+            sum_w2  = float((w_b**2).sum().item())
+            sum_w_abs = float(w_b.abs().sum().item())
 
-            # Single-sequence view + closure
+            # Single-sequence view + functional closure
             seq_view = _make_single_seq_view(mb_E, b)
             input_ids = seq_view.sequences[:, 0].to(device=device)         # [1, L]
             att_mask  = seq_view.attention_masks[:, 0].to(device=device)   # [1, L]
@@ -267,13 +349,19 @@ def compute_jvp_per_sequence(
                 prompt_lens=prompt_lens,
                 gen_lens=gen_lens,
             )
-            # jvp returns: primals_out = (logp_cat[T_b], H_sum[scalar]),
-            #              tangents_out = (j_logp_cat[T_b], j_H_sum[scalar])
-            (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(f_seq, (tuple(primals),), (tuple(tangents),))
+            # jvp returns:
+            #   primals_out = (logp_cat[T_b], H_sum[scalar]),
+            #   tangents_out = (j_logp_cat[T_b], j_H_sum[scalar])
+            (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(
+                f_seq, (tuple(primals),), (tuple(tangents),)
+            )
 
-            # Per-seq contribution (aligned with production): scale * (w·j_logp + j_H_sum)
-            contrib = (w_b.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum
-            y_i = float(scale * contrib.item())
+            # Component terms of the directional derivative
+            wjlogp_sum = float((w_b.to(j_logp_cat) * j_logp_cat).sum().item())
+            jH_sum_f   = float(j_H_sum.item())
+
+            # Aligned per-seq contribution: scale * (w·j_logp + jH_sum)
+            y_i = float(scale * (wjlogp_sum + jH_sum_f))
 
             # Per-seq features from primal log-probs
             lp = logp_cat.detach()
@@ -288,6 +376,23 @@ def compute_jvp_per_sequence(
             else:
                 var_lp, max_lp, min_lp = 0.0, -1e30, +1e30
 
+            # JVP magnitude diagnostics (cheap)
+            sum_abs_jlogp  = float(j_logp_cat.abs().sum().item())
+            mean_abs_jlogp = sum_abs_jlogp / max(length, 1)
+
+            # Extras (add any new features here)
+            extras = {
+                "H_sum": float(H_sum.detach().item()),   # RB entropy sum (primal)
+                "sum_w": sum_w,
+                "sum_w2": sum_w2,
+                "sum_w_abs": sum_w_abs,
+                "wjlogp_sum": wjlogp_sum,
+                "jH_sum": jH_sum_f,
+                "sum_abs_jlogp": sum_abs_jlogp,
+                "mean_abs_jlogp": mean_abs_jlogp,
+                "token_share": float(length / max(T_total, 1)),
+            }
+
             records.append(CVBatchRecord(
                 gdotv_i=y_i,
                 length=length,
@@ -296,7 +401,7 @@ def compute_jvp_per_sequence(
                 var_logp=var_lp,
                 max_logp=max_lp,
                 min_logp=min_lp,
-                extras={"H_sum": float(H_sum.detach().item()), "sum_w": sum_w, "sum_w2": sum_w2}
+                extras=extras
             ))
 
     meta = {
@@ -314,15 +419,19 @@ def compute_jvp_per_sequence(
 
 def fit_control_variates(
     records: List[CVBatchRecord],
-    features: List[str] = ("length", "mean_logp", "var_logp"),
+    features: List[str] | str = ("length", "mean_logp", "var_logp"),
     ridge: float = 1e-8,
     crossfit_folds: int = 0,
 ) -> CVSummary:
     """
     Build centered design Z from chosen features and response y = gdotv_i.
-    Also report batch-level SE of the estimator before/after CV.
+    Reports:
+      - per-sequence variance (diagnostic)
+      - batch-level SE before/after CV
+      - for *every* available feature: correlation, single-feature var ratio, and SE_after
+      - rankings of features by |corr| and by variance reduction
 
-    Returns: CVSummary
+    Pass features="all" or "*" to include all available features.
     """
     if not records:
         raise ValueError("[control_variates] Empty records.")
@@ -331,87 +440,111 @@ def fit_control_variates(
     y = np.array([r.gdotv_i for r in records], dtype=np.float64)
     B = y.shape[0]
     var_y = float(y.var(ddof=1)) if B > 1 else 0.0
-    gdotv_batch = float(y.sum())                         # batch estimator (sum of per-seq contributions)
-    var_batch = var_y / max(B, 1)                        # variance of the batch estimator
+    gdotv_batch = float(y.sum())                  # batch estimator (sum of per-seq contributions)
+    var_batch = var_y / max(B, 1)                 # variance of the batch estimator
     se_batch = float(var_batch ** 0.5)
 
-    # Base feature map already in the file
-    feature_map = {
-        "length":       np.array([r.length   for r in records], dtype=np.float64),
-        "sum_logp":     np.array([r.sum_logp for r in records], dtype=np.float64),
-        "mean_logp":    np.array([r.mean_logp for r in records], dtype=np.float64),
-        "var_logp":     np.array([r.var_logp  for r in records], dtype=np.float64),
-        "max_logp":     np.array([r.max_logp  for r in records], dtype=np.float64),
-        "min_logp":     np.array([r.min_logp  for r in records], dtype=np.float64),
-        # NEW (from extras; see compute_jvp_per_sequence)
-        "rb_entropy_sum": np.array([r.extras.get("H_sum",  0.0)  for r in records], dtype=np.float64),
-        "sum_w":          np.array([r.extras.get("sum_w",  0.0)  for r in records], dtype=np.float64),
-        "sum_w2":         np.array([r.extras.get("sum_w2", 0.0)  for r in records], dtype=np.float64),
-        # NEW (derived surprisal features; often correlate better than raw logp)
-        "surprisal_sum":  lambda fm=None: None,  # placeholder, set just below
-        "surprisal_mean": lambda fm=None: None,
+    # Build a *complete* feature map (direct + derived + extras + simple interactions)
+    feature_map: Dict[str, np.ndarray] = {
+        # direct
+        "length":         _feature_vector(records, "length"),
+        "sum_logp":       _feature_vector(records, "sum_logp"),
+        "mean_logp":      _feature_vector(records, "mean_logp"),
+        "var_logp":       _feature_vector(records, "var_logp"),
+        "max_logp":       _feature_vector(records, "max_logp"),
+        "min_logp":       _feature_vector(records, "min_logp"),
+        # derived
+        "surprisal_sum":  _feature_vector(records, "surprisal_sum"),
+        "surprisal_mean": _feature_vector(records, "surprisal_mean"),
+        "length_inv":     _feature_vector(records, "length_inv"),
+        "length_log":     _feature_vector(records, "length_log"),
+        # extras from JVP computation
+        "rb_entropy_sum":  _feature_vector(records, "rb_entropy_sum"),
+        "rb_entropy_mean": _feature_vector(records, "rb_entropy_mean"),
+        "sum_w":           _feature_vector(records, "sum_w"),
+        "sum_w2":          _feature_vector(records, "sum_w2"),
+        "sum_w_abs":       _feature_vector(records, "sum_w_abs"),
+        "wjlogp_sum":      _feature_vector(records, "wjlogp_sum"),
+        "jH_sum":          _feature_vector(records, "jH_sum"),
+        "sum_abs_jlogp":   _feature_vector(records, "sum_abs_jlogp"),
+        "mean_abs_jlogp":  _feature_vector(records, "mean_abs_jlogp"),
+        "token_share":     _feature_vector(records, "token_share"),
+        # simple interactions (safe & cheap)
+        "length_x_surprisal_mean": _feature_vector(records, "length_x_surprisal_mean"),
+        "length_x_rb_entropy_mean": _feature_vector(records, "length_x_rb_entropy_mean"),
     }
-    # Fill derived surprisal features
-    feature_map["surprisal_sum"]  = -feature_map["sum_logp"]
-    feature_map["surprisal_mean"] = -feature_map["mean_logp"]
+    all_feature_names = list(feature_map.keys())
 
-    # Build design matrix for requested features
-    cols, X = [], []
-    for f in features:
-        if f not in feature_map:
-            raise ValueError(f"[control_variates] Unknown feature '{f}'. "
-                             f"Known: {sorted(feature_map.keys())}")
-        X.append(feature_map[f])
-        cols.append(f)
-    Z = np.stack(X, axis=1) if X else np.zeros((B, 0), dtype=np.float64)
+    # Allow "all" / "*" to select everything
+    if isinstance(features, str) and features.lower() in {"all", "*"}:
+        selected = all_feature_names
+    else:
+        selected = list(features) if isinstance(features, (list, tuple)) else [str(features)]
 
-    # Correlations (diagnostic)
-    def _pearson_safe(x, y):
-        if x.size < 2 or y.size < 2:
-            return 0.0
-        xc, yc = x - x.mean(), y - y.mean()
-        vx, vy = float(xc.var(ddof=1)), float(yc.var(ddof=1))
-        if vx <= 0.0 or vy <= 0.0:
-            return 0.0
-        return float((xc @ yc) / ((vx * vy) ** 0.5) / (x.size - 1))
-    corr = {c: _pearson_safe(feature_map[c], y) for c in cols}
+    # Correlations for *all* features (diagnostic)
+    corr_all = {c: _pearson(feature_map[c], y) for c in all_feature_names}
 
-    # Center and fit joint OLS (tiny ridge)
-    y_c, Z_c, y_mean, Z_mean = _center_columns(y, Z)
-    beta, var_ratio_joint, resid = _ols_centered(y_c, Z_c, ridge=ridge)
+    # Center y once
+    y_c = y - (y.mean() if y.size else 0.0)
 
-    # Single-feature variance ratios AND corresponding batch-SE after CV
-    var_after = {}
-    se_batch_after = {}
-    for j, c in enumerate(cols):
-        zc = Z_c[:, [j]]
-        _, r1, _ = _ols_centered(y_c, zc, ridge=ridge)           # r1 = Var(resid)/Var(y)
-        var_after[c] = float(r1)
-        se_batch_after[c] = float(((r1 * var_y) / max(B, 1)) ** 0.5)
+    # Single-feature variance ratios & SE_after for *all* features
+    var_ratio_single: Dict[str, float] = {}
+    se_after_single: Dict[str, float] = {}
+    for c in all_feature_names:
+        z = feature_map[c]
+        zc = z - (z.mean() if z.size else 0.0)
+        # solve OLS with 1 column (tiny ridge)
+        if zc.ndim == 1:
+            zc = zc[:, None]
+        _, r1, _ = _ols_centered(y_c, zc, ridge=ridge)
+        var_ratio_single[c] = float(r1)
+        se_after_single[c] = float(((r1 * var_y) / max(B, 1)) ** 0.5)
 
-    # Joint OLS: batch-level SE after CV
+    # Joint OLS on the *selected* subset
+    Z = np.stack([feature_map[f] for f in selected], axis=1) if selected else np.zeros((B, 0), dtype=np.float64)
+    y_c2, Z_c, y_mean, _ = _center_columns(y, Z)
+    beta, var_ratio_joint, resid = _ols_centered(y_c2, Z_c, ridge=ridge)
+
+    # Also report single-feature numbers for the selected subset (for backwards compat fields)
+    var_after_subset = {c: var_ratio_single[c] for c in selected}
+    se_after_subset  = {c: se_after_single[c]  for c in selected}
+
+    # Batch-level SE after *joint* CV on the selected subset
     se_batch_after_joint = float(((var_ratio_joint * var_y) / max(B, 1)) ** 0.5)
+
+    # Rankings
+    top_by_abs_corr = sorted(all_feature_names, key=lambda k: abs(corr_all[k]), reverse=True)
+    top_by_var_reduction = sorted(all_feature_names, key=lambda k: var_ratio_single[k])  # smaller is better
 
     summary = CVSummary(
         n_seqs=int(B),
         normalization="per_token",  # overwritten by caller with actual selection
         mean_gdotv=float(y.mean()),
         var_gdotv=var_y,            # per-sequence variance (kept for diagnostics)
-        corr={k: float(v) for k, v in corr.items()},
-        ols_beta={c: float(b) for c, b in zip(cols, beta.tolist() if beta.size else [])},
-        var_after_cv=var_after,                 # per-sequence variance ratios
+        corr={k: float(corr_all[k]) for k in selected},
+        ols_beta={c: float(b) for c, b in zip(selected, beta.tolist() if beta.size else [])},
+        var_after_cv=var_after_subset,                 # per-seq variance ratios for selected subset
         var_after_cv_joint=float(var_ratio_joint),
         diagnostics={
-            "features": cols,
+            "features": selected,
+            "features_all": all_feature_names,
             "ridge": float(ridge),
             "crossfit_folds": int(crossfit_folds),
             "y_mean": float(y_mean),
-            # Batch-level quantities you actually care about:
+            # Batch-level quantities:
             "gdotv_batch": gdotv_batch,
             "var_batch": var_batch,
             "se_batch": se_batch,
-            "se_batch_after_cv": se_batch_after,            # per-feature
-            "se_batch_after_cv_joint": se_batch_after_joint # joint OLS
+            "se_batch_after_cv": se_after_subset,              # per-feature for selected
+            "se_batch_after_cv_joint": se_batch_after_joint,   # joint OLS on selected
+            # Full per-feature diagnostics (for *all* features)
+            "all_features_stats": {
+                "corr": {k: float(v) for k, v in corr_all.items()},
+                "var_ratio_single": {k: float(v) for k, v in var_ratio_single.items()},
+                "se_after_single": {k: float(v) for k, v in se_after_single.items()},
+                "rank_top_abs_corr": top_by_abs_corr,
+                "rank_top_var_reduction": top_by_var_reduction,
+            },
         },
     )
     return summary
@@ -424,12 +557,12 @@ def save_cv_artifacts(
     make_plots: bool = True,
 ) -> Dict[str, str]:
     """
-    Save per-seq table (CSV), summary (JSON), and plots (PNG).
+    Save per-seq table (CSV), per-feature stats (CSV), summary (JSON), and plots (PNG).
     Returns dict of file paths.
     """
     _ensure_dir(out_dir)
 
-    # CSV
+    # ----- Per-sequence CSV (unchanged except for robustness) -----
     import csv
     csv_path = os.path.join(out_dir, "cv_per_seq.csv")
     with open(csv_path, "w", newline="") as f:
@@ -438,54 +571,105 @@ def save_cv_artifacts(
             "gdotv_i",
             "length",
             "sum_logp", "mean_logp", "var_logp", "max_logp", "min_logp",
-            # extras / derived:
-            "rb_entropy_sum", "sum_w", "sum_w2",
+            "rb_entropy_sum", "rb_entropy_mean",
+            "sum_w", "sum_w2", "sum_w_abs",
+            "wjlogp_sum", "jH_sum",
+            "sum_abs_jlogp", "mean_abs_jlogp",
             "surprisal_sum", "surprisal_mean",
+            "token_share",
+            "length_inv", "length_log",
+            "length_x_surprisal_mean", "length_x_rb_entropy_mean",
         ]
         writer.writerow(header)
         for r in records:
             rb_entropy_sum = float(r.extras.get("H_sum", 0.0))
-            sum_w  = float(r.extras.get("sum_w", 0.0))
-            sum_w2 = float(r.extras.get("sum_w2", 0.0))
+            rb_entropy_mean = rb_entropy_sum / max(r.length, 1)
+            sum_w   = float(r.extras.get("sum_w", 0.0))
+            sum_w2  = float(r.extras.get("sum_w2", 0.0))
+            sum_w_abs = float(r.extras.get("sum_w_abs", 0.0))
+            wjlogp_sum = float(r.extras.get("wjlogp_sum", 0.0))
+            jH_sum     = float(r.extras.get("jH_sum", 0.0))
+            sum_abs_jlogp  = float(r.extras.get("sum_abs_jlogp", 0.0))
+            mean_abs_jlogp = float(r.extras.get("mean_abs_jlogp", 0.0))
             surprisal_sum  = -float(r.sum_logp)
             surprisal_mean = -float(r.mean_logp)
+            token_share = float(r.extras.get("token_share", 0.0))
+            length_inv  = 1.0 / max(r.length, 1)
+            length_log  = math.log(max(r.length, 1.0))
+            length_x_surprisal_mean = r.length * surprisal_mean
+            length_x_rb_entropy_mean = rb_entropy_mean * r.length  # equals rb_entropy_sum
+
             writer.writerow([
                 r.gdotv_i,
                 r.length,
                 r.sum_logp, r.mean_logp, r.var_logp, r.max_logp, r.min_logp,
-                rb_entropy_sum, sum_w, sum_w2,
+                rb_entropy_sum, rb_entropy_mean,
+                sum_w, sum_w2, sum_w_abs,
+                wjlogp_sum, jH_sum,
+                sum_abs_jlogp, mean_abs_jlogp,
                 surprisal_sum, surprisal_mean,
+                token_share,
+                length_inv, length_log,
+                length_x_surprisal_mean, length_x_rb_entropy_mean,
             ])
 
-    # JSON summary
+    # ----- Per-feature stats CSV (new) -----
+    feat_csv = os.path.join(out_dir, "cv_feature_stats.csv")
+    with open(feat_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "feature",
+            "selected_in_joint",       # whether this feature was in the joint model
+            "corr",                    # Pearson corr(y, feature)
+            "var_ratio_single",        # Var(resid)/Var(y) using this single CV
+            "se_after_single",         # batch SE after single-feature CV
+            "beta_joint",              # joint OLS coefficient (if selected, else "")
+        ])
+        diag = summary.diagnostics
+        selected = set(diag.get("features", []))
+        stats_all = diag.get("all_features_stats", {})
+        corr_all = stats_all.get("corr", {})
+        vr_all   = stats_all.get("var_ratio_single", {})
+        se_all   = stats_all.get("se_after_single", {})
+        beta_map = summary.ols_beta or {}
+        # iterate over all features so you can sort in a spreadsheet
+        names = diag.get("features_all", list(corr_all.keys()))
+        for name in names:
+            writer.writerow([
+                name,
+                int(name in selected),
+                corr_all.get(name, float("nan")),
+                vr_all.get(name, float("nan")),
+                se_all.get(name, float("nan")),
+                beta_map.get(name, ""),
+            ])
+
+    # ----- JSON summary -----
     json_path = os.path.join(out_dir, "cv_summary.json")
     with open(json_path, "w") as f:
         d = asdict(summary)
-        # Include timestamp and version-ish info
         d["timestamp"] = datetime.utcnow().isoformat() + "Z"
         json.dump(d, f, indent=2)
 
-    paths = {"csv_path": csv_path, "summary_path": json_path}
+    paths = {"csv_path": csv_path, "feature_stats_path": feat_csv, "summary_path": json_path}
 
+    # ----- Plots (top-3 by |corr| across *all* features) -----
     if make_plots:
-        # Scatter plots: y vs top features in summary.diagnostics['features']
-        feats = summary.diagnostics.get("features", [])[:3]
         try:
-            import pandas as pd  # optional; only for quick plotting convenience
-            xs = {name: [] for name in feats}
-            ys = []
-            for r in records:
-                ys.append(r.gdotv_i)
-                for name in feats:
-                    xs[name].append(getattr(r, name))
-            ys = np.array(ys, dtype=np.float64)
-
-            for name in feats:
+            ys = np.array([r.gdotv_i for r in records], dtype=np.float64)
+            stats_all = summary.diagnostics.get("all_features_stats", {})
+            top_corr = stats_all.get("rank_top_abs_corr", [])[:3]
+            for name in top_corr:
+                try:
+                    xs = _feature_vector(records, name)
+                except Exception:
+                    continue
                 fig = plt.figure()
-                plt.scatter(np.array(xs[name], dtype=np.float64), ys, s=9)
+                plt.scatter(xs, ys, s=9)
+                rho = _pearson(xs, ys)
                 plt.xlabel(name)
                 plt.ylabel("per-seq contribution (y_i)")
-                plt.title(f"y_i vs {name}")
+                plt.title(f"y_i vs {name}  (ρ≈{rho:.3f})")
                 outp = os.path.join(out_dir, f"scatter_{name}.png")
                 fig.savefig(outp, dpi=120, bbox_inches="tight")
                 plt.close(fig)
@@ -503,7 +687,6 @@ def save_cv_artifacts(
             paths["plot_hist_yi"] = outp
 
         except Exception:
-            # Plots are optional; do not fail the run if plotting libs are absent.
             pass
 
     return paths
@@ -545,7 +728,6 @@ def run_control_variate_analysis(
         ridge=float(ridge),
         crossfit_folds=int(crossfit_folds),
     )
-    # carry normalization string through
     summary.normalization = normalization
     summary.diagnostics["meta"] = meta
 
