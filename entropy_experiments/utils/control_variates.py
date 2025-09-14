@@ -248,6 +248,9 @@ def compute_jvp_per_sequence(
             total_tokens_used += T_b
             w_b = w_list[b]  # shape [T_b], detached
 
+            sum_w  = float(w_b.sum().item())
+            sum_w2 = float((w_b**2).sum().item())
+
             # Single-sequence view + closure
             seq_view = _make_single_seq_view(mb_E, b)
             input_ids = seq_view.sequences[:, 0].to(device=device)         # [1, L]
@@ -293,7 +296,7 @@ def compute_jvp_per_sequence(
                 var_logp=var_lp,
                 max_logp=max_lp,
                 min_logp=min_lp,
-                extras={"H_sum": float(H_sum.detach().item())}
+                extras={"H_sum": float(H_sum.detach().item()), "sum_w": sum_w, "sum_w2": sum_w2}
             ))
 
     meta = {
@@ -317,60 +320,98 @@ def fit_control_variates(
 ) -> CVSummary:
     """
     Build centered design Z from chosen features and response y = gdotv_i.
-    Optionally perform K-fold cross-fitting to approximate out-of-sample variance.
+    Also report batch-level SE of the estimator before/after CV.
 
     Returns: CVSummary
     """
     if not records:
         raise ValueError("[control_variates] Empty records.")
 
-    # Assemble arrays
+    # Response and batch-level quantities
     y = np.array([r.gdotv_i for r in records], dtype=np.float64)
-    cols = []
-    X = []
+    B = y.shape[0]
+    var_y = float(y.var(ddof=1)) if B > 1 else 0.0
+    gdotv_batch = float(y.sum())                         # batch estimator (sum of per-seq contributions)
+    var_batch = var_y / max(B, 1)                        # variance of the batch estimator
+    se_batch = float(var_batch ** 0.5)
+
+    # Base feature map already in the file
     feature_map = {
-        "length": np.array([r.length for r in records], dtype=np.float64),
-        "sum_logp": np.array([r.sum_logp for r in records], dtype=np.float64),
-        "mean_logp": np.array([r.mean_logp for r in records], dtype=np.float64),
-        "var_logp": np.array([r.var_logp for r in records], dtype=np.float64),
-        "max_logp": np.array([r.max_logp for r in records], dtype=np.float64),
-        "min_logp": np.array([r.min_logp for r in records], dtype=np.float64),
+        "length":       np.array([r.length   for r in records], dtype=np.float64),
+        "sum_logp":     np.array([r.sum_logp for r in records], dtype=np.float64),
+        "mean_logp":    np.array([r.mean_logp for r in records], dtype=np.float64),
+        "var_logp":     np.array([r.var_logp  for r in records], dtype=np.float64),
+        "max_logp":     np.array([r.max_logp  for r in records], dtype=np.float64),
+        "min_logp":     np.array([r.min_logp  for r in records], dtype=np.float64),
+        # NEW (from extras; see compute_jvp_per_sequence)
+        "rb_entropy_sum": np.array([r.extras.get("H_sum",  0.0)  for r in records], dtype=np.float64),
+        "sum_w":          np.array([r.extras.get("sum_w",  0.0)  for r in records], dtype=np.float64),
+        "sum_w2":         np.array([r.extras.get("sum_w2", 0.0)  for r in records], dtype=np.float64),
+        # NEW (derived surprisal features; often correlate better than raw logp)
+        "surprisal_sum":  lambda fm=None: None,  # placeholder, set just below
+        "surprisal_mean": lambda fm=None: None,
     }
+    # Fill derived surprisal features
+    feature_map["surprisal_sum"]  = -feature_map["sum_logp"]
+    feature_map["surprisal_mean"] = -feature_map["mean_logp"]
+
+    # Build design matrix for requested features
+    cols, X = [], []
     for f in features:
         if f not in feature_map:
-            raise ValueError(f"[control_variates] Unknown feature '{f}'.")
+            raise ValueError(f"[control_variates] Unknown feature '{f}'. "
+                             f"Known: {sorted(feature_map.keys())}")
         X.append(feature_map[f])
         cols.append(f)
-    Z = np.stack(X, axis=1) if X else np.zeros((y.shape[0], 0), dtype=np.float64)
+    Z = np.stack(X, axis=1) if X else np.zeros((B, 0), dtype=np.float64)
 
-    # Correlations (for quick diagnostics)
-    corr = {c: _pearson(feature_map[c], y) for c in cols}
+    # Correlations (diagnostic)
+    def _pearson_safe(x, y):
+        if x.size < 2 or y.size < 2:
+            return 0.0
+        xc, yc = x - x.mean(), y - y.mean()
+        vx, vy = float(xc.var(ddof=1)), float(yc.var(ddof=1))
+        if vx <= 0.0 or vy <= 0.0:
+            return 0.0
+        return float((xc @ yc) / ((vx * vy) ** 0.5) / (x.size - 1))
+    corr = {c: _pearson_safe(feature_map[c], y) for c in cols}
 
-    # In-sample OLS on centered variables
+    # Center and fit joint OLS (tiny ridge)
     y_c, Z_c, y_mean, Z_mean = _center_columns(y, Z)
     beta, var_ratio_joint, resid = _ols_centered(y_c, Z_c, ridge=ridge)
 
-    # Single-feature variance reductions
+    # Single-feature variance ratios AND corresponding batch-SE after CV
     var_after = {}
+    se_batch_after = {}
     for j, c in enumerate(cols):
         zc = Z_c[:, [j]]
-        b1, r1, _ = _ols_centered(y_c, zc, ridge=ridge)
+        _, r1, _ = _ols_centered(y_c, zc, ridge=ridge)           # r1 = Var(resid)/Var(y)
         var_after[c] = float(r1)
+        se_batch_after[c] = float(((r1 * var_y) / max(B, 1)) ** 0.5)
+
+    # Joint OLS: batch-level SE after CV
+    se_batch_after_joint = float(((var_ratio_joint * var_y) / max(B, 1)) ** 0.5)
 
     summary = CVSummary(
-        n_seqs=int(y.shape[0]),
-        normalization="per_token",  # The estimator alignment; downstream stores the actual used one.
+        n_seqs=int(B),
+        normalization="per_token",  # overwritten by caller with actual selection
         mean_gdotv=float(y.mean()),
-        var_gdotv=float(y.var(ddof=1)) if y.size > 1 else 0.0,
+        var_gdotv=var_y,            # per-sequence variance (kept for diagnostics)
         corr={k: float(v) for k, v in corr.items()},
         ols_beta={c: float(b) for c, b in zip(cols, beta.tolist() if beta.size else [])},
-        var_after_cv=var_after,
+        var_after_cv=var_after,                 # per-sequence variance ratios
         var_after_cv_joint=float(var_ratio_joint),
         diagnostics={
             "features": cols,
             "ridge": float(ridge),
             "crossfit_folds": int(crossfit_folds),
             "y_mean": float(y_mean),
+            # Batch-level quantities you actually care about:
+            "gdotv_batch": gdotv_batch,
+            "var_batch": var_batch,
+            "se_batch": se_batch,
+            "se_batch_after_cv": se_batch_after,            # per-feature
+            "se_batch_after_cv_joint": se_batch_after_joint # joint OLS
         },
     )
     return summary
@@ -393,10 +434,28 @@ def save_cv_artifacts(
     csv_path = os.path.join(out_dir, "cv_per_seq.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        header = ["gdotv_i", "length", "sum_logp", "mean_logp", "var_logp", "max_logp", "min_logp"]
+        header = [
+            "gdotv_i",
+            "length",
+            "sum_logp", "mean_logp", "var_logp", "max_logp", "min_logp",
+            # extras / derived:
+            "rb_entropy_sum", "sum_w", "sum_w2",
+            "surprisal_sum", "surprisal_mean",
+        ]
         writer.writerow(header)
         for r in records:
-            writer.writerow([r.gdotv_i, r.length, r.sum_logp, r.mean_logp, r.var_logp, r.max_logp, r.min_logp])
+            rb_entropy_sum = float(r.extras.get("H_sum", 0.0))
+            sum_w  = float(r.extras.get("sum_w", 0.0))
+            sum_w2 = float(r.extras.get("sum_w2", 0.0))
+            surprisal_sum  = -float(r.sum_logp)
+            surprisal_mean = -float(r.mean_logp)
+            writer.writerow([
+                r.gdotv_i,
+                r.length,
+                r.sum_logp, r.mean_logp, r.var_logp, r.max_logp, r.min_logp,
+                rb_entropy_sum, sum_w, sum_w2,
+                surprisal_sum, surprisal_mean,
+            ])
 
     # JSON summary
     json_path = os.path.join(out_dir, "cv_summary.json")
