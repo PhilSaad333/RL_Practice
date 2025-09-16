@@ -1,0 +1,21 @@
+Run Output Structure Summary
+============================
+- Each run executed via run_entropy_experiments.py (D:125-164) builds a single ExperimentPlan (compute_true, compute_linear, compute_linquad, run_control_variates, capture_per_sequence, eta_list, clip_overrides) and iterates over n runs, saving plan.json/config.yaml/results.json.
+- results.json is to_serializable(EntropyMeasurements.run_experiments(...)), so tensors/arrays become basic Python types.
+- Top-level keys (observed in run_01/results.json): B_E, B_U, G_U, sampling_sec, update, approx, true, control_variates, precision, timing.
+    * update: stats from compute_update_vector_adamw (entropy_experiments/update_vector.py:75-136) including method, vec_norm, num_params, avg_mb_loss, num_microbatches, AMP flags.
+    * approx: DeltaEntropyApprox.compute_delta_h_approx output (entropy_experiments/delta_entropy_approx.py:260-339) + runner metadata (duration, method, used_quad, update stats). Default run lacked per_sequence records because capture_per_sequence=False.
+    * true: list of eta sweep entries (entropy_experiments/entropy_experiment_runner.py:244-312) each embedding DeltaEntropyTrue diagnostics (entropy_experiments/delta_entropy_true.py:121-196) with sequence-level deltas, ESS, logweight stats, clip overrides, optional symmetric_fd.
+    * control_variates: optional run_control_variate_analysis summary (entropy_experiments/utils/control_variates.py:706-751) with CVSummary diagnostics and artifact paths.
+    * precision: runtime/entropy dtype recording; timing: total runtime seconds.
+- Per-sequence histograms previously viewed in analyze_diagnostics.ipynb likely used true diagnostics delta_h_seq (available inside true.entries[eta].diagnostics). Approximate per-sequence records require rerun with capture_per_sequence=True or control variates outputs.
+
+Quoted Instructions
+===================
+"okay great. now let's move on to analyzing my data. the notebook entropy_experiments\results\diagnostics_run\notebooks\analyze_diagnostics.ipynb is relatively basic right now. the last cell, with histograms of the per sequence contributions to the entropy before and after an update, as well as the delta h per seq, is interesting.
+
+we are comparing this "true delta h", computed by estimating the entropy before and after an update (for each run we sweep over 5 different learning rates eta - i'm not sure which one we used for the histograms??), with the approximate version, obtained by computing the linear and quadratic order in learning rate expansion of the entropy.
+
+i'm seeing that there is a large error between by true delta h and my approximate one. the true delta h seems like it is being reliably computed. I want to get a sense of what is going wrong with the approximate delta h computation. i think its useful for me to look at the histograms of the per-sequence contributions to delta h true, and delta h approx, for both linear and lin+quadratic, for the various learning rates. I suspect that the approximate delta h per sequence has big outliers, whereas the true delta h per sequence doesnt have large tails. 
+
+let's make a new notebook in the entropy_experiments\results\diagnostics_run\notebooks folder focused on studying the distribution of the per-sequence contributions to delta h, both true and approximate (lin and lin+quad). i'd like to start by seeing some histograms, and then we can move on to computing measures of the spread and error and stuff about outliers, etc"

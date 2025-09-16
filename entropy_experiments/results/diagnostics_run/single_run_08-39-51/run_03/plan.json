@@ -1,0 +1,9 @@
+{
+  "compute_true": true,
+  "compute_linear": true,
+  "compute_linquad": false,
+  "run_control_variates": false,
+  "capture_per_sequence": false,
+  "eta_list": null,
+  "clip_overrides": null
+}

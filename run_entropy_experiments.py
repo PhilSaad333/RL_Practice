@@ -20,7 +20,11 @@ from entropy_experiments.entropy_experiment_runner import (
 )
 
 DEFAULT_CONFIG = Path("entropy_experiments/configs/config_template.yaml")
-DEFAULT_OUTPUT_ROOT = Path.home() / "RL_Practice_Files" / "experiment_runs"
+_COLAB_DRIVE_ROOT = Path("/content/drive/MyDrive/RL_Practice_Files/experiment_runs")
+if _COLAB_DRIVE_ROOT.anchor and Path("/content/drive").exists():
+    DEFAULT_OUTPUT_ROOT = _COLAB_DRIVE_ROOT
+else:
+    DEFAULT_OUTPUT_ROOT = Path.home() / "RL_Practice_Files" / "experiment_runs"
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,9 +50,17 @@ def parse_args() -> argparse.Namespace:
     )
     toggles.add_argument(
         "--capture-per-sequence",
+        dest="capture_per_sequence",
         action="store_true",
         help="Return per-sequence diagnostics",
     )
+    toggles.add_argument(
+        "--no-capture-per-sequence",
+        dest="capture_per_sequence",
+        action="store_false",
+        help="Disable per-sequence diagnostics (enabled by default)",
+    )
+    p.set_defaults(capture_per_sequence=True)
 
     diag = p.add_argument_group("diagnostic options")
     diag.add_argument(
