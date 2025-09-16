@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -71,32 +71,20 @@ class DeltaEntropyTrue:
         v_named: Dict[str, torch.Tensor],
         eta: float,
         cfg: Optional[Dict[str, Any]] = None,
-    ) -> float:
-        """
-        Compute ΔH_true(η) on the given E-batch using sequence-level SNIS.
-
-        Args:
-            E_batch: dict with BatchedSequences data (sequences, prompt_lens, gen_lens, attention_masks)
-            v_named: named update direction (per-parameter tensors) such that Δθ(η) = η * v_named
-            eta:     scalar step size
-            cfg:     optional overrides, supports:
-                     - clip_c (float, default=10.0)
-                     - report_per_token (bool, default=False) [reserved]
-                     - is_mode (str, default='snis') [reserved for future]
-
-        Returns:
-            ΔH_true(η) as a Python float.
-        """
+        *,
+        return_details: bool = False,
+        symmetric_eta: Optional[float] = None,
+        clip_overrides: Optional[Sequence[float]] = None,
+    ) -> Union[float, Dict[str, Any]]:
+        """Compute ΔH_true(η) on the given E-batch using sequence-level SNIS."""
         cfg = cfg or {}
         clip_c = float(cfg.get("clip_c", 10.0))
         report_per_token = bool(cfg.get("report_per_token", False))
         use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
 
-        # Cache key must reflect objective (per-token vs per-sequence) and integrand kind
         key = (id(E_batch), int(report_per_token), int(use_simple))
-        base_info = self._base_cache.get(key, None)
+        base_info = self._base_cache.get(key)
         if base_info is None:
-            # --- Baseline pass (η = 0) ---
             base_stats, H_base_mean = self._score_batch_base(
                 E_batch, report_per_token=report_per_token
             )
@@ -106,28 +94,106 @@ class DeltaEntropyTrue:
         base_stats: _SeqStats = base_info["seq_stats"]
         H_base_mean: float = base_info["H_base_mean"]
 
-        # --- New pass at θ' = θ + η v (params-only, fp32) ---
         new_stats = self._score_batch_new(E_batch, v_named, eta)
 
-        # --- SNIS reducer over sequences ---
-        H_new_snis, ess, lw_stats = self._snis_reduce(
-            base=base_stats, new=new_stats, clip_c=clip_c, report_per_token=report_per_token
+        clip_overrides = tuple(float(x) for x in (clip_overrides or ()))
+        H_new_snis, ess, lw_stats, detail = self._snis_reduce(
+            base=base_stats,
+            new=new_stats,
+            clip_c=clip_c,
+            report_per_token=report_per_token,
+            return_details=True,
         )
+        delta_val = H_new_snis - H_base_mean
 
-        if self.logger:
-            lab = "per-token" if report_per_token else "per-sequence"
-            # Audit: token counts and (when per-token) the weighted denominator used by SNIS
-            total_T_base = int(base_stats.T_tokens.sum()) if base_stats.T_tokens.size else 0
-            total_T_new  = int(new_stats.T_tokens.sum())  if new_stats.T_tokens.size  else 0
-            self.logger.info(
-                f"[SNIS:{lab}] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
-                f"ΔH_true={H_new_snis - H_base_mean:.6e}  ESS={ess:.1f}/{len(base_stats.seq_logprob)}  "
-                f"lw[min/med/max]={lw_stats}  T_base={total_T_base} T_new={total_T_new}"
+        if not return_details and not clip_overrides and symmetric_eta is None:
+            if self.logger:
+                lab = "per-token" if report_per_token else "per-sequence"
+                total_T_base = int(base_stats.T_tokens.sum()) if base_stats.T_tokens.size else 0
+                total_T_new = int(new_stats.T_tokens.sum()) if new_stats.T_tokens.size else 0
+                self.logger.info(
+                    f"[SNIS:{lab}] η={eta:g}  H_new={H_new_snis:.6e}  H_base={H_base_mean:.6e}  "
+                    f"ΔH_true={delta_val:.6e}  ESS={ess:.1f}/{len(base_stats.seq_logprob)}  "
+                    f"lw[min/med/max]={lw_stats}  T_base={total_T_base} T_new={total_T_new}"
+                )
+            return float(delta_val)
+
+        detail = detail or {}
+        diag: Dict[str, Any] = {
+            "delta_h_true": float(delta_val),
+            "base_entropy": float(H_base_mean),
+            "ess": float(ess),
+            "logweight_stats": {
+                "min": lw_stats[0],
+                "median": lw_stats[1],
+                "max": lw_stats[2],
+            },
+            "clip_fraction": float(detail.get("clip_fraction", 0.0)),
+            "weights_sum": float(detail.get("weights_sum", 0.0)),
+            "normalized_weights": list(detail.get("norm_weights", [])),
+            "log_weights": list(detail.get("log_weights", [])),
+            "h_base": base_stats.integrand_seq.tolist(),
+            "h_new": new_stats.integrand_seq.tolist(),
+            "delta_h_seq": (new_stats.integrand_seq - base_stats.integrand_seq).tolist(),
+            "token_counts": new_stats.T_tokens.astype(int).tolist(),
+        }
+
+        if clip_overrides:
+            clip_data: Dict[str, Any] = {}
+            for clip_value in clip_overrides:
+                H_clip, ess_clip, _, clip_detail = self._snis_reduce(
+                    base=base_stats,
+                    new=new_stats,
+                    clip_c=clip_value,
+                    report_per_token=report_per_token,
+                    return_details=True,
+                )
+                logs = clip_detail.get("log_weights") or []
+                logs_arr = np.asarray(logs, dtype=np.float64) if logs else None
+                clip_data[f"{clip_value:.6g}"] = {
+                    "delta_h_true": float(H_clip - H_base_mean),
+                    "ess": float(ess_clip),
+                    "logweight_stats": {
+                        "min": float(logs_arr.min()) if logs_arr is not None and logs_arr.size else 0.0,
+                        "median": float(np.median(logs_arr)) if logs_arr is not None and logs_arr.size else 0.0,
+                        "max": float(logs_arr.max()) if logs_arr is not None and logs_arr.size else 0.0,
+                    },
+                    "clip_fraction": float(clip_detail.get("clip_fraction", 0.0)),
+                    "weights_sum": float(clip_detail.get("weights_sum", 0.0)),
+                }
+            diag["clip_overrides"] = clip_data
+            if self.logger and clip_data:
+                worst_key, worst_val = max(
+                    clip_data.items(), key=lambda kv: kv[1].get("clip_fraction", 0.0)
+                )
+                clip_summary = {
+                    "clip_fraction": worst_val.get("clip_fraction", 0.0),
+                    "ess": worst_val.get("ess"),
+                }
+                self.logger.info(
+                    f"[SNIS:clip] worst_clip={worst_key} summary={clip_summary}"
+                )
+
+        if symmetric_eta is not None:
+            diag["symmetric_fd"] = self._compute_symmetric_fd(
+                base_stats=base_stats,
+                H_base=H_base_mean,
+                E_batch=E_batch,
+                v_named=v_named,
+                eta=float(symmetric_eta),
+                clip_c=clip_c,
+                report_per_token=report_per_token,
             )
 
-        return float(H_new_snis - H_base_mean)
+        if self.logger:
+            diag_summary = {
+                "clip_fraction": diag.get("clip_fraction"),
+                "weights_sum": diag.get("weights_sum"),
+                "ess": diag.get("ess"),
+            }
+            self.logger.info(f"[SNIS:detail] summary={diag_summary}")
 
-    # ---------- Internals ----------
+        return diag
 
     def _batch_key(self, E_batch: Dict[str, Any]) -> int:
         """
@@ -269,46 +335,47 @@ class DeltaEntropyTrue:
         new: _SeqStats,
         clip_c: float,
         report_per_token: bool = False,
-    ) -> Tuple[float, float, Tuple[float, float, float]]:
-        """
-        Self-normalized IS at sequence level.
+        return_details: bool = False,
+    ) -> Union[
+        Tuple[float, float, Tuple[float, float, float]],
+        Tuple[float, float, Tuple[float, float, float], Dict[str, Any]],
+    ]:
+        """Self-normalized IS at sequence level."""
+        lw_raw = (new.seq_logprob - base.seq_logprob).astype(np.float64, copy=False)
+        if not np.isfinite(lw_raw).all():
+            lw_raw = np.nan_to_num(lw_raw, neginf=-1e3, posinf=1e3)
 
-        Returns:
-            (H_new_snis, ESS, (lw_min, lw_med, lw_max))
-        """
-        # log-weights in float64 on CPU
-        lw = (new.seq_logprob - base.seq_logprob).astype(np.float64, copy=False)
-        if not np.isfinite(lw).all():
-            lw = np.nan_to_num(lw, neginf=-1e3, posinf=1e3)
-
+        lw = lw_raw.copy()
+        clip_fraction = 0.0
         if clip_c and clip_c > 0:
             lw = np.clip(lw, -clip_c, +clip_c)
+            if lw_raw.size:
+                clip_fraction = float(np.mean(np.abs(lw_raw) > clip_c))
 
-        # stability shift
         m = float(lw.max()) if lw.size else 0.0
         w = np.exp(lw - m, dtype=np.float64)
 
         Z = float(w.sum()) if w.size else 1.0
         if Z <= 0.0 or not np.isfinite(Z):
-            # Degenerate weights => fall back to unweighted averages
             if report_per_token:
                 num = float(new.integrand_seq.sum()) if new.integrand_seq.size else 0.0
                 den = float(new.T_tokens.sum()) if new.T_tokens.size else 1.0
-                H_new = (num / max(den, 1.0))
+                H_new = num / max(den, 1.0)
             else:
                 H_new = float(np.mean(new.integrand_seq)) if new.integrand_seq.size else 0.0
             ess = 0.0
+            norm_weights = np.zeros_like(lw_raw)
         else:
             if report_per_token:
                 num = float(np.dot(new.integrand_seq, w))
                 den = float(np.dot(new.T_tokens.astype(np.float64, copy=False), w))
                 den = den if np.isfinite(den) and den > 0.0 else 1.0
-                H_new = (num / den)
+                H_new = num / den
             else:
                 H_new = float(np.dot(new.integrand_seq, w) / Z)
             ess = float((Z ** 2) / float(np.dot(w, w))) if w.size else 0.0
+            norm_weights = w / Z if Z else np.zeros_like(w)
 
-        # lw diagnostics
         if lw.size:
             lw_sorted = np.sort(lw)
             lw_min = float(lw_sorted[0])
@@ -317,4 +384,76 @@ class DeltaEntropyTrue:
         else:
             lw_min = lw_med = lw_max = 0.0
 
+        if return_details:
+            details = {
+                "clip_fraction": clip_fraction,
+                "norm_weights": norm_weights.tolist(),
+                "log_weights": lw_raw.tolist(),
+                "weights_sum": float(Z),
+            }
+            return H_new, ess, (lw_min, lw_med, lw_max), details
         return H_new, ess, (lw_min, lw_med, lw_max)
+
+
+    def _compute_symmetric_fd(
+        self,
+        *,
+        base_stats: _SeqStats,
+        H_base: float,
+        E_batch: Dict[str, Any],
+        v_named: Dict[str, torch.Tensor],
+        eta: float,
+        clip_c: float,
+        report_per_token: bool,
+    ) -> Dict[str, Any]:
+        eta_abs = abs(float(eta))
+        if eta_abs == 0.0:
+            return {"eta": 0.0, "finite_difference": 0.0}
+
+        stats_plus = self._score_batch_new(E_batch, v_named, eta_abs)
+        H_plus, ess_plus, _, detail_plus = self._snis_reduce(
+            base=base_stats,
+            new=stats_plus,
+            clip_c=clip_c,
+            report_per_token=report_per_token,
+            return_details=True,
+        )
+        delta_plus = H_plus - H_base
+
+        stats_minus = self._score_batch_new(E_batch, v_named, -eta_abs)
+        H_minus, ess_minus, _, detail_minus = self._snis_reduce(
+            base=base_stats,
+            new=stats_minus,
+            clip_c=clip_c,
+            report_per_token=report_per_token,
+            return_details=True,
+        )
+        delta_minus = H_minus - H_base
+
+        finite_diff = (delta_plus - delta_minus) / (2.0 * eta_abs)
+
+        def _log_stats(detail: Dict[str, Any]) -> Dict[str, float]:
+            logs = detail.get("log_weights") or []
+            if not logs:
+                return {"min": 0.0, "median": 0.0, "max": 0.0}
+            arr = np.asarray(logs, dtype=np.float64)
+            return {
+                "min": float(arr.min()),
+                "median": float(np.median(arr)),
+                "max": float(arr.max()),
+            }
+
+        return {
+            "eta": eta_abs,
+            "delta_plus": float(delta_plus),
+            "delta_minus": float(delta_minus),
+            "finite_difference": float(finite_diff),
+            "ess_plus": float(ess_plus),
+            "ess_minus": float(ess_minus),
+            "logweight_stats_plus": _log_stats(detail_plus),
+            "logweight_stats_minus": _log_stats(detail_minus),
+            "clip_fraction_plus": float(detail_plus.get("clip_fraction", 0.0)),
+            "clip_fraction_minus": float(detail_minus.get("clip_fraction", 0.0)),
+            "weights_sum_plus": float(detail_plus.get("weights_sum", 0.0)),
+            "weights_sum_minus": float(detail_minus.get("weights_sum", 0.0)),
+        }

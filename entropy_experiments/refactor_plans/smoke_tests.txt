@@ -1,0 +1,18 @@
+# Smoke Test Checklist (Colab)
+
+## baseline_run.sh
+# python run_entropy_experiments_batch.py --config entropy_experiments/configs/config_template.yaml --mode full --eta 4e-6 --log-dir /content/drive/MyDrive/RL_Practice_Files/smoke_baseline
+
+## approx_only.sh
+# python run_entropy_experiments_batch.py --config entropy_experiments/configs/config_template.yaml --mode linear --eta 4e-6 --diagnostics-level full --log-dir /content/drive/MyDrive/RL_Practice_Files/smoke_linear
+
+## control_variates.sh
+# python run_entropy_experiments_batch.py --config entropy_experiments/configs/config_template.yaml --mode diagnostics --log-dir /content/drive/MyDrive/RL_Practice_Files/smoke_cv
+
+## true_entropy_bias.sh
+# python run_entropy_experiments_batch.py --config entropy_experiments/configs/config_template.yaml --mode true --sym-fd --clip-sweep --log-dir /content/drive/MyDrive/RL_Practice_Files/smoke_true_bias
+
+## verification steps
+# 1. Ensure run directories contain results.json, per-seq CSV, and diagnostics bundle.
+# 2. Confirm logs report eta sweep summary and ESS diagnostics without exceptions.
+# 3. Load saved artifacts locally and check plotting notebooks render without missing keys.

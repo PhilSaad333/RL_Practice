@@ -1,0 +1,120 @@
+Summary:
+Modernize `DeltaEntropyApprox` so the JVP pathway is the default `compute_delta_h_approx`, exposing quadratic add-ons, per-sequence contributions, and the preferred control-variates feature set (`length_log`, `sum_w`, `sum_w2`, `rb_entropy_sum`, `var_logp`). Legacy grad·dot code paths are removed outright.
+
+Rationale:
+- Two separate public entry points (`compute_delta_h_approx` vs `_jvp`) cause confusion and duplicate logic; the JVP path is more stable and supports per-sequence decompositions used in diagnostics.
+- Control-variates experiments have identified a new feature set that should become the default to reduce variance when we emit linear predictions.
+- Returning quadratic info (vHv, ??) from the same call simplifies runner integration and reduces redundant JVP invocations.
+
+Minimal Diffs:
+diff --git a/entropy_experiments/delta_entropy_approx.py b/entropy_experiments/delta_entropy_approx.py
+index AAA1111..BBB2222 100644
+--- a/entropy_experiments/delta_entropy_approx.py
++++ b/entropy_experiments/delta_entropy_approx.py
+@@
+-class DeltaEntropyApprox:
+-    ...
+-    def compute_delta_h_approx(
+-        self,
+-        *,
+-        E_batch: Dict[str, Any],
+-        v_named: Dict[str, torch.Tensor],
+-    ) -> Dict[str, Any]:
+-        """
+-        Compute ??_? H, v? over the provided E-batch.
+-        """
+-        ...
+-
+-    def compute_delta_h_approx_jvp(
+-        self,
+-        *,
+-        E_batch: Dict[str, Any],
+-        v_named: Dict[str, torch.Tensor],
+-    ) -> Dict[str, Any]:
+-        """
+-        Directional derivative using forward-mode JVP with a vectorized closure.
+-        """
+-        ...
++class DeltaEntropyApprox:
++    DEFAULT_CV_FEATURES: Tuple[str, ...] = (
++        "length_log",
++        "sum_w",
++        "sum_w2",
++        "rb_entropy_sum",
++        "var_logp",
++    )
++
++    ...
++
++    def compute_delta_h_approx(
++        self,
++        *,
++        E_batch: Dict[str, Any],
++        v_named: Dict[str, torch.Tensor],
++        include_quadratic: bool = False,
++        return_per_sequence: bool = False,
++        control_variate_features: Optional[Sequence[str]] = None,
++    ) -> Dict[str, Any]:
++        """Compute linear (and optional quadratic) entropy change diagnostics via JVP."""
++        features = tuple(control_variate_features or self.DEFAULT_CV_FEATURES)
++        base = self._compute_delta_h_jvp(
++            E_batch=E_batch,
++            v_named=v_named,
++            features=features,
++            return_per_sequence=return_per_sequence,
++        )
++        if include_quadratic:
++            quad = self._compute_dir_quadratic_jvp(
++                E_batch=E_batch,
++                v_named=v_named,
++            )
++            base["quadratic"] = quad
++            base["eta_star"] = self._safe_eta_star(
++                linear=base["delta_h_per_lr"],
++                curvature=quad["vHv"],
++            )
++        return base
++
++    def _compute_delta_h_jvp(
++        self,
++        *,
++        E_batch: Dict[str, Any],
++        v_named: Dict[str, torch.Tensor],
++        features: Tuple[str, ...],
++        return_per_sequence: bool,
++    ) -> Dict[str, Any]:
++        """Internal JVP routine shared by production and diagnostics."""
++        raise NotImplementedError
++
++    def _compute_dir_quadratic_jvp(
++        self,
++        *,
++        E_batch: Dict[str, Any],
++        v_named: Dict[str, torch.Tensor],
++    ) -> Dict[str, Any]:
++        raise NotImplementedError
++
++    def _safe_eta_star(self, *, linear: float, curvature: float) -> Optional[float]:
++        raise NotImplementedError
+
+Implementation Steps:
+1. Introduce `DEFAULT_CV_FEATURES` and teach `_compute_delta_h_jvp` to emit per-sequence diagnostics (y_i, baseline weights, RB entropy sums, etc.), aligning output structure with control_variates.
+2. Fold existing forward-mode JVP logic into `_compute_delta_h_jvp`, accepting `features` to build control-variate matrices and optional per-sequence payloads (saved under `result["per_sequence"]`).
+3. Reuse the nested JVP path for curvature inside `_compute_dir_quadratic_jvp`, returning `gdotv`, `vHv`, and raw tensors needed for ??; update runner to consume the new dict.
+4. Delete the gradient-dot-product estimator and the standalone `compute_delta_h_approx_jvp`; ensure config `approx_delta_h.method` selects JVP implicitly and emit a clear error if unsupported keys remain.
+5. Adopt the stronger control-variates features (default list above) and expose `control_variate_features` override for experimentation.
+6. Update imports and typed hints across modules/scripts to use the new API; adjust control_variates utilities to accept the richer payload instead of recomputing features.
+
+Config/Flags:
+- Honour `config['approx_delta_h']['include_quadratic']` and `config['approx_delta_h']['per_sequence_payload']` to drive the new keyword arguments.
+- Add `config['control_variates']['default_features']` fallback to match `DEFAULT_CV_FEATURES`.
+- Deprecate `config['approx_delta_h']['method']` values other than `"jvp"`; raise a ValueError if set.
+
+Validation:
+- `pytest -q tests/entropy_experiments/test_delta_entropy_approx.py` (add/expand tests for new API, default feature list, quadratic outputs).
+- Manual Colab run: `python run_entropy_experiments_batch.py --mode linear --eta 2e-5 --save-per-seq` (new script) should capture per-sequence CSV matching control variates.
+- Backward compatibility is not required; new scripts must call the updated API directly.
+
+Rollback:
+- Revert `delta_entropy_approx.py` to previous commit if JVP unification needs to be abandoned.
+- Update scripts back to older call signatures if necessary.

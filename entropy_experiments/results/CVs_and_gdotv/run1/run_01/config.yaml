@@ -1,0 +1,95 @@
+checkpoint:
+  checkpoint_path: /content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_40/model
+  optimizer_path: /content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_40/optimizer.pt
+  backbone: qwen2_5_15
+  device_map: cuda
+batch_config:
+  dataset_name: gsm8k_r1_template
+  E_split: train
+  U_split: test
+  B_E: 512
+  B_U: 64
+  G: 8
+estimator:
+  use_simple_entropy_for_x: false
+  eta_sweep: false
+  single_eta: 4e-6
+  eta_list:
+  - 1e-06
+  - 2e-06
+  - 4e-06
+  - 8e-06
+  - 1.6e-05
+  - 3.2e-05
+  - 6.4e-05
+  - 0.000128
+rb_requires_grad: true
+true_delta_h:
+  microbatch_size: 1
+  is_mode: snis
+  clip_c: 10.0
+  report_per_token: true
+  snapshot_device: cpu
+approx_delta_h:
+  method: jvp
+  microbatch_size: 8
+  normalize: per_token
+  baseline:
+    kind: hk_ema
+    ema_beta: 0.9
+    pos_bins: 32
+    regression_l2: 0.0
+    include_intercept: true
+    fit_dtype: float64
+    normalize: false
+    clip_min: null
+    clip_max: null
+  ridge:
+    lambda: 0.001
+    eps: 1.0e-08
+  simple_baseline:
+    kind: time_loo
+  variance:
+    enabled: true
+    jackknife: true
+  report_per_token: false
+  curvature:
+    enabled: true
+generation:
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 150
+  gen_batch_size: 128
+  tf_batch_size: 16
+detailed_logging:
+  enabled: true
+  level: standard
+  log_sequences: false
+  log_tokens: false
+  log_raw_tensors: false
+  output_directory: entropy_experiments/logs
+  compress: true
+  max_files: 50
+output:
+  log_level: INFO
+  results_path: ''
+precision:
+  allow_tf32: false
+  matmul_precision: high
+  runtime_dtype: float32
+  entropy_dtype: float64
+  update_vector:
+    use_amp: false
+    amp_dtype: bfloat16
+    grads_fp32: true
+  tf_withgrad:
+    autocast: false
+    dtype: float32
+    cast_logits_fp32: true
+control_variates:
+  features:
+  - length_log
+  - sum_w
+  - sum_w2
+  - rb_entropy_sum
+  - var_logp

@@ -1,0 +1,109 @@
+{
+  "n_runs": 8,
+  "mean_abs_g": 376.81215230890706,
+  "median_abs_g": 406.2115090395218,
+  "mean_se": 0.5418836738541031,
+  "mean_se_after": 0.5187073027686546,
+  "mean_VR_SE": 0.9560006823896278,
+  "median_VR_SE": 0.9534972910480723,
+  "mean_SNR": 751.4669083825016,
+  "mean_SNR_after": 787.5990192008941,
+  "rows": [
+    {
+      "run_dir": "/content/drive/MyDrive/RL_Practice_Files/good_cvs_20250915_0000/run_01",
+      "gdotv_batch": -430.0164386164877,
+      "se_batch": 0.3816922724111071,
+      "se_batch_after": 0.3619910832120076,
+      "VR_SE": 0.9483846265090743,
+      "SNR": 1126.6050420673237,
+      "SNR_after": 1187.9199752681188,
+      "features": "length_log,sum_w,sum_w2,rb_entropy_sum,var_logp",
+      "B_total": 512,
+      "T_total": 51960
+    },
+    {
+      "run_dir": "/content/drive/MyDrive/RL_Practice_Files/good_cvs_20250915_0000/run_02",
+      "gdotv_batch": -382.4065794625559,
+      "se_batch": 0.44080310782888127,
+      "se_batch_after": 0.4193582258697744,
+      "VR_SE": 0.9513504292999864,
+      "SNR": 867.5224213959154,
+      "SNR_after": 911.8852471998647,
+      "features": "length_log,sum_w,sum_w2,rb_entropy_sum,var_logp",
+      "B_total": 512,
+      "T_total": 53225
+    },
+    {
+      "run_dir": "/content/drive/MyDrive/RL_Practice_Files/good_cvs_20250915_0000/run_03",
+      "gdotv_batch": -377.6262291440098,
+      "se_batch": 0.5683917003696187,
+      "se_batch_after": 0.5224936481465337,
+      "VR_SE": 0.9192492568184263,
+      "SNR": 664.3767474057832,
+      "SNR_after": 722.7384112392201,
+      "features": "length_log,sum_w,sum_w2,rb_entropy_sum,var_logp",
+      "B_total": 512,
+      "T_total": 52800
+    },
+    {
+      "run_dir": "/content/drive/MyDrive/RL_Practice_Files/good_cvs_20250915_0000/run_04",
+      "gdotv_batch": -350.8600307890414,
+      "se_batch": 0.4398991306474306,
+      "se_batch_after": 0.4197265847098605,
+      "VR_SE": 0.9541427919898803,
+      "SNR": 797.5920076783419,
+      "SNR_after": 835.925203621725,
+      "features": "length_log,sum_w,sum_w2,rb_entropy_sum,var_logp",
+      "B_total": 512,
+      "T_total": 51915
+    },
+    {
+      "run_dir": "/content/drive/MyDrive/RL_Practice_Files/good_cvs_20250915_0000/run_05",
+      "gdotv_batch": -559.5393047219977,
+      "se_batch": 0.6607637146237855,
+      "se_batch_after": 0.6296098883165389,
+      "VR_SE": 0.9528517901062644,
+      "SNR": 846.8069482910072,
+      "SNR_after": 888.7079366210448,
+      "features": "length_log,sum_w,sum_w2,rb_entropy_sum,var_logp",
+      "B_total": 512,
+      "T_total": 51917
+    },
+    {
+      "run_dir": "/content/drive/MyDrive/RL_Practice_Files/good_cvs_20250915_0000/run_06",
+      "gdotv_batch": -454.7132363705375,
+      "se_batch": 0.6982712232603004,
+      "se_batch_after": 0.6849424423884837,
+      "VR_SE": 0.9809117425610305,
+      "SNR": 651.1985904953013,
+      "SNR_after": 663.8707258158702,
+      "features": "length_log,sum_w,sum_w2,rb_entropy_sum,var_logp",
+      "B_total": 512,
+      "T_total": 51899
+    },
+    {
+      "run_dir": "/content/drive/MyDrive/RL_Practice_Files/good_cvs_20250915_0000/run_07",
+      "gdotv_batch": -440.33564690755196,
+      "se_batch": 0.4270212010418879,
+      "se_batch_after": 0.41443776758459133,
+      "VR_SE": 0.9705320639195565,
+      "SNR": 1031.1798239365592,
+      "SNR_after": 1062.4891873969343,
+      "features": "length_log,sum_w,sum_w2,rb_entropy_sum,var_logp",
+      "B_total": 512,
+      "T_total": 52500
+    },
+    {
+      "run_dir": "/content/drive/MyDrive/RL_Practice_Files/good_cvs_20250915_0000/run_08",
+      "gdotv_batch": -18.9997524590745,
+      "se_batch": 0.7182270406498134,
+      "se_batch_after": 0.697098781921447,
+      "VR_SE": 0.9705827579128035,
+      "SNR": 26.4536857897811,
+      "SNR_after": 27.255466444374733,
+      "features": "length_log,sum_w,sum_w2,rb_entropy_sum,var_logp",
+      "B_total": 512,
+      "T_total": 51624
+    }
+  ]
+}

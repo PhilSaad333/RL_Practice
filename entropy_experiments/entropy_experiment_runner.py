@@ -13,6 +13,8 @@ Usage:
     results = probe.run_experiments()
 """
 
+from dataclasses import dataclass, field, asdict
+
 # === Model and optimizer loading ===
 from entropy_experiments.utils.model_loader import load_peft_for_probe, load_adam_optimizer_from_path
 
@@ -24,10 +26,11 @@ import time
 import math
 import os
 import random
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any, Union, Sequence
 from pathlib import Path
 import yaml
 import json
+
 
 # import torch.distributed as dist
 from entropy_experiments.utils.sequence_processor import (
@@ -48,6 +51,16 @@ from entropy_experiments.utils import control_variates as cv
 
 
 
+
+@dataclass
+class ExperimentPlan:
+    compute_true: bool = True
+    compute_linear: bool = True
+    compute_linquad: bool = False
+    run_control_variates: bool = False
+    capture_per_sequence: bool = False
+    eta_list: Optional[Sequence[float]] = None
+    clip_overrides: Optional[Sequence[float]] = None
 class EntropyMeasurements:
     """
     Main method is run_mixed_probe, at the end of the class.
@@ -107,6 +120,231 @@ class EntropyMeasurements:
         
         self.logger.info(f"Initialized OfflineEntropyProbe on rank {self.rank}/{self.world_size}")
         
+    @dataclass
+    class _Batches:
+        E: Dict[str, Any]
+        U: Dict[str, Any]
+        sampling_sec: float
+        info: Dict[str, Any] = field(default_factory=dict)
+
+    @dataclass
+    class _UpdateInfo:
+        v_named: Dict[str, torch.Tensor]
+        stats: Dict[str, Any]
+        seconds: float
+
+    def _resolve_plan(
+        self,
+        plan: Optional[ExperimentPlan],
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> ExperimentPlan:
+        """Merge plan defaults with any overrides supplied by the caller."""
+        resolved = ExperimentPlan() if plan is None else plan
+        if overrides:
+            for key, value in overrides.items():
+                if hasattr(resolved, key):
+                    setattr(resolved, key, value)
+        return resolved
+
+    def _prepare_batches(self) -> "_Batches":
+        """Sample (or load) the E and U batches once."""
+        B_E = int(self.config["batch_config"]["B_E"])
+        B_U = int(self.config["batch_config"]["B_U"])
+        G_U = int(self.config["batch_config"]["G"])
+
+        self.logger.info(f"[sampling] Target sizes: E: B={B_E}, G=1;  U: B={B_U}, G={G_U}")
+
+        t_samp = time.time()
+        E_batch = self._get_or_sample_E(B_E)
+        U_batch = self._get_or_sample_U(B_U, G_U)
+        sampling_sec = time.time() - t_samp
+
+        B_E_real = int(E_batch.get("num_prompts", B_E))
+        B_U_real = int(U_batch.get("num_prompts", B_U))
+        self.logger.info(
+            f"[sampling] Done in {sampling_sec:.2f}s.  E(B={B_E_real}, G=1)  U(B={B_U_real}, G={G_U})"
+        )
+
+        info = {
+            "B_E": B_E,
+            "B_U": B_U,
+            "G_U": G_U,
+            "B_E_real": B_E_real,
+            "B_U_real": B_U_real,
+        }
+        return self._Batches(E=E_batch, U=U_batch, sampling_sec=sampling_sec, info=info)
+
+    def _compute_update_info(self, U_batch: Dict[str, Any]) -> "_UpdateInfo":
+        """Compute the normalized update vector plus timing/stats."""
+        self.logger.info("[update-vector] Computing v (normalized by LR) on U …")
+        t_v = time.time()
+        v_named, v_stats = compute_update_vector(
+            model=self.model,
+            optimizer=self.optimizer,
+            U_batch=U_batch,
+            config=self.config,
+            logger=self.logger,
+        )
+        seconds = time.time() - t_v
+        self.logger.info(
+            f"[update-vector] ||v|| = {v_stats.get('vec_norm', 0.0):.3e}  ({seconds:.2f}s)"
+        )
+        return self._UpdateInfo(v_named=v_named, stats=v_stats, seconds=seconds)
+
+    def _maybe_compute_delta_h_approx(
+        self,
+        E_batch: Dict[str, Any],
+        update: "_UpdateInfo",
+        plan: ExperimentPlan,
+    ) -> Optional[Dict[str, Any]]:
+        """Return approx δH diagnostics if requested."""
+        if not plan.compute_linear and not plan.compute_linquad:
+            return None
+
+        if self.delta_entropy_approx is None:
+            self.delta_entropy_approx = DeltaEntropyApprox(
+                model=self.model,
+                sequence_processor=self._sequence_processor,
+                config=self.config,
+                logger=self.logger,
+            )
+
+        approx_cfg = (self.config.get("approx_delta_h", {}) or {})
+        method = str(approx_cfg.get("method", "grad_dot")).lower()
+        curv_cfg = (approx_cfg.get("curvature", {}) or {})
+        use_quad = bool(curv_cfg.get("enabled", False)) or plan.compute_linquad
+
+        t_approx = time.time()
+        if method in {"jvp", "forward", "jvp_rb"}:
+            self.logger.info("[h_approx] Using JVP method")
+            approx_result = self.delta_entropy_approx.compute_delta_h_approx(
+                E_batch=E_batch,
+                v_named=update.v_named,
+                include_quadratic=use_quad,
+                return_per_sequence=plan.capture_per_sequence,
+            )
+        else:
+            self.logger.info("[h_approx] Using grad·dot method")
+            approx_result = self.delta_entropy_approx.compute_delta_h_approx(
+                E_batch=E_batch,
+                v_named=update.v_named,
+                include_quadratic=use_quad,
+                return_per_sequence=plan.capture_per_sequence,
+            )
+        duration = time.time() - t_approx
+        self.logger.info(f"[δHapprox] Computed in {duration:.2f}s")
+
+        approx_result["duration"] = duration
+        approx_result["method"] = method
+        approx_result["used_quad"] = use_quad
+        approx_result["update_seconds"] = update.seconds
+        approx_result["update_stats"] = update.stats
+        return approx_result
+
+    def _maybe_compute_delta_h_true(
+        self,
+        E_batch: Dict[str, Any],
+        update: "_UpdateInfo",
+        plan: ExperimentPlan,
+        approx: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not plan.compute_true:
+            return None
+
+        true_cfg = (self.config.get("true_delta_h", {}) or {})
+        comp_cfg = (self.config.get("estimator", {}) or {})
+
+        if plan.eta_list is not None:
+            eta_list = [float(x) for x in plan.eta_list]
+        elif comp_cfg.get("eta_sweep", False):
+            eta_list = [float(x) for x in comp_cfg.get("eta_list", [])]
+        else:
+            eta_list = [float(comp_cfg.get("single_eta", 2e-5))]
+
+        clip_overrides = plan.clip_overrides or true_cfg.get("clip_overrides") or []
+        symmetric_eta_cfg = true_cfg.get("symmetric_eta") if plan.clip_overrides is None else None
+
+        entries = []
+        total_true_time = 0.0
+        for eta in eta_list:
+            t_true = time.time()
+            result = self.delta_entropy_true.compute_delta_h_true(
+                E_batch=E_batch,
+                v_named=update.v_named,
+                eta=float(eta),
+                cfg=true_cfg,
+                return_details=True,
+                symmetric_eta=symmetric_eta_cfg,
+                clip_overrides=clip_overrides,
+            )
+            total_true_time += time.time() - t_true
+
+            if isinstance(result, dict):
+                delta_val = float(result.get("delta_h_true", 0.0))
+                diagnostics = result
+            else:
+                delta_val = float(result)
+                diagnostics = None
+
+            if self.logger:
+                ess_val = diagnostics.get("ess") if diagnostics else "n/a"
+                self.logger.info(f"[δH_true] η={eta:g}  ΔH={delta_val:.6e}  ESS={ess_val}")
+
+            entries.append(
+                {
+                    "eta": float(eta),
+                    "delta_h_true": delta_val,
+                    "diagnostics": diagnostics,
+                }
+            )
+
+        return {
+            "entries": entries,
+            "duration": total_true_time,
+        }
+    
+    def _maybe_run_control_variates(
+        self,
+        E_batch: Dict[str, Any],
+        update: "_UpdateInfo",
+        plan: ExperimentPlan,
+        approx: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not plan.run_control_variates:
+            return None
+        cv_cfg = (self.config.get("control_variates", {}) or {})
+        features = plan.clip_overrides or cv_cfg.get("features")
+        return cv.run_control_variate_analysis(
+            delta_approx=self.delta_entropy_approx,
+            E_batch=E_batch,
+            v_named=update.v_named,
+            normalization=str((self.config.get("approx_delta_h", {}) or {}).get("normalize", "per_token")).lower(),
+            out_dir=None,
+            features=features
+        )
+
+    def _assemble_outputs(
+        self,
+        plan: ExperimentPlan,
+        batches: "_Batches",
+        update: "_UpdateInfo",
+        approx: Optional[Dict[str, Any]],
+        true: Optional[Dict[str, Any]],
+        cv: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        return {
+            "B_E": batches.info.get("B_E_real", batches.info.get("B_E")),
+            "B_U": batches.info.get("B_U_real", batches.info.get("B_U")),
+            "G_U": batches.info.get("G_U"),
+            "sampling_sec": batches.sampling_sec,
+            "update": update.stats,
+            "approx": approx,
+            "true": true,
+            "control_variates": cv,
+        }
+
+
+
     def _setup_logging(self) -> logging.Logger:
         """Setup logging configuration with both console and file output."""
         logger = logging.getLogger(f"entropy_probe_rank_{self.rank if hasattr(self, 'rank') else 0}")
@@ -491,424 +729,92 @@ class EntropyMeasurements:
     #----------------------------------------------------------------------------------------------
 
 
-    def run_experiments(self) -> Dict[str, Any]:
-        """
-        Unified, single-GPU mixed probe:
-        1) Sample U and E batches via SequenceProcessor (no DDP).
-        2) Compute the update vector v on U (normalized by LR).
-        3) For an eta sweep, evaluate:
-            - Ground-truth ΔH_true on E via parameter overrides (IS path).
-            - First-order ΔH1 ≈ X̄ · Δη using the same Δη = η v.
 
-        Assumptions / conventions:
-        - SequenceProcessor enforces runtime fp32, with optional fp64 for entropy/log-softmax
-            controlled by `config["precision"]["entropy_dtype"] in {float32,float64}`.
-        - Top-p is forced to 1.0 in SP to keep the policy simple/consistent during probing.
-        - `compute_update_vector` returns a named mapping `v_named: Dict[str, Tensor]`.
-        - We interpret the physical update as Δη = η v_named (η are "learning rate" scalars).
+    def _resolve_plan(
+        self,
+        plan: Optional['ExperimentPlan'],
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> 'ExperimentPlan':
+        """Return a concrete ExperimentPlan based on explicit overrides."""
+        if plan is None:
+            plan = ExperimentPlan()
+        if overrides:
+            for key, value in overrides.items():
+                if hasattr(plan, key):
+                    setattr(plan, key, value)
+        return plan
 
-        Returns:
-        dict with:
-            - sweep: list of per-eta results (deltaH_true, deltaH1, bars_dot, norms, timing)
-            - E/U batch sizes and precision summary
-            - aggregate timing
-        """
+    def run_experiments(
+        self,
+        plan: Optional[ExperimentPlan] = None,
+        **overrides: Any,
+    ) -> Dict[str, Any]:
+        """Run ΔH experiments according to `plan`, returning measurements and diagnostics."""
+        resolved_plan = self._resolve_plan(plan, overrides)
 
         if not self.checkpoint_loaded:
-            # Get optimizer path from config if available
-            checkpoint_path = self.config['checkpoint'].get('checkpoint_path')
-            optimizer_path = self.config['checkpoint'].get('optimizer_path')
+            checkpoint_path = (self.config["checkpoint"] or {}).get("checkpoint_path")
+            optimizer_path = (self.config["checkpoint"] or {}).get("optimizer_path")
             self.load_checkpoint(checkpoint_path, optimizer_path)
-
 
         t0 = time.time()
         self.logger.info("=== Mixed Probe: start ===")
 
-        # ---------------------------------------------------------------------
-        # 0) Ensure a clean SP instance with your trimmed precision config
-        # ---------------------------------------------------------------------
         self._ensure_sequence_processor()
-
-        # Pull a compact precision summary for logs
         pcfg = (self.config.get("precision", {}) or {})
         runtime_dtype = str(pcfg.get("runtime_dtype", "float32")).lower()
         entropy_dtype = str(pcfg.get("entropy_dtype", "float32")).lower()
         self.logger.info(f"[precision] runtime={runtime_dtype}, entropy={entropy_dtype}")
 
-        # ---------------------------------------------------------------------
-        # 1) Sample E and U batches (or load from cache) — single GPU, no DDP
-        # ---------------------------------------------------------------------
-        B_E = int(self.config["batch_config"]["B_E"])
-        B_U = int(self.config["batch_config"]["B_U"])
-        G_U = int(self.config["batch_config"]["G"])
+        batches = self._prepare_batches()
+        update_info = self._compute_update_info(batches.U)
 
-        self.logger.info(f"[sampling] Target sizes: E: B={B_E}, G=1;  U: B={B_U}, G={G_U}")
-
-        t_samp = time.time()
-        E_batch = self._get_or_sample_E(B_E)
-        U_batch = self._get_or_sample_U(B_U, G_U)
-        t_samp = time.time() - t_samp
-
-        B_E_real = int(E_batch.get("num_prompts", B_E))
-        B_U_real = int(U_batch.get("num_prompts", B_U))
-        self.logger.info(f"[sampling] Done in {t_samp:.2f}s.  E(B={B_E_real}, G=1)  U(B={B_U_real}, G={G_U})")
-
-        # ---------------------------------------------------------------------
-        # 2) Compute update vector v on U (normalized by LR)
-        # ---------------------------------------------------------------------
-        self.logger.info("[update-vector] Computing v (normalized by LR) on U …")
-        t_v = time.time()
-        v_named, v_stats = compute_update_vector(
-            model=self.model,
-            optimizer=self.optimizer,
-            U_batch=U_batch,
-            config=self.config,
-            logger=self.logger,
+        approx_result = self._maybe_compute_delta_h_approx(
+            batches.E,
+            update_info,
+            resolved_plan,
         )
-        t_v = time.time() - t_v
-        v_norm = float(v_stats.get("vec_norm", 0.0))
-        self.logger.info(f"[update-vector] ||v||₂ ≈ {v_stats.get('vec_norm', 0.0):.3e}  ({t_v:.2f}s)")
+        true_result = self._maybe_compute_delta_h_true(
+            batches.E,
+            update_info,
+            resolved_plan,
+            approx_result,
+        )
+        cv_result = self._maybe_run_control_variates(
+            batches.E,
+            update_info,
+            resolved_plan,
+            approx_result,
+        )
 
+        result = self._assemble_outputs(
+            resolved_plan,
+            batches,
+            update_info,
+            approx_result,
+            true_result,
+            cv_result,
+        )
 
-        # ---------------------------------------------------------------------
-        # 3) Prepare components for the two ΔH estimates
-        # ---------------------------------------------------------------------
-        # 3A) ΔH_true via importance sampling + functional param overrides
-        if self.delta_entropy_true is None:
-            self.delta_entropy_true = DeltaEntropyTrue(
-                model=self.model,
-                sequence_processor=self._sequence_processor,
-                config=self.config,
-                logger=self.logger,
-            )
+        precision = result.setdefault("precision", {})
+        precision["runtime_dtype"] = runtime_dtype
+        precision["entropy_dtype"] = entropy_dtype
 
-        # Base IS config; we’ll override lr/eta per sweep item
-        true_cfg_base = {
-            "microbatch_size": self.config.get("true_delta_h", {}).get("microbatch_size", 1),
-            "is_mode": self.config.get("true_delta_h", {}).get("is_mode", "snis"),
-            "clip_c": self.config.get("true_delta_h", {}).get("clip_c", 10.0),
-            "report_per_token": self.config.get("true_delta_h", {}).get("report_per_token", False),
-            "snapshot_device": self.config.get("true_delta_h", {}).get("snapshot_device", "cpu"),
-            # we’ll set "lr_override" per-eta below when the fallback path is used
-        }
-
-        # 3B) ΔH1 ≈ X̄ · Δη (first-order approx on E)
-        if self.delta_entropy_approx is None:
-            self.delta_entropy_approx = DeltaEntropyApprox(
-                model=self.model,
-                sequence_processor=self._sequence_processor,
-                config=self.config,
-                logger=self.logger,
-            )
-        
-
-        trainable_names = {n for n, _ in self.model.named_parameters() if _.requires_grad}
-        extra = [k for k in v_named if k not in trainable_names]
-        if extra:
-            self.logger.warning(f"[update-vector] v_named contains non-trainable keys (ignored by LoRA path): {extra[:5]}")
-
-
-
-        # ---------------------------------------------------------------------
-        # 4) Eta sweep
-        # ---------------------------------------------------------------------
-
-        comp_cfg = self.config.get("estimator", {})
-        if comp_cfg.get("eta_sweep", False):
-            eta_list = [float(eta) for eta in comp_cfg.get("eta_list", [2e-5])]
-        else:
-            eta_list = [float(comp_cfg.get("single_eta", 2e-5))]
-
-        self.logger.info(f"[sweep] η values: {eta_list}")
-
-        sweep_results = []
-
-        # Compute normalized h_approx once (choose method per config)
-        t_approx = time.time()
-
-        approx_cfg = (self.config.get("approx_delta_h", {}) or {})
-        method = str(approx_cfg.get("method", "grad_dot")).lower()
-
-        curv_cfg = (approx_cfg.get("curvature", {}) or {})
-        use_quad = bool(curv_cfg.get("enabled", False))
-        used_quad=False
-        if method in {"jvp", "forward", "jvp_rb"} and use_quad:
-            self.logger.info("[h_approx] Using JVP method incl quadratic")
-            used_quad = True
-        elif method in {"jvp", "forward", "jvp_rb"}:
-            self.logger.info("[h_approx] Using JVP method")
-            h_approx_normalized_dict = self.delta_entropy_approx.compute_delta_h_approx_jvp(
-                E_batch=E_batch,
-                v_named=v_named,
-            )
-        else:
-            self.logger.info("[h_approx] Using grad·dot method")
-            h_approx_normalized_dict = self.delta_entropy_approx.compute_delta_h_approx(
-                E_batch=E_batch,
-                v_named=v_named,
-            )
-
-        if not used_quad:
-            h_approx_normalized = float(h_approx_normalized_dict["delta_h_per_lr"])
-            approx_variance = h_approx_normalized_dict.get("variance", {})
-            approx_meta = {"method": h_approx_normalized_dict.get("method"),
-                        "baseline": h_approx_normalized_dict.get("baseline", {})}
-        else:
-            h_approx_normalized = 0.0
-            approx_meta = {}
-            approx_variance = 0.0            
-
-
-        t_approx = time.time() - t_approx
-        self.logger.info(f"[ΔHapprox] Computed h_approx_normalized in {t_approx:.2f}s")
-
-
-        # Optional curvature (nested JVP) on the same E-batch (time not included in h_approx)
-        curvature_info = None
-        if use_quad:
-            try:
-                curvature_info = self.delta_entropy_approx.compute_dir_linear_and_quadratic_jvp(
-                    E_batch=E_batch,
-                    v_named=v_named,
-                )
-                self.logger.info(
-                    f"[curvature] g·v={curvature_info.get('gdotv'):.3e} vHv={curvature_info.get('vHvv'):.3e} "
-                    f"eta*={curvature_info.get('eta_star'):.3e}"
-                )
-            except Exception as e:
-                self.logger.warning(f"[curvature] Failed to compute nested JVP: {e}")
-
-
-        # Then sweep over eta to compue true deltaH, using h_approx = eta*h_approx_normalized
-
-        t_true_total = 0.0
-
-        for eta in eta_list:
-            self.logger.info(f"— sweep η={eta:g} —")
-
-            # 4A) Ground-truth ΔH_true on E
-            t_true = time.time()
-            # If we’re on the fallback path, we must pass lr_override in cfg
-            true_cfg = dict(true_cfg_base)
-
-            deltaH_true = self.delta_entropy_true.compute_delta_h_true(
-                E_batch, 
-                v_named, 
-                float(eta), 
-                true_cfg)
-            
-            t_true = time.time() - t_true
-            t_true_total += t_true
-
-            # 4B) Approximate ΔH ≈ X̄ · Δ\theta on E
-            deltaH_approx = float(eta) * h_approx_normalized if not used_quad else 0.0
-            # Quadratic correction if curvature was computed
-            deltaH_approx_linquad = None
-            if 'curvature_info' in locals() and curvature_info is not None:
-                try:
-                    gdotv = float(curvature_info.get('gdotv', 0.0))
-                    vHvv = float(curvature_info.get('vHvv', 0.0))
-                    deltaH_approx_linquad = float(eta) * gdotv + 0.5 * (float(eta) ** 2) * vHvv
-                    deltaH_approx = float(eta)* gdotv
-                except Exception:
-                    deltaH_approx_linquad = None
-
-            self.logger.info(
-                f"[η={eta:g}] ΔH_true={deltaH_true:.6e}   ΔH1={deltaH_approx:.6e}   "
-                f"||v||₂={v_norm:.3e}"
-                f"True {t_true:.2f}s"
-            )
-
-            sweep_results.append({
-                "eta": float(eta),
-                "deltaH_true": deltaH_true,
-                "deltaH_approx": deltaH_approx,
-            })
-            if deltaH_approx_linquad is not None:
-                sweep_results[-1]["deltaH_approx_linear"] = deltaH_approx
-                sweep_results[-1]["deltaH_approx_linquad"] = deltaH_approx_linquad
-
-        # ---------------------------------------------------------------------
-        # 5) Package results
-        # ---------------------------------------------------------------------
+        timing = result.setdefault("timing", {})
         total_time = time.time() - t0
-        out = {
-            "sweep": sweep_results,
-            "B_E": B_E_real,
-            "B_U": B_U_real,
-            "G_U": G_U,
-            "precision": {
-                "runtime_dtype": runtime_dtype,
-                "entropy_dtype": entropy_dtype,
-            },
-            "timing": {
-                "total": total_time,
-                "sampling": t_samp,
-                "update_vector": t_v,
-                "true_total": t_true_total,
-                "h_approx": t_approx,
-            },
-            "variance": approx_variance,
-            "approx": {"h_approx_normalized": h_approx_normalized, **approx_meta},
-            "curvature": curvature_info,
-        }
+        timing["total"] = total_time
 
         self.logger.info(
-            f"=== Mixed Probe: done in {total_time:.2f}s "
-            f"(sampling {t_samp:.2f}s, v {t_v:.2f}s, true Σ {t_true_total:.2f}s, h_approx Σ {t_approx:.2f}s) ==="
+            "=== Mixed Probe: done in "
+            f"{total_time:.2f}s "
+            f"(sampling {timing.get('sampling', 0.0):.2f}s, "
+            f"update {timing.get('update_vector', 0.0):.2f}s, "
+            f"true {timing.get('true', 0.0) or 0.0:.2f}s, "
+            f"approx {timing.get('approx', 0.0) or 0.0:.2f}s) ==="
         )
-        return out
+
+        return result
 
 
-    def run_control_variate_analysis(
-        self,
-        *,
-        out_dir: str | None = None,
-        normalization: str | None = None,
-        features: list[str] | None = None,
-        ridge: float | None = None,
-        crossfit_folds: int | None = None,
-    ) -> Dict[str, Any]:
-        """
-        Sample E and U, compute the normalized update vector v on U, then
-        run control-variates analysis for the first-order JVP estimator on E.
 
-        Artifacts (CSV, JSON, PNGs) are written under `out_dir` (or a timestamped
-        subdirectory if `out_dir` is a parent directory). Returns a dict with
-        paths and a JSON-serializable summary.
 
-        Args:
-            out_dir: Base directory to save outputs. If None, uses
-                    config['output']['cv_output_dir'] or 'entropy_experiments/cv_runs'.
-            normalization: 'per_token' (default) or 'per_sequence'. If None, uses
-                        config['approx_delta_h']['normalize'] (default 'per_token').
-            features: list of feature names to use as control variates; if None,
-                    uses config['control_variates']['features'] or
-                    ['length', 'mean_logp', 'var_logp'].
-            ridge: tiny ridge for OLS; if None, uses config['control_variates']['ridge'] or 1e-8.
-            crossfit_folds: K for K-fold cross-fitting (0 = in-sample OLS).
-                            If None, uses config['control_variates']['crossfit_folds'] or 0.
-
-        Returns:
-            Dict with keys: 'csv_path', 'summary_path', optional 'plot_*', and 'summary'.
-        """
-        t0 = time.time()
-        # ----------------------------
-        # Ensure model / optimizer / SP
-        # ----------------------------
-        if not getattr(self, "checkpoint_loaded", False):
-            ckpt = (self.config.get("checkpoint", {}) or {})
-            adapter_path = ckpt.get("checkpoint_path")
-            optimizer_path = ckpt.get("optimizer_path")
-            assert adapter_path, "Missing checkpoint_path in config['checkpoint']"
-            self.load_checkpoint(adapter_path, optimizer_path)
-
-        self._ensure_sequence_processor()
-
-        # Precision summary for logs (mirrors run_experiments)
-        pcfg = (self.config.get("precision", {}) or {})
-        runtime_dtype = str(pcfg.get("runtime_dtype", "float32")).lower()
-        entropy_dtype = str(pcfg.get("entropy_dtype", "float32")).lower()
-        self.logger.info(f"[precision] runtime={runtime_dtype}, entropy={entropy_dtype}")
-
-        # ----------------------------
-        # 1) Sample E and U
-        # ----------------------------
-        B_E = int(self.config["batch_config"]["B_E"])
-        B_U = int(self.config["batch_config"]["B_U"])
-        G_U = int(self.config["batch_config"]["G"])
-
-        self.logger.info(f"[CV] Sampling E(B={B_E}, G=1) and U(B={B_U}, G={G_U})")
-        t_samp = time.time()
-        E_batch = self._get_or_sample_E(B_E)
-        U_batch = self._get_or_sample_U(B_U, G_U)
-        t_samp = time.time() - t_samp
-        self.logger.info(f"[CV] Sampling done in {t_samp:.2f}s.")
-
-        # ----------------------------
-        # 2) Compute update vector v
-        # ----------------------------
-        self.logger.info("[CV] Computing v (normalized by LR) on U …")
-        t_v = time.time()
-        v_named, v_stats = compute_update_vector(
-            model=self.model,
-            optimizer=self.optimizer,
-            U_batch=U_batch,
-            config=self.config,
-            logger=self.logger,
-        )
-        t_v = time.time() - t_v
-        self.logger.info(f"[CV] v computed in {t_v:.2f}s. |v|₂ ≈ {v_stats.get('norm_l2','?')}")
-
-        # ----------------------------
-        # 3) Build (or reuse) DeltaEntropyApprox
-        # ----------------------------
-        if self.delta_entropy_approx is None:
-            self.delta_entropy_approx = DeltaEntropyApprox(
-                model=self.model,
-                sequence_processor=self._sequence_processor,
-                config=self.config,
-                logger=self.logger,
-            )
-
-        # Normalization / features / CV knobs
-        approx_cfg = (self.config.get("approx_delta_h", {}) or {})
-        norm_default = str(approx_cfg.get("normalize", "per_token")).lower()
-        normalization = (normalization or norm_default)
-        assert normalization in {"per_token", "per_sequence"}, \
-            f"normalization must be 'per_token' or 'per_sequence', got {normalization}"
-
-        cv_cfg = (self.config.get("control_variates", {}) or {})
-        features = features or cv_cfg.get("features", ["length", "mean_logp", "var_logp"])
-        ridge = float(ridge if ridge is not None else cv_cfg.get("ridge", 1e-8))
-        crossfit_folds = int(crossfit_folds if crossfit_folds is not None else cv_cfg.get("crossfit_folds", 0))
-
-        # Output directory
-        out_root = (self.config.get("output", {}) or {}).get("cv_output_dir", "entropy_experiments/cv_runs")
-        out_dir = out_dir or out_root
-        self.logger.info(f"[CV] Output directory: {out_dir}")
-
-        # ----------------------------
-        # 4) Run CV analysis
-        # ----------------------------
-        t_cv = time.time()
-        result = cv.run_control_variate_analysis(
-            delta_approx=self.delta_entropy_approx,
-            E_batch=E_batch,
-            v_named=v_named,
-            normalization=normalization,
-            out_dir=out_dir,
-            features=features,
-            ridge=ridge,
-            crossfit_folds=crossfit_folds,
-        )
-        t_cv = time.time() - t_cv
-
-        # Compose return payload
-        total = time.time() - t0
-        payload = {
-            "paths": {k: v for k, v in result.items() if k.endswith("_path") or k.startswith("plot_")},
-            "summary": result.get("summary", {}),
-            "v_stats": v_stats,
-            "timing_sec": {
-                "total": total,
-                "sampling": t_samp,
-                "update_vector": t_v,
-                "cv_analysis": t_cv,
-            },
-            "config_used": {
-                "normalization": normalization,
-                "features": features,
-                "ridge": ridge,
-                "crossfit_folds": crossfit_folds,
-                "out_dir": out_dir,
-            },
-        }
-        self.logger.info(
-            "[CV] Done. "
-            f"csv={payload['paths'].get('csv_path','?')}, "
-            f"summary={payload['paths'].get('summary_path','?')}, "
-            f"plots={[k for k in payload['paths'].keys() if k.startswith('plot_')]} "
-            f"(elapsed {total:.2f}s)"
-        )
-        return payload

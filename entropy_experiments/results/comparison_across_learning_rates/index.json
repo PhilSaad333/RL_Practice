@@ -1,0 +1,122 @@
+[
+  {
+    "run": 1,
+    "path": "/content/drive/MyDrive/RL_Practice_Files/overnight_runs_20250915_0246/run_01",
+    "timing": {
+      "total": 1002.695249080658,
+      "sampling": 212.0625786781311,
+      "update_vector": 21.3780357837677,
+      "true_total": 438.779335975647,
+      "h_approx": 7.128715515136719e-05
+    },
+    "variance": 0.0,
+    "approx": {
+      "h_approx_normalized": 0.0
+    }
+  },
+  {
+    "run": 2,
+    "path": "/content/drive/MyDrive/RL_Practice_Files/overnight_runs_20250915_0246/run_02",
+    "timing": {
+      "total": 1026.2448363304138,
+      "sampling": 213.29128313064575,
+      "update_vector": 21.23335909843445,
+      "true_total": 457.2402319908142,
+      "h_approx": 7.271766662597656e-05
+    },
+    "variance": 0.0,
+    "approx": {
+      "h_approx_normalized": 0.0
+    }
+  },
+  {
+    "run": 3,
+    "path": "/content/drive/MyDrive/RL_Practice_Files/overnight_runs_20250915_0246/run_03",
+    "timing": {
+      "total": 1020.1253881454468,
+      "sampling": 214.77929639816284,
+      "update_vector": 24.2035174369812,
+      "true_total": 449.55359721183777,
+      "h_approx": 0.00010418891906738281
+    },
+    "variance": 0.0,
+    "approx": {
+      "h_approx_normalized": 0.0
+    }
+  },
+  {
+    "run": 4,
+    "path": "/content/drive/MyDrive/RL_Practice_Files/overnight_runs_20250915_0246/run_04",
+    "timing": {
+      "total": 1030.5257806777954,
+      "sampling": 215.15240573883057,
+      "update_vector": 20.226304292678833,
+      "true_total": 459.542929649353,
+      "h_approx": 8.320808410644531e-05
+    },
+    "variance": 0.0,
+    "approx": {
+      "h_approx_normalized": 0.0
+    }
+  },
+  {
+    "run": 5,
+    "path": "/content/drive/MyDrive/RL_Practice_Files/overnight_runs_20250915_0246/run_05",
+    "timing": {
+      "total": 1031.7118668556213,
+      "sampling": 212.3697395324707,
+      "update_vector": 20.92845606803894,
+      "true_total": 464.8934061527252,
+      "h_approx": 6.508827209472656e-05
+    },
+    "variance": 0.0,
+    "approx": {
+      "h_approx_normalized": 0.0
+    }
+  },
+  {
+    "run": 6,
+    "path": "/content/drive/MyDrive/RL_Practice_Files/overnight_runs_20250915_0246/run_06",
+    "timing": {
+      "total": 1038.3797612190247,
+      "sampling": 216.27482843399048,
+      "update_vector": 20.915535926818848,
+      "true_total": 464.6259729862213,
+      "h_approx": 0.00010013580322265625
+    },
+    "variance": 0.0,
+    "approx": {
+      "h_approx_normalized": 0.0
+    }
+  },
+  {
+    "run": 7,
+    "path": "/content/drive/MyDrive/RL_Practice_Files/overnight_runs_20250915_0246/run_07",
+    "timing": {
+      "total": 1038.125602722168,
+      "sampling": 219.05198550224304,
+      "update_vector": 21.74557399749756,
+      "true_total": 459.2222013473511,
+      "h_approx": 7.534027099609375e-05
+    },
+    "variance": 0.0,
+    "approx": {
+      "h_approx_normalized": 0.0
+    }
+  },
+  {
+    "run": 8,
+    "path": "/content/drive/MyDrive/RL_Practice_Files/overnight_runs_20250915_0246/run_08",
+    "timing": {
+      "total": 1024.042398929596,
+      "sampling": 220.9047656059265,
+      "update_vector": 21.285635948181152,
+      "true_total": 446.7813181877136,
+      "h_approx": 7.009506225585938e-05
+    },
+    "variance": 0.0,
+    "approx": {
+      "h_approx_normalized": 0.0
+    }
+  }
+]

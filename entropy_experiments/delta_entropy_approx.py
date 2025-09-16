@@ -61,11 +61,6 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Ordere
 import math
 import torch
 from torch.func import jvp, functional_call
-from entropy_experiments.utils.param_registry import (
-    dot_named,
-    flatten_named,
-
-)
 from entropy_experiments.utils.sequence_processor import (
     BatchedSequences,
     LogprobResults,
@@ -95,6 +90,14 @@ class _Intersections:
 
 
 class DeltaEntropyApprox:
+    DEFAULT_CV_FEATURES: Tuple[str, ...] = (
+        "length_log",
+        "sum_w",
+        "sum_w2",
+        "rb_entropy_sum",
+        "var_logp",
+    )
+
     """
     Compute the linearized entropy change per unit learning rate:
         delta_h_per_lr = ⟨∇_θ H(θ), v⟩,
@@ -206,281 +209,335 @@ class DeltaEntropyApprox:
         *,
         E_batch: Dict[str, Any],
         v_named: Dict[str, torch.Tensor],
+        include_quadratic: bool = False,
+        return_per_sequence: bool = False,
+        control_variate_features: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        """
-        Compute ⟨∇H, v⟩ over the provided E-batch.
+        """Compute the linearized entropy change and optional diagnostics."""
+        features = tuple(control_variate_features or self.DEFAULT_CV_FEATURES)
+        result = self.compute_delta_h_approx_jvp(
+            E_batch=E_batch,
+            v_named=v_named,
+            return_per_sequence=return_per_sequence,
+            features=features,
+        )
+        if include_quadratic:
+            quad = self.compute_dir_linear_and_quadratic_jvp(
+                E_batch=E_batch,
+                v_named=v_named,
+            )
+            result["quadratic"] = quad
+            result["eta_star"] = quad.get("eta_star")
+        return result
 
-        Parameters
-        ----------
-        E_batch : dict
-            A dict produced by your `_pack_E_from_sequences`, with keys:
-              - 'sequences': [B, G, L] tensor,
-              - 'attention_masks': [B, G, L] tensor,
-              - 'prompt_lens': list[int] length B,
-              - 'gen_lens': list[list[int]] shape [B][G], with G==1,
-              - plus auxiliary fields (unused here).
-        v_named : Dict[str, Tensor]
-            Name-keyed update direction (CPU fp32) normalized by the LR used to produce it.
-
-        Returns
-        -------
-        Dict[str, Any] with keys:
-            - 'delta_h_per_lr' : float
-            - 'num_sequences'  : int
-            - 'num_tokens'     : int
-            - 'norms'          : dict (grad_l2, v_l2, cosine)
-            - 'intersection'   : dict (matched, v_named, trainable, missing lists)
-            - 'estimator'      : 'rb' or 'simple'
-            - 'baseline'       : dict (kind, mean_b, mean_G)
-        """
+    def compute_delta_h_approx_jvp(
+        self,
+        *,
+        E_batch: Dict[str, Any],
+        v_named: Dict[str, torch.Tensor],
+        return_per_sequence: bool = False,
+        features: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Forward-mode JVP estimator with optional per-sequence diagnostics."""
         device = next(self.model.parameters()).device
+        mdl = self.model
+        mdl.eval()
 
-        # Preflight: intersection / mismatches
-        name_to_param = self._select_params_intersecting(v_named)
-        inter = self._intersections_report(name_to_param, v_named)
-        if inter.matched == 0:
-            raise ValueError(
-                "[delta-h approx] No named-parameter intersection between model trainables and v_named."
-            )
-        if self.debug and self.logger:
-            self.logger.info(
-                f"[delta-h approx] compute: matched={inter.matched} / v_named={inter.v_named_total} / "
-                f"trainable={inter.trainable_total}; "
-                f"missing_in_model={inter.missing_in_model[:3]} ...; missing_in_v={inter.missing_in_v[:3]} ..."
-            )
+        base_map = snapshot_base_functional_state(self.model)
+        names, primals, tangents = intersect_jvp_primals_tangents(self.model, base_map, v_named)
+        feature_tuple = tuple(features or self.DEFAULT_CV_FEATURES)
 
-        # Count totals for normalization
         B_total = int(E_batch["sequences"].shape[0])
         T_total = self._count_total_gen_tokens(E_batch)
 
-        if self.use_rb and not bool(getattr(self.sp.config, "rb_requires_grad", True)):
-            # We need differentiable RB entropies if RB estimator is requested.
-            raise ValueError(
-                "[delta-h approx] RB estimator requested but sequence_processor.config.rb_requires_grad=False. "
-                "Enable RB entropies with grad (e.g., GenerationConfig.rb_requires_grad=True)."
-            )
-
-        # Accumulate gradients over microbatches
-        self.model.zero_grad(set_to_none=True)
+        contribs_mb: List[float] = []
         total_tokens_used = 0
-        baseline_means = []
-        G_means = []
+        scale_sum = 0.0
 
-        # For variance diagnostics (microbatch-level directional contributions)
-        contribs: List[float] = []
-        last_dot_val = 0.0
-        # Prepare v on CPU/fp32 up-front (used inside the loop if variance enabled)
-        v_named_cpu = {k: (v.detach().to("cpu", torch.float32) if isinstance(v, torch.Tensor) else v)
-                       for k, v in v_named.items()}
+        baseline_kind = str(self.baseline_kind).lower()
 
         for mb_E in self._iter_microbatches(E_batch, self.mb):
-            # Teacher-forced with-grad forward
-            # Note: tf_batch_size can be ≤ microbatch size; cap by current B_mb
             B_mb = int(mb_E.sequences.shape[0])
             tf_bs = min(self.mb, B_mb)
 
-            want_feats = self.use_rb and (self.baseline_kind in {"regression", "reg", "reg_ridge", "regression_ridge"})
-            res, _diag = self.sp.teacher_force_logprobs_with_diagnostics(
-                sequences=mb_E,
-                tf_batch_size=tf_bs,
-                compute_rb=True,
-                with_grad=True,
-                return_baseline_features=want_feats,
+            ema_state = None
+            if baseline_kind == "hk_ema":
+                ema_state = EmaState(
+                    pos_bins=self._pos_bins,
+                    ema_beta=self._ema_beta,
+                    ema_resid=self._ema_resid,
+                    ema_cnt=self._ema_cnt,
+                )
+            ridge_cfg = RidgeConfig(lambda_=self.ridge_lambda, eps=self.ridge_eps)
+            w_list = build_weights_base(
+                kind=baseline_kind,
+                model=self.model,
+                sp=self.sp,
+                mb_E=mb_E,
+                tf_bs=tf_bs,
+                ema=ema_state,
+                ridge=ridge_cfg,
             )
 
-            # Build surrogate for this microbatch
-            sur = torch.zeros((), device=device, dtype=torch.float32)
-            T_mb = 0
-            b_vals = []
-            G_vals = []
+            input_ids_mb = mb_E.sequences[:, 0].to(device=device)
+            attention_mask_mb = mb_E.attention_masks[:, 0].to(device=device)
+            prompt_lens = [int(x) for x in mb_E.prompt_lens]
+            T_list = [int(mb_E.gen_lens[b][0]) for b in range(B_mb)]
+            T_mb = sum(t for t in T_list if t > 0)
+            if T_mb == 0:
+                continue
 
-            for b in range(len(res.logprobs)):
-                # G==1 is enforced at E construction time
-                lp: torch.Tensor = res.logprobs[b][0]  # [T], graph-carrying
-                T = int(lp.numel())
-                if T == 0:
-                    continue
-                T_mb += T
+            w_cat = torch.cat([w_list[b] for b in range(B_mb) if T_list[b] > 0], dim=0)
 
-                if self.use_rb:
-                    H_rb: Optional[torch.Tensor] = None
-                    if res.rb_entropies_torch is None or len(res.rb_entropies_torch[b]) == 0:
-                        raise RuntimeError(
-                            "[delta-h approx] RB estimator active but rb_entropies_torch is missing."
-                        )
-                    H_rb = res.rb_entropies_torch[b][0]  # [T], graph-carrying
-                    if H_rb is None or H_rb.numel() != T:
-                        raise RuntimeError("[delta-h approx] RB tensor shape mismatch.")
+            f_mb = make_mb_outputs_closure(
+                model=self.model,
+                base_map=base_map,
+                names=list(names),
+                input_ids_mb=input_ids_mb,
+                attention_mask_mb=attention_mask_mb,
+                prompt_lens=prompt_lens,
+                gen_lens=T_list,
+            )
+            (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(f_mb, (primals,), (tangents,))
+            mb_contrib = float(((w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum).item())
 
-                    # Entropy-to-go G_k (detached weight)
-                    G = torch.flip(torch.cumsum(torch.flip(H_rb.detach(), dims=[0]), dim=0), dims=[0])  # [T]
-
-
-                    # Baseline b_k
-                    # Create strategy once per microbatch (EMA state is persistent)
-                    baseline_kind = str(self.baseline_kind).lower()
-                    if baseline_kind == "hk_ema":
-                        ema_state = EmaState(
-                            pos_bins=self._pos_bins,
-                            ema_beta=self._ema_beta,
-                            ema_resid=self._ema_resid,
-                            ema_cnt=self._ema_cnt,
-                        )
-                        strat = get_strategy("hk_ema", ema=ema_state)
-                    elif baseline_kind in {"regression", "reg", "reg_ridge", "regression_ridge"}:
-                        strat = get_strategy(
-                            baseline_kind,
-                            l2=self.baseline_reg_l2,
-                            include_intercept=self.baseline_reg_intercept,
-                            fit_dtype=self.baseline_reg_fit_dtype,
-                            normalize=self.baseline_reg_normalize,
-                            clip_min=self.baseline_reg_clip_min,
-                            clip_max=self.baseline_reg_clip_max,
-                        )
-                    elif baseline_kind == "hk":
-                        strat = get_strategy("hk")
-                    elif baseline_kind == "none":
-                        strat = None
-                    else:
-                        strat = get_strategy("hk")
-
-                    phi = None
-                    if strat is not None and (hasattr(res, "baseline_feats_torch") and res.baseline_feats_torch is not None) and len(res.baseline_feats_torch[b]) > 0:
-                        phi = res.baseline_feats_torch[b][0]
-                        if phi.dim() == 2 and int(phi.shape[0]) != T:
-                            T_eff = min(T, int(phi.shape[0]))
-                            phi = phi[:T_eff]
-                            lp = lp[:T_eff]
-                            H_rb = H_rb[:T_eff]
-                            G = G[:T_eff]
-
-                    if strat is None:
-                        b_k = torch.zeros_like(G)
-                    else:
-                        b_k = strat.compute_bk_rb(H_rb=H_rb, G=G, phi=phi, update_state=(baseline_kind == "hk_ema"))
-
-                    # Accumulate statistics for diagnostics
-                    b_vals.append(b_k.mean().item())
-                    G_vals.append(G.mean().item())
-
-                    # Score term + RB term
-                    sur = sur + ((G - b_k) * lp).sum() + H_rb.sum()
-
-                else:
-                    # -------- Simple estimator for ∇ E[-log π]:
-                    # grad L = - (logπ - b).detach() * ∇ logπ
-                    # where b is action-independent (timewise batch baseline).
-                    # Gather ragged list first to build baselines jointly.
-                    lp_list: List[torch.Tensor] = []
-                    lengths: List[int] = []
-                    for b in range(len(res.logprobs)):
-                        lp_b: torch.Tensor = res.logprobs[b][0]  # [T_b], graph-carrying
-                        lengths.append(int(lp_b.numel()))
-                        if int(lp_b.numel()) > 0:
-                            lp_list.append(lp_b)
-
-                    # Build baselines for all sequences/time steps at once (detached)
-                    tw_strat = get_timewise_strategy(self.simple_baseline_kind)
-                    baselines = tw_strat.compute_timewise_baselines(lp_list)
-
-                    # Now accumulate the surrogate
-                    list_idx = 0
-                    for b in range(len(res.logprobs)):
-                        lp_b: torch.Tensor = res.logprobs[b][0]
-                        T_b = int(lp_b.numel())
-                        if T_b == 0:
-                            continue
-                        b_b = baselines[list_idx]  # same shape as lp_b
-                        list_idx += 1
-
-                        # Surrogate: - Σ_t (logπ_t - b_t).detach() * logπ_t
-                        sur = sur - ((lp_b - b_b).detach() * lp_b).sum()
-                        # Diagnostics
-                        b_vals.append(float(b_b.mean().item()))
-                        # No meaningful "G" in this estimator; track mean logπ as a proxy
-                        G_vals.append(float(lp_b.detach().mean().item()))
-
-
-            # Normalize this microbatch contribution
-            scale = self._scale_for_average(B_total, T_total, B_mb, T_mb)
+            scale = self._scale_for_derivative(B_total, T_total)
             total_tokens_used += T_mb
-            baseline_means.append(float(sum(b_vals) / max(len(b_vals), 1)) if b_vals else 0.0)
-            G_means.append(float(sum(G_vals) / max(len(G_vals), 1)) if G_vals else 0.0)
+            scale_sum += float(scale)
+            contribs_mb.append(mb_contrib * float(scale))
 
-            (sur * float(scale)).backward()
-
-            # --- Variance: record this microbatch's contribution to g·v (optional)
-            if self.var_enabled:
-                from entropy_experiments.utils.variance import update_shard_contrib
-                last_dot_val = update_shard_contrib(name_to_param, v_named_cpu, contribs, last_dot_val)
-
-
-        # Collect grads on intersection (CPU/fp32) and contract with v
-        from entropy_experiments.utils.variance import gather_named_grads, compute_variance_info
-        grads_named = gather_named_grads(name_to_param)
-
-        # Ensure v_named is CPU/fp32 as well
-        v_named_cpu = {k: (v.detach().to("cpu", torch.float32) if isinstance(v, torch.Tensor) else v)
-                       for k, v in v_named.items()}
-
-        delta_h_per_lr = float(dot_named(grads_named, v_named_cpu).item())
-
-        # Diagnostics: norms & cosine
-        grad_vec = flatten_named(grads_named)
-        v_vec = flatten_named(v_named_cpu)
-        grad_l2 = float(torch.linalg.norm(grad_vec).item())
-        v_l2 = float(torch.linalg.norm(v_vec).item())
-        cosine = float(delta_h_per_lr / (max(grad_l2, 1e-12) * max(v_l2, 1e-12)))
-
-        out = {
+        delta_h_per_lr = float(sum(contribs_mb))
+        out: Dict[str, Any] = {
             "delta_h_per_lr": delta_h_per_lr,
-            "num_sequences": int(E_batch["sequences"].shape[0]),
+            "num_sequences": B_total,
             "num_tokens": int(T_total),
-            "norms": {"grad_l2": grad_l2, "v_l2": v_l2, "cosine": cosine},
-            "intersection": {
-                "matched": inter.matched,
-                "v_named": inter.v_named_total,
-                "trainable": inter.trainable_total,
-                "missing_in_model": inter.missing_in_model,
-                "missing_in_v": inter.missing_in_v,
-            },
-            "estimator": ("rb" if self.use_rb else "simple"),
-            "baseline": {
-                "kind": self.baseline_kind,
-                "mean_b": float(sum(baseline_means) / max(len(baseline_means), 1)) if baseline_means else 0.0,
-                "mean_G": float(sum(G_means) / max(len(G_means), 1)) if G_means else 0.0,
-            },
+            "estimator": "rb",
+            "baseline": {"kind": self.baseline_kind},
+            "method": "jvp",
+            "audit": {"scale_sum": scale_sum, "total_tokens_used": total_tokens_used},
         }
-
-        # Variance diagnostics
         if self.var_enabled:
-            out["variance"] = compute_variance_info(contribs, debug=self.debug, use_jackknife=self.var_jackknife)
+            from entropy_experiments.utils.variance import compute_variance_info
 
+            out["variance"] = compute_variance_info(
+                contribs_mb,
+                debug=self.debug,
+                use_jackknife=self.var_jackknife,
+            )
 
-
+        if return_per_sequence:
+            out.update(
+                self._compute_per_sequence_jvp(
+                    E_batch=E_batch,
+                    v_named=v_named,
+                    base_map=base_map,
+                    names=tuple(names),
+                    primals=tuple(primals),
+                    tangents=tuple(tangents),
+                    B_total=B_total,
+                    T_total=T_total,
+                    features=feature_tuple,
+                )
+            )
 
         if self.logger:
             self.logger.info(
-                f"[delta-h approx] ⟨∇H, v⟩={out['delta_h_per_lr']:.6e} | "
-                f"B={out['num_sequences']} T={out['num_tokens']} | "
-                f"||g||={grad_l2:.3e} ||v||={v_l2:.3e} cos={cosine:.3f} | "
-                f"est={out['estimator']} baseline={self.baseline_kind}"
+                f"[delta-h approx JVP] gdotv={out['delta_h_per_lr']:.6e} | B={B_total} T={T_total} | baseline={self.baseline_kind}"
             )
-
             if self.var_enabled:
                 vinfo = out.get("variance", {})
                 self.logger.info(
-                    f"[delta-h approx][variance] shards={vinfo.get('num_shards', 0)} "
+                    f"[delta-h approx JVP][variance] shards={vinfo.get('num_shards', 0)} "
                     f"SE(shard)={vinfo.get('se_shard', 0.0):.3e} "
                     f"SE(jack)={vinfo.get('se_jackknife', 0.0):.3e}"
                 )
-
-
+            self.logger.info(
+                f"[delta-h approx JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
+                f"sum_deriv_scales={scale_sum:.6e} total_tokens_used={total_tokens_used} pre_count={T_total}"
+            )
         return out
 
-    # ---------------------------------------------------------------------------------------------
-    # Phase 1: linear + quadratic directional terms via nested JVP (LoRA-only, microbatched)
-    # ---------------------------------------------------------------------------------------------
+    def _compute_per_sequence_jvp(
+        self,
+        *,
+        E_batch: Dict[str, Any],
+        v_named: Dict[str, torch.Tensor],
+        base_map: Dict[str, torch.Tensor],
+        names: Tuple[str, ...],
+        primals: Tuple[torch.Tensor, ...],
+        tangents: Tuple[torch.Tensor, ...],
+        B_total: int,
+        T_total: int,
+        features: Tuple[str, ...],
+    ) -> Dict[str, Any]:
+        scale = self._scale_for_derivative(B_total, T_total)
+        baseline_kind = str(self.baseline_kind).lower()
+        records: List[Dict[str, Any]] = []
+        total_tokens_used = 0
+        seq_index = 0
+
+        ema_state = None
+        if baseline_kind == "hk_ema":
+            ema_state = EmaState(
+                pos_bins=self._pos_bins,
+                ema_beta=self._ema_beta,
+                ema_resid=self._ema_resid,
+                ema_cnt=self._ema_cnt,
+            )
+        ridge_cfg = RidgeConfig(lambda_=self.ridge_lambda, eps=self.ridge_eps)
+
+        for mb_E in self._iter_microbatches(E_batch, self.mb):
+            B_mb = int(mb_E.sequences.shape[0])
+            tf_bs = min(self.mb, B_mb)
+            w_list = build_weights_base(
+                kind=baseline_kind,
+                model=self.model,
+                sp=self.sp,
+                mb_E=mb_E,
+                tf_bs=tf_bs,
+                ema=ema_state,
+                ridge=ridge_cfg,
+            )
+
+            for b in range(B_mb):
+                T_b = int(mb_E.gen_lens[b][0])
+                if T_b <= 0:
+                    records.append({
+                        "index": seq_index,
+                        "gdotv": 0.0,
+                        "length": 0,
+                        "sum_logp": 0.0,
+                        "mean_logp": 0.0,
+                        "var_logp": 0.0,
+                        "max_logp": -1e30,
+                        "min_logp": 1e30,
+                        "extras": {},
+                        "features": {},
+                    })
+                    seq_index += 1
+                    continue
+
+                total_tokens_used += T_b
+                w_b = w_list[b]
+                sum_w = float(w_b.sum().item())
+                sum_w2 = float((w_b ** 2).sum().item())
+                sum_w_abs = float(w_b.abs().sum().item())
+
+                seq_view = self._slice_single_sequence(mb_E, b)
+                device = primals[0].device
+                input_ids = seq_view.sequences[:, 0].to(device=device)
+                att_mask = seq_view.attention_masks[:, 0].to(device=device)
+                prompt_lens = [int(seq_view.prompt_lens[0])]
+                gen_lens = [int(seq_view.gen_lens[0][0])]
+
+                f_seq = make_mb_outputs_closure(
+                    model=self.model,
+                    base_map=base_map,
+                    names=list(names),
+                    input_ids_mb=input_ids,
+                    attention_mask_mb=att_mask,
+                    prompt_lens=prompt_lens,
+                    gen_lens=gen_lens,
+                )
+                (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(
+                    f_seq,
+                    (primals,),
+                    (tangents,),
+                )
+
+                wjlogp_sum = float((w_b.to(j_logp_cat) * j_logp_cat).sum().item())
+                jH_sum = float(j_H_sum.item())
+                gdotv_i = float(scale * (wjlogp_sum + j_H_sum))
+
+                lp = logp_cat.detach()
+                length = int(T_b)
+                sum_lp = float(lp.sum().item())
+                mean_lp = sum_lp / max(length, 1)
+                if length > 0:
+                    diffs = lp - lp.mean()
+                    var_lp = float((diffs.pow(2).sum() / float(length)).item())
+                    max_lp = float(lp.max().item())
+                    min_lp = float(lp.min().item())
+                else:
+                    var_lp, max_lp, min_lp = 0.0, -1e30, 1e30
+
+                sum_abs_jlogp = float(j_logp_cat.abs().sum().item())
+                mean_abs_jlogp = sum_abs_jlogp / max(length, 1)
+                rb_sum = float(H_sum.detach().item())
+
+                extras = {
+                    "rb_entropy_sum": rb_sum,
+                    "sum_w": sum_w,
+                    "sum_w2": sum_w2,
+                    "sum_w_abs": sum_w_abs,
+                    "wjlogp_sum": wjlogp_sum,
+                    "jH_sum": jH_sum,
+                    "sum_abs_jlogp": sum_abs_jlogp,
+                    "mean_abs_jlogp": mean_abs_jlogp,
+                    "token_share": float(length / max(T_total, 1)),
+                }
+
+                feature_vals: Dict[str, float] = {}
+                for name in dict.fromkeys(features):
+                    if name == "length_log":
+                        feature_vals[name] = float(math.log(max(length, 1)))
+                    elif name == "sum_w":
+                        feature_vals[name] = sum_w
+                    elif name == "sum_w2":
+                        feature_vals[name] = sum_w2
+                    elif name == "rb_entropy_sum":
+                        feature_vals[name] = rb_sum
+                    elif name == "var_logp":
+                        feature_vals[name] = var_lp
+                    elif name == "length":
+                        feature_vals[name] = float(length)
+                    elif name == "sum_logp":
+                        feature_vals[name] = sum_lp
+                    elif name == "mean_logp":
+                        feature_vals[name] = mean_lp
+                    elif name == "mean_abs_jlogp":
+                        feature_vals[name] = mean_abs_jlogp
+                    else:
+                        if name in extras:
+                            feature_vals[name] = float(extras[name])
+
+                records.append({
+                    "index": seq_index,
+                    "gdotv": gdotv_i,
+                    "length": length,
+                    "sum_logp": sum_lp,
+                    "mean_logp": mean_lp,
+                    "var_logp": var_lp,
+                    "max_logp": max_lp,
+                    "min_logp": min_lp,
+                    "extras": extras,
+                    "features": feature_vals,
+                })
+                seq_index += 1
+
+        meta = {
+            "B_total": B_total,
+            "T_total": int(T_total),
+            "scale": float(scale),
+            "baseline_kind": baseline_kind,
+            "total_tokens_used": int(total_tokens_used),
+            "features": list(features),
+        }
+        return {"per_sequence": records, "per_sequence_meta": meta}
+
+    def _slice_single_sequence(self, mb_E: BatchedSequences, idx: int) -> BatchedSequences:
+        seq = mb_E.sequences[idx:idx + 1]
+        att = mb_E.attention_masks[idx:idx + 1]
+        prom = [int(mb_E.prompt_lens[idx])]
+        gen = [[int(mb_E.gen_lens[idx][0])]]
+        resp = [[mb_E.responses_text[idx][0] if mb_E.responses_text else ""]]
+        return BatchedSequences(
+            sequences=seq,
+            prompt_lens=prom,
+            gen_lens=gen,
+            attention_masks=att,
+            responses_text=resp,
+        )
     def compute_dir_linear_and_quadratic_jvp(
         self,
         *,
@@ -901,120 +958,6 @@ class DeltaEntropyApprox:
             )
 
 
-    # -----------------------------------------------------------
-    # ---------- For JVP approach -----------------------------
-    # -----------------------------------------------------------
-
-
-    def compute_delta_h_approx_jvp(
-        self,
-        *,
-        E_batch: Dict[str, Any],
-        v_named: Dict[str, torch.Tensor],
-    ) -> Dict[str, Any]:
-        """
-        Directional derivative using forward-mode JVP with a vectorized closure.
-        Assumes top_p=1.0 (full-softmax for RB entropies).
-        Baselines supported: 'hk' and 'none' (extendable: add EMA/ridge weights as detached terms).
-        """
-        device = next(self.model.parameters()).device
-        mdl = self.model; mdl.eval()
-
-        base_map = snapshot_base_functional_state(self.model)
-        names, primals, tangents = intersect_jvp_primals_tangents(self.model, base_map, v_named)
-
-        # Count totals for normalization
-        B_total = int(E_batch["sequences"].shape[0])
-        T_total = self._count_total_gen_tokens(E_batch)
-
-        contribs_mb: List[float] = []
-        total_tokens_used = 0
-        scale_sum = 0.0
-
-
-        for mb_E in self._iter_microbatches(E_batch, self.mb):
-            B_mb = int(mb_E.sequences.shape[0])
-            tf_bs = min(self.mb, B_mb)
-            # Build detached per-seq weights w_t = (G - b_t) using baseline strategies
-            baseline_kind = str(self.baseline_kind).lower()
-            ema_state = None
-            if baseline_kind == "hk_ema":
-                ema_state = EmaState(
-                    pos_bins=self._pos_bins,
-                    ema_beta=self._ema_beta,
-                    ema_resid=self._ema_resid,
-                    ema_cnt=self._ema_cnt,
-                )
-            ridge_cfg = RidgeConfig(lambda_=self.ridge_lambda, eps=self.ridge_eps)
-            w_list = build_weights_base(
-                kind=baseline_kind,
-                model=self.model,
-                sp=self.sp,
-                mb_E=mb_E,
-                tf_bs=tf_bs,
-                ema=ema_state,
-                ridge=ridge_cfg,
-            )
-            # Build one microbatch closure and one concatenated weight vector
-            input_ids_mb = mb_E.sequences[:, 0].to(device=device)          # [B_mb, L]
-            attention_mask_mb = mb_E.attention_masks[:, 0].to(device=device)
-            prompt_lens = [int(x) for x in mb_E.prompt_lens]
-            T_list = [int(mb_E.gen_lens[b][0]) for b in range(B_mb)]
-            T_mb = sum(t for t in T_list if t > 0)
-            if T_mb == 0:
-                continue
-            # Concatenate weights in the same order we will concatenate logp vectors
-            w_cat = torch.cat([w_list[b] for b in range(B_mb) if T_list[b] > 0], dim=0)  # [T_mb]
-
-            f_mb = make_mb_outputs_closure(
-                model=self.model,
-                base_map=base_map,
-                names=names,
-                input_ids_mb=input_ids_mb,
-                attention_mask_mb=attention_mask_mb,
-                prompt_lens=prompt_lens,
-                gen_lens=T_list,
-            )
-            (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(f_mb, (primals,), (tangents,))
-            mb_contrib = float(((w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum).item())
-
-            # Derivative averaging (NOT value averaging):
-            scale = self._scale_for_derivative(B_total, T_total)
-            total_tokens_used += T_mb
-            scale_sum += float(scale)
-            contribs_mb.append(mb_contrib * float(scale))
-
-        delta_h_per_lr = float(sum(contribs_mb))
-        out = {
-            "delta_h_per_lr": delta_h_per_lr,
-            "num_sequences": int(E_batch["sequences"].shape[0]),
-            "num_tokens": int(T_total),
-            "estimator": "rb",
-            "baseline": {"kind": self.baseline_kind},
-            "method": "jvp",
-            "audit": {"scale_sum": scale_sum, "total_tokens_used": total_tokens_used},
-        }
-        if self.var_enabled:
-            from entropy_experiments.utils.variance import compute_variance_info
-            out["variance"] = compute_variance_info(contribs_mb, debug=self.debug, use_jackknife=self.var_jackknife)
-        if self.logger:
-            self.logger.info(
-                f"[delta-h approx JVP] ⟨∇H, v⟩={out['delta_h_per_lr']:.6e} | "
-                f"B={out['num_sequences']} T={out['num_tokens']} | baseline={self.baseline_kind}"
-            )
-            if self.var_enabled:
-                vinfo = out.get("variance", {})
-                self.logger.info(
-                    f"[delta-h approx JVP][variance] shards={vinfo.get('num_shards', 0)} "
-                    f"SE(shard)={vinfo.get('se_shard', 0.0):.3e} "
-                    f"SE(jack)={vinfo.get('se_jackknife', 0.0):.3e}"
-                )
-            self.logger.info(
-                f"[delta-h approx JVP][audit] deriv_scale={self._scale_for_derivative(B_total, T_total):.6e}, "
-                f"sum_deriv_scales={scale_sum:.6e} "
-                f"(per_token ⇒ ≈ #microbatches/T_total), total_tokens_used={total_tokens_used}, pre_count={T_total}"
-            )
-        return out
 
 
 
