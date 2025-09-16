@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Single-run entropy experiment CLI.
-
-Uses the refactored `EntropyMeasurements` to run true/approx/control-variates
-measurements with optional diagnostics, then saves everything under
-~/RL_Practice_Files/experiment_runs/DATE/run_TIMESTAMP/.
-"""
+"""Single-run entropy experiment CLI with diagnostics and repeat support."""
 
 from __future__ import annotations
 
@@ -29,7 +24,7 @@ DEFAULT_OUTPUT_ROOT = Path.home() / "RL_Practice_Files" / "experiment_runs"
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run entropy diagnostics once and save results")
+    p = argparse.ArgumentParser(description="Run entropy diagnostics and save results")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="YAML config path")
     p.add_argument(
         "--out-root",
@@ -37,14 +32,23 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_ROOT,
         help="Root directory to store run outputs",
     )
-    p.add_argument("--label", type=str, default="single_run", help="Label for this run")
+    p.add_argument("--label", type=str, default="single_run", help="Label for this run series")
+    p.add_argument("--n-runs", type=int, default=1, help="Number of runs to execute")
 
     toggles = p.add_argument_group("measurement toggles")
     toggles.add_argument("--no-true", action="store_true", help="Skip ?H_true measurements")
-    toggles.add_argument("--no-linear", action="store_true", help="Skip linear approx")
+    toggles.add_argument("--no-linear", action="store_true", help="Skip linear approximation")
     toggles.add_argument("--linquad", action="store_true", help="Enable curvature / lin+quad output")
-    toggles.add_argument("--control-variates", action="store_true", help="Run control-variates analysis")
-    toggles.add_argument("--capture-per-sequence", action="store_true", help="Return per-sequence diagnostics")
+    toggles.add_argument(
+        "--control-variates",
+        action="store_true",
+        help="Run control-variates analysis",
+    )
+    toggles.add_argument(
+        "--capture-per-sequence",
+        action="store_true",
+        help="Return per-sequence diagnostics",
+    )
 
     diag = p.add_argument_group("diagnostic options")
     diag.add_argument(
@@ -60,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         action="append",
         dest="clip_overrides",
         help="Alternative clip thresholds for SNIS diagnostics (repeatable)",
+    )
+    diag.add_argument(
+        "--eta-sweep",
+        action="store_true",
+        help="Force config estimator.eta_sweep = True",
     )
 
     return p.parse_args()
@@ -105,6 +114,9 @@ def main() -> None:
     args = parse_args()
 
     config = load_config(args.config)
+    if args.eta_sweep:
+        config.setdefault("estimator", {})["eta_sweep"] = True
+
     runner = EntropyMeasurements(config)
 
     eta_list = flatten_option(args.etas)
@@ -120,32 +132,36 @@ def main() -> None:
         clip_overrides=clip_overrides,
     )
 
-    result = runner.run_experiments(plan=plan)
-
     timestamp = datetime.now()
-    run_dir = (
+    base_dir = (
         args.out_root.expanduser()
         / timestamp.strftime("%Y-%m-%d")
         / f"{args.label}_{timestamp.strftime('%H-%M-%S')}"
     )
-    run_dir.mkdir(parents=True, exist_ok=True)
+    base_dir.mkdir(parents=True, exist_ok=True)
 
-    results_path = run_dir / "results.json"
-    plan_path = run_dir / "plan.json"
-    config_copy_path = run_dir / "config.yaml"
+    for run_idx in range(1, args.n_runs + 1):
+        run_dir = base_dir / f"run_{run_idx:02d}"
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    with results_path.open("w") as fh:
-        json.dump(to_serializable(result), fh, indent=2)
+        result = runner.run_experiments(plan=plan)
 
-    with plan_path.open("w") as fh:
-        json.dump(to_serializable(asdict(plan)), fh, indent=2)
+        results_path = run_dir / "results.json"
+        plan_path = run_dir / "plan.json"
+        config_copy_path = run_dir / "config.yaml"
 
-    shutil.copy(args.config, config_copy_path)
+        with results_path.open("w") as fh:
+            json.dump(to_serializable(result), fh, indent=2)
 
-    print(f"Saved entropy run to {run_dir}")
-    print(f"- results: {results_path}")
-    print(f"- plan:    {plan_path}")
-    print(f"- config:  {config_copy_path}")
+        with plan_path.open("w") as fh:
+            json.dump(to_serializable(asdict(plan)), fh, indent=2)
+
+        if run_idx == 1:
+            shutil.copy(args.config, config_copy_path)
+
+        print(f"Saved run {run_idx} -> {results_path}")
+
+    print(f"All runs saved under {base_dir}")
 
 
 if __name__ == "__main__":

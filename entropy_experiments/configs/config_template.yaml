@@ -10,7 +10,7 @@ batch_config:
   dataset_name: "gsm8k_r1_template"
   E_split: "train" #use larger for less overlap
   U_split: "test"
-  B_E: 512
+  B_E: 2048
   B_U: 64
   G: 8
 
@@ -19,7 +19,7 @@ estimator:
   use_simple_entropy_for_x: false
   eta_sweep: false
   single_eta: 4e-6
-  eta_list: [1e-06, 2e-06, 4e-06, 8e-06, 1.6e-05, 3.2e-05, 6.4e-05, 0.000128]
+  eta_list: [8e-7, 1.6e-6, 3.2e-6, 6.4e-6, 1.28e-5]
 
 # Make RB entropies differentiable in the with-grad path
 rb_requires_grad: true
