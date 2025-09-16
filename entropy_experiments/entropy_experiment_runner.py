@@ -251,6 +251,14 @@ class EntropyMeasurements:
         if not plan.compute_true:
             return None
 
+        if self.delta_entropy_true is None:
+            self.delta_entropy_true = DeltaEntropyTrue(
+                model=self.model,
+                sequence_processor=self._sequence_processor,
+                config=self.config,
+                logger=self.logger,
+            )
+
         true_cfg = (self.config.get("true_delta_h", {}) or {})
         comp_cfg = (self.config.get("estimator", {}) or {})
 
