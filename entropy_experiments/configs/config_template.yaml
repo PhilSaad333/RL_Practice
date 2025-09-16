@@ -17,7 +17,7 @@ batch_config:
 # === COMPUTATION OPTIONS ===
 estimator:
   use_simple_entropy_for_x: false
-  eta_sweep: false
+  eta_sweep: true
   single_eta: 4e-6
   eta_list: [8e-7, 1.6e-6, 3.2e-6, 6.4e-6, 1.28e-5]
 
