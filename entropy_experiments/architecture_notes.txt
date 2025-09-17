@@ -1,0 +1,68 @@
+Entropy Experiments Module Notes
+================================
+
+Purpose
+-------
+This document summarizes the components under `entropy_experiments/` (excluding `debug/` and `other_scripts/`). It captures the intent of each module and highlights key entry points so future work can start from here instead of re-reading the full source tree.
+
+Top-Level Files & Directories
+-----------------------------
+- `README.md`: High-level overview for human collaborators; keep in sync with these notes.
+- `changes.txt` / `suggestions.txt`: ad-hoc running notes from earlier iterations.
+- `configs/`: YAML templates for experiment runs; `config_template.yaml` is the baseline used by `run_entropy_experiments.py`.
+- `results/`: Default landing spot for experiment outputs (plans, configs, results.json files, notebooks).
+- `baselines/`: Legacy or experimental baseline implementations (not currently used by the main runner but referenced by older studies).
+
+Core Orchestrator
+-----------------
+- `entropy_experiment_runner.py`: Defines `ExperimentPlan` and `EntropyMeasurements`. Responsibilities:
+  * Load model + optimizer (delegates to utils/model_loader and update_vector helpers).
+  * Sample E and U batches through `SequenceProcessor`.
+  * Compute ΔH approximations (`_maybe_compute_delta_h_approx`), ground-truth (`_maybe_compute_delta_h_true`), optional control variates, and assemble outputs.
+  * Handles logging, timing, precision setup, and serialization-friendly result dictionaries.
+
+Delta H Implementations
+-----------------------
+- `delta_entropy_approx.py`: Linear/quadratic entropy-change approximations via forward-mode JVP. Key exports:
+  * `DeltaEntropyApprox.compute_delta_h_approx` — main entry returning aggregate stats and optional per-sequence records.
+  * `compute_dir_linear_and_quadratic_jvp` — nested JVP for curvature, now also emitting per-sequence quadratic contributions when requested.
+  * Utilities for microbatch iteration, baseline construction, and variance diagnostics.
+- `delta_entropy_true.py`: Self-normalized importance sampling ground truth. Provides `DeltaEntropyTrue.compute_delta_h_true`, caching of baseline statistics, and per-sequence diagnostic payloads (entropy integrands, weights, etc.).
+
+Optimizer & Update Utilities
+----------------------------
+- `update_vector.py`: Extracts normalized update vector (AdamW) from the U batch, managing PEFT/LoRA parameter intersections, optimizer state loading, AMP controls, and audit statistics.
+- `baselines/` (selected files) may define additional surrogate baselines; cross-check before removal during refactors.
+
+Utility Package (`utils/`)
+--------------------------
+- `README.md`: Short index.
+- `sequence_processor.py`: Core interface to model generation and teacher-forcing passes; see `sequence_processor_doc.md` for detailed behavior and configuration.
+- `model_loader.py`: Loads PEFT adapters, tokenizer, and associated optimizer states with correct precision overrides.
+- `param_overrides.py` / `param_registry.py`: Build functional parameter maps for perturbations (used extensively by JVP routines and SNIS evaluation).
+- `precision_utils.py`: Applies global precision policies (TF32, matmul modes, dtype enforcement).
+- `detailed_logger.py`: Optional structured logging of sequences, tensors, and metadata to disk.
+- `control_variates.py`: Implements control-variate diagnostics and regression baselines.
+- `jvp_utils.py`: Helpers for forward-mode differentiation over parameter dictionaries.
+- `variance.py`: Shared shard/jackknife variance estimators for microbatch contributions.
+- `distributed_helpers.py`: Skeleton utilities for DDP setups (mostly inactive but kept for future scaling).
+
+Scripts & Entry Points
+----------------------
+- `run_entropy_experiments.py`: CLI to execute one or multiple mixed-probe runs. Builds an `ExperimentPlan`, calls `EntropyMeasurements.run_experiments`, and writes plan/config/results under timestamped directories. Recent updates default per-sequence capture to true and redirect outputs to mounted Colab Drive when present.
+- `run_control_variate_analysis.py` (top-level repo): Leverages the same utils; check when modifying CV code.
+
+Results & Notebooks
+-------------------
+- `results/diagnostics_run/`: Example outputs from recent investigations (per-sequence ΔH true/approx, timing, etc.). New runs should mirror this structure. Add notebooks to `results/.../notebooks/` for exploratory analysis.
+
+Planned Extensions
+------------------
+- `fisher_kernel.py` (planned): Compute preconditioned Fisher kernel interactions between U and E batches. See `fisher_kernel_plan.txt` for scope and implementation notes.
+- Additional docs should cross-reference this file when large new modules are added.
+
+Maintenance Tips
+----------------
+- Keep `ExperimentPlan` and CLI flags synchronized so capture toggles and diagnostics remain discoverable.
+- When adding new per-sequence diagnostics, ensure serialization stays JSON-friendly (cast tensors via `to_serializable`).
+- Update this document whenever major modules are refactored or new analytical tools are introduced, so future sessions can ramp up quickly.

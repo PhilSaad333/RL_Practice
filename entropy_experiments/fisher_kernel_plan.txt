@@ -1,0 +1,73 @@
+Fisher Kernel Study Plan
+========================
+
+Context
+-------
+We want tools for analyzing how an RL optimizer step affects log-probabilities of individual sequences. The objective is to approximate the Fisher kernel interaction between an "update" batch U (with rewards/advantages) and an evaluation batch E (arbitrary, potentially custom prompts/responses) while respecting AdamW preconditioning but ignoring momentum terms.
+
+Key Definitions
+---------------
+- For a sequence X with prompt P, let S(X|P) = log pi(X|P).
+- Classic REINFORCE SGD update produces Δ log pi(X|P) proportional to Σ_{(X',P')∈U} K((X,P), (X',P')) * A(X'|P'), where K is the Fisher kernel Σ_α ∂_α S(X|P) ∂_α S(X'|P').
+- In AdamW, the effective kernel includes preconditioning. We will model a simplified variant that uses the instantaneous diagonal preconditioner (sqrt(v̂)+ε)^{-1} but omits momentum.
+
+High-Level Workflow
+-------------------
+1. Load checkpoint + optimizer state with the same helpers already used in entropy experiments (model_loader, update_vector.compute_update_vector).
+2. Sample (or load) E and U batches using SequenceProcessor utilities so that batching aligns with existing entropy probes.
+3. For each U microbatch:
+   - Compute per-sequence gradients of S(X|P) with respect to model parameters.
+   - Apply Adam diagonal preconditioning (using stored exp_avg_sq) to obtain preconditioned gradients ĝ.
+4. For each E microbatch:
+   - Compute gradients of S(X|P) as above.
+   - Contract with stored ĝ blocks to obtain Fisher kernel entries K_block and influence contributions Δ log pi_E = K_block @ A_U.
+   - Stream results to avoid holding the full K matrix unless explicitly requested.
+5. Aggregate diagnostics:
+   - Per-sequence Δ log pi for E.
+   - Attribution summary (top contributing U sequences per E sequence, cosine similarities, norm statistics).
+   - Optional selected K submatrices for qualitative inspection.
+
+Design Considerations
+---------------------
+- Reuse SequenceProcessor + batching logic from delta_entropy_true/approx to avoid code drift.
+- Build around microbatch loops so memory footprint stays manageable (batch sizes ≈512).
+- Provide toggles for what to store (full K vs. aggregate), and for which E source to use (model-generated, dataset, or manual list).
+- Integrate with DetailedLogger for debugging and reproducibility.
+
+Proposed Module Skeleton
+------------------------
+File: entropy_experiments/fisher_kernel.py
+
+Classes / Functions:
+- FisherKernelPlan dataclass: flags for capturing full K, choosing E source, batch sizes, etc.
+- FisherKernelRunner(config): handles checkpoint loading, batch preparation, gradient collection, preconditioning, and diagnostics assembly.
+- _collect_gradients(batch, microbatch_size): returns list of per-sequence gradients (sparsified or low-rank handle) together with metadata.
+- _apply_adam_preconditioner(grads, optimizer_state): scales gradient tensors in place.
+- _contract_blocks(E_grads, U_grads, advantages, capture_full): yields influence vectors and optional K blocks.
+- save_results(...): dump JSON/NPZ outputs mirroring run_entropy_experiments structure.
+
+Outputs & Artifacts
+-------------------
+- results.json containing per-sequence Δ log pi, influence metadata, configuration snapshot, and optional stored K slices.
+- plan.json recording toggles (full kernel capture, microbatch sizes, etc.).
+- Optional notebook helpers in results/notebooks to visualize heatmaps and influence distributions.
+
+Execution Flow
+--------------
+1. CLI (to be added later) parses config, creates FisherKernelPlan, and selects output directory.
+2. FisherKernelRunner loads model/optimizer, prepares U/E batches.
+3. Runner iterates over microbatches, collects gradients, applies preconditioning, computes contributions, and aggregates diagnostics.
+4. Results are serialized for downstream analysis (histograms, qualitative inspection, comparison with actual Δ log pi observed during training).
+
+Next Steps
+----------
+- Draft module skeleton with placeholder functions mirroring this plan.
+- Confirm gradient APIs in SequenceProcessor support required per-sequence differentiation efficiently; extend if necessary.
+- Prototype on small batches to validate memory usage and check alignment between predicted Δ log pi and actual entropy probe measurements.
+
+
+Custom E Overrides
+------------------
+- Support injecting hand-crafted evaluation batches. Provide a helper (e.g., CustomSample) that emits payloads matching SequenceProcessor outputs (tokens, text, logprobs) so the Fisher kernel runner can ingest them without extra glue.
+- Use cases: (1) select prompts from dataset with curated responses; (2) author new prompts/responses to probe specific behaviors (e.g., low-probability tokens).
+- Keep runner interfaces flexible: plan should accept an optional E override payload or callback.

@@ -1,0 +1,139 @@
+Results JSON Guide
+====================
+
+Context
+-------
+These notes describe the structure of `results.json` files produced by
+`run_entropy_experiments.py` (e.g. under `entropy_experiments/results/diagnostics_run/full_data/run_*/results.json`).
+They are intended to help analysts interpret both aggregate measurements and
+per-sequence diagnostics, especially when comparing ground-truth (SNIS) entropy
+change to linear and quadratic approximations.
+
+Top-Level Keys
+--------------
+- `B_E`, `B_U`, `G_U`: Nominal evaluation/update batch sizes and number of
+  responses per prompt in the update batch.
+- `sampling_sec`: Wall-clock time spent sampling E/U batches.
+- `update`: Statistics from computing the normalized update vector (see
+  `entropy_experiments/update_vector.py`). Useful fields include `method`,
+  `vec_norm`, `num_params`, `avg_mb_loss`, and AMP flags.
+- `approx`: Results from the linearized entropy approximation (JVP-based).
+- `true`: Ground-truth ΔH(η) via self-normalized importance sampling (SNIS).
+- `control_variates`: Optional diagnostics from control-variate analysis (often
+  `null` if not requested).
+- `precision`: Record of runtime vs entropy dtypes.
+- `timing`: Total runtime and (if enabled) per-component timings.
+
+Approximation Block (`approx`)
+-------------------------------
+Key fields:
+- `delta_h_per_lr`: Aggregate linear term g·v (per unit learning rate).
+- `num_sequences`, `num_tokens`: Sizes of the evaluation batch; align with
+  `per_sequence_meta` below.
+- `method`: Estimator used (e.g. `jvp`).
+- `baseline`: Baseline configuration (e.g. `hk_ema`).
+- `variance`: Jackknife/shard standard errors for microbatch contributions.
+- `eta_star`, `used_quad`: Scalar diagnostics about curvature prediction.
+- `duration`, `update_seconds`, `update_stats`: Timing information.
+- `per_sequence`: List of per-sequence records containing:
+  * `index`: Sequence index in the E batch (0-based).
+  * `gdotv`: Linear contribution (directional derivative) for that sequence.
+  * `length`, `sum_logp`, `mean_logp`, `var_logp`, `max_logp`, `min_logp`: Basic
+    diagnostics about the sequence under the base model.
+  * `extras`: Additional RB-related metadata (sum of weights, RB entropy sum,
+    etc.). When per-token normalization is active, denominator corrections are
+    exposed as `denom_corr_unscaled` and `denom_corr_scaled` (scaled by the
+    derivative normalization).
+  * `features`: Subset of features used by regression baselines (length, sum of
+    weights, etc.).
+  * `vhvv`: Per-sequence quadratic curvature term (only present when curvature
+    diagnostics are enabled).
+- `per_sequence_meta`:
+  * `B_total`: Number of sequences in E.
+  * `T_total`: Total generated tokens across E.
+  * `scale`: Derivative scaling constant used when forming `gdotv` (equals
+    `1 / T_total` for `per_token` normalization).
+  * `baseline_kind`, `total_tokens_used`, `features`: Additional metadata.
+  * `H_base_mean`: Baseline entropy per token used in the SNIS denominator
+    correction (only populated for per-token normalization).
+- `quadratic`: Aggregate curvature diagnostics with fields:
+  * `gdotv`, `vHvv`: Batch-level linear and quadratic terms.
+  * `eta_star`: Predicted optimal step size from curvature.
+  * `ratio_pred`: Predicted ratios for selected η values.
+  * `per_sequence_vhvv`: List of per-sequence curvature terms (matches length of
+    `per_sequence`).
+  * `audit`, `variance`, `baseline` mirror the linear block.
+
+Ground-Truth Block (`true`)
+---------------------------
+- `entries`: List of measurements across η values. Each entry contains:
+  * `eta`: Learning rate used.
+  * `delta_h_true`: Aggregate entropy change (per token, matching the config).
+  * `diagnostics`: Dictionary with rich per-sequence statistics, including:
+    - `delta_h_true`: Same as in the parent entry (redundant scalar).
+    - `base_entropy`: Mean baseline entropy (either per-token or per-sequence
+      depending on config).
+    - `ess`: Effective sample size for SNIS weights.
+    - `logweight_stats`: Min/median/max of log-weights.
+    - `clip_fraction`, `weights_sum`: SNIS clipping diagnostics.
+    - `normalized_weights`: SNIS weights normalized to sum to 1.
+    - `log_weights`: Raw log-weights before exponentiation.
+    - `h_base`, `h_new`: Per-sequence integrands (sum of token-level entropy
+      integrands before/after the update).
+    - `delta_h_seq`: Per-sequence difference `h_new - h_base` (raw sums).
+    - `token_counts`: Number of generated tokens per sequence.
+
+Comparing True vs Approximate Per-Sequence Contributions
+--------------------------------------------------------
+The `delta_h_seq` array in `true` is not directly comparable to `gdotv * η` or
+`gdotv * η + 0.5 η² vhvv`, because `delta_h_seq` represents the total change in
+integrand (sum over tokens) rather than the contribution to the per-token mean
+used for ΔH_true.
+
+To compute per-sequence contributions that *do* sum to `delta_h_true`, use the
+SNIS weights:
+
+1. Convert normalized weights back to unnormalized weights:
+   ```python
+   weights = np.array(diagnostics['normalized_weights']) * diagnostics['weights_sum']
+   ```
+2. Let `T = np.array(diagnostics['token_counts'])`. With per-token reporting,
+   ΔH_true is `(weights @ h_new) / (weights @ T) - base_entropy`.
+3. Per-sequence contributions that sum to ΔH_true:
+   ```python
+   denom = np.dot(T, weights)
+   total_tokens = T.sum()
+   true_contrib = (weights * np.array(h_new)) / denom - (T / total_tokens) * base_entropy
+   ```
+   Summing `true_contrib` yields `delta_h_true`, making it directly comparable to
+   per-sequence approximations.
+4. Linear approximation per sequence: `linear_seq = np.array([rec['gdotv'] * eta for rec in approx['per_sequence']])`.
+5. Quadratic correction per sequence (if available): `quad_seq = 0.5 * eta ** 2 * np.array([rec['vhvv'] for rec in approx['per_sequence']])`.
+   The lin+quad estimate is `linear_seq + quad_seq`.
+
+Alignment Notes
+---------------
+- Sequence order aligns across `true` and `approx`. Use `index` in the approx
+  records if you need to double-check.
+- `per_sequence_meta['T_total']` matches `sum(token_counts)` from the true
+  diagnostics; `scale` = `1 / T_total` under per-token normalization.
+- When comparing aggregate values: `approx['delta_h_per_lr'] * eta` and
+  `approx['quadratic']['gdotv'] * eta + 0.5 * approx['quadratic']['vHvv'] * eta**2` should match the sums of the per-sequence linear and lin+quad arrays.
+
+Common Pitfalls
+---------------
+- Forgetting to multiply `gdotv` by η when comparing to ΔH_true.
+- Comparing raw `delta_h_seq` to linear contributions without accounting for
+  SNIS weighting and per-token averaging.
+- Ignoring the difference between per-token and per-sequence normalization (the
+  config defaults to per-token; check `config['approx_delta_h']['normalize']`).
+
+Additional Files
+----------------
+- `plan.json` (same directory) records the `ExperimentPlan` used; check
+  `capture_per_sequence=True` to confirm per-sequence logging was enabled.
+- `config.yaml` is a copy of the run configuration (only copied for run_01).
+
+Usage Tip
+---------
+The companion notebook `entropy_experiments/results/diagnostics_run/full_data/notebooks/fisher_vs_true.ipynb` contains helper functions (`get_per_sequence_contributions`, `plot_delta_histograms`, etc.) that apply the weighting logic above and produce visual diagnostics. Reviewing that code can clarify how the per-sequence comparisons are performed programmatically.

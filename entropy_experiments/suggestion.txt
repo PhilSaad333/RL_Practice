@@ -1,0 +1,828 @@
+Executive summary
+
+What your “linear” estimator actually differentiates.
+In DeltaEntropyApprox the JVP path forms
+
+𝑔
+^
+⋅
+𝑣
+  
+=
+  
+1
+𝑇
+tot
+[
+∑
+𝑖
+∑
+𝑘
+(
+𝐺
+𝑖
+,
+𝑘
+−
+𝑏
+𝑖
+,
+𝑘
+)
+ 
+j
+l
+o
+g
+p
+𝑖
+,
+𝑘
+]
+  
++
+  
+1
+𝑇
+tot
+∑
+𝑖
+j
+𝐻
+𝑖
+,
+g
+^
+	​
+
+⋅v=
+T
+tot
+	​
+
+1
+	​
+
+[
+i
+∑
+	​
+
+k
+∑
+	​
+
+(G
+i,k
+	​
+
+−b
+i,k
+	​
+
+)jlogp
+i,k
+	​
+
+]+
+T
+tot
+	​
+
+1
+	​
+
+i
+∑
+	​
+
+jH
+i
+	​
+
+,
+
+i.e. the directional derivative of the numerator 
+∑
+𝑖
+𝐻
+𝑖
+(
+𝜃
+)
+∑
+i
+	​
+
+H
+i
+	​
+
+(θ) divided by the fixed token count 
+𝑇
+tot
+T
+tot
+	​
+
+ of the E‑batch. This is exactly what the code computes: the microbatch contribution is
+
+(w_cat * j_logp_cat).sum() + j_H_sum
+
+
+and then it is scaled by 1/T_total (per‑token normalization) before accumulation. 
+
+delta_entropy_approx
+
+ 
+
+sequence_processor
+
+
+The audit in your results.json confirms scale = 1/T_total (here, 
+1
+/
+53,966
+1/53,966). 
+
+results
+
+What your “true” ΔH differentiates.
+In DeltaEntropyTrue you estimate
+
+𝐻
+(
+𝜃
++
+𝜂
+𝑣
+)
+  
+=
+  
+∑
+𝑖
+𝑤
+𝑖
+(
+𝜂
+)
+ 
+𝐻
+𝑖
+(
+𝜃
++
+𝜂
+𝑣
+)
+∑
+𝑖
+𝑤
+𝑖
+(
+𝜂
+)
+ 
+𝑇
+𝑖
+with SNIS weights 
+𝑤
+𝑖
+(
+𝜂
+)
+=
+exp
+⁡
+(
+ℓ
+𝑖
+(
+𝜂
+)
+)
+,
+H(θ+ηv)=
+∑
+i
+	​
+
+w
+i
+	​
+
+(η)T
+i
+	​
+
+∑
+i
+	​
+
+w
+i
+	​
+
+(η)H
+i
+	​
+
+(θ+ηv)
+	​
+
+with SNIS weights w
+i
+	​
+
+(η)=exp(ℓ
+i
+	​
+
+(η)),
+
+i.e., a ratio of means over sequences, with the denominator 
+∑
+𝑖
+𝑤
+𝑖
+(
+𝜂
+)
+𝑇
+𝑖
+∑
+i
+	​
+
+w
+i
+	​
+
+(η)T
+i
+	​
+
+ depending on 
+𝜂
+η. This is explicit in the SNIS description and the helper notes you included for reconstructing per‑sequence contributions: the estimator uses the denominator 
+(
+𝑇
+⋅
+𝑤
+)
+(T⋅w). 
+
+delta_entropy_true
+
+ 
+
+results_json_guide
+
+The missing term.
+Linearizing the ratio at 
+𝜂
+=
+0
+η=0 gives
+
+𝑑
+𝑑
+𝜂
+𝐻
+∣
+𝜂
+=
+0
+  
+=
+  
+1
+𝑇
+tot
+[
+∑
+𝑖
+𝑑
+ℓ
+𝑖
+𝑑
+𝜂
+⏟
+∑
+𝑘
+j
+l
+o
+g
+p
+𝑖
+,
+𝑘
+ 
+𝐻
+𝑖
+  
++
+  
+∑
+𝑖
+j
+𝐻
+𝑖
+]
+⏟
+what your JVP computes
+  
+−
+  
+𝐻
+base
+𝑇
+tot
+∑
+𝑖
+𝑇
+𝑖
+𝑑
+ℓ
+𝑖
+𝑑
+𝜂
+⏟
+**denominator correction** that is **not** in your JVP
+.
+dη
+d
+	​
+
+H
+	​
+
+η=0
+	​
+
+=
+what your JVP computes
+T
+tot
+	​
+
+1
+	​
+
+[
+i
+∑
+	​
+
+∑
+k
+	​
+
+jlogp
+i,k
+	​
+
+dη
+dℓ
+i
+	​
+
+	​
+
+	​
+
+	​
+
+H
+i
+	​
+
++
+i
+∑
+	​
+
+jH
+i
+	​
+
+]
+	​
+
+	​
+
+−
+**denominator correction** that is **not** in your JVP
+T
+tot
+	​
+
+H
+base
+	​
+
+	​
+
+i
+∑
+	​
+
+T
+i
+	​
+
+dη
+dℓ
+i
+	​
+
+	​
+
+	​
+
+	​
+
+.
+
+Your JVP implements the first bracketed term (score‑function piece with RB returns + pathwise RB derivative) but omits the denominator correction 
+−
+𝐻
+base
+𝑇
+tot
+∑
+𝑖
+𝑇
+𝑖
+ 
+j
+s
+e
+q
+_
+l
+o
+g
+p
+𝑖
+−
+T
+tot
+	​
+
+H
+base
+	​
+
+	​
+
+∑
+i
+	​
+
+T
+i
+	​
+
+jseq_logp
+i
+	​
+
+. The code never applies this correction anywhere in DeltaEntropyApprox. 
+
+delta_entropy_approx
+
+ 
+
+sequence_processor
+
+Because 
+𝐻
+base
+≈
+0.5
+H
+base
+	​
+
+≈0.5 here and because 
+𝑇
+𝑖
+T
+i
+	​
+
+ varies a fair bit across sequences, the correction can be non‑negligible and typically has the same sign as the measured ΔH, making the true slope larger in magnitude than your linear prediction — exactly your observation (ratio 
+∣
+Δ
+𝐻
+true
+∣
+/
+∣
+Δ
+𝐻
+lin
+∣
+∼
+1
+ ⁣
+−
+ ⁣
+10
+∣ΔH
+true
+	​
+
+∣/∣ΔH
+lin
+	​
+
+∣∼1−10). Your own run shows 
+Δ
+𝐻
+lin
+/
+𝜂
+≈
+−
+208.85
+ΔH
+lin
+	​
+
+/η≈−208.85 per token, while 
+Δ
+𝐻
+true
+/
+𝜂
+ΔH
+true
+	​
+
+/η at 
+8
+⋅
+10
+−
+7
+8⋅10
+−7
+ is about 
+−
+386
+−386 per token — a factor 
+≈
+1.85
+≈1.85 gap in the expected direction. 
+
+results
+
+ 
+
+results
+
+Why the histograms differ.
+The per‑sequence contributions for the true ΔH include the SNIS weighting and, crucially, the T‑weighted denominator term. This introduces a length‑dependent reweighting that (i) sharpens mass near 0 for many sequences (most have small weights) yet (ii) yields heavier tails when 
+𝑇
+𝑖
+T
+i
+	​
+
+ and 
+j
+s
+e
+q
+_
+l
+o
+g
+p
+𝑖
+jseq_logp
+i
+	​
+
+ correlate — matching your “sharper center with heavier tails” description. The guide you attached shows the correct way to compute per‑sequence SNIS contributions that sum exactly to ΔH, and its structure already reveals the two ingredients that are absent from “raw” linear terms. 
+
+results_json_guide
+
+Concrete fix: add the denominator term to the JVP estimator
+
+What to add. For per‑token normalization, correct the linear term by
+
+(
+∇
+𝐻
+⋅
+𝑣
+)
+corr
+  
+=
+  
+(
+∇
+𝐻
+⋅
+𝑣
+)
+current
+  
+−
+  
+𝐻
+base
+𝑇
+tot
+∑
+𝑖
+𝑇
+𝑖
+∑
+𝑘
+j
+l
+o
+g
+p
+𝑖
+,
+𝑘
+⏟
+j
+s
+e
+q
+_
+l
+o
+g
+p
+𝑖
+.
+(∇H⋅v)
+corr
+	​
+
+=(∇H⋅v)
+current
+	​
+
+−
+T
+tot
+	​
+
+H
+base
+	​
+
+	​
+
+i
+∑
+	​
+
+T
+i
+	​
+
+jseq_logp
+i
+	​
+
+k
+∑
+	​
+
+jlogp
+i,k
+	​
+
+	​
+
+	​
+
+.
+
+Where. In DeltaEntropyApprox, inside the microbatch loop where you already have j_logp_cat (per-token) and T_list (per‑sequence), compute per‑sequence sums of j_logp and accumulate the correction. The scaling must use the same derivative scaling constant (1/T_total for the per‑token objective). The base per‑token RB entropy 
+𝐻
+base
+H
+base
+	​
+
+ can be computed once with a single no‑grad TF pass on the same E‑batch (exactly what DeltaEntropyTrue._score_batch_base does). 
+
+delta_entropy_true
+
+Minimal patch (illustrative):
+
+# In DeltaEntropyApprox.__init__: cache a base entropy helper
+self._H_base_cache = {}
+
+def _compute_H_base_mean(self, E_batch):
+    key = id(E_batch)
+    if key in self._H_base_cache:
+        return self._H_base_cache[key]
+    # No-grad TF to get per-seq RB sums and token counts
+    seqs = BatchedSequences(
+        sequences=E_batch["sequences"],
+        prompt_lens=E_batch["prompt_lens"],
+        gen_lens=E_batch["gen_lens"],
+        attention_masks=E_batch["attention_masks"],
+        responses_text=[]
+    )
+    lp, _ = self.sp.teacher_force_logprobs_with_diagnostics(
+        sequences=seqs, with_grad=False, tf_batch_size=1,
+        compute_rb=True, return_baseline_features=False,
+        params_override=None, buffers_override=None,
+    )
+    # Flatten and compute per-token mean H_base
+    rb_sums = [np.asarray(x).sum() for row in lp.rb_entropies for x in row]
+    T_list = [len(x) for row in lp.rb_entropies for x in row]
+    H_base = (float(sum(rb_sums)) / max(float(sum(T_list)), 1.0)) if sum(T_list) > 0 else 0.0
+    self._H_base_cache[key] = H_base
+    return H_base
+
+
+Then in the JVP microbatch path (the same block that now has mb_contrib = ((w_cat * j_logp_cat).sum() + j_H_sum); cf. 
+
+delta_entropy_approx
+
+), insert:
+
+H_base = self._compute_H_base_mean(E_batch)            # once per run; cached
+# compute per-sequence sums of j_logp
+offsets, acc = [], 0
+for b in range(B_mb):
+    if T_list[b] > 0:
+        offsets.append((b, acc, acc + T_list[b]))
+        acc += T_list[b]
+j_seqlogp = []
+for b, s, e in offsets:
+    j_seqlogp.append(j_logp_cat[s:e].sum())            # scalar tensor
+
+# denominator correction for this microbatch (still unscaled)
+denom_corr_mb = - H_base * sum( float(T_list[b]) * float(j_seqlogp[idx].item())
+                                for idx, (b, _, _) in enumerate(offsets) )
+
+# apply the same derivative scaling (per-token: 1 / T_total)
+scale = self._scale_for_derivative(B_total, T_total)
+mb_contrib = float(((w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum).item())
+contribs_mb.append( (mb_contrib + denom_corr_mb) * float(scale) )
+
+
+With this change, the reported "delta_h_per_lr" becomes the true derivative of the ratio-of-means objective your SNIS target is estimating, so 
+𝜂
+ 
+(
+∇
+𝐻
+⋅
+𝑣
+)
+corr
+η(∇H⋅v)
+corr
+	​
+
+ should line up with your measured 
+Δ
+𝐻
+true
+(
+𝜂
+)
+ΔH
+true
+	​
+
+(η) for small 
+𝜂
+η.
+
+Implementation notes
+
+You already have all the ingredients on the JVP path; the only extra work is the one no‑grad TF pass to get 
+𝐻
+base
+H
+base
+	​
+
+. That pass is cheap (one forward per sequence; no RB grads).
+
+The correction should also be applied in the nested JVP used for curvature if you rely on those diagnostics. The place is analogous (the block that builds gdotv_mb before vHvv_mb). 
+
+delta_entropy_approx
+
+ 
+
+delta_entropy_approx

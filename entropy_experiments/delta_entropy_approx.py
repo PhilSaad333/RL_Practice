@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, OrderedDict as TOrderedDict
 
 import math
+import numpy as np
 import torch
 from torch.func import jvp, functional_call
 from entropy_experiments.utils.sequence_processor import (
@@ -175,6 +176,9 @@ class DeltaEntropyApprox:
         self.ridge_lambda = float(ridge_cfg.get("lambda", 1e-3))
         self.ridge_eps = float(ridge_cfg.get("eps", 1e-8))
 
+        # Cache for baseline entropy estimates keyed by E-batch identity.
+        self._h_base_cache: Dict[int, float] = {}
+
 
 
     # ---------------------------------------------------------------------------------------------
@@ -203,6 +207,59 @@ class DeltaEntropyApprox:
                 f"trainable={inter.trainable_total}; "
                 f"missing_in_model={inter.missing_in_model[:3]} ...; missing_in_v={inter.missing_in_v[:3]} ..."
             )
+
+    def _compute_h_base_mean(self, E_batch: Dict[str, Any]) -> float:
+        """Return the per-token baseline entropy for the provided E batch."""
+
+        if self.normalize != "per_token":
+            return 0.0
+
+        key = id(E_batch)
+        cached = self._h_base_cache.get(key)
+        if cached is not None:
+            return cached
+
+        seqs = BatchedSequences(
+            sequences=E_batch["sequences"],
+            prompt_lens=E_batch["prompt_lens"],
+            gen_lens=E_batch["gen_lens"],
+            attention_masks=E_batch["attention_masks"],
+            responses_text=[],
+        )
+
+        lp, _ = self.sp.teacher_force_logprobs_with_diagnostics(
+            sequences=seqs,
+            with_grad=False,
+            tf_batch_size=1,
+            compute_rb=True,
+            return_baseline_features=False,
+            params_override=None,
+            buffers_override=None,
+        )
+
+        if lp.rb_entropies:
+            ent_nested = lp.rb_entropies
+        else:
+            ent_nested = lp.entropies
+
+        rb_sums: List[float] = []
+        token_counts: List[int] = []
+        for row in ent_nested:
+            for arr in row:
+                if arr is None:
+                    continue
+                arr_np = np.asarray(arr, dtype=np.float64)
+                rb_sums.append(float(arr_np.sum()))
+                token_counts.append(int(arr_np.size))
+
+        total_tokens = int(np.sum(token_counts)) if token_counts else 0
+        if total_tokens > 0:
+            h_base = float(np.sum(rb_sums) / total_tokens)
+        else:
+            h_base = 0.0
+
+        self._h_base_cache[key] = h_base
+        return h_base
 
     def compute_delta_h_approx(
         self,
@@ -259,6 +316,8 @@ class DeltaEntropyApprox:
 
         B_total = int(E_batch["sequences"].shape[0])
         T_total = self._count_total_gen_tokens(E_batch)
+        apply_denom_correction = self.normalize == "per_token"
+        h_base_mean = self._compute_h_base_mean(E_batch) if apply_denom_correction else 0.0
 
         contribs_mb: List[float] = []
         total_tokens_used = 0
@@ -309,7 +368,22 @@ class DeltaEntropyApprox:
                 gen_lens=T_list,
             )
             (logp_cat, H_sum), (j_logp_cat, j_H_sum) = jvp(f_mb, (primals,), (tangents,))
+
+            offsets: List[Tuple[int, int, int]] = []
+            acc = 0
+            for b in range(B_mb):
+                if T_list[b] > 0:
+                    offsets.append((b, acc, acc + T_list[b]))
+                    acc += T_list[b]
+
+            denom_corr_mb = 0.0
+            if apply_denom_correction and offsets:
+                for b, s, e in offsets:
+                    j_sum = float(j_logp_cat[s:e].sum().item())
+                    denom_corr_mb += -h_base_mean * float(T_list[b]) * j_sum
+
             mb_contrib = float(((w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum).item())
+            mb_contrib += denom_corr_mb
 
             scale = self._scale_for_derivative(B_total, T_total)
             total_tokens_used += T_mb
@@ -346,6 +420,7 @@ class DeltaEntropyApprox:
                     tangents=tuple(tangents),
                     B_total=B_total,
                     T_total=T_total,
+                    H_base_mean=h_base_mean,
                     features=feature_tuple,
                 )
             )
@@ -378,6 +453,7 @@ class DeltaEntropyApprox:
         tangents: Tuple[torch.Tensor, ...],
         B_total: int,
         T_total: int,
+        H_base_mean: float,
         features: Tuple[str, ...],
     ) -> Dict[str, Any]:
         scale = self._scale_for_derivative(B_total, T_total)
@@ -385,6 +461,7 @@ class DeltaEntropyApprox:
         records: List[Dict[str, Any]] = []
         total_tokens_used = 0
         seq_index = 0
+        apply_denom_correction = self.normalize == "per_token"
 
         ema_state = None
         if baseline_kind == "hk_ema":
@@ -457,7 +534,11 @@ class DeltaEntropyApprox:
 
                 wjlogp_sum = float((w_b.to(j_logp_cat) * j_logp_cat).sum().item())
                 jH_sum = float(j_H_sum.item())
-                gdotv_i = float(scale * (wjlogp_sum + j_H_sum))
+                j_logp_sum = float(j_logp_cat.sum().item())
+                denom_corr = 0.0
+                if apply_denom_correction:
+                    denom_corr = -H_base_mean * float(T_b) * j_logp_sum
+                gdotv_i = float(scale * (wjlogp_sum + jH_sum + denom_corr))
 
                 lp = logp_cat.detach()
                 length = int(T_b)
@@ -486,6 +567,10 @@ class DeltaEntropyApprox:
                     "mean_abs_jlogp": mean_abs_jlogp,
                     "token_share": float(length / max(T_total, 1)),
                 }
+
+                if apply_denom_correction:
+                    extras["denom_corr_scaled"] = float(scale * denom_corr)
+                    extras["denom_corr_unscaled"] = float(denom_corr)
 
                 feature_vals: Dict[str, float] = {}
                 for name in dict.fromkeys(features):
@@ -532,6 +617,7 @@ class DeltaEntropyApprox:
             "baseline_kind": baseline_kind,
             "total_tokens_used": int(total_tokens_used),
             "features": list(features),
+            "H_base_mean": float(H_base_mean) if apply_denom_correction else None,
         }
         return {"per_sequence": records, "per_sequence_meta": meta}
 
@@ -620,6 +706,8 @@ class DeltaEntropyApprox:
 
             B_total = int(E_batch["sequences"].shape[0])
             T_total = self._count_total_gen_tokens(E_batch)
+            apply_denom_correction = self.normalize == "per_token"
+            h_base_mean = self._compute_h_base_mean(E_batch) if apply_denom_correction else 0.0
 
             gdotv_total = 0.0
             vHvv_total = 0.0
@@ -747,6 +835,11 @@ class DeltaEntropyApprox:
                     if T_list[b] > 0:
                         offsets.append((b, acc, acc + T_list[b]))
                         acc += T_list[b]
+                denom_corr_mb = 0.0
+                if apply_denom_correction and offsets:
+                    for b, s, e in offsets:
+                        j_sum = float(j_logp_cat[s:e].sum().item())
+                        denom_corr_mb += -h_base_mean * float(T_list[b]) * j_sum
                 # Per-seq dot(w, j_logp) + j_f (or j_H_sum/T_b) as required
                 gdotv_mb = 0.0
                 if self.normalize == "per_token":
@@ -763,6 +856,12 @@ class DeltaEntropyApprox:
                 else:
                     # 'per_sequence' (sum per sequence): original surrogate linear piece
                     gdotv_mb = (w_cat.to(j_logp_cat) * j_logp_cat).sum() + j_H_sum
+
+                if isinstance(gdotv_mb, torch.Tensor):
+                    gdotv_mb_value = float(gdotv_mb.item())
+                else:
+                    gdotv_mb_value = float(gdotv_mb)
+                gdotv_mb_value += denom_corr_mb
 
                 # ----- Quadratic term v^T H v (three normalization modes) -----
                 if getattr(self, "normalize", "") == "per_seq_token_mean":
@@ -789,7 +888,7 @@ class DeltaEntropyApprox:
                     # 'per_token' ⇒ 1/T_total ; 'per_sequence' ⇒ 1/B_total (as before)
                     scale = self._scale_for_derivative(B_total, T_total)
                 scale_sum += float(scale)
-                g_val = float(gdotv_mb.item()) * float(scale)
+                g_val = gdotv_mb_value * float(scale)
                 h_val = float(vHvv_mb.item()) * float(scale)
                 g_contribs_mb.append(g_val); gdotv_total += g_val
                 h_contribs_mb.append(h_val); vHvv_total  += h_val
