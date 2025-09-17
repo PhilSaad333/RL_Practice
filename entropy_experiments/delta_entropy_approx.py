@@ -225,9 +225,19 @@ class DeltaEntropyApprox:
             quad = self.compute_dir_linear_and_quadratic_jvp(
                 E_batch=E_batch,
                 v_named=v_named,
+                return_per_sequence=return_per_sequence,
             )
             result["quadratic"] = quad
             result["eta_star"] = quad.get("eta_star")
+            if return_per_sequence and "per_sequence" in result and "per_sequence_vhvv" in quad:
+                seq_vals = quad.get("per_sequence_vhvv") or []
+                records = result.get("per_sequence") or []
+                if len(records) == len(seq_vals):
+                    for rec, vhvv in zip(records, seq_vals):
+                        rec["vhvv"] = vhvv
+                else:
+                    # Length mismatch implies diagnostics bug; preserve raw list for debugging
+                    result.setdefault("per_sequence_quadratic", seq_vals)
         return result
 
     def compute_delta_h_approx_jvp(
@@ -544,6 +554,7 @@ class DeltaEntropyApprox:
         E_batch: Dict[str, Any],
         v_named: Dict[str, torch.Tensor],
         etas: Optional[List[float]] = None,
+        return_per_sequence: bool = False,
     ) -> Dict[str, Any]:
         """
         Compute the linear term g·v and the quadratic curvature term v^T H v for the RB surrogate on E-batch
@@ -616,6 +627,7 @@ class DeltaEntropyApprox:
             total_tokens_used = 0
             g_contribs_mb: List[float] = []
             h_contribs_mb: List[float] = []
+            per_seq_vhvv: List[float] = [] if return_per_sequence else []
 
             # ---- Microbatch loop: single forward + nested JVPs per microbatch ----
             for mb_E in self._iter_microbatches(E_batch, self.mb):
@@ -649,6 +661,8 @@ class DeltaEntropyApprox:
                 T_list = [int(mb_E.gen_lens[b][0]) for b in range(B_mb)]
                 T_mb = sum(t for t in T_list if t > 0)
                 if T_mb == 0:
+                    if return_per_sequence:
+                        per_seq_vhvv.extend([0.0] * B_mb)
                     continue
                 total_tokens_used += T_mb
                 w_cat = torch.cat([w_list[b] for b in range(B_mb) if T_list[b] > 0], dim=0)
@@ -780,6 +794,16 @@ class DeltaEntropyApprox:
                 g_contribs_mb.append(g_val); gdotv_total += g_val
                 h_contribs_mb.append(h_val); vHvv_total  += h_val
 
+                if return_per_sequence:
+                    eff_lookup = {b: idx for idx, b in enumerate(eff_idx)}
+                    for b in range(B_mb):
+                        if T_list[b] <= 0:
+                            per_seq_vhvv.append(0.0)
+                        else:
+                            idx_local = eff_lookup[b]
+                            val = float(vHvv_seq[idx_local].item()) * float(scale)
+                            per_seq_vhvv.append(val)
+
             eps = 1e-30
             eta_star = (2.0 * abs(gdotv_total) / max(abs(vHvv_total), eps)) if abs(vHvv_total) > 0 else float("inf")
             kappa = (vHvv_total / max(gdotv_total, eps)) if abs(gdotv_total) > 0 else float("nan")
@@ -807,6 +831,8 @@ class DeltaEntropyApprox:
                     "se_gdotv": (var_g ** 0.5) / (M ** 0.5),
                     "se_vHvv": (var_h ** 0.5) / (M ** 0.5),
                 }
+            if return_per_sequence:
+                out["per_sequence_vhvv"] = per_seq_vhvv
             if self.logger:
                 self.logger.info(
                     f"[dir JVP] g·v={gdotv_total:.6e}  vHv={vHvv_total:.6e}  eta*={eta_star:.3e}  "
