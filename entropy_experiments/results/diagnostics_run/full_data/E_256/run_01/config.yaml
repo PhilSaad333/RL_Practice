@@ -1,0 +1,123 @@
+# === MODEL AND CHECKPOINT ===
+checkpoint:
+  checkpoint_path: "/content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_40/model"
+  optimizer_path: "/content/drive/MyDrive/RL_Practice_Files/new_rl_checkpoint/step_40/optimizer.pt"
+  backbone: "qwen2_5_15"
+  device_map: "cuda"
+
+# === BATCH CONFIGURATION ===
+batch_config:
+  dataset_name: "gsm8k_r1_template"
+  E_split: "train" #use larger for less overlap
+  U_split: "test"
+  B_E: 256
+  B_U: 64
+  G: 8
+
+# === COMPUTATION OPTIONS ===
+estimator:
+  use_simple_entropy_for_x: false
+  eta_sweep: true
+  single_eta: 4e-6
+  eta_list: [8e-7, 1.6e-6, 3.2e-6, 6.4e-6, 1.28e-5]
+
+# Make RB entropies differentiable in the with-grad path
+rb_requires_grad: true
+
+# === GROUND TRUTH ENTROPY CHANGE ===  
+true_delta_h:
+  microbatch_size: 1
+  is_mode: "snis"
+  clip_c: 10.0
+  report_per_token: true
+  snapshot_device: "cpu"
+
+# === APPROXIMATE ENTROPY CHANGE ===
+approx_delta_h:
+  # Method to compute approximate delta-H:
+  #  - 'jvp'     (forward-mode JVP; full-softmax closure; hk/hk_ema/hk_ridge baselines)
+  #  - 'grad_dot' (backprop on surrogate; hk/hk_ema/regression baselines)
+  method: jvp
+
+  # Microbatching and normalization of the surrogate across E-batch
+  microbatch_size: 8
+  normalize: per_token   # 'per_seq_token_mean' | 'per_sequence' | 'per_token' | 'none'
+
+  # Baseline settings for RB estimator paths (both methods use this 'kind')
+  baseline:
+    # 'hk' | 'hk_ema' | 'regression' | 'hk_ridge' | 'none'
+    kind: hk_ema
+
+    # hk_ema controls (used when kind == 'hk_ema')
+    ema_beta: 0.9
+    pos_bins: 32
+
+    # regression controls (used when kind in {'regression','reg','reg_ridge','regression_ridge'})
+    # Per-sequence linear baseline b_k = phi_k^T beta; optional L2 via regression_l2
+    regression_l2: 0.0           # set >0 to add ridge penalty to regression baseline
+    include_intercept: true
+    fit_dtype: float64           # 'float64' | 'float32'
+    normalize: false             # standardize features before fitting/predicting
+    clip_min: null               # clamp predictions if desired
+    clip_max: null
+
+  # Ridge fit settings used by JVP hk_ridge baseline (microbatch-pooled)
+  ridge:
+    lambda: 1.0e-3
+    eps: 1.0e-8
+
+  # Simple-estimator timewise baseline (only used when estimator.use_simple_entropy_for_x == true)
+  simple_baseline:
+    kind: time_loo               # 'time_loo' | 'time_mean' | 'none'
+
+  # Optional variance diagnostics aggregation across microbatches
+  variance:
+    enabled: true
+    jackknife: true
+
+  report_per_token: false
+  
+  curvature:
+    enabled: true
+
+
+# === GENERATION SETTINGS ===  
+generation:
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 150
+  gen_batch_size: 128
+  tf_batch_size: 16
+
+# === DETAILED LOGGING ===
+detailed_logging:
+  enabled: true
+  level: "standard"
+  log_sequences: false
+  log_tokens: false
+  log_raw_tensors: false
+  output_directory: "entropy_experiments/logs"
+  compress: true
+  max_files: 50
+
+# === OUTPUT CONFIGURATION ===
+output:
+  log_level: "INFO"
+  results_path: ""
+
+# === NUMERICAL PRECISION SETTINGS ===
+precision:
+  allow_tf32: false
+  matmul_precision: high
+  runtime_dtype: float32
+  entropy_dtype: float64
+
+  update_vector:
+    use_amp: false
+    amp_dtype: bfloat16
+    grads_fp32: true
+  
+  tf_withgrad:
+    autocast: false
+    dtype: float32
+    cast_logits_fp32: true     # <- keep logits in fp32 for RB/entropy math

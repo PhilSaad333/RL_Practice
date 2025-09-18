@@ -28,9 +28,7 @@ Here the advantage just tells us the strength and direction of the update to the
 
 Here is a sampling of some current thoughts, so that any reader can get an idea of the way I am trying to think about this:
 
-1) - Current goal is to thoroughly test the first-order approximation to the step change in entropy $\delta \mathcal{H}$. I want to do this very properly, as it seems like a good way to force myself to learn important stuff.
-
-2) - Next goal is to do a detailed exploration of the first order step change formula. Beyond the naive contributions identified by Cui et al, what groups of sequences have an outsized effect on the entropy change? Does the behavior depend in an interesting way on the sequence lengths? I can't study long responses in pratice, but perhaps I can come up with a simple model of the Fisher kernel which would make some predictions.
+1) - Next goal is to do a detailed exploration of the first order step change formula. Beyond the naive contributions identified by Cui et al, what groups of sequences have an outsized effect on the entropy change? Does the behavior depend in an interesting way on the sequence lengths? I can't study long responses in pratice, but perhaps I can come up with a simple model of the Fisher kernel which would make some predictions.
 
 Some more thoughs:
 
@@ -46,7 +44,122 @@ entropy_experiments - At least for now this is where have our offline experiment
 
 rl_training - Some training code so we can do online measurements during training, or save checkpoints and do offline measurements on them. Online experiments will be put in this folder, including measuring the gradient noise scale during training, and measuring the predicted entropy step change.
 
+### Results So Far
 
+So far I've focused on doing a 'precision test' of the linear order approximation to $\delta \mathcal{H}$. In the end, I'm somewhat lucky: the linear approximation is quite valid in the range of learning rates I used for training (therefore the interesting learning rates), but for not much larger learning rates the nonlinear terms become important, and for slightly smaller ones, numerical precision limits my ability to measure the entropy change.
+
+Let's briefly review the experimental setup and then I'll show some plots.
+
+The main goal of this 'precision measurement' is to show that the linear approximation is valid for the learning rates of interest. We approach this in two ways. For both, we begin by sampling a batch of prompts, and for each we use the model with parameters $\theta$ to compute $G=8$ responses per prompt. Call this batch of prompt–response pairs $U$, and the model is chosen to be some checkpoint a few dozen steps into RL training so that we hopefully have relatively stable optimizer states. We also focus just on the LoRA parameters, freezing the base ones.
+
+We then directly compute the change in model parameters from doing an RL update with $U$, rather than doing an actual model update. To do this we need to read off the AdamW optimizer states, compute the gradient of the RL loss, and assemble it all into an "update vector" $v$, which is the change in parameters normalized by the learning rate. We do all this so that we can reuse the update vector throughout our computations. (We could have done this instead by doing a real model update, reading off the new parameters, then computing the difference. I tested my update_vector.py's output against this approach and found they agree. I stuck with the explicit approach in case I want to mess around with it.)
+
+Then, for a given update vector $v$, we do two things:
+
+1. Estimate the true change in entropy after a step $\theta \rightarrow \theta + \eta v$ for various learning rates $\eta$.
+2. Estimate the linear order change in entropy $\delta \mathcal{H}_1 = \eta \nabla \mathcal{H} \cdot v$ for those same learning rates.
+
+and compare the results. We also computed the quadratic order term, but I won't discuss it here.
+
+To estimate both the true and linearized entropy changes, we use the same batch $E$ of 'entropy' or 'eval' sequences, where we draw $|E|$ prompts from our pool with replacement and then for each compute the model response at parameters $\theta$. We compute just the entropy of the response tokens.
+
+#### True Entropy Change
+
+To compute the true change in entropy $\Delta \mathcal{H} = \mathcal{H}(\theta + \eta v) - \mathcal{H}(\theta)$ we need to be careful about:
+
+1. Using importance sampling in our estimate of $\mathcal{H}(\theta + \eta v)$ since the $E$ batch was drawn from the model with parameters $\theta$.
+2. Using variance reduction techniques since the entropy seems tricky to estimate (fat tails from sequences with unlikely tokens).
+
+To reduce variance we do three things:
+
+1. **Compute the per-token entropy rather than per-sequence.**
+
+   This means we need to be careful about the importance sampling for the expected number of tokens as well. We also accept a small bias to compute $\mathbb{E}[H]/\mathbb{E}[T]$ where $T$ is the number of tokens, so our estimator for $\mathcal{H}(\theta + \eta v)$ becomes
+
+   $$
+   \mathcal{H}_{\text{per tok}}(\theta+\eta v) \rightarrow \sum_{t_i\in E} \frac{w(\theta + \eta v; t_i)}{\sum_{t_j\in E} w(\theta+\eta v; t_j) T_j} H(t_i)
+   $$
+
+   where $w(\theta+\eta v; t)$ are the IS weights for sequence $t$ and shift $\theta \rightarrow \theta+\eta v$.
+
+2. **Use a Rao-Blackwell estimator of the entropy.**
+
+   The prefix of a token $t_k$ is sufficient to compute the entropy of the $k$'th term in the sequence:
+
+   $$
+   H_k(t_{<k}, \text{prompt } p) = \mathbb{E}[H_k \mid t_{<k}, \text{prompt } p] = - \sum_{t_k' \in V} \pi(t_k' \mid t_{<k}, p) \log \pi(t_k' \mid t_{<k}, p)
+   $$
+
+   So the estimator
+
+   $$
+   H^{RB} = \mathbb{E}_{t \sim \pi}\!\left[\sum_k H_k \right]
+   $$
+
+   is not only easy to compute, but seems to noticeably reduce the variance.
+
+3. **Consider control variates** (In the end I didn't find any that made a big difference so I'll not discuss this.)
+
+In practice, we use PyTorch's `functional_call` to compute the model outputs with overridden parameters $\theta+\eta v$. We could have just done an actual update, but `functional_call` is needed for PyTorch's JVP which we use later so it was simpler to just use it everywhere.
+
+#### Linearized Entropy Change
+
+Similarly, to compute the linearized $\delta \mathcal{H}$ we need to account for the per-token normalization and also use variance reduction techniques. The linearized $\delta \mathcal{H}$ is a sum of three terms:
+
+$$
+\delta \mathcal{H}_1/\eta \times (T_{tot}/|E|) = \mathbb{E}[\nabla_v H] + \mathbb{E}[H \nabla_v \log \pi] - \mathbb{E}[H]\mathbb{E}[T \nabla_v \log \pi]
+$$
+
+where the factor of $(T_{tot}/|E|)$ is to convert from the per-sequence normalization implicit in the expectation values to the per-token normalization we use, and $\nabla_v(\cdot) = v \cdot \nabla(\cdot)$. The second term is from the IS weights in the numerator, the third for the IS weights in the denominator.
+
+Using our RB estimator for $H$ means in the first term we simply take the gradient of the RB entropy
+
+$$
+\mathbb{E}[\nabla_v H] \rightarrow \frac{1}{|E|} \sum_{t_i\in E} \sum_{k=1}^{|t_i|} \nabla_v H_k^{RB}
+$$
+
+For the second term we can use the same logic used in the REINFORCE policy gradient objective to get a lower variance. $H$ is like the total reward, which we can decompose into entropy per step. The variance reduced version of the second term then involves the 'Entropy-to-go' for the sequence $G_k = \sum_{k'\geq k} H_k^{RB}$. We can also subtract a baseline to get
+
+$$
+\mathbb{E}[H \nabla_v \log \pi] \rightarrow \frac{1}{|E|} \sum_{t_i\in E} \sum_{k=1}^{|t_i|} (G_k - b_k) \nabla_v \log \pi(t_k \mid t_{<k}, p)
+$$
+
+I experimented with various baselines. An obvious choice is $b_k = H_k$, but we can also augment this by computing an ema of the remaining part of the entropy-to-go.
+
+As of yet I haven't done anything special to the last term besides using the RB estimator for $H$, we could use the score trick to subtract a baseline token length.
+
+#### Results
+
+Even with all the variance-reduction tricks in the entropy experiments, the linearized $\delta \mathcal{H}$ remains noisy. The encouraging news is that it matches the true entropy change extremely well on average, and the true entropy change behaves linearly in the learning rates of interest.
+
+##### Linear Fit
+
+Below are eight runs with $|E|=2048$. On a log–log plot the curves are effectively straight lines with slope almost exactly one, confirming the linear-in-$\eta$ behaviour.
+
+![Log-log $\Delta \mathcal{H}$ vs $\eta$](entropy_experiments/results/diagnostics_run/full_data/notebooks/figures/delta_h_true_vs_eta_aggregate_loglog.png)
+
+| Run   | Slope | R²   |
+|-------|:-----:|:----:|
+| run_01 | 0.930 | 0.996 |
+| run_02 | 0.980 | 0.999 |
+| run_03 | 1.010 | 1.000 |
+| run_04 | 1.022 | 1.000 |
+| run_05 | 0.993 | 1.000 |
+| run_06 | 1.025 | 1.000 |
+| run_07 | 1.058 | 0.998 |
+| run_08 | 0.947 | 0.999 |
+
+The linear-scale view shows that each run extrapolates cleanly through the origin while differing in slope based on the update vector from that run.
+
+![Linear-scale $\Delta \mathcal{H}$ vs $\eta$](entropy_experiments/results/diagnostics_run/full_data/notebooks/figures/delta_h_true_linear_overlay.png)
+
+##### Linearized $\delta\mathcal{H}$ Error Distribution
+
+For the agreement study we drew 2,000 'synthetic' batches of size 256 from the $|E|=2048$ runs, computed the linearized and true entropy changes for each subsample, and normalised by the full-batch $\Delta \mathcal{H}_{true}$. The histogram below illustrates how the approximation errors spread.
+
+![Normalised error distribution](entropy_experiments/results/diagnostics_run/full_data/notebooks/figures/err_rel_distribution_eta_3.2e-6.png)
+
+For $\eta = 1.6\times 10^{-6}$ the mean relative error is $0.068$ with a standard deviation of $1.215$ (variance $\approx 1.48$). The approximation is centred near zero—as desired—but the spread reflects the inherent stochasticity of small batches.
 
 
 ### Models & Datasets
