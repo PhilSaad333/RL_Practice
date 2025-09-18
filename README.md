@@ -131,9 +131,12 @@ For the last term we can subtract a baseline $T$.
 
 #### Some Practical Notes
 
-To get my results, in addition to learning about and using these various variance reduction technqiues for my estimators, I found that I needed to raise the numerical precision wherever possible. I needed to have the model run at fp32 (and have everything else done at least at fp32, with the softmaxs and stuff done at fp64) or else $\Delta \mathcal{H}$ would stay flat as I decreased $\eta$. Even after raising the precision I still get this flattening happening for learning rates in the small end of the learning rates I studied (possibly some small effect at $\eta$ = 8e-7, and at $\eta$ = 4e-7 the data is unusuable).
+To get my results, in addition to learning about and using these various variance reduction technqiues for my estimators, I found that I needed to raise the numerical precision wherever possible. I needed to have the model run at fp32 (and have everything else done at least at fp32, with the softmaxs and stuff done at fp64) or else $\Delta \mathcal{H}$ would stay flat as I decreased $\eta$. It took me quite a while to see this was the issue (I thought my estimators were just bad) - only when I saw that the changes in individual logprobs after an update were very quantized did I realize what was happening.
+
+Even after raising the precision I still get this flattening happening for learning rates in the small end of the learning rates I studied (possibly some small effect at $\eta$ = 8e-7, and at $\eta$ = 4e-7 the data is unusuable).
 
 I made heavy use of Pytorch's `functional_call` and `jvp` in my code. `functional_call` seemed like a simple approach to recomputing $\Delta \mathcal{H}$ for various learning rates, and for all the derivatives in the approximate $\delta \mathcal{H}$ (both linear and quadratic) Pytorch's `jvp`, which requires using `functional_call`, was either useful or pretty much essential. For the quadratic term we need the Hessian of the entropy dotted with the update vector, which is exactly what `jvp` is for. But also for the linear term we naturally have the structure that `jvp` is made for - we want the directional derivative of a vector, but the vector is the logprob for different sequences, which we then dot into the vector of baseline-subtracted entropies-to-go.
+
 
 
 #### Results
