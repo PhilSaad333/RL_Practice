@@ -80,20 +80,20 @@ $$
 \mathcal{H}_{\text{per tok}}(\theta+\eta v) \rightarrow \sum_{t_i\in E} \frac{w\left(\theta + \eta v; t_i\right)}{\sum_{t_j\in E} w\left(\theta+\eta v; t_j\right) T_j} H(t_i)
 $$
 
-   where $w(\theta+\eta v; t)$ are the IS weights for sequence $t$ and shift $\theta \rightarrow \theta+\eta v$.
+   where $w\left(\theta+\eta v; t\right)$ are the IS weights for sequence $t$ and shift $\theta \rightarrow \theta+\eta v$.
 
 2. **Use a Rao-Blackwell estimator of the entropy.**
 
    The prefix of a token $t_k$ is sufficient to compute the entropy of the $k$'th term in the sequence:
 
 $$
-H_k(t_{<k}, \text{prompt } p) = \mathbb{E}[H_k \mid t_{<k}, \text{prompt } p] = - \sum_{t_k' \in V} \pi(t_k' \mid t_{<k}, p) \log \pi(t_k' \mid t_{<k}, p)
+H_k\left(t_{<k}, \text{prompt } p\right) = \mathbb{E}\left[H_k \mid t_{<k}, \text{prompt } p\right] = - \sum_{t_k' \in V} \pi\left(t_k' \mid t_{<k}, p\right) \log \pi\left(t_k' \mid t_{<k}, p\right)
 $$
 
    So the estimator
 
 $$
-H^{RB} = \mathbb{E}_{t \sim \pi}\!\left[\sum_k H_k \right]
+H^{RB} = \mathbb{E}_{t \sim \pi}\left[\sum_k H_k\right]
 $$
 
    is not only easy to compute, but seems to noticeably reduce the variance.
