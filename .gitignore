@@ -43,3 +43,9 @@ lambda_cloud/DEBUGGING_SESSION_AUG_2025.md
 lambda_cloud/LAMBDA_EVAL_INTEGRATION.md
 rl_training/algs/PROBE_DOCUMENTATION.md
 lambda/
+
+# Additional files to ignore
+lambda_cloud/
+agents.md
+claude.md
+lambda_LAMBDA_SETUP_GUIDE.md
