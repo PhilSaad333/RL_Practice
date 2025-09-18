@@ -87,7 +87,7 @@ $$
    The prefix of a token $t_k$ is sufficient to compute the entropy of the $k$'th term in the sequence:
 
 $$
-H_k\left(t_{k} \mid \text{prompt}, p\right) = \mathbb{E}\left[H_k \mid t_{k'<k}, \text{prompt}, p\right] = - \sum_{t_k'' \in V} \pi\left(t_k'' \mid t_{k'<k}, p\right) \log \pi\left(t_k'' \mid t_{k'<k}, p\right)
+H_k\left(t_{k} \mid \text{prompt}, p\right) = \mathbb{E}\left[H_k \mid t_{\lt k}, \text{prompt}, p\right] = - \sum_{t_k' \in V} \pi\left(t_k' \mid t_{\lt k}, p\right) \log \pi\left(t_k' \mid t_{\lt k}, p\right)
 $$
 
    So the estimator
@@ -121,7 +121,7 @@ $$
 For the second term we can use the same logic used in the REINFORCE policy gradient objective to get a lower variance. $H$ is like the total reward, which we can decompose into entropy per step. The variance reduced version of the second term then involves the 'Entropy-to-go' for the sequence $G_k = \sum_{k'\geq k} H_k^{RB}$. We can also subtract a baseline to get
 
 $$
-\mathbb{E}[H \nabla_v \log \pi] \rightarrow \frac{1}{|E|} \sum_{t_i\in E} \sum_{k=1}^{|t_i|} (G_k - b_k) \nabla_v \log \pi(t_k | t_{<k}, p)
+\mathbb{E}[H \nabla_v \log \pi] \rightarrow \frac{1}{|E|} \sum_{t_i\in E} \sum_{k=1}^{|t_i|} (G_k - b_k) \nabla_v \log \pi(t_k | t_{\lt k}, p)
 $$
 
 I experimented with various baselines. An obvious choice is $b_k = H_k$, but we can also augment this by computing an ema of the remaining part of the entropy-to-go.
