@@ -100,7 +100,7 @@ $$
 
 3. **Consider control variates** (In the end I didn't find any that made a big difference so I'll not discuss this.)
 
-In practice, we use PyTorch's `functional_call` to compute the model outputs with overridden parameters $\theta+\eta v$. We could have just done an actual update, but `functional_call` is needed for PyTorch's JVP which we use later so it was simpler to just use it everywhere.
+In practice, we use PyTorch's `functional_call` to compute the model outputs with overridden parameters $\theta+\eta v$. We could have just done an actual update, but `functional_call` is needed for PyTorch's `jvp` which we use later so it was simpler to just use it everywhere.
 
 #### Linearized Entropy Change
 
@@ -126,7 +126,15 @@ $$
 
 I experimented with various baselines. An obvious choice is $b_k = H_k$, but we can also augment this by computing an ema of the remaining part of the entropy-to-go.
 
-As of yet I haven't done anything special to the last term besides using the RB estimator for $H$, we could use the score trick to subtract a baseline token length.
+For the last term we can subtract a baseline $T$.
+
+
+#### Some Practical Notes
+
+To get my results, in addition to learning about and using these various variance reduction technqiues for my estimators, I found that I needed to raise the numerical precision wherever possible. I needed to have the model run at fp32 (and have everything else done at least at fp32, with the softmaxs and stuff done at fp64) or else $\Delta \mathcal{H}$ would stay flat as I decreased $\eta$. Even after raising the precision I still get this flattening happening for learning rates in the small end of the learning rates I studied (possibly some small effect at $\eta$ = 8e-7, and at $\eta$ = 4e-7 the data is unusuable).
+
+I made heavy use of Pytorch's `functional_call` and `jvp` in my code. `functional_call` seemed like a simple approach to recomputing $\Delta \mathcal{H}$ for various learning rates, and for all the derivatives in the approximate $\delta \mathcal{H}$ (both linear and quadratic) Pytorch's `jvp`, which requires using `functional_call`, was either useful or pretty much essential. For the quadratic term we need the Hessian of the entropy dotted with the update vector, which is exactly what `jvp` is for. But also for the linear term we naturally have the structure that `jvp` is made for - we want the directional derivative of a vector, but the vector is the logprob for different sequences, which we then dot into the vector of baseline-subtracted entropies-to-go.
+
 
 #### Results
 
@@ -134,7 +142,7 @@ Even with all the variance-reduction tricks in the entropy experiments, the line
 
 ##### Linear Fit
 
-Below are eight runs with $|E|=2048$. On a log–log plot the curves are effectively straight lines with slope almost exactly one, confirming the linear-in-$\eta$ behaviour.
+Below are eight runs with $|E|=2048$. On a log–log plot the curves are effectively straight lines with slope almost exactly one, confirming the linear-in- $\eta$ behaviour.
 
 ![Log-log $\Delta \mathcal{H}$ vs $\eta$](entropy_experiments/results/diagnostics_run/full_data/notebooks/figures/delta_h_true_vs_eta_aggregate_loglog.png)
 
@@ -149,7 +157,9 @@ Below are eight runs with $|E|=2048$. On a log–log plot the curves are effecti
 | run_07 | 1.058 | 0.998 |
 | run_08 | 0.947 | 0.999 |
 
-The linear-scale view shows that each run extrapolates cleanly through the origin while differing in slope based on the update vector from that run.
+The linear-scale view shows that each run extrapolates cleanly through the origin while differing in slope based on the update vector from that run. 
+
+Runs 1 and 8 show the largest disagreement, but this is due to the smallest learning rate datapoints - if we remove these datapoint we get agreement. We have reason to be suspicious of these datapoints: They're pushing up against the regime where numerical precision limits our ability to precisely measure $\Delta \mathcal{H}$. I think these two data points (which are the smallest two values of $\Delta\mathcal{H}$ in the plot) are plausibly inflated a bit by numerical precision error.
 
 ![Linear-scale $\Delta \mathcal{H}$ vs $\eta$](entropy_experiments/results/diagnostics_run/full_data/notebooks/figures/delta_h_true_linear_overlay.png)
 
