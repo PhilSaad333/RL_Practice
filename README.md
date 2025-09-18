@@ -121,8 +121,15 @@ $$
 For the second term we can use the same logic used in the REINFORCE policy gradient objective to get a lower variance. $H$ is like the total reward, which we can decompose into entropy per step. The variance reduced version of the second term then involves the 'Entropy-to-go' for the sequence $G_k = \sum_{k'\geq k} H_k^{RB}$. We can also subtract a baseline to get
 
 $$
-\mathbb{E}[H \nabla_v \log \pi] \rightarrow \frac{1}{|E|} \sum_{t_i\in E} \sum_{k=1}^{|t_i|} (G_k - b_k) \nabla_v \log \pi(t_k \mid t_{<k}, p)
+\mathbb{E}\!\left[ H \,\nabla_{v} \log \pi \right]
+\;\rightarrow\;
+\frac{1}{\lvert E\rvert}\,
+\sum_{t_i\in E}\,
+\sum_{k=1}^{\lvert t_i\rvert}
+\bigl(G_k - b_k\bigr)\;
+\nabla_{v} \log \pi\!\bigl(t_k \mid t_{<k}, p\bigr)
 $$
+
 
 I experimented with various baselines. An obvious choice is $b_k = H_k$, but we can also augment this by computing an ema of the remaining part of the entropy-to-go.
 
