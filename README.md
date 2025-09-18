@@ -87,7 +87,7 @@ $$
    The prefix of a token $t_k$ is sufficient to compute the entropy of the $k$'th term in the sequence:
 
 $$
-H_k\left(t_{k} \mid \text{prompt}, p\right) = \mathbb{E}\left[H_k \mid t_{k}, \text{prompt} p\right] = - \sum_{t_k' \in V} \pi\left(t_k' \mid t_{k}, p\right) \log \pi\left(t_k' \mid t_{k}, p\right)
+H_k\left(t_{k} \mid \text{prompt}, p\right) = \mathbb{E}\left[H_k \mid t_{<k}, \text{prompt} p\right] = - \sum_{t_k' \in V} \pi\left(t_k' \mid t_{k}, p\right) \log \pi\left(t_k' \mid t_{k}, p\right)
 $$
 
    So the estimator
