@@ -76,9 +76,9 @@ To reduce variance we do three things:
 
    This means we need to be careful about the importance sampling for the expected number of tokens as well. We also accept a small bias to compute $\mathbb{E}[H]/\mathbb{E}[T]$ where $T$ is the number of tokens, so our estimator for $\mathcal{H}(\theta + \eta v)$ becomes
 
-   $$
-   \mathcal{H}_{\text{per tok}}(\theta+\eta v) \rightarrow \sum_{t_i\in E} \frac{w(\theta + \eta v; t_i)}{\sum_{t_j\in E} w(\theta+\eta v; t_j) T_j} H(t_i)
-   $$
+$$
+\mathcal{H}_{\text{per tok}}(\theta+\eta v) \rightarrow \sum_{t_i\in E} \frac{w\left(\theta + \eta v; t_i\right)}{\sum_{t_j\in E} w\left(\theta+\eta v; t_j\right) T_j} H(t_i)
+$$
 
    where $w(\theta+\eta v; t)$ are the IS weights for sequence $t$ and shift $\theta \rightarrow \theta+\eta v$.
 
@@ -86,15 +86,15 @@ To reduce variance we do three things:
 
    The prefix of a token $t_k$ is sufficient to compute the entropy of the $k$'th term in the sequence:
 
-   $$
-   H_k(t_{<k}, \text{prompt } p) = \mathbb{E}[H_k \mid t_{<k}, \text{prompt } p] = - \sum_{t_k' \in V} \pi(t_k' \mid t_{<k}, p) \log \pi(t_k' \mid t_{<k}, p)
-   $$
+$$
+H_k(t_{<k}, \text{prompt } p) = \mathbb{E}[H_k \mid t_{<k}, \text{prompt } p] = - \sum_{t_k' \in V} \pi(t_k' \mid t_{<k}, p) \log \pi(t_k' \mid t_{<k}, p)
+$$
 
    So the estimator
 
-   $$
-   H^{RB} = \mathbb{E}_{t \sim \pi}\!\left[\sum_k H_k \right]
-   $$
+$$
+H^{RB} = \mathbb{E}_{t \sim \pi}\!\left[\sum_k H_k \right]
+$$
 
    is not only easy to compute, but seems to noticeably reduce the variance.
 
