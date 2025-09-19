@@ -245,13 +245,13 @@ class SampleGenerator:
         prompt_tokens_per_prompt: List[List[int]] = []
         for idx in range(B):
             prompt_len = sequences.prompt_lens[idx]
-            token_slice = sequences_tensor[idx, 0, :prompt_len].detach().cpu().tolist()
+            slice_tensor = sequences_tensor[idx, 0, :prompt_len].detach().cpu().reshape(-1)
+            token_slice = slice_tensor.tolist()
             if pad_token_id is not None:
-                token_slice = [int(tok) for tok in token_slice if tok != pad_token_id]
+                prompt_tokens = [int(tok) for tok in token_slice if tok != pad_token_id]
             else:
-                token_slice = [int(tok) for tok in token_slice]
-            prompt_tokens_per_prompt.append(token_slice)
-
+                prompt_tokens = [int(tok) for tok in token_slice]
+            prompt_tokens_per_prompt.append(prompt_tokens)
         diagnostics_list = getattr(diagnostics, "diagnostics", None)
         rb_entropies = getattr(logprob_results, "rb_entropies", None)
         token_logqs = getattr(logprob_results, "token_logqs", None)
