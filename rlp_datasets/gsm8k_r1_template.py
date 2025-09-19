@@ -16,6 +16,15 @@ tokenizer = AutoTokenizer.from_pretrained(
     add_prefix_space=False
 )
 
+GLOBAL_ID_OFFSETS = {
+    "train": 0,
+    "test": 1_000_000,
+    "validation": 2_000_000,
+    "val": 2_000_000,
+}
+
+
+
 
 def prompt_template(question: str) -> str:
     template = (
@@ -38,29 +47,24 @@ def filter_lens(unfiltered, tolerance: int = 200):
             filtered.append(ex)
     return filtered
 
-def _parse_one(rec: dict, split: str) -> Example:
+def _parse_one(rec: dict, split: str, global_prompt_id: int) -> Example:
     text = rec['text']
     q = text.split('<think>')[0].strip()
     sol = text.split('<think>')[-1].split('</think>')[0].strip()
     ans = text.split('<answer>')[-1].split('</answer>')[0].strip()
 
-    meta = dict(dataset="gsm8k_latex", split=split)
+    meta = dict(dataset="gsm8k_latex", split=split, global_prompt_id=int(global_prompt_id))
     return Example(text=text, question=prompt_template(q), answer=ans, meta=meta)
 
 def build_gsm8k(split: str = "train", root: str = None) -> list[Example]:
-    ds = []
-    with open(os.path.join(BASE, f"gsm8k_latex_{split}.jsonl"), 'r') as f:
+    ds: list[dict] = []
+    dataset_path = os.path.join(BASE, f"gsm8k_latex_{split}.jsonl")
+    with open(dataset_path, "r") as f:
         for line in f:
             ds.append(json.loads(line))
-    return filter_lens([_parse_one(rec, split) for rec in ds])
+
+    offset = GLOBAL_ID_OFFSETS.get(split, GLOBAL_ID_OFFSETS.get(split.lower(), 3000000))
+    examples = [_parse_one(rec, split, offset + idx) for idx, rec in enumerate(ds)]
+    return filter_lens(examples)
 
 DATASET_REGISTRY["gsm8k_r1_template"] = build_gsm8k
-
-
-
-
-
-
-
-    
-

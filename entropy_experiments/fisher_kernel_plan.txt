@@ -71,3 +71,19 @@ Custom E Overrides
 - Support injecting hand-crafted evaluation batches. Provide a helper (e.g., CustomSample) that emits payloads matching SequenceProcessor outputs (tokens, text, logprobs) so the Fisher kernel runner can ingest them without extra glue.
 - Use cases: (1) select prompts from dataset with curated responses; (2) author new prompts/responses to probe specific behaviors (e.g., low-probability tokens).
 - Keep runner interfaces flexible: plan should accept an optional E override payload or callback.
+
+Sample Generator Blueprint
+--------------------------
+- Create utils/sample_generator.py as the hub for sampling update/eval batches without initializing EntropyMeasurements; it should own checkpoint/model/tokenizer loading and orchestrate SequenceProcessor usage.
+- Introduce dataclasses:
+  * SequenceRecord capturing prompt/response tokens, decoded text, per-token logprobs/logqs/entropies, rewards, advantages, provenance (global_prompt_id, dataset split, batch indices, stable sequence_id).
+  * GeneratedBatch wrapping a list of SequenceRecord, raw tensors (prompt/response token tensors, masks, rewards, advantages), sampling diagnostics, and lookup helpers for sequence ids or prompt groupings.
+- SampleGenerator APIs:
+  * generate_update_batch(batch_size_prompts, completions_per_prompt, dataset_split, seed, reward_cfg, advantage_cfg) to mirror RL update sampling; produces rich metadata and ids like U-000-01.
+  * generate_evaluation_batch(batch_size_prompts, completions_per_prompt=1, with_replacement=True, dataset_split, seed) for E batches; ids like E-003-00.
+  * generate_from_prompt_ids(prompt_ids, dataset_split, completions_per_prompt, seed) for deterministic retrieval.
+  * generate_from_custom_prompts(prompts, completions_per_prompt, seed) leveraging GSM8K templates but marking provenance as custom.
+  * build_custom_sequence(prompt, response, metadata=None) for fully specified pairs; returns a singleton GeneratedBatch or SequenceRecord with teacher-forced stats.
+  * Serialization helpers (save_batch, load_batch, clone_with_subset) to persist and reuse U batches when probing Fisher correlations repeatedly.
+- Require updates to rlp_datasets/gsm8k_r1_template.py to annotate each sample's meta with a deterministic global_prompt_id; SampleGenerator must propagate this into SequenceRecord.
+- Plan FisherKernelRunner refactor so it consumes GeneratedBatch instances directly, enabling U-U kernel queries (K(i, j) within U) and cumulative influence calculations sum_j K(t, t_j) * A(t_j) via stable sequence_id lookups.
