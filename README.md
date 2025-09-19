@@ -42,7 +42,9 @@ Cui et al seem to have come up with a simple diagnostic: tokens with very low pr
 
 ### Key Components
 
-entropy_experiments - At least for now this is where have our offline experiments, where we load checkpoints and do some tests on them. Currently implemented is the a measurement of the predicted value of $\delta\mathcal{H}$ and the true value. As part of that we also measure an estimator of the variance of the estimator of $\delta\mathcal{H}$ so we can get a sense of what batch sizes we need to make a good comparison (this is forcing me to become familiar with more sophisticated stats stuff). Next we will add some measurments of the Fisher Kernel itself. See the README.md in this folder for a hopefully up-to-date explanation of the various components.
+entropy_experiments - Where all the main experiment stuff lives. We have the experiments for testing the linearized approximation here (done with this now), and the measurement of the Fisher kernel in progress. Later I will add things to study the correlation between response token statistics for responses used in an update and the entropy change for individual sequences (hopefully some qualitative lessons from studying the Fisher kernel will guide me there). This part will make heavy use of the existing entropy step change code.
+
+The utils subfolder in entropy_experiments has lots of important stuff in it. In particular, sequence_processor.py is my main code for making batches and getting logprobs and entropies.
 
 rl_training - Some training code so we can do online measurements during training, or save checkpoints and do offline measurements on them. Online experiments will be put in this folder, including measuring the gradient noise scale during training, and measuring the predicted entropy step change.
 
