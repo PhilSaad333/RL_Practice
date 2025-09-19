@@ -333,7 +333,7 @@ class SequenceProcessor:
         Returns:
             rewards: [B][G] list of rewards for each sequence
         """
-        from rl_training.rewards.tag_pref import reward_fn, PROMPT2GOLD
+        from training_files.rl_training.rewards.tag_pref import reward_fn, PROMPT2GOLD
         
         B, G = sequences.sequences.shape[:2]
         all_rewards = []
