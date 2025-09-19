@@ -1,6 +1,6 @@
-# RL Practice: Entropy Dynamics in Reinforcement Learning
+# Entropy Dynamics in Reinforcement Learning
 
-A research project exploring entropy dynamics during reinforcement learning training, with a focus on understanding the theoretical foundations and empirical behavior of entropy changes in policy optimization.
+A research project exploring entropy dynamics during reinforcement learning training, with a focus on understanding the theoretical foundations and empirical behavior of entropy changes in policy optimization. A big motivation is to understand what kind of sequences/tokens used in updates have especially large effect on the change in entropy, and whether we can characterize sequences that have a big effect on the entropy but not as much on the expected reward - in other words, are there sequences or tokens for which we can adjust the loss so that the entropy decreases less but at small cost to the change in expected reward. Or put even more simply, how can we encourage more exploration at small local cost to performance? Doing this probably helps performance overall down the line.
 
 ## Project Overview
 
@@ -24,17 +24,19 @@ In a more thorough analysis of the step change in entropy, it is easy to see tha
 
 $$\delta \log \pi(t) = \eta \frac{1}{B}\sum_{i=1}^B K(t,t_i') A(t_i')$$
 
-Here the advantage just tells us the strength and direction of the update to the logprob. (Also, using adam instead of SGD simply modifies the inner product used in the definition of the fisher kernel, doesn't change the above forumula.) Clearly the fisher kernel should NOT behave like it is diagonal - the fact that sequences used for updates have a big effect on the model's probability for totally different sequences is the whole point! 
+Here the advantage just tells us the strength and direction of the update to the logprob. (Using Adam instead of SGD slightly changes the above formula but the idea is basically the same.) Clearly the fisher kernel should NOT behave like it is diagonal - the fact that sequences used for updates have a big effect on the model's probability for totally different sequences is the whole point! 
 
 Here is a sampling of some current thoughts, so that any reader can get an idea of the way I am trying to think about this:
 
-1) - Next goal is to do a detailed exploration of the first order step change formula. Beyond the naive contributions identified by Cui et al, what groups of sequences have an outsized effect on the entropy change? Does the behavior depend in an interesting way on the sequence lengths? I can't study long responses in pratice, but perhaps I can come up with a simple model of the Fisher kernel which would make some predictions.
+1) - I have shown that the linear order in learning rate formula for the entropy change is valid in the regime of learning rates that I'm interested in. This means that the simple "fisher correlation" picture is correct, which makes this problem seem fairly tractable.
 
-Some more thoughs:
+2) - Vaguely, can we characterize what kind of sequences have large fisher correlation with others?
 
-One immediate thing we can see is a separate scenario from the one identified by Cui et al in which certain sequences can cause the entropy to decrease a lot: If there is an sequence $t$, not necessarily in the batch of sequences used for updates, that has "fisher correlation" with sequences $t_i'$ used in the update, such that $\sum_i K(t, t_i') A(t_i')$ is negative, then this sequence will be made less likely - whether or not it was a good sequence! So incorrect sequences can punish other, yet-to-be-observed sequences, making unlikely but good sequences (good exploration) less likely. But unfortunately it's not immediately obvious to me how to make use of this observation.
+3) - More precisely, can we come up with some diagnostic for sequences that would be used in an update that tell us whether or not they have an outsized change on the entropy, and if so how this correlates with their effect on the RL loss?
 
-Probably it would be good to have a more quantitative understanding of the Fisher Kernel. The Fisher Kernel is a product of two rectangular matrices $$K = w^T w$$ with $$w_{\alpha, t} = \nabla_\alpha \log \pi(t)$$ So if the number of sequences is larger than the number of model parameters, K is degenerate. The number of sequences $$V^L$$ for vocab of size V grows exponentially in L, so this is true even for short sequences. Really we should be concerned with just the typical set of sequences, of size $$exp(h L)$$ where h is the per token entropy, but even then for small sequence lengths, $$N_{seqs}^{(typical)} \gg N_{params}$$. So K must be very degenerate. Also, we expect a lot of structure in K - e.g. matrix elements between sequences with the same prompt are probably correlated. It would be nice to have a simple model of $K$, perhaps as some structured matrix with random noise. 
+Cui et al seem to have come up with a simple diagnostic: tokens with very low probability in incorrect responses. Are there other diagnostics? Is it useful to use things beyond token level statistics of the responses (e.g. factor in estimated difficulties for the prompts, characterized by past pass rates, or other 'qualitative' features)?
+
+4) - In the end I'd like to have some sort of test for this that isn't just "tweak the loss and run training for a long time". Measuring the correlation between the change in entropy change and change in expected reward due to a tweak seems like the right approach for a simple test. Unfortunately it seems harder to get at the idea of "encouraging more exploration earlier on will pay dividends later" seems harder to test without extended (expensive!) runs...
 
 
 
