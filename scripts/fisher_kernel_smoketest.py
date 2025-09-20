@@ -1,12 +1,13 @@
 ﻿#!/usr/bin/env python3
-"""Colab-ready Fisher kernel smoke test that saves plots to disk."""
+"""Colab-ready Fisher kernel smoke test with saved plots and diagnostics."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,6 +34,8 @@ class TestConfig:
     seed: int = 123
     topk: int = 5
     output_dir: Path = Path("fisher_kernel_outputs")
+    heatmap_percentile: float = 99.0
+    outlier_top_k: int = 20
 
 
 def parse_args() -> TestConfig:
@@ -46,6 +49,8 @@ def parse_args() -> TestConfig:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--output-dir", type=Path, default=Path("fisher_kernel_outputs"))
+    parser.add_argument("--heatmap-percentile", type=float, default=99.0)
+    parser.add_argument("--outlier-top-k", type=int, default=20)
     args = parser.parse_args()
     return TestConfig(
         config_path=args.config,
@@ -57,6 +62,8 @@ def parse_args() -> TestConfig:
         seed=args.seed,
         topk=args.topk,
         output_dir=args.output_dir,
+        heatmap_percentile=args.heatmap_percentile,
+        outlier_top_k=args.outlier_top_k,
     )
 
 
@@ -116,16 +123,53 @@ def save_histogram(values: np.ndarray, title: str, path: Path) -> None:
     plt.close()
 
 
-def save_heatmap(matrix: np.ndarray, title: str, path: Path) -> None:
+def save_heatmap(matrix: np.ndarray, title: str, path: Path, percentile: float) -> None:
+    clipped = matrix.copy()
+    if clipped.size > 0:
+        clip_val = np.percentile(np.abs(clipped), percentile)
+        if clip_val > 0:
+            clipped = np.clip(clipped, -clip_val, clip_val)
     plt.figure(figsize=(6, 5))
-    plt.imshow(matrix, aspect="auto", cmap="RdBu_r")
+    plt.imshow(clipped, aspect="auto", cmap="RdBu_r")
     plt.colorbar()
-    plt.title(title)
+    plt.title(f"{title} (clipped at ±{percentile}th pct)")
     plt.xlabel("U index")
     plt.ylabel("E index")
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
+
+
+def save_outliers(matrix: np.ndarray, row_ids: List[str], col_ids: List[str], top_k: int, path: Path) -> None:
+    if matrix.size == 0:
+        path.write_text(json.dumps([], indent=2))
+        return
+    flat = matrix.ravel()
+    idx = np.argpartition(np.abs(flat), -top_k)[-top_k:]
+    entries = []
+    num_cols = matrix.shape[1]
+    for index in idx:
+        r, c = divmod(index, num_cols)
+        entries.append(
+            {
+                "row_index": int(r),
+                "col_index": int(c),
+                "row_sequence_id": row_ids[r] if r < len(row_ids) else None,
+                "col_sequence_id": col_ids[c] if c < len(col_ids) else None,
+                "value": float(matrix[r, c]),
+            }
+        )
+    entries.sort(key=lambda item: abs(item["value"]), reverse=True)
+    path.write_text(json.dumps(entries, indent=2))
+
+
+def save_sequences(batch: GeneratedBatch, path: Path) -> None:
+    serializable = [asdict(record) for record in batch.sequences]
+    path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+
+
+def save_numpy(matrix: np.ndarray, path: Path) -> None:
+    np.save(path, matrix)
 
 
 def main() -> None:
@@ -146,19 +190,31 @@ def main() -> None:
 
     outputs = []
 
+    save_sequences(workspace.batch, cfg.output_dir / "workspace_sequences.json")
+    outputs.append(cfg.output_dir / "workspace_sequences.json")
+
     if self_influence is not None:
         influence_np = self_influence.detach().cpu().numpy()
         path = cfg.output_dir / "influence_update_self_hist.png"
         save_histogram(influence_np, "Influence on update batch (self kernel)", path)
         outputs.append(path)
+        save_numpy(influence_np, cfg.output_dir / "influence_update_self.npy")
+
     if self_kernel is not None:
         kernel_np = self_kernel.detach().cpu().numpy()
+        save_numpy(kernel_np, cfg.output_dir / "kernel_update.npy")
         path = cfg.output_dir / "kernel_update_heatmap.png"
-        save_heatmap(kernel_np, "Update batch Fisher kernel (self)", path)
+        save_heatmap(kernel_np, "Update batch Fisher kernel (self)", path, cfg.heatmap_percentile)
         outputs.append(path)
+        outlier_path = cfg.output_dir / "kernel_update_top_outliers.json"
+        row_ids = [cache.sequence_id for cache in workspace.gradient_caches]
+        save_outliers(kernel_np, row_ids, row_ids, cfg.outlier_top_k, outlier_path)
+        outputs.append(outlier_path)
 
     if results.evaluations:
         primary_eval = results.evaluations[0]
+        save_sequences(primary_eval.batch, cfg.output_dir / "evaluation_sequences.json")
+        outputs.append(cfg.output_dir / "evaluation_sequences.json")
         influence = primary_eval.influence
         kernel_block = primary_eval.kernel_block
         if influence is not None:
@@ -166,18 +222,29 @@ def main() -> None:
             path = cfg.output_dir / "influence_eval_hist.png"
             save_histogram(influence_np, "Influence on evaluation batch", path)
             outputs.append(path)
+            save_numpy(influence_np, cfg.output_dir / "influence_eval.npy")
         if kernel_block is not None and kernel_block.matrix is not None:
             matrix_np = kernel_block.matrix.detach().cpu().numpy()
+            save_numpy(matrix_np, cfg.output_dir / "kernel_eval.npy")
             path = cfg.output_dir / "kernel_eval_heatmap.png"
-            save_heatmap(matrix_np, "Evaluation vs update Fisher kernel", path)
+            save_heatmap(matrix_np, "Evaluation vs update Fisher kernel", path, cfg.heatmap_percentile)
             outputs.append(path)
+            outlier_path = cfg.output_dir / "kernel_eval_top_outliers.json"
+            save_outliers(
+                matrix_np,
+                kernel_block.row_sequence_ids,
+                kernel_block.col_sequence_ids,
+                cfg.outlier_top_k,
+                outlier_path,
+            )
+            outputs.append(outlier_path)
 
     if outputs:
-        print("Saved figures:")
+        print("Saved outputs:")
         for path in outputs:
             print(f"  - {path}")
     else:
-        print("No figures generated (check evaluation outputs).")
+        print("No outputs generated (check evaluation results).")
 
 
 if __name__ == "__main__":
