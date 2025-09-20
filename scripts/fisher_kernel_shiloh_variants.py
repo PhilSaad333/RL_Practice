@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Run Fisher-kernel with a custom workspace dominated by Shiloh prompt variants."""
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import List
 
+import json
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
@@ -42,10 +43,10 @@ UNRELATED_PROMPT = (
 VARIANTS: List[str] = [
     BASE_PROMPT,
     "Today Shiloh is 44. In seven years his age will be triple his nephew's. Determine the nephew's age now.",
-    "Shiloh currently age 44; after 7 years he will be 3 times older than his nephew. How old is the nephew today?",
+    "Shiloh currently is 44; after 7 years he will be three times older than his nephew. How old is the nephew today?",
     "In seven years Shiloh will be 51, exactly three times his nephew. How old is the nephew right now?",
     "If Shiloh (age 44) expects to be triple his nephew's age in seven years, what is the nephew's current age?",
-    "Shiloh plans for seven years from now when his age equals 3× his nephew's. Given he is 44 now, find the nephew's age.",
+    "Shiloh plans for seven years from now when his age equals 3 times his nephew's. Given he is 44 now, find the nephew's age.",
     "An uncle aged 44 will be three times his nephew in 7 years. What is the nephew's present age?",
     UNRELATED_PROMPT,
 ]
@@ -128,7 +129,7 @@ def main() -> None:
         for record, cache in zip(results.workspace.batch.sequences, results.workspace.gradient_caches)
     ]
     (OUTPUT_DIR / "workspace_sequences.json").write_text(
-        yaml.safe_dump(workspace_meta, sort_keys=False), encoding="utf-8"
+        json.dumps(workspace_meta, indent=2), encoding="utf-8"
     )
 
     if results.workspace.self_kernel is not None:
@@ -143,7 +144,9 @@ def main() -> None:
     for idx, eval_res in enumerate(results.evaluations):
         prefix = f"eval_{idx:02d}"
         eval_meta = [asdict(record) for record in eval_res.batch.sequences]
-        (OUTPUT_DIR / f"{prefix}_sequences.yaml").write_text(yaml.safe_dump(eval_meta, sort_keys=False), encoding="utf-8")
+        (OUTPUT_DIR / f"{prefix}_sequences.json").write_text(
+            json.dumps(eval_meta, indent=2), encoding="utf-8"
+        )
         if eval_res.kernel_block and eval_res.kernel_block.matrix is not None:
             mat = eval_res.kernel_block.matrix.detach().cpu().numpy()
             np.save(OUTPUT_DIR / f"{prefix}_kernel.npy", mat)
