@@ -147,14 +147,24 @@ def main() -> None:
         (OUTPUT_DIR / f"{prefix}_sequences.json").write_text(
             json.dumps(eval_meta, indent=2), encoding="utf-8"
         )
+        if idx == 0:
+            (OUTPUT_DIR / "evaluation_sequences.json").write_text(
+                json.dumps(eval_meta, indent=2), encoding="utf-8"
+            )
         if eval_res.kernel_block and eval_res.kernel_block.matrix is not None:
             mat = eval_res.kernel_block.matrix.detach().cpu().numpy()
             np.save(OUTPUT_DIR / f"{prefix}_kernel.npy", mat)
             save_heatmap(mat, f"Evaluation kernel {idx}", OUTPUT_DIR / f"{prefix}_kernel_heatmap.png")
+            if idx == 0:
+                np.save(OUTPUT_DIR / "evaluation_kernel.npy", mat)
+                save_heatmap(mat, "Evaluation kernel", OUTPUT_DIR / "evaluation_kernel_heatmap.png")
         if eval_res.influence is not None:
             influence_np = eval_res.influence.delta_logprobs.detach().cpu().numpy()
             np.save(OUTPUT_DIR / f"{prefix}_influence.npy", influence_np)
             save_histogram(influence_np, f"Evaluation influence {idx}", OUTPUT_DIR / f"{prefix}_influence_hist.png")
+            if idx == 0:
+                np.save(OUTPUT_DIR / "evaluation_influence.npy", influence_np)
+                save_histogram(influence_np, "Evaluation influence", OUTPUT_DIR / "evaluation_influence_hist.png")
 
     print("Workspace sequences:")
     for cache in results.workspace.gradient_caches:
