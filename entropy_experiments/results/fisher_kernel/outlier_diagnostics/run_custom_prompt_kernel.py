@@ -1,9 +1,10 @@
 ﻿#!/usr/bin/env python3
-"""Custom Fisher-kernel run with a workspace anchored on specific prompt IDs."""
+"""Custom Fisher-kernel run anchored on a specific prompt (sequence ID or global ID)."""
 
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
@@ -19,14 +20,17 @@ from entropy_experiments.fisher_kernel import (
     FisherKernelRunner,
     WorkspaceSpec,
 )
-from entropy_experiments.utils.sample_generator import SampleGenerator
+
+DEFAULT_WORKSPACE_JSON = Path(
+    "entropy_experiments/results/fisher_kernel/outlier_diagnostics/workspace_sequences.json"
+)
 
 
 @dataclass
 class Config:
     config_path: Path
     target_prompt_id: int
-    prompt_ids_path: Path
+    prompt_sequences_path: Path
     total_prompts: int = 8
     completions_per_prompt: int = 8
     microbatch_size: int = 2
@@ -37,11 +41,29 @@ class Config:
     output_dir: Path = Path("fisher_kernel_anchor")
 
 
+def parse_key(text: str, prompt_sequences_path: Path) -> int:
+    try:
+        return int(text)
+    except ValueError:
+        if not prompt_sequences_path.exists():
+            raise ValueError(
+                "Prompt sequences JSON not found and non-numeric target supplied"
+            )
+        data = json.loads(prompt_sequences_path.read_text(encoding="utf-8"))
+        for entry in data:
+            if entry.get("sequence_id") == text:
+                gid = entry.get("global_prompt_id")
+                if gid is None:
+                    raise ValueError(f"Sequence {text} lacks global_prompt_id")
+                return int(gid)
+        raise ValueError(f"Sequence ID {text} not present in {prompt_sequences_path}")
+
+
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Fisher kernel with anchored prompt IDs")
     parser.add_argument("--config", type=Path, default=Path("entropy_experiments/configs/config_template.yaml"))
-    parser.add_argument("--target-prompt-id", type=int, required=True)
-    parser.add_argument("--prompt-ids-path", type=Path, default=Path("entropy_experiments/results/fisher_kernel/outlier_diagnostics/workspace_sequences.json"))
+    parser.add_argument("--target", required=True, help="Global prompt id or sequence id (e.g. U-004-07)")
+    parser.add_argument("--prompt-json", type=Path, default=DEFAULT_WORKSPACE_JSON)
     parser.add_argument("--total-prompts", type=int, default=8)
     parser.add_argument("--completions", type=int, default=8)
     parser.add_argument("--microbatch-size", type=int, default=2)
@@ -51,10 +73,11 @@ def parse_args() -> Config:
     parser.add_argument("--eval-completions", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=Path("fisher_kernel_anchor"))
     args = parser.parse_args()
+    target_prompt_id = parse_key(args.target, args.prompt_json)
     return Config(
         config_path=args.config,
-        target_prompt_id=args.target_prompt_id,
-        prompt_ids_path=args.prompt_ids_path,
+        target_prompt_id=target_prompt_id,
+        prompt_sequences_path=args.prompt_json,
         total_prompts=args.total_prompts,
         completions_per_prompt=args.completions,
         microbatch_size=args.microbatch_size,
@@ -71,11 +94,10 @@ def load_config(path: Path) -> Dict[str, Any]:
         return yaml.safe_load(fh)
 
 
-def sample_prompt_ids(cfg: Config, base_config: Dict[str, Any]) -> List[int]:
-    workspace_path = cfg.prompt_ids_path
-    data = json.loads(workspace_path.read_text()) if workspace_path.exists() else None
+def sample_prompt_ids(cfg: Config) -> List[int]:
     candidate_ids: List[int] = []
-    if data:
+    if cfg.prompt_sequences_path.exists():
+        data = json.loads(cfg.prompt_sequences_path.read_text(encoding="utf-8"))
         for entry in data:
             gid = entry.get("global_prompt_id")
             if gid is not None and int(gid) != cfg.target_prompt_id:
@@ -83,13 +105,11 @@ def sample_prompt_ids(cfg: Config, base_config: Dict[str, Any]) -> List[int]:
     candidate_ids = list(dict.fromkeys(candidate_ids))
     rng = np.random.default_rng(cfg.seed)
     rng.shuffle(candidate_ids)
-    num_needed = max(0, cfg.total_prompts - 1)
-    sampled = candidate_ids[:num_needed]
-    sampled = [gid for gid in sampled if gid != cfg.target_prompt_id]
-    while len(sampled) < num_needed:
+    needed = max(0, cfg.total_prompts - 1)
+    sampled = candidate_ids[:needed]
+    while len(sampled) < needed:
         sampled.append(sampled[-1] if sampled else cfg.target_prompt_id)
-    prompt_ids = [cfg.target_prompt_id] + sampled
-    return prompt_ids
+    return [cfg.target_prompt_id] + sampled
 
 
 def build_plan(cfg: Config, base_config: Dict[str, Any], prompt_ids: List[int]) -> FisherKernelPlan:
@@ -131,15 +151,15 @@ def build_plan(cfg: Config, base_config: Dict[str, Any], prompt_ids: List[int]) 
 def main() -> None:
     cfg = parse_args()
     base_config = load_config(cfg.config_path)
-    prompt_ids = sample_prompt_ids(cfg, base_config)
+    prompt_ids = sample_prompt_ids(cfg)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     runner = FisherKernelRunner(base_config)
     plan = build_plan(cfg, base_config, prompt_ids)
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     results = runner.run(plan)
-    print("Workspace sequence IDs:")
+    print("Workspace sequences:")
     for cache in results.workspace.gradient_caches:
-        print(cache.sequence_id)
-    print(f"Done. Save outputs in {cfg.output_dir}")
+        print(f"  {cache.sequence_id}")
+    print(f"Run complete. Consider re-running analyze_outliers.py in {cfg.output_dir}")
 
 
 if __name__ == "__main__":
