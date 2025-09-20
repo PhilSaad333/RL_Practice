@@ -87,3 +87,34 @@ Sample Generator Blueprint
   * Serialization helpers (save_batch, load_batch, clone_with_subset) to persist and reuse U batches when probing Fisher correlations repeatedly.
 - Require updates to rlp_datasets/gsm8k_r1_template.py to annotate each sample's meta with a deterministic global_prompt_id; SampleGenerator must propagate this into SequenceRecord.
 - Plan FisherKernelRunner refactor so it consumes GeneratedBatch instances directly, enabling U-U kernel queries (K(i, j) within U) and cumulative influence calculations sum_j K(t, t_j) * A(t_j) via stable sequence_id lookups.
+
+Fisher Kernel Runner Refactor
+-----------------------------
+- Objectives:
+  * Treat the update batch as a reusable workspace with cached gradients and Adam-preconditioned vectors.
+  * Support ad-hoc Fisher-kernel queries between any sequence pair (U-U or U-vs-external) and influence accumulation \(\sum_j K(t,t_j) A_j\).
+  * Delegate all batch construction to SampleGenerator so dataset provenance and metadata stay consistent.
+- Plan revisions:
+  * Redefine FisherKernelPlan to describe: (i) how to source the U workspace (generator kwargs or pre-saved path), (ii) which evaluation requests to execute (list of BatchRequest descriptors), and (iii) storage toggles (full K, top-k, serialization paths).
+  * Introduce BatchRequest dataclass capturing the SampleGenerator entry point (kind \in {update, evaluation, prompt_ids, custom_prompts, custom_sequence, from_file}) plus parameters and optional sequence_id filters.
+  * Create KernelWorkspace dataclass bundling: the GeneratedBatch for U, per-sequence gradient tensors (flattened or parameter-sharded), preconditioned gradients, Adam stats metadata, and lookup maps from sequence_id -> index.
+  * Add GradientCache objects (one per sequence) that store: raw gradient view, preconditioned view, norm stats, and lazy materialization hooks so we can stream large models.
+- Runner structure:
+  * FisherKernelRunner.__init__ takes config + logger, instantiates SampleGenerator lazily.
+  * prepare_update_workspace(plan) -> generates/loads the U batch (via SampleGenerator or file), computes gradients microbatch-wise, applies Adam diagonal preconditioning, and returns KernelWorkspace (optionally persisted to disk for reuse).
+  * compute_self_kernel(workspace, sequence_ids=None, capture_full=False) -> forms K_UU or selected submatrix and stores diagnostics (cosine sims, norm ratios).
+  * evaluate_batch(request, workspace, capture_full=None) -> materializes an E batch (SampleGenerator or provided) and streams gradient dot-products against workspace to produce:
+    - Fisher kernel blocks (when requested).
+    - Influence vector for each E sequence (delta_logpi using workspace advantages or overrides).
+    - Top-k contributor summaries keyed by U sequence_id.
+  * serialize_workspace / load_workspace helpers persist U batches + gradient caches (NPZ/torch.save) to avoid recomputation.
+- Execution flow:
+  1. Plan enumerates requests: e.g., build U workspace, optionally compute U-U kernel, evaluate prompt-id subset, check custom probes.
+  2. Runner iterates through requests, reusing the workspace and SampleGenerator as needed.
+  3. Results object aggregates per-request outputs plus metadata snapshots (config, SampleGenerator sampling metadata, gradient stats).
+- Next implementation steps:
+  * Define dataclasses (BatchRequest, KernelWorkspace, GradientCache, FisherKernelResults).
+  * Refactor existing FisherKernelRunner scaffold to call SampleGenerator and operate on GeneratedBatch structures.
+  * Implement gradient collection + Adam preconditioning utilities that accept GeneratedBatch and sequence filters.
+  * Update CLI/plan ingestion to parse the new plan format and drive the refactored runner.
+
