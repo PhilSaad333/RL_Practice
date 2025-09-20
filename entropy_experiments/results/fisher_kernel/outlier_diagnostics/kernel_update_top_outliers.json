@@ -1,0 +1,142 @@
+[
+  {
+    "row_index": 35,
+    "col_index": 35,
+    "row_sequence_id": "U-004-03",
+    "col_sequence_id": "U-004-03",
+    "value": 1.0238567014291016e+21
+  },
+  {
+    "row_index": 35,
+    "col_index": 39,
+    "row_sequence_id": "U-004-03",
+    "col_sequence_id": "U-004-07",
+    "value": 8.862466820026393e+20
+  },
+  {
+    "row_index": 39,
+    "col_index": 35,
+    "row_sequence_id": "U-004-07",
+    "col_sequence_id": "U-004-03",
+    "value": 8.862466820026393e+20
+  },
+  {
+    "row_index": 39,
+    "col_index": 39,
+    "row_sequence_id": "U-004-07",
+    "col_sequence_id": "U-004-07",
+    "value": 7.678264636407581e+20
+  },
+  {
+    "row_index": 36,
+    "col_index": 35,
+    "row_sequence_id": "U-004-04",
+    "col_sequence_id": "U-004-03",
+    "value": 4.571646967633408e+20
+  },
+  {
+    "row_index": 35,
+    "col_index": 36,
+    "row_sequence_id": "U-004-03",
+    "col_sequence_id": "U-004-04",
+    "value": 4.571646967633408e+20
+  },
+  {
+    "row_index": 36,
+    "col_index": 39,
+    "row_sequence_id": "U-004-04",
+    "col_sequence_id": "U-004-07",
+    "value": 3.959632280703603e+20
+  },
+  {
+    "row_index": 39,
+    "col_index": 36,
+    "row_sequence_id": "U-004-07",
+    "col_sequence_id": "U-004-04",
+    "value": 3.959632280703603e+20
+  },
+  {
+    "row_index": 12,
+    "col_index": 35,
+    "row_sequence_id": "U-001-04",
+    "col_sequence_id": "U-004-03",
+    "value": 2.832603314978111e+20
+  },
+  {
+    "row_index": 35,
+    "col_index": 12,
+    "row_sequence_id": "U-004-03",
+    "col_sequence_id": "U-001-04",
+    "value": 2.832603314978111e+20
+  },
+  {
+    "row_index": 12,
+    "col_index": 39,
+    "row_sequence_id": "U-001-04",
+    "col_sequence_id": "U-004-07",
+    "value": 2.452556405843236e+20
+  },
+  {
+    "row_index": 39,
+    "col_index": 12,
+    "row_sequence_id": "U-004-07",
+    "col_sequence_id": "U-001-04",
+    "value": 2.452556405843236e+20
+  },
+  {
+    "row_index": 34,
+    "col_index": 35,
+    "row_sequence_id": "U-004-02",
+    "col_sequence_id": "U-004-03",
+    "value": 2.110894052148217e+20
+  },
+  {
+    "row_index": 35,
+    "col_index": 34,
+    "row_sequence_id": "U-004-03",
+    "col_sequence_id": "U-004-02",
+    "value": 2.110894052148217e+20
+  },
+  {
+    "row_index": 36,
+    "col_index": 36,
+    "row_sequence_id": "U-004-04",
+    "col_sequence_id": "U-004-04",
+    "value": 2.044637390552373e+20
+  },
+  {
+    "row_index": 34,
+    "col_index": 39,
+    "row_sequence_id": "U-004-02",
+    "col_sequence_id": "U-004-07",
+    "value": 1.8276665730687546e+20
+  },
+  {
+    "row_index": 39,
+    "col_index": 34,
+    "row_sequence_id": "U-004-07",
+    "col_sequence_id": "U-004-02",
+    "value": 1.8276665730687546e+20
+  },
+  {
+    "row_index": 13,
+    "col_index": 35,
+    "row_sequence_id": "U-001-05",
+    "col_sequence_id": "U-004-03",
+    "value": 1.515659008024124e+20
+  },
+  {
+    "row_index": 35,
+    "col_index": 13,
+    "row_sequence_id": "U-004-03",
+    "col_sequence_id": "U-001-05",
+    "value": 1.515659008024124e+20
+  },
+  {
+    "row_index": 13,
+    "col_index": 39,
+    "row_sequence_id": "U-001-05",
+    "col_sequence_id": "U-004-07",
+    "value": 1.312167412477955e+20
+  }
+]
