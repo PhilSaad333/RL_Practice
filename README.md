@@ -30,14 +30,19 @@ Here is a sampling of some current thoughts, so that any reader can get an idea 
 
 1) - I have shown that the linear order in learning rate formula for the entropy change is valid in the regime of learning rates that I'm interested in. This means that the simple "fisher correlation" picture is correct, which makes this problem seem fairly tractable.
 
-2) - Vaguely, can we characterize what kind of sequences have large fisher correlation with others?
+2) - If the linear approximation is valid then the different sequences or tokens used in an update are 'decoupled'
 
-3) - More precisely, can we come up with some diagnostic for sequences that would be used in an update that tell us whether or not they have an outsized change on the entropy, and if so how this correlates with their effect on the RL loss?
+$$\Delta \mathcal{H} \approx \sum_{\text{seq or tok }i \in B} \Delta \mathcal{H}_i$$
+
+So we can isolate the contribution of individual sequences or tokens.
+
+3) - Vaguely, can we characterize what kind of sequences/tokens have large fisher correlation with others?
+
+4) - More precisely, can we come up with some diagnostic for sequences that would be used in an update that tell us whether or not they have an outsized change on the entropy, and if so how this correlates with their effect on the RL loss?
 
 Cui et al seem to have come up with a simple diagnostic: tokens with very low probability in incorrect responses. Are there other diagnostics? Is it useful to use things beyond token level statistics of the responses (e.g. factor in estimated difficulties for the prompts, characterized by past pass rates, or other 'qualitative' features)?
 
-4) - In the end I'd like to have some sort of test for this that isn't just "tweak the loss and run training for a long time". Measuring the correlation between the step change in entropy change and step change in expected reward due to a tweak, for various update batches and model states (taken from checkpoints along short training runs) seems like the right approach for a simple test. Unfortunately it seems harder to get at the idea of "encouraging more exploration earlier on will pay dividends later" seems harder to test without extended (expensive!) runs...
-
+5) - In the end I'd like to have some sort of test for this that isn't just "tweak the loss and run training for a long time". Measuring the correlation between the step change in entropy change and step change in expected reward due to a tweak, for various update batches and model states (taken from checkpoints along short training runs) seems like the right approach for a simple test. Unfortunately it seems harder to get at the idea of "encouraging more exploration earlier on will pay dividends later" seems harder to test without extended (expensive!) runs...
 
 
 ### Key Components
