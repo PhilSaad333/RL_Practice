@@ -61,7 +61,7 @@ def main() -> None:
             )
         ],
         etas=ETAS,
-        microbatch_size=8,
+        microbatch_size=1,
         auto_scale=False,
     )
 
