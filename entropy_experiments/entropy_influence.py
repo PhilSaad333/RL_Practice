@@ -133,6 +133,52 @@ def _sequence_ids_from_batch(batch: GeneratedBatch) -> List[str]:
     return [record.sequence_id for record in batch.sequences]
 
 
+def _compute_sequence_contributions(details: Dict[str, Any], *, report_per_token: bool) -> List[float]:
+    seq_deltas = details.get("delta_h_seq", []) or []
+    if not seq_deltas:
+        return []
+
+    weights = details.get("normalized_weights") or []
+    h_new = details.get("h_new") or []
+    h_base = details.get("h_base") or []
+    tokens = details.get("token_counts") or []
+
+    contributions: List[float] = []
+
+    if report_per_token:
+        denom_new = 0.0
+        for idx in range(len(seq_deltas)):
+            weight = float(weights[idx]) if idx < len(weights) else 0.0
+            token = float(tokens[idx]) if idx < len(tokens) else 0.0
+            denom_new += weight * token
+        denom_new = denom_new if denom_new > 0.0 else 1.0
+
+        denom_base = sum(float(tok) for tok in tokens) if tokens else len(seq_deltas) or 1.0
+
+        for idx in range(len(seq_deltas)):
+            weight = float(weights[idx]) if idx < len(weights) else 0.0
+            token = float(tokens[idx]) if idx < len(tokens) else 0.0
+            h_base_val = float(h_base[idx]) if idx < len(h_base) else 0.0
+            h_new_val = float(h_new[idx]) if idx < len(h_new) else h_base_val + float(seq_deltas[idx])
+
+            new_term = (weight * h_new_val) / denom_new if denom_new else 0.0
+            base_term = h_base_val / denom_base if denom_base else 0.0
+            contributions.append(new_term - base_term)
+    else:
+        n = len(h_base) if h_base else len(seq_deltas)
+        n = n or 1
+        for idx in range(len(seq_deltas)):
+            weight = float(weights[idx]) if idx < len(weights) else 0.0
+            h_base_val = float(h_base[idx]) if idx < len(h_base) else 0.0
+            h_new_val = float(h_new[idx]) if idx < len(h_new) else h_base_val + float(seq_deltas[idx])
+
+            new_term = weight * h_new_val
+            base_term = h_base_val / n
+            contributions.append(new_term - base_term)
+
+    return contributions
+
+
 class EntropyInfluenceRunner:
     """Coordinate entropy influence experiments."""
 
@@ -281,6 +327,8 @@ class EntropyInfluenceRunner:
         sequence_records = workspace_batch.sequences
 
         true_cfg = self.config.get("true_delta_h", {})
+        per_token = bool(true_cfg.get("report_per_token", False))
+        per_token = bool(true_cfg.get("report_per_token", False))
 
         def _run_direction(eta: float, direction: Dict[str, torch.Tensor]) -> List[Dict[str, Any]]:
             results: List[Dict[str, Any]] = []
@@ -319,15 +367,19 @@ class EntropyInfluenceRunner:
 
             return eta, details, iterations
 
+        per_token = bool(true_cfg.get("report_per_token", False))
+
         def _sequence_callback(index: int, direction: Dict[str, torch.Tensor], meta: Dict[str, Any]) -> None:
             base_eta = self._choose_base_eta(plan, index, total_sequences)
             eta_used, detail_list, num_scales = _auto_scale_eta(base_eta, direction)
 
             if eval_contexts:
                 for ctx, details in zip(eval_contexts, detail_list):
-                    seq_deltas = details.get("delta_h_seq", [])
-                    for row_idx, delta_val in enumerate(seq_deltas):
-                        ctx["delta_rows"][row_idx][index] = float(delta_val)
+                    weighted = _compute_sequence_contributions(details, report_per_token=per_token)
+                    raw_seq = [float(x) for x in details.get("delta_h_seq", [])]
+                    for row_idx, contribution in enumerate(weighted):
+                        if row_idx < len(ctx["delta_rows"]):
+                            ctx["delta_rows"][row_idx][index] = contribution
                     ctx["per_sequence_details"].append({
                         "delta_h_true": float(details.get("delta_h_true", 0.0)),
                         "ess": float(details.get("ess", 0.0)),
@@ -335,6 +387,9 @@ class EntropyInfluenceRunner:
                         "clip_fraction": details.get("clip_fraction", 0.0),
                         "weights_sum": details.get("weights_sum", 0.0),
                         "eta_used": eta_used,
+                        "weighted_seq_delta": weighted,
+                        "raw_seq_delta": raw_seq,
+                        "normalized_weights": [float(x) for x in details.get("normalized_weights", [])],
                     })
 
             seq_meta = dict(meta)
@@ -386,6 +441,7 @@ class EntropyInfluenceRunner:
             return []
 
         true_cfg = self.config.get("true_delta_h", {})
+        per_token = bool(true_cfg.get("report_per_token", False))
         eta_reference = plan.etas[0] if plan.etas else (eta_per_sequence[0] if eta_per_sequence else 0.0)
 
         evaluation_results: List[EvaluationEntropyResult] = []
@@ -403,15 +459,17 @@ class EntropyInfluenceRunner:
                     cfg=true_cfg,
                     return_details=True,
                 )
+                weighted = _compute_sequence_contributions(details, report_per_token=per_token)
                 aggregate_results.append(
                     AggregateEntropyResult(
                         eta=eta,
                         delta_h=float(details.get("delta_h_true", 0.0)),
-                        per_sequence_delta=[float(x) for x in details.get("delta_h_seq", [])],
+                        per_sequence_delta=weighted,
                         diagnostics={
                             "ess": float(details.get("ess", 0.0)),
                             "logweight_stats": details.get("logweight_stats", {}),
                             "clip_fraction": details.get("clip_fraction", 0.0),
+                            "weights_sum": details.get("weights_sum", 0.0),
                         },
                     )
                 )
