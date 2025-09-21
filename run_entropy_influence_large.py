@@ -95,7 +95,7 @@ def main() -> None:
                 "diagnostics": to_serializable(agg.diagnostics),
             }
             eval_entry["aggregate"].append(entry)
-
+        }
         per_seq = eval_res.per_sequence
         if per_seq:
             matrix = np.array(per_seq.delta_matrix, dtype=np.float64)
