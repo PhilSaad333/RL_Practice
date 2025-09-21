@@ -6,17 +6,14 @@ All outputs are CPU fp32 tensors for numerical stability and portability.
 """
 from __future__ import annotations
 
-from collections import OrderedDict
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import math
 import torch
-import gc
-import torch.nn.functional as F
 
 from .utils.param_registry import (
     get_trainable_named,
     get_optimizer_named_params,
-    to_cpu_fp32_named,
 )
 
 from entropy_experiments.utils.precision_utils import force_grads_fp32, str_to_dtype
@@ -39,6 +36,252 @@ def _resolve_amp_dtype_from_cfg(prec_section: dict, default: str = "bfloat16") -
     return mapping.get(name, torch.bfloat16)
 
 
+def _get_trainable_items(model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> List[Tuple[str, torch.nn.Parameter]]:
+    """Return named parameters restricted to the optimizer's trainable set."""
+
+    named = get_optimizer_named_params(model, optimizer)
+    return list(named.items())
+
+
+def _init_named_buffer(
+    trainable_items: List[Tuple[str, torch.nn.Parameter]],
+    *,
+    device: torch.device = torch.device("cpu"),
+) -> Dict[str, torch.Tensor]:
+    """Allocate zero buffers matching the LoRA trainables (CPU float32)."""
+
+    buffer: Dict[str, torch.Tensor] = {}
+    for name, param in trainable_items:
+        buffer[name] = torch.zeros_like(param.detach(), dtype=torch.float32, device=device)
+    return buffer
+
+
+def _collect_sequence_gradients(
+    *,
+    model: torch.nn.Module,
+    U_batch: Dict[str, Any],
+    trainable_items: List[Tuple[str, torch.nn.Parameter]],
+    temp: float,
+    mb_size: int,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+    aggregate_holder: Optional[Dict[str, torch.Tensor]] = None,
+    callback: Optional[Callable[[int, Dict[str, torch.Tensor], Dict[str, Any]], None]] = None,
+    sequence_records: Optional[List[Any]] = None,
+) -> Tuple[float, int]:
+    """Iterate over the U batch and accumulate sequence-wise gradients.
+
+    Returns
+    -------
+    total_loss_val : float
+        Sum of per-sequence losses across the batch (pre-normalisation as in RL loss).
+    num_microbatches : int
+        Number of microbatch slices processed.
+    """
+
+    sequences = U_batch["sequences"]
+    attention_masks = U_batch["attention_masks"]
+    prompt_lens = U_batch["prompt_lens"]
+    advantages = U_batch["advantages"]
+    max_lengths = U_batch.get("max_lengths")
+
+    if not isinstance(prompt_lens, (list, tuple)):
+        prompt_lens = list(prompt_lens)
+    if max_lengths is None:
+        max_lengths = [max(int(pl), 1) for pl in prompt_lens]
+
+    device = next(model.parameters()).device
+    advantages = advantages.to(device)
+
+    B_U, G, Lmax = sequences.shape
+    params = [param for _, param in trainable_items]
+
+    total_sequences = B_U * G
+    seq_counter = 0
+    total_loss_val = 0.0
+    num_microbatches = 0
+
+    for start in range(0, B_U, mb_size):
+        end = min(start + mb_size, B_U)
+        B_mb = end - start
+        num_microbatches += 1
+
+        mb_seqs = sequences[start:end].to(device, non_blocking=True)
+        mb_masks = attention_masks[start:end].to(device, non_blocking=True)
+        mb_adv = advantages[start:end]
+
+        flat_seqs = mb_seqs.view(-1, Lmax)
+        flat_masks = mb_masks.view(-1, Lmax)
+
+        if use_amp:
+            autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype or torch.bfloat16)
+        else:
+            autocast_ctx = torch.amp.autocast("cuda", enabled=False)
+
+        with autocast_ctx:
+            out = model(flat_seqs, attention_mask=flat_masks)
+            logits = out.logits if hasattr(out, "logits") else out[0]
+
+        logits = (logits / max(float(temp), 1e-8)).to(torch.float32)
+        logp_all = torch.nn.functional.log_softmax(logits, dim=-1)
+        targets = flat_seqs[:, 1:].unsqueeze(-1)
+        new_logp = logp_all[:, :-1].gather(-1, targets).squeeze(-1)
+        new_logp = torch.nan_to_num(new_logp, neginf=-80.0, posinf=0.0).clamp(min=-80.0, max=0.0)
+        new_logp = new_logp.view(B_mb, G, -1)
+
+        for local_b in range(B_mb):
+            prompt_index = start + local_b
+            prompt_len = int(prompt_lens[prompt_index])
+            L_max_b = max(int(max_lengths[prompt_index]), 1)
+            gen_start = max(prompt_len - 1, 0)
+
+            lp_gen = new_logp[local_b, :, gen_start:]
+            mask_gen = mb_masks[local_b, :, prompt_len:].float()
+            Tg = min(lp_gen.shape[1], mask_gen.shape[1]) if lp_gen.ndim > 1 else 0
+            if Tg == 0:
+                continue
+            lp_gen = lp_gen[:, :Tg]
+            mask_gen = mask_gen[:, :Tg]
+
+            denom = (G * L_max_b + 1e-8)
+
+            for g in range(G):
+                adv_scalar = mb_adv[local_b, g]
+                lp_seq = lp_gen[g]
+                mask_seq = mask_gen[g]
+                seq_loss = - (adv_scalar * mask_seq * lp_seq).sum() / denom
+
+                retain = seq_counter < (total_sequences - 1)
+                grads = torch.autograd.grad(
+                    seq_loss,
+                    params,
+                    retain_graph=retain,
+                    allow_unused=True,
+                )
+
+                grad_named: Dict[str, torch.Tensor] = {}
+                grad_norm_sq = 0.0
+                for (name, param), grad in zip(trainable_items, grads):
+                    if grad is None:
+                        grad_cpu = torch.zeros_like(param.detach(), dtype=torch.float32, device="cpu")
+                    else:
+                        grad_cpu = grad.detach().to(torch.float32).cpu()
+                    grad_named[name] = grad_cpu
+                    if aggregate_holder is not None:
+                        aggregate_holder[name] += grad_cpu
+                    grad_norm_sq += float((grad_cpu.to(torch.float64) ** 2).sum().item())
+
+                sequence_meta: Dict[str, Any] = {
+                    "prompt_index": prompt_index,
+                    "completion_index": g,
+                    "advantage": float(mb_adv[local_b, g].item()),
+                    "prompt_length": prompt_len,
+                    "gen_length": int(Tg),
+                    "loss": float(seq_loss.item()),
+                    "grad_norm": math.sqrt(grad_norm_sq),
+                }
+
+                if sequence_records is not None and seq_counter < len(sequence_records):
+                    record = sequence_records[seq_counter]
+                    sequence_meta.setdefault("sequence_id", getattr(record, "sequence_id", None))
+                    sequence_meta.setdefault("global_prompt_id", getattr(record, "global_prompt_id", None))
+
+                if callback is not None:
+                    callback(seq_counter, grad_named, sequence_meta)
+
+                total_loss_val += float(seq_loss.item())
+                seq_counter += 1
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return total_loss_val, num_microbatches
+
+
+def _adamw_direction_from_named_grads(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    grad_named: Dict[str, torch.Tensor],
+    *,
+    include_components: bool = False,
+) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, Dict[str, Any]]]]:
+    """Compute AdamW direction given explicit named gradients (CPU tensors)."""
+
+    direction: Dict[str, torch.Tensor] = {}
+    components: Optional[Dict[str, Dict[str, Any]]] = {} if include_components else None
+
+    trainable_items = _get_trainable_items(model, optimizer)
+
+    for name, param in trainable_items:
+        grad = grad_named.get(name)
+        if grad is None:
+            grad_cpu = torch.zeros_like(param.detach(), dtype=torch.float32, device="cpu")
+        else:
+            grad_cpu = grad.to(torch.float32).cpu()
+
+        state = optimizer.state.get(param, {})
+        betas = state.get("betas", None)
+        if betas is None:
+            betas = optimizer.defaults.get("betas", (0.9, 0.999))
+        beta1, beta2 = map(float, betas)
+        eps = float(state.get("eps", optimizer.defaults.get("eps", 1e-8)))
+        weight_decay = float(state.get("weight_decay", optimizer.defaults.get("weight_decay", 0.0)))
+        step = int(state.get("step", 0))
+        amsgrad = bool(state.get("amsgrad", optimizer.defaults.get("amsgrad", False)))
+
+        exp_avg = state.get("exp_avg")
+        if exp_avg is None:
+            exp_avg_cpu = torch.zeros_like(param.detach(), dtype=torch.float32, device="cpu")
+        else:
+            exp_avg_cpu = exp_avg.detach().to(torch.float32).cpu()
+
+        exp_avg_sq = state.get("exp_avg_sq")
+        if exp_avg_sq is None:
+            exp_avg_sq_cpu = torch.zeros_like(param.detach(), dtype=torch.float32, device="cpu")
+        else:
+            exp_avg_sq_cpu = exp_avg_sq.detach().to(torch.float32).cpu()
+
+        t_eff = step + 1
+        bc1 = 1.0 - (beta1 ** t_eff)
+        bc2 = 1.0 - (beta2 ** t_eff)
+        step_factor = 1.0 / max(bc1, 1e-16)
+
+        one_minus_beta1 = (1.0 - beta1)
+        one_minus_beta2 = (1.0 - beta2)
+
+        exp_avg_t = exp_avg_cpu.mul(beta1).add(grad_cpu, alpha=one_minus_beta1)
+        exp_avg_sq_t = exp_avg_sq_cpu.mul(beta2).addcmul(grad_cpu, grad_cpu, value=one_minus_beta2)
+
+        if amsgrad:
+            max_exp_avg_sq = state.get("max_exp_avg_sq")
+            if max_exp_avg_sq is None:
+                max_exp_avg_sq_cpu = torch.zeros_like(exp_avg_sq_t)
+            else:
+                max_exp_avg_sq_cpu = max_exp_avg_sq.detach().to(torch.float32).cpu()
+            v_eff = torch.maximum(max_exp_avg_sq_cpu, exp_avg_sq_t)
+        else:
+            v_eff = exp_avg_sq_t
+
+        denom = v_eff.sqrt().div(math.sqrt(max(bc2, 1e-16))).add(eps)
+
+        momentum_term = -step_factor * (beta1 * exp_avg_cpu / denom)
+        grad_term = -step_factor * (one_minus_beta1 * grad_cpu / denom)
+        weight_decay_term = -weight_decay * param.detach().to(torch.float32).cpu()
+
+        direction[name] = (momentum_term + grad_term + weight_decay_term).to(torch.float32)
+
+        if include_components and components is not None:
+            components[name] = {
+                "step_factor": step_factor,
+                "one_minus_beta1": one_minus_beta1,
+                "denom": denom,
+                "momentum_term": momentum_term,
+                "weight_decay_term": weight_decay_term,
+            }
+
+    return direction, components
+
+
 
 def compute_update_vector(*, model, optimizer, U_batch, config, logger=None):
     """Preferred entry point: AdamW-from-grads update vector (per-unit-LR)."""
@@ -55,6 +298,8 @@ def compute_update_vector_adamw(
     U_batch: Dict[str, Any],
     config: Dict[str, Any],
     logger=None,
+    sequence_callback: Optional[Callable[[int, Dict[str, torch.Tensor], Dict[str, Any]], None]] = None,
+    sequence_records: Optional[List[Any]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """
     Build update_vector using AdamW math from current grads and optimizer state.
@@ -66,59 +311,59 @@ def compute_update_vector_adamw(
         ONLY for the forward; grads still accumulate into fp32 params. You can additionally force
         fp32 grad storage via precision.update_vector.grads_fp32.
     """
-    device = next(model.parameters()).device
-    B = int(U_batch["sequences"].shape[0])
+    sequences = U_batch["sequences"]
+    B = int(sequences.shape[0])
+    G = int(sequences.shape[1]) if sequences.ndim >= 2 else 1
+    total_sequences = max(B * G, 1)
 
-    # Precision knobs (opt-in AMP, default OFF)
     uv_prec = (config.get("precision", {}) or {}).get("update_vector", {}) or {}
     use_amp: bool = bool(uv_prec.get("use_amp", False))
     amp_dtype: torch.dtype = _resolve_amp_dtype_from_cfg(uv_prec)
+    mb_size = int(config.get("true_delta_h", {}).get("microbatch_size", 1))
+    temp = float(config.get("generation", {}).get("temperature", 1.0))
 
-    # Zero grads
-    model.zero_grad(set_to_none=True)
-
-    # Ensure train mode for grad path
     was_training = model.training
     model.train()
+    model.zero_grad(set_to_none=True)
 
-    if torch.cuda.is_available():
-        print(f"  [AdamW] Before forward pass: GPU alloc={torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+    trainable_items = _get_trainable_items(model, optimizer)
+    aggregate_grads = _init_named_buffer(trainable_items)
 
-    # Loss / backward accumulates across microbatches
-    try:
-        total_loss_val = rl_loss(
-            U_batch,
-            model,
-            temp=float(config.get("generation", {}).get("temperature", 1.0)),
-            mb_size=int(config.get("true_delta_h", {}).get("microbatch_size", 1)),
-            amp_dtype=amp_dtype,
-            use_amp=use_amp,
-            backward_per_microbatch=True,
-        )
-        num_microbatches = (B + int(config.get("true_delta_h", {}).get("microbatch_size", 1)) - 1) // int(
-            config.get("true_delta_h", {}).get("microbatch_size", 1)
-        )
-    finally:
-        model.train(was_training)
+    total_loss_val, num_microbatches = _collect_sequence_gradients(
+        model=model,
+        U_batch=U_batch,
+        trainable_items=trainable_items,
+        temp=temp,
+        mb_size=mb_size,
+        amp_dtype=amp_dtype,
+        use_amp=use_amp,
+        aggregate_holder=aggregate_grads,
+        callback=None,
+        sequence_records=None,
+    )
 
-    # (Optional) force grads to fp32 storage if anything leaked in mixed modes
-    if bool(uv_prec.get("grads_fp32", True)):
-        force_grads_fp32(model)
-
-    # Optional grad clipping
+    grad_scale = 1.0
     max_norm = float(config.get("max_grad_norm", 0.0))
     if max_norm > 0.0:
-        params_to_clip = []
-        for g in optimizer.param_groups:
-            params_to_clip.extend([p for p in g.get("params", []) if p is not None])
-        if params_to_clip:
-            torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm)
+        total_norm_sq = 0.0
+        for tensor in aggregate_grads.values():
+            total_norm_sq += float((tensor.to(torch.float64) ** 2).sum().item())
+        total_norm = math.sqrt(total_norm_sq)
+        if total_norm > max_norm and total_norm > 0.0:
+            grad_scale = max_norm / (total_norm + 1e-12)
+            for tensor in aggregate_grads.values():
+                tensor.mul_(grad_scale)
+    else:
+        total_norm = math.sqrt(
+            sum(float((tensor.to(torch.float64) ** 2).sum().item()) for tensor in aggregate_grads.values())
+        )
 
-    # Build per-unit-LR direction using AdamW math over optimizer params (LoRA trainables)
-    dir_named = _adamw_direction_from_grads(model, optimizer, only_optimizer_params=True)
-
-    # Clear grads
-    model.zero_grad(set_to_none=True)
+    dir_named, components = _adamw_direction_from_named_grads(
+        model,
+        optimizer,
+        aggregate_grads,
+        include_components=sequence_callback is not None,
+    )
 
     vnorm64 = torch.sqrt(sum((v.to(torch.float64) ** 2).sum() for v in dir_named.values()))
     vec_norm = float(vnorm64.item()) if vnorm64.numel() else 0.0
@@ -130,9 +375,60 @@ def compute_update_vector_adamw(
         "avg_mb_loss": (total_loss_val / max(B, 1)),
         "num_microbatches": num_microbatches,
         "amp": {"enabled": use_amp, "dtype": str(amp_dtype).split(".")[-1]},
+        "per_sequence": {"count": total_sequences},
+        "gradient_clip": {
+            "max_norm": max_norm,
+            "applied_scale": grad_scale,
+            "preclip_norm": total_norm,
+        },
     }
+
+    if sequence_callback is not None and components is not None:
+        baseline_shares: Dict[str, torch.Tensor] = {}
+        for name, comp in components.items():
+            baseline = comp["momentum_term"] + comp["weight_decay_term"]
+            baseline_shares[name] = baseline / float(total_sequences)
+            comp["baseline_share"] = baseline_shares[name]
+
+        def _sequence_direction_callback(
+            index: int,
+            grad_named: Dict[str, torch.Tensor],
+            meta: Dict[str, Any],
+        ) -> None:
+            dir_per_seq: Dict[str, torch.Tensor] = {}
+            for name, grad in grad_named.items():
+                if grad_scale != 1.0:
+                    grad = grad * grad_scale
+                comp = components[name]
+                grad_term = -comp["step_factor"] * (
+                    comp["one_minus_beta1"] * grad / comp["denom"]
+                )
+                dir_per_seq[name] = (grad_term + comp["baseline_share"]).to(torch.float32)
+            sequence_callback(index, dir_per_seq, meta)
+
+        _collect_sequence_gradients(
+            model=model,
+            U_batch=U_batch,
+            trainable_items=trainable_items,
+            temp=temp,
+            mb_size=mb_size,
+            amp_dtype=amp_dtype,
+            use_amp=use_amp,
+            aggregate_holder=None,
+            callback=_sequence_direction_callback,
+            sequence_records=sequence_records,
+        )
+
+    model.train(was_training)
+
+    if bool(uv_prec.get("grads_fp32", True)):
+        force_grads_fp32(model)
+
     if logger:
-        logger.info(f"[update-vector] built over {len(dir_named)} params; ||v||₂ ≈ {vec_norm:.3e}; AMP={use_amp}")
+        logger.info(
+            f"[update-vector] built over {len(dir_named)} params; ||v||₂ ≈ {vec_norm:.3e}; AMP={use_amp}"
+        )
+
     return dir_named, stats
 
 
@@ -173,74 +469,28 @@ def _adamw_direction_from_grads(
     *,
     only_optimizer_params: bool = True,
 ) -> Dict[str, torch.Tensor]:
-    """Compute per-parameter AdamW direction (per-unit-LR) from grads/state.
+    """Backward-compatible helper using parameter grads already stored on tensors."""
 
-    Mirrors PyTorch 2.5.x AdamW math excluding LR scaling:
-      step_size_per_lr = 1 / (1 - beta1^t)
-      denom            = sqrt(v_t) / sqrt(1 - beta2^t) + eps
-      dir_per_lr       = - [ step_size_per_lr * (exp_avg_t / denom) + weight_decay * p ]
+    trainable = (
+        get_optimizer_named_params(model, optimizer)
+        if only_optimizer_params
+        else get_trainable_named(model)
+    )
 
-    If amsgrad=True, denom uses max_exp_avg_sq. Operates over optimizer params by default.
-    """
-    hparams = _infer_group_hparams(optimizer)
-    trainable = get_optimizer_named_params(model, optimizer) if only_optimizer_params else get_trainable_named(model)
-    dir_named: Dict[str, torch.Tensor] = {}
-    for name, p in trainable.items():
-        pid = id(p)
-        if p.grad is None:
-            # No grad -> zero direction
-            dir_named[name] = torch.zeros_like(p.detach()).to("cpu", torch.float32)
-            continue
-        hp = hparams.get(pid, None) or {}
-        beta1, beta2 = map(float, hp.get("betas", (0.9, 0.999)))
-        eps = float(hp.get("eps", 1e-8))
-        weight_decay = float(hp.get("weight_decay", 0.0))
-        step = int(hp.get("step", 0))
-        amsgrad = bool(hp.get("amsgrad", False))
-
-        st = optimizer.state.get(p, {})
-        exp_avg = st.get("exp_avg", torch.zeros_like(p))
-        exp_avg_sq = st.get("exp_avg_sq", torch.zeros_like(p))
-
-        # Update moments with current grad (like AdamW.step)
-        g = p.grad
-        exp_avg_t = exp_avg.mul(beta1).add(g, alpha=(1.0 - beta1))
-        exp_avg_sq_t = exp_avg_sq.mul(beta2).addcmul(g, g, value=(1.0 - beta2))
-
-        # Bias correction factors for the step being formed
-        t_eff = step + 1
-        bc1 = 1.0 - (beta1 ** t_eff)
-        bc2 = 1.0 - (beta2 ** t_eff)
-        # torch.optim.AdamW bias correction:
-        # step_size_per_lr = 1 / bc1; denom = sqrt(v_t)/sqrt(bc2) + eps
-        step_factor = 1.0 / max(bc1, 1e-16)
-        if amsgrad:
-            max_v = st.get("max_exp_avg_sq", exp_avg_sq)
-            v_eff = torch.maximum(max_v, exp_avg_sq_t)
-            denom = v_eff.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
+    grad_named: Dict[str, torch.Tensor] = {}
+    for name, param in trainable.items():
+        if param.grad is None:
+            grad_named[name] = torch.zeros_like(param.detach(), dtype=torch.float32, device="cpu")
         else:
-            denom = exp_avg_sq_t.sqrt().div(max(bc2, 1e-16) ** 0.5).add(eps)
-        adam_dir = -step_factor * (exp_avg_t / denom)
-        wd_dir = -weight_decay * p.detach()
-        direction = (adam_dir + wd_dir)
-        dir_named[name] = direction.detach().to("cpu", torch.float32)
-    return dir_named
+            grad_named[name] = param.grad.detach().to(torch.float32).cpu()
 
-
-def _resolve_amp_dtype_from_cfg(cfg: Dict[str, Any]) -> torch.dtype:
-    """
-    Map config string to torch dtype for autocast when precision.update_vector.use_amp=True.
-    Accepts: {"amp_dtype": "bfloat16"|"bf16"|"float16"|"fp16"|"float32"|"fp32"} (case-insensitive).
-    """
-    name = str(cfg.get("amp_dtype", "bfloat16")).lower()
-    return {
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float16": torch.float16,
-        "fp16": torch.float16,
-        "float32": torch.float32,
-        "fp32": torch.float32,
-    }.get(name, torch.bfloat16)
+    direction, _ = _adamw_direction_from_named_grads(
+        model,
+        optimizer,
+        grad_named,
+        include_components=False,
+    )
+    return direction
 
 
 def rl_loss(
@@ -333,8 +583,3 @@ def rl_loss(
             total_loss += (mb_loss * (B_mb / max(B_U, 1))).to(total_loss.dtype)
 
     return (total_loss_val / max(B_U, 1)) if backward_per_microbatch else total_loss
-
-
-
-
-
