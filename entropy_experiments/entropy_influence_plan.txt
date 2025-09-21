@@ -1,0 +1,59 @@
+Summary
+-------
+Implement a new entropy-influence experiment runner that mirrors the Fisher kernel
+workflow but measures true SNIS entropy deltas for both full update vectors and
+individual U-sequence contributions.
+
+Rationale
+---------
+We want to attribute entropy changes to specific U-batch sequences without the
+instability of the Fisher kernel magnitudes. Leveraging `DeltaEntropyTrue`
+provides low-variance per-token estimates, while the SampleGenerator-driven
+batch construction keeps metadata rich and consistent with previous studies.
+
+Minimal Diffs
+-------------
+* Add `entropy_experiments/entropy_influence.py` with plan/result dataclasses,
+  an `EntropyInfluenceRunner`, and orchestration logic.
+* Extend `update_vector.compute_update_vector_adamw` to optionally emit
+  per-sequence AdamW directions (`v_i`) alongside the aggregate vector.
+* Introduce helper utilities in `update_vector.py` for turning explicit
+  gradient maps into AdamW-style directions without mutating model grads.
+* (If necessary) add small ergonomic hooks in `delta_entropy_true.py` to ease
+  repeated `return_details=True` calls (no algorithmic changes).
+
+Steps
+-----
+1. Scaffold `entropy_influence.py`:
+   * Define plan/result dataclasses (`EntropyInfluencePlan`,
+     `EntropyInfluenceResults`, etc.).
+   * Stub `EntropyInfluenceRunner.run(plan)` with placeholders for workspace
+     prep, aggregate delta-H, and per-sequence passes.
+2. Enhance `update_vector.compute_update_vector_adamw` so it can return both the
+   global direction and a dictionary of per-sequence directions without
+   exploding memory (microbatch streaming, CPU fp32 storage).
+3. Add helper `_adamw_direction_from_named_grads(named_grads, optimizer)` to
+   reuse existing AdamW math with explicit gradients.
+4. Wire the runner to:
+   * Materialize U/E batches via `SampleGenerator`.
+   * Cache base stats in `DeltaEntropyTrue` once and reuse for aggregate +
+     per-sequence evaluations.
+   * Stream per-sequence `v_i`, choose learning-rate scaling, and accumulate the
+     `M_{a i}` matrix plus diagnostics.
+5. Implement output packaging (metadata JSON/NPZ writers mirroring Fisher
+   workflow) once core computations are validated.
+
+Validation
+----------
+* Unit-style smoke script that runs on a tiny U/E batch (e.g., 1 prompt × 2
+  completions) to ensure:
+  - Aggregate ΔH matches the sum of per-sequence ΔH within tolerance.
+  - ESS/log-weight stats are populated and finite.
+* Confirm microbatch streaming keeps peak GPU memory comparable to the Fisher
+  run (manual monitoring via `torch.cuda.memory_allocated`).
+
+Rollback
+--------
+Revert `entropy_influence.py` and the targeted helper additions in
+`update_vector.py` / `delta_entropy_true.py`. No migrations or checkpoint
+formats are altered, so rollback is a straight git revert.

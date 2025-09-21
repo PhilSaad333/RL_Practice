@@ -5,9 +5,11 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
-from typing import List
+from typing import Iterable, List, Sequence
 
 import json
+import random
+
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
@@ -22,34 +24,75 @@ from entropy_experiments.fisher_kernel import (
 
 CONFIG_PATH = Path("entropy_experiments/configs/config_lambda.yaml")
 OUTPUT_DIR = Path("entropy_experiments/results/fisher_kernel/shiloh_variants")
-MICROBATCH_SIZE = 2
+MICROBATCH_SIZE = 4
 TOPK = 5
-EVAL_PROMPTS = 64
 EVAL_COMPLETIONS = 1
 COMPLETIONS_PER_PROMPT = 8
 SEED = 321
 HEATMAP_PERCENTILE = 99.0
+
+DATASET_PATHS = {
+    "train": Path("rlp_datasets/processed/gsm8k_latex_train.jsonl"),
+    "test": Path("rlp_datasets/processed/gsm8k_latex_test.jsonl"),
+}
 
 BASE_PROMPT = (
     "Shiloh is 44 years old today. In 7 years, he will be three times as old as his nephew. "
     "How old is his nephew today?"
 )
 
-UNRELATED_PROMPT = (
-    "Rachel bought 23 cookies and Janet gave her 42 more. Her brother later ate 44 of them. "
-    "How many cookies does Rachel have now?"
-)
-
-VARIANTS: List[str] = [
-    BASE_PROMPT,
-    "Today Shiloh is 44. In seven years his age will be triple his nephew's. Determine the nephew's age now.",
-    "Shiloh currently is 44; after 7 years he will be three times older than his nephew. How old is the nephew today?",
-    "In seven years Shiloh will be 51, exactly three times his nephew. How old is the nephew right now?",
-    "If Shiloh (age 44) expects to be triple his nephew's age in seven years, what is the nephew's current age?",
-    "Shiloh plans for seven years from now when his age equals 3 times his nephew's. Given he is 44 now, find the nephew's age.",
-    "An uncle aged 44 will be three times his nephew in 7 years. What is the nephew's present age?",
-    UNRELATED_PROMPT,
+VARIANT_PROMPTS: List[str] = [
+    "Paul is 44 years old today. In 7 years, he will be three times as old as his cousin. How old is his cousin today?",
+    "Shiloh is 44 years old today. In 7 years, he will be three times as old as his niece. How old is his niece today?",
+    "Shiloh is 40 years old today. In 5 years, he will be three times as old as his nephew. How old is his nephew today?",
+    "Mira is 53 years old today. In 7 years, she will be three times as old as her nephew. How old is her nephew today?",
+    "Shiloh is 50 years old today. In 8 years, he will be three times as old as his younger cousin. How old is his younger cousin today?",
+    "Caleb is 38 years old today. In 4 years, he will be three times as old as his nephew. How old is his nephew today?",
+    "At present, Shiloh is 44. Seven years from now his age will triple that of his nephew. Determine the nephew's current age.",
 ]
+
+
+def _load_questions(split: str) -> List[str]:
+    path = DATASET_PATHS.get(split)
+    if path is None:
+        raise ValueError(f"Unsupported split '{split}'. Expected one of: {list(DATASET_PATHS)}")
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset file not found: {path}")
+
+    questions: List[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            record = json.loads(line)
+            question = record["text"].split("<think>")[0].strip()
+            questions.append(question)
+    return questions
+
+
+def sample_questions(
+    *,
+    split: str,
+    count: int,
+    rng: random.Random,
+    exclude: Sequence[str] | None = None,
+) -> List[str]:
+    if count <= 0:
+        return []
+    questions = _load_questions(split)
+    exclude_set = set(exclude or ())
+    candidates = [q for q in questions if q not in exclude_set]
+    if len(candidates) < count:
+        raise ValueError(
+            f"Requested {count} prompts from split '{split}' but only {len(candidates)} available after exclusions."
+        )
+    return rng.sample(candidates, count)
+
+
+def record_prompts(path: Path, *, name: str, prompts: Iterable[str]) -> None:
+    payload = {
+        "label": name,
+        "prompts": list(prompts),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def save_histogram(values: np.ndarray, title: str, path: Path) -> None:
@@ -85,10 +128,28 @@ def main() -> None:
     cfg_dict = yaml.safe_load(CONFIG_PATH.read_text())
     runner = FisherKernelRunner(cfg_dict)
 
+    rng = random.Random(SEED)
+
+    workspace_random = sample_questions(
+        split="test",
+        count=7,
+        rng=rng,
+        exclude=[BASE_PROMPT],
+    )
+    workspace_prompts = [BASE_PROMPT, *workspace_random]
+
+    eval_random = sample_questions(
+        split="train",
+        count=1,
+        rng=rng,
+        exclude=[BASE_PROMPT, *VARIANT_PROMPTS, *workspace_random],
+    )
+    eval_prompts = [*VARIANT_PROMPTS, *eval_random]
+
     workspace_spec = WorkspaceSpec(
         kind=BatchRequestKind.CUSTOM_PROMPTS,
         params={
-            "prompts": VARIANTS,
+            "prompts": workspace_prompts,
             "completions_per_prompt": COMPLETIONS_PER_PROMPT,
             "seed": SEED,
             "apply_template": True,
@@ -97,13 +158,12 @@ def main() -> None:
     )
 
     eval_request = BatchRequest(
-        kind=BatchRequestKind.EVALUATION,
+        kind=BatchRequestKind.CUSTOM_PROMPTS,
         params={
-            "batch_size_prompts": EVAL_PROMPTS,
+            "prompts": eval_prompts,
             "completions_per_prompt": EVAL_COMPLETIONS,
-            "with_replacement": True,
-            "dataset_split": cfg_dict.get("batch_config", {}).get("E_split", cfg_dict.get("batch_config", {}).get("split", "train")),
             "seed": SEED + 1,
+            "apply_template": True,
         },
         capture_full_kernel=True,
         topk_contributors=TOPK,
@@ -119,6 +179,8 @@ def main() -> None:
 
     results = runner.run(plan)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    record_prompts(OUTPUT_DIR / "workspace_prompts.json", name="workspace", prompts=workspace_prompts)
+    record_prompts(OUTPUT_DIR / "evaluation_prompts.json", name="evaluation", prompts=eval_prompts)
 
     workspace_meta = [
         {
@@ -157,14 +219,18 @@ def main() -> None:
             save_heatmap(mat, f"Evaluation kernel {idx}", OUTPUT_DIR / f"{prefix}_kernel_heatmap.png")
             if idx == 0:
                 np.save(OUTPUT_DIR / "evaluation_kernel.npy", mat)
+                np.save(OUTPUT_DIR / "kernel_eval.npy", mat)
                 save_heatmap(mat, "Evaluation kernel", OUTPUT_DIR / "evaluation_kernel_heatmap.png")
+                save_heatmap(mat, "Evaluation kernel", OUTPUT_DIR / "kernel_eval_heatmap.png")
         if eval_res.influence is not None:
             influence_np = eval_res.influence.delta_logprobs.detach().cpu().numpy()
             np.save(OUTPUT_DIR / f"{prefix}_influence.npy", influence_np)
             save_histogram(influence_np, f"Evaluation influence {idx}", OUTPUT_DIR / f"{prefix}_influence_hist.png")
             if idx == 0:
                 np.save(OUTPUT_DIR / "evaluation_influence.npy", influence_np)
+                np.save(OUTPUT_DIR / "influence_eval.npy", influence_np)
                 save_histogram(influence_np, "Evaluation influence", OUTPUT_DIR / "evaluation_influence_hist.png")
+                save_histogram(influence_np, "Evaluation influence", OUTPUT_DIR / "influence_eval_hist.png")
 
     print("Workspace sequences:")
     for cache in results.workspace.gradient_caches:
