@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -92,14 +91,16 @@ def main() -> None:
             "num_sequences": len(eval_res.batch.sequences),
             "aggregate": [],
         }
+
         for agg in eval_res.aggregate:
-            entry = {
-                "eta": agg.eta,
-                "delta_h": agg.delta_h,
-                "per_sequence_delta_sum": float(sum(agg.per_sequence_delta or [])),
-                "diagnostics": to_serializable(agg.diagnostics),
-            }
-            eval_entry["aggregate"].append(entry)
+            eval_entry["aggregate"].append(
+                {
+                    "eta": agg.eta,
+                    "delta_h": agg.delta_h,
+                    "per_sequence_delta_sum": float(sum(agg.per_sequence_delta or [])),
+                    "diagnostics": to_serializable(agg.diagnostics),
+                }
+            )
 
         per_seq = eval_res.per_sequence
         if per_seq:
@@ -116,11 +117,17 @@ def main() -> None:
                 }
             )
             diag_path = run_dir / f"eval_{eval_idx:02d}_diagnostics.json"
-            diag_path.write_text(json.dumps(to_serializable(per_seq.diagnostics), indent=2), encoding="utf-8")
+            diag_path.write_text(
+                json.dumps(to_serializable(per_seq.diagnostics), indent=2),
+                encoding="utf-8",
+            )
 
         summary["evaluations"].append(eval_entry)
 
-    (run_dir / "summary.json").write_text(json.dumps(to_serializable(summary), indent=2), encoding="utf-8")
+    (run_dir / "summary.json").write_text(
+        json.dumps(to_serializable(summary), indent=2),
+        encoding="utf-8",
+    )
 
     print(json.dumps(summary, indent=2))
 
