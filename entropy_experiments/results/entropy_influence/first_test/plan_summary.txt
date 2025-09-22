@@ -1,0 +1,29 @@
+Plan for per-sequence entropy influence analysis (Sept 2025)
+
+Goal
+----
+Quantify how each update-batch sequence contributes to entropy change under the AdamW update used in `run_entropy_influence_large.py`, and relate those contributions to sequence-level statistics.
+
+Key insights so far
+-------------------
+- Stored per-sequence influence matrix (`eval_00_delta_matrix.npy`) currently overcounts the AdamW momentum/weight-decay “baseline” term, causing ΣᵢδHᵢ to overshoot the true aggregate by ≈7×. The bias scales linearly with η.
+- AdamW update decomposes as `v = v_baseline + Σᵢ v_i_grad`, where `v_baseline` is optimizer state (momentum + weight decay) shared across sequences. Per-sequence directions emitted today equal `v_i_grad + v_baseline / total_sequences`.
+- Linear aggregate behaviour holds for the full update vector across η ∈ [2e-6, 1e-5].
+
+Next steps
+----------
+1. **Separate baseline from per-sequence grad terms** while capturing both in the summary output:
+   - Modify the per-sequence callback to log `v_i_grad` separately from `v_baseline`.
+   - Persist `v_baseline` once per run for later reuse.
+2. **Validate linearity for candidate δθ choices**:
+   - For each i, sweep η for `δθ = η·v_i_grad` and check linear fit; if unstable, test `δθ = η·(v_baseline + v_i_grad)` and subtract the baseline contribution (`δH_baseline`) afterwards.
+   - Confirm `δH_full` matches `δH_baseline + Σᵢ δH_i` within numerical tolerance.
+3. **Build analysis scripts** to compute per-sequence δH, correlate with stored metadata (advantages, entropies, weights), and visualize distributions/relationships.
+4. **Optional baseline comparisons**:
+   - Derive an “RMSProp-style” direction by omitting momentum/weight decay and rerun the linearity + correlation analysis to contrast optimizer effects.
+
+Open questions
+--------------
+- How sensitive are δHᵢ estimates to SNIS variance at very small η·‖v_i‖? Need empirical confirmation from step 2.
+- Whether allocating the baseline uniformly is the best choice for correlation studies, or if alternative normalisations (e.g., proportional to grad norm) offer clearer signals.
+

@@ -42,7 +42,7 @@ So we can isolate the contribution of individual sequences or tokens.
 
 Cui et al seem to have come up with a simple diagnostic: tokens with very low probability in incorrect responses. Are there other diagnostics? Is it useful to use things beyond token level statistics of the responses (e.g. factor in estimated difficulties for the prompts, characterized by past pass rates, or other 'qualitative' features)?
 
-5) - In the end I'd like to have some sort of test for this that isn't just "tweak the loss and run training for a long time". Measuring the correlation between the step change in entropy change and step change in expected reward due to a tweak, for various update batches and model states (taken from checkpoints along short training runs) seems like the right approach for a simple test. Unfortunately it seems harder to get at the idea of "encouraging more exploration earlier on will pay dividends later" seems harder to test without extended (expensive!) runs...
+5) - In the end I'd like to have some sort of test for this that isn't just "tweak the loss and run training for a long time". Measuring the correlation between the step change in entropy change and step change in expected reward due to a tweak, for various update batches and model states (taken from checkpoints along short training runs) seems like the right approach for a simple test. Unfortunately it seems harder to get at the idea of "encouraging more exploration earlier on will pay dividends later" seems harder to test without extended (expensive!) runs...i want
 
 
 ### Key Components

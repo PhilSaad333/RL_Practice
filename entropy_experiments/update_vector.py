@@ -300,7 +300,7 @@ def compute_update_vector_adamw(
     logger=None,
     sequence_callback: Optional[Callable[[int, Dict[str, torch.Tensor], Dict[str, Any]], None]] = None,
     sequence_records: Optional[List[Any]] = None,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, Any]]:
     """
     Build update_vector using AdamW math from current grads and optimizer state.
     Output is name→tensor (CPU, fp32), normalized per-unit LR (Δθ / lr).
@@ -365,12 +365,24 @@ def compute_update_vector_adamw(
         include_components=sequence_callback is not None,
     )
 
+    baseline_named: Dict[str, torch.Tensor] = {}
+    if components is not None:
+        for name, comp in components.items():
+            baseline_named[name] = (comp["momentum_term"] + comp["weight_decay_term"]).to(torch.float32)
+    else:
+        for name, tensor in dir_named.items():
+            baseline_named[name] = torch.zeros_like(tensor)
+
+    baseline_norm64 = torch.sqrt(sum((b.to(torch.float64) ** 2).sum() for b in baseline_named.values()))
+    baseline_norm = float(baseline_norm64.item()) if baseline_norm64.numel() else 0.0
+
     vnorm64 = torch.sqrt(sum((v.to(torch.float64) ** 2).sum() for v in dir_named.values()))
     vec_norm = float(vnorm64.item()) if vnorm64.numel() else 0.0
 
     stats = {
         "method": "adamw_from_grads",
         "vec_norm": vec_norm,
+        "baseline_norm": baseline_norm,
         "num_params": len(dir_named),
         "avg_mb_loss": (total_loss_val / max(B, 1)),
         "num_microbatches": num_microbatches,
@@ -385,10 +397,10 @@ def compute_update_vector_adamw(
 
     if sequence_callback is not None and components is not None:
         baseline_shares: Dict[str, torch.Tensor] = {}
-        for name, comp in components.items():
-            baseline = comp["momentum_term"] + comp["weight_decay_term"]
-            baseline_shares[name] = baseline / float(total_sequences)
-            comp["baseline_share"] = baseline_shares[name]
+        for name in components:
+            share = baseline_named[name] / float(total_sequences)
+            baseline_shares[name] = share
+            components[name]["baseline_share"] = share
 
         def _sequence_direction_callback(
             index: int,
@@ -403,7 +415,7 @@ def compute_update_vector_adamw(
                 grad_term = -comp["step_factor"] * (
                     comp["one_minus_beta1"] * grad / comp["denom"]
                 )
-                dir_per_seq[name] = (grad_term + comp["baseline_share"]).to(torch.float32)
+                dir_per_seq[name] = grad_term.to(torch.float32)
             sequence_callback(index, dir_per_seq, meta)
 
         _collect_sequence_gradients(
@@ -429,7 +441,7 @@ def compute_update_vector_adamw(
             f"[update-vector] built over {len(dir_named)} params; ||v||₂ ≈ {vec_norm:.3e}; AMP={use_amp}"
         )
 
-    return dir_named, stats
+    return dir_named, baseline_named, stats
 
 
 

@@ -114,15 +114,17 @@ def main():
     print(f"Option B stats: {stats_B}")
     
     print("\n>>> Computing Option A (adamw_from_grads)...")
-    vec_A, stats_A = compute_update_vector_adamw(
+    vec_A, baseline_A, stats_A = compute_update_vector_adamw(
         model=probe.model,
         optimizer=probe.optimizer,
         U_batch=U_batch,
         config=probe.config,
         logger=probe.logger,
     )
+    baseline_norm = float(torch.sqrt(sum((v.double() ** 2).sum() for v in baseline_A.values())).item())
     print(f"After Option A: {get_gpu_memory()}")
     print(f"Option A stats: {stats_A}")
+    print(f"Option A baseline norm: {baseline_norm:.6e}")
     
     print("\n>>> Computing Option C (adamw_manual)...")
     vec_C, stats_C = compute_update_vector_adamw_manual(

@@ -25,6 +25,7 @@ class EntropyInfluencePlan:
     microbatch_size: int = 4
     auto_scale: bool = False
     auto_scale_target: float = 1e-6
+    record_per_sequence_eta: bool = False
 
 
 @dataclass
@@ -46,6 +47,8 @@ class PerSequenceEntropyResult:
     sequence_ids: List[str]
     eta_per_sequence: List[float]
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    grad_eta_deltas: Dict[str, List[float]] = field(default_factory=dict)
+    baseline_eta_delta: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -54,8 +57,10 @@ class WorkspaceResult:
 
     batch: GeneratedBatch
     update_vector: Dict[str, torch.Tensor]
+    baseline_vector: Dict[str, torch.Tensor]
     update_stats: Dict[str, Any]
     per_sequence_metadata: List[Dict[str, Any]] = field(default_factory=list)
+    per_sequence_vectors: List[Dict[str, torch.Tensor]] = field(default_factory=list)
 
 
 @dataclass
@@ -233,6 +238,8 @@ class EntropyInfluenceRunner:
             plan,
             eval_contexts,
             workspace_result.update_vector,
+            workspace_result.baseline_vector,
+            workspace_result.per_sequence_vectors,
             eta_per_sequence,
             delta_true,
         )
@@ -317,6 +324,7 @@ class EntropyInfluenceRunner:
 
         total_sequences = len(workspace_batch.sequences)
         per_sequence_metadata: List[Dict[str, Any]] = []
+        per_sequence_vectors: List[Dict[str, torch.Tensor]] = []
         eta_per_sequence: List[float] = []
 
         cfg_override = dict(self.config)
@@ -407,8 +415,9 @@ class EntropyInfluenceRunner:
 
             eta_per_sequence.append(eta_used)
             per_sequence_metadata.append(seq_meta)
+            per_sequence_vectors.append({name: tensor.clone() for name, tensor in direction.items()})
 
-        update_vector, update_stats = compute_update_vector_adamw(
+        update_vector, baseline_vector, update_stats = compute_update_vector_adamw(
             model=model,
             optimizer=optimizer,
             U_batch=U_payload,
@@ -423,8 +432,10 @@ class EntropyInfluenceRunner:
         workspace_result = WorkspaceResult(
             batch=workspace_batch,
             update_vector=update_vector,
+            baseline_vector=baseline_vector,
             update_stats=update_stats,
             per_sequence_metadata=per_sequence_metadata,
+            per_sequence_vectors=per_sequence_vectors,
         )
 
         return workspace_result, eta_per_sequence
@@ -434,6 +445,8 @@ class EntropyInfluenceRunner:
         plan: EntropyInfluencePlan,
         eval_contexts: List[Dict[str, Any]],
         update_vector: Dict[str, torch.Tensor],
+        baseline_vector: Dict[str, torch.Tensor],
+        per_sequence_vectors: List[Dict[str, torch.Tensor]],
         eta_per_sequence: List[float],
         delta_true: DeltaEntropyTrue,
     ) -> List[EvaluationEntropyResult]:
@@ -481,12 +494,42 @@ class EntropyInfluenceRunner:
                 diag.setdefault("sequence_index", idx)
                 diagnostics_per_sequence.append(diag)
 
+            grad_eta_deltas: Dict[str, List[float]] = {}
+            baseline_eta_delta: Dict[str, float] = {}
+            if plan.record_per_sequence_eta and per_sequence_vectors:
+                for eta in plan.etas:
+                    eta_key = f"{eta:.8g}"
+                    per_seq_values: List[float] = []
+                    for direction in per_sequence_vectors:
+                        delta_val = float(
+                            delta_true.compute_delta_h_true(
+                                ctx["data"],
+                                direction,
+                                eta,
+                                cfg=true_cfg,
+                                return_details=False,
+                            )
+                        )
+                        per_seq_values.append(delta_val)
+                    grad_eta_deltas[eta_key] = per_seq_values
+                    baseline_eta_delta[eta_key] = float(
+                        delta_true.compute_delta_h_true(
+                            ctx["data"],
+                            baseline_vector,
+                            eta,
+                            cfg=true_cfg,
+                            return_details=False,
+                        )
+                    )
+
             per_sequence = PerSequenceEntropyResult(
                 eta_reference=eta_reference,
                 delta_matrix=ctx["delta_rows"],
                 sequence_ids=ctx["sequence_ids"],
                 eta_per_sequence=eta_per_sequence,
                 diagnostics=diagnostics_per_sequence,
+                grad_eta_deltas=grad_eta_deltas,
+                baseline_eta_delta=baseline_eta_delta,
             )
 
             evaluation_results.append(

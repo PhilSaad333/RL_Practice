@@ -1,0 +1,19 @@
+Summary:
+- Extend the entropy influence analysis script with optional plot generation alongside the linear fit report.
+
+Rationale:
+- Visual diagnostics (scatter + fit line, residuals) will make it easier to confirm the near-linearity indicated by the regression numbers.
+
+Minimal Diffs:
+- Update analyze_entropy_linearity.py to accept a --plots-dir argument (defaulting to ./plots) and save matplotlib figures for the fit and residuals.
+
+Steps:
+1. Add matplotlib dependency and helper functions to render/save the aggregate vs eta and residual plots.
+2. Wire CLI argument parsing to resolve the plots directory and handle optional report saving.
+3. Emit figures into entropy_experiments/results/entropy_influence/first_test/plots by default.
+
+Validation:
+- Run `python entropy_experiments/results/entropy_influence/first_test/analyze_entropy_linearity.py --data-dir entropy_experiments/results/entropy_influence/first_test/data` and confirm figures land in the plots directory along with the console summary.
+
+Rollback:
+- Remove the added plotting helpers and CLI options or delete the script if no longer needed.

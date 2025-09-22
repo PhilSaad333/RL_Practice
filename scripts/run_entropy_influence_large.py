@@ -63,6 +63,7 @@ def main() -> None:
         etas=ETAS,
         microbatch_size=1,
         auto_scale=False,
+        record_per_sequence_eta=True,
     )
 
     results = runner.run(plan)
@@ -116,6 +117,22 @@ def main() -> None:
                     "eta_per_sequence": per_seq.eta_per_sequence,
                 }
             )
+
+            grad_dir = run_dir / f"eval_{eval_idx:02d}_grad_eta"
+            grad_dir.mkdir(parents=True, exist_ok=True)
+            grad_summary: Dict[str, Any] = {}
+            for eta_key, values in per_seq.grad_eta_deltas.items():
+                arr = np.array(values, dtype=np.float64)
+                safe_key = eta_key.replace('.', 'p').replace('-', 'm')
+                np.save(grad_dir / f"delta_{safe_key}.npy", arr)
+                grad_summary[eta_key] = {
+                    "sum": float(arr.sum()),
+                    "mean": float(arr.mean()),
+                    "max_abs": float(np.abs(arr).max()),
+                }
+            eval_entry["grad_eta_summaries"] = grad_summary
+            eval_entry["baseline_eta_delta"] = per_seq.baseline_eta_delta
+
             diag_path = run_dir / f"eval_{eval_idx:02d}_diagnostics.json"
             diag_path.write_text(
                 json.dumps(to_serializable(per_seq.diagnostics), indent=2),
