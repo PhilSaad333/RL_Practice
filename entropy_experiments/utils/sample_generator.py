@@ -9,7 +9,7 @@ use cases (update batches, evaluation batches, custom prompts, etc.).
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -370,6 +370,141 @@ class SampleGenerator:
         )
         return generated_batch
 
+    def _filter_zero_advantage_prompts(
+        self, batch: GeneratedBatch, *, tol: float = 0.0
+    ) -> GeneratedBatch:
+        advantages = batch.advantages
+        if advantages is None:
+            return batch
+        if advantages.ndim == 1:
+            advantages = advantages.unsqueeze(1)
+        max_vals = advantages.abs().max(dim=1).values
+        keep_mask = max_vals > tol
+        keep_indices = [idx for idx, flag in enumerate(keep_mask.tolist()) if flag]
+        if len(keep_indices) == advantages.shape[0]:
+            return batch
+        if not keep_indices:
+            if self.logger:
+                self.logger.warning("All update prompts have zero advantage; retaining original batch")
+            return batch
+
+        prefix = batch.sequences[0].sequence_id.split('-')[0] if batch.sequences else 'SEQ'
+        index_map = {old: new for new, old in enumerate(keep_indices)}
+
+        new_sequences = []
+        for record in batch.sequences:
+            prompt_idx = record.prompt_batch_idx or 0
+            if prompt_idx in index_map:
+                new_idx = index_map[prompt_idx]
+                new_seq_id = f"{prefix}-{new_idx:03d}-{record.completion_idx:02d}"
+                new_record = replace(record, sequence_id=new_seq_id, prompt_batch_idx=new_idx)
+                new_sequences.append(new_record)
+
+        full_tensor = batch.full_sequence_tensor[keep_indices].clone() if batch.full_sequence_tensor is not None else None
+        attn = batch.attention_mask[keep_indices].clone() if batch.attention_mask is not None else None
+        prompt_lens = [batch.prompt_lens[idx] for idx in keep_indices] if batch.prompt_lens else None
+        gen_lens = [batch.gen_lens[idx] for idx in keep_indices] if batch.gen_lens else None
+        rewards = batch.rewards[keep_indices].clone() if batch.rewards is not None else None
+        advantages_filtered = batch.advantages[keep_indices].clone() if batch.advantages is not None else None
+
+        metadata = dict(batch.sampling_metadata)
+        metadata["num_prompts"] = len(keep_indices)
+        metadata["filtered_zero_adv_prompts"] = int(batch.advantages.shape[0] - len(keep_indices))
+
+        return GeneratedBatch(
+            batch_type=batch.batch_type,
+            sequences=new_sequences,
+            full_sequence_tensor=full_tensor,
+            attention_mask=attn,
+            prompt_lens=prompt_lens,
+            gen_lens=gen_lens,
+            rewards=rewards,
+            advantages=advantages_filtered,
+            sampling_metadata=metadata,
+        )
+
+    def _merge_update_batches(
+        self,
+        batches: List[GeneratedBatch],
+        completions_per_prompt: int,
+    ) -> GeneratedBatch:
+        if not batches:
+            raise ValueError("_merge_update_batches requires at least one batch")
+
+        first = batches[0]
+        dtype = first.full_sequence_tensor.dtype if first.full_sequence_tensor is not None else torch.long
+
+        valid_batches = [b for b in batches if b.full_sequence_tensor is not None]
+        if not valid_batches:
+            return batches[0]
+
+        total_prompts = sum(batch.full_sequence_tensor.shape[0] for batch in valid_batches)
+        max_len = max(batch.full_sequence_tensor.shape[-1] for batch in valid_batches)
+
+        final_sequences = torch.zeros((total_prompts, completions_per_prompt, max_len), dtype=dtype)
+        attn_dtype = valid_batches[0].attention_mask.dtype if valid_batches[0].attention_mask is not None else torch.float32
+        final_attention = torch.zeros((total_prompts, completions_per_prompt, max_len), dtype=attn_dtype)
+
+        prompt_lens: List[int] = []
+        gen_lens: List[List[int]] = []
+        rewards_list: List[torch.Tensor] = []
+        advantages_list: List[torch.Tensor] = []
+        new_records: List[SequenceRecord] = []
+
+        filtered_total = 0
+        prefix = first.sequences[0].sequence_id.split('-')[0] if first.sequences else 'U'
+
+        offset = 0
+        for batch in valid_batches:
+            seq_tensor = batch.full_sequence_tensor
+            attn_tensor = batch.attention_mask
+            assert seq_tensor is not None and attn_tensor is not None
+            assert seq_tensor.shape[1] == completions_per_prompt
+
+            curr_prompts = seq_tensor.shape[0]
+            curr_len = seq_tensor.shape[-1]
+            final_sequences[offset: offset + curr_prompts, :, :curr_len] = seq_tensor
+            final_attention[offset: offset + curr_prompts, :, :curr_len] = attn_tensor
+
+            if batch.prompt_lens:
+                prompt_lens.extend(batch.prompt_lens)
+            if batch.gen_lens:
+                gen_lens.extend(batch.gen_lens)
+            if batch.rewards is not None:
+                rewards_list.append(batch.rewards)
+            if batch.advantages is not None:
+                advantages_list.append(batch.advantages)
+
+            filtered_total += batch.sampling_metadata.get("filtered_zero_adv_prompts", 0)
+
+            for record in batch.sequences:
+                local_idx = record.prompt_batch_idx or 0
+                new_idx = offset + local_idx
+                new_seq_id = f"{prefix}-{new_idx:03d}-{record.completion_idx:02d}"
+                new_records.append(replace(record, sequence_id=new_seq_id, prompt_batch_idx=new_idx))
+
+            offset += curr_prompts
+
+        rewards_tensor = torch.cat(rewards_list, dim=0) if rewards_list else None
+        advantages_tensor = torch.cat(advantages_list, dim=0) if advantages_list else None
+
+        sampling_metadata = dict(first.sampling_metadata)
+        sampling_metadata["num_prompts"] = total_prompts
+        sampling_metadata["completions_per_prompt"] = completions_per_prompt
+        sampling_metadata["filtered_zero_adv_prompts"] = filtered_total
+
+        return GeneratedBatch(
+            batch_type=first.batch_type,
+            sequences=new_records,
+            full_sequence_tensor=final_sequences,
+            attention_mask=final_attention,
+            prompt_lens=prompt_lens,
+            gen_lens=gen_lens,
+            rewards=rewards_tensor,
+            advantages=advantages_tensor,
+            sampling_metadata=sampling_metadata,
+        )
+
     # ------------------------------------------------------------------
     # Batch construction entry points
     # ------------------------------------------------------------------
@@ -382,6 +517,8 @@ class SampleGenerator:
         seed: Optional[int] = None,
         reward_cfg: Optional[Dict[str, Any]] = None,
         advantage_cfg: Optional[Dict[str, Any]] = None,
+        filter_zero_advantage_prompts: Optional[bool] = None,
+        advantage_filter_tol: Optional[float] = None,
     ) -> GeneratedBatch:
         """Sample an update batch mirroring the RL training loop."""
 
@@ -399,38 +536,93 @@ class SampleGenerator:
         if dataset_name is None:
             raise ValueError("SampleGenerator requires 'batch_config.dataset_name' to sample prompts.")
 
-        prompts, examples = self._sequence_processor.sample_prompts(
-            dataset_name=dataset_name,
-            split=dataset_split,
-            num_prompts=batch_size_prompts,
-            seed=seed,
-        )
-        prompt_metadata = [getattr(ex, "meta", {}).copy() for ex in examples] if examples else [{} for _ in prompts]
+        if filter_zero_advantage_prompts is None:
+            filter_zero_advantage_prompts = bool(batch_cfg.get("filter_zero_advantage_prompts", True))
+        tol = float(advantage_filter_tol if advantage_filter_tol is not None else batch_cfg.get("advantage_filter_tol", 0.0))
 
-        sequences, logprob_results, diagnostics = self._generate_sequences(
-            prompts,
-            examples,
-            completions_per_prompt,
-            dataset_split=dataset_split,
-            compute_rb=self._compute_rb_flag(),
-        )
+        attempts = 0
+        max_attempts = int(batch_cfg.get("max_resample_attempts", 10))
+        remaining = batch_size_prompts
+        accepted_batches: List[GeneratedBatch] = []
+        last_batch: Optional[GeneratedBatch] = None
 
-        sampling_extra = {"sampling_strategy": "without_replacement"}
-        return self._build_generated_batch(
-            batch_type="update",
-            sequence_id_prefix="U",
-            prompts=prompts,
-            prompt_metadata=prompt_metadata,
-            sequences=sequences,
-            logprob_results=logprob_results,
-            diagnostics=diagnostics,
-            completions_per_prompt=completions_per_prompt,
-            dataset_name=dataset_name,
-            dataset_split=dataset_split,
-            seed=seed,
-            sampling_extra=sampling_extra,
-        )
+        while remaining > 0 and attempts < max_attempts:
+            attempts += 1
+            prompts_needed = remaining
+            prompts, examples = self._sequence_processor.sample_prompts(
+                dataset_name=dataset_name,
+                split=dataset_split,
+                num_prompts=prompts_needed,
+                seed=seed if attempts == 1 else None,
+            )
+            prompt_metadata = [getattr(ex, "meta", {}).copy() for ex in examples] if examples else [{} for _ in prompts]
 
+            sequences, logprob_results, diagnostics = self._generate_sequences(
+                prompts,
+                examples,
+                completions_per_prompt,
+                dataset_split=dataset_split,
+                compute_rb=self._compute_rb_flag(),
+            )
+
+            sampling_extra = {"sampling_strategy": "without_replacement", "attempt": attempts}
+            batch = self._build_generated_batch(
+                batch_type="update",
+                sequence_id_prefix="U",
+                prompts=prompts,
+                prompt_metadata=prompt_metadata,
+                sequences=sequences,
+                logprob_results=logprob_results,
+                diagnostics=diagnostics,
+                completions_per_prompt=completions_per_prompt,
+                dataset_name=dataset_name,
+                dataset_split=dataset_split,
+                seed=seed if attempts == 1 else None,
+                sampling_extra=sampling_extra,
+            )
+            last_batch = batch
+
+            if filter_zero_advantage_prompts:
+                filtered = self._filter_zero_advantage_prompts(batch, tol=tol)
+                if filtered is not batch and self.logger:
+                    before = batch.sampling_metadata.get("num_prompts", len(prompts))
+                    after = filtered.sampling_metadata.get("num_prompts", len(prompts))
+                    removed = before - after
+                    if removed > 0:
+                        self.logger.info(
+                            "Resample attempt %d: filtered %d zero-advantage prompt group(s)",
+                            attempts,
+                            removed,
+                        )
+                batch = filtered
+
+            kept = batch.sampling_metadata.get("num_prompts", len(batch.prompt_lens or []))
+            if kept > 0:
+                accepted_batches.append(batch)
+                remaining -= kept
+            elif self.logger:
+                self.logger.debug(
+                    "Resample attempt %d produced no usable prompts (kept=0)", attempts
+                )
+
+        if not accepted_batches:
+            if self.logger and filter_zero_advantage_prompts:
+                self.logger.warning(
+                    "Unable to find non-zero advantage update prompts after %d attempts; returning last batch",
+                    attempts,
+                )
+            return last_batch if last_batch is not None else batch
+
+        if remaining > 0 and self.logger:
+            self.logger.warning(
+                "Reached max resample attempts (%d); using %d/%d prompts",
+                max_attempts,
+                batch_size_prompts - remaining,
+                batch_size_prompts,
+            )
+
+        merged = self._merge_update_batches(accepted_batches, completions_per_prompt)
+        return merged
     def generate_evaluation_batch(
         self,
         batch_size_prompts: int,

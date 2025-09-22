@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - fallback when tqdm missing
+    def tqdm(iterable: Iterable, *args: Any, **kwargs: Any):
+        return iterable
 
 from entropy_experiments.fisher_kernel import BatchRequest, BatchRequestKind, WorkspaceSpec
 from entropy_experiments.delta_entropy_true import DeltaEntropyTrue
@@ -26,6 +32,7 @@ class EntropyInfluencePlan:
     auto_scale: bool = False
     auto_scale_target: float = 1e-6
     record_per_sequence_eta: bool = False
+    show_progress: bool = True
 
 
 @dataclass
@@ -234,6 +241,14 @@ class EntropyInfluenceRunner:
             delta_true,
         )
 
+        if self.logger:
+            self.logger.info(
+                "Workspace batch ready: %d prompts × %d completions",  # type: ignore[arg-type]
+                workspace_batch.sampling_metadata.get("num_prompts", len(workspace_batch.prompt_lens or [])),
+                workspace_batch.sampling_metadata.get("completions_per_prompt", 0),
+            )
+            self.logger.info("Running aggregate sweeps for %d evaluation batch(es)", len(eval_contexts))
+
         evaluation_results = self._finalise_evaluations(
             plan,
             eval_contexts,
@@ -417,6 +432,13 @@ class EntropyInfluenceRunner:
             per_sequence_metadata.append(seq_meta)
             per_sequence_vectors.append({name: tensor.clone() for name, tensor in direction.items()})
 
+        if self.logger:
+            self.logger.info(
+                "Computing update vector for %d sequences (microbatch=%d)",
+                total_sequences,
+                plan.microbatch_size,
+            )
+
         update_vector, baseline_vector, update_stats = compute_update_vector_adamw(
             model=model,
             optimizer=optimizer,
@@ -428,6 +450,15 @@ class EntropyInfluenceRunner:
         )
 
         update_stats.setdefault("per_sequence_eta", eta_per_sequence)
+
+        if self.logger:
+            vec_norm = update_stats.get("vec_norm")
+            baseline_norm = update_stats.get("baseline_norm")
+            self.logger.info(
+                "Update vector norms: ||v||=%s, ||baseline||=%s",
+                f"{vec_norm:.3e}" if vec_norm is not None else "n/a",
+                f"{baseline_norm:.3e}" if baseline_norm is not None else "n/a",
+            )
 
         workspace_result = WorkspaceResult(
             batch=workspace_batch,
@@ -459,12 +490,24 @@ class EntropyInfluenceRunner:
 
         evaluation_results: List[EvaluationEntropyResult] = []
 
-        for ctx in eval_contexts:
+        eta_list = list(plan.etas)
+
+        for eval_idx, ctx in enumerate(eval_contexts):
             request: BatchRequest = ctx["request"]
             batch: GeneratedBatch = ctx["batch"]
 
+            if self.logger:
+                self.logger.info(
+                    "Eval batch %d: %d sequences", eval_idx, len(ctx["sequence_ids"])
+                )
+
             aggregate_results: List[AggregateEntropyResult] = []
-            for eta in plan.etas:
+            eta_iter: Iterable[float]
+            eta_iter = eta_list
+            if plan.show_progress and eta_list:
+                eta_iter = tqdm(eta_list, desc=f"Eval {eval_idx} aggregate η", leave=False)
+
+            for eta in eta_iter:
                 details = delta_true.compute_delta_h_true(
                     ctx["data"],
                     update_vector,
@@ -496,23 +539,34 @@ class EntropyInfluenceRunner:
 
             grad_eta_deltas: Dict[str, List[float]] = {}
             baseline_eta_delta: Dict[str, float] = {}
-            if plan.record_per_sequence_eta and per_sequence_vectors:
-                for eta in plan.etas:
-                    eta_key = f"{eta:.8g}"
-                    per_seq_values: List[float] = []
-                    for direction in per_sequence_vectors:
-                        delta_val = float(
-                            delta_true.compute_delta_h_true(
-                                ctx["data"],
-                                direction,
-                                eta,
-                                cfg=true_cfg,
-                                return_details=False,
+            if plan.record_per_sequence_eta and per_sequence_vectors and eta_list:
+                per_eta_values = {eta: [] for eta in eta_list}
+                seq_iter: Iterable[Tuple[int, Dict[str, torch.Tensor]]] = enumerate(per_sequence_vectors)
+                if plan.show_progress:
+                    seq_iter = tqdm(
+                        seq_iter,
+                        total=len(per_sequence_vectors),
+                        desc=f"Eval {eval_idx} per-seq",
+                        leave=False,
+                    )
+                for seq_idx, direction in seq_iter:
+                    for eta in eta_list:
+                        per_eta_values[eta].append(
+                            float(
+                                delta_true.compute_delta_h_true(
+                                    ctx["data"],
+                                    direction,
+                                    eta,
+                                    cfg=true_cfg,
+                                    return_details=False,
+                                )
                             )
                         )
-                        per_seq_values.append(delta_val)
-                    grad_eta_deltas[eta_key] = per_seq_values
-                    baseline_eta_delta[eta_key] = float(
+                grad_eta_deltas = {
+                    f"{eta:g}": per_eta_values[eta] for eta in eta_list
+                }
+                baseline_eta_delta = {
+                    f"{eta:g}": float(
                         delta_true.compute_delta_h_true(
                             ctx["data"],
                             baseline_vector,
@@ -521,6 +575,8 @@ class EntropyInfluenceRunner:
                             return_details=False,
                         )
                     )
+                    for eta in eta_list
+                }
 
             per_sequence = PerSequenceEntropyResult(
                 eta_reference=eta_reference,
