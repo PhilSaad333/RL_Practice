@@ -79,6 +79,7 @@ class DeltaEntropyTrue:
         """Compute ΔH_true(η) on the given E-batch using sequence-level SNIS."""
         cfg = cfg or {}
         clip_c = float(cfg.get("clip_c", 10.0))
+        tf_batch_size = int(cfg.get("tf_batch_size", 1))
         report_per_token = bool(cfg.get("report_per_token", False))
         use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
 
@@ -86,7 +87,9 @@ class DeltaEntropyTrue:
         base_info = self._base_cache.get(key)
         if base_info is None:
             base_stats, H_base_mean = self._score_batch_base(
-                E_batch, report_per_token=report_per_token
+                E_batch,
+                report_per_token=report_per_token,
+                tf_batch_size=tf_batch_size,
             )
             base_info = {"seq_stats": base_stats, "H_base_mean": float(H_base_mean)}
             self._base_cache[key] = base_info
@@ -208,6 +211,7 @@ class DeltaEntropyTrue:
 
         cfg = cfg or {}
         clip_c = float(cfg.get("clip_c", 10.0))
+        tf_batch_size = int(cfg.get("tf_batch_size", 1))
         report_per_token = bool(cfg.get("report_per_token", False))
         use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
 
@@ -215,7 +219,9 @@ class DeltaEntropyTrue:
         base_info = self._base_cache.get(key)
         if base_info is None:
             base_stats, H_base_mean = self._score_batch_base(
-                E_batch, report_per_token=report_per_token
+                E_batch,
+                report_per_token=report_per_token,
+                tf_batch_size=tf_batch_size,
             )
             base_info = {"seq_stats": base_stats, "H_base_mean": float(H_base_mean)}
             self._base_cache[key] = base_info
@@ -223,7 +229,12 @@ class DeltaEntropyTrue:
         base_stats: _SeqStats = base_info["seq_stats"]
         H_base_mean: float = base_info["H_base_mean"]
 
-        new_stats_list = self._score_batch_new_multi(E_batch, v_named_list, eta)
+        new_stats_list = self._score_batch_new_multi(
+            E_batch,
+            v_named_list,
+            eta,
+            tf_batch_size=tf_batch_size,
+        )
 
         results: List[Dict[str, Any]] = []
         for new_stats in new_stats_list:
@@ -288,7 +299,7 @@ class DeltaEntropyTrue:
         lp, diag = self.sp.teacher_force_logprobs_with_diagnostics(
             sequences=seqs,
             with_grad=False,
-            tf_batch_size=1,
+            tf_batch_size=tf_batch_size,
             compute_rb=not use_simple,
             return_baseline_features=False,
             params_override=None,
@@ -310,6 +321,8 @@ class DeltaEntropyTrue:
         E_batch: Dict[str, Any],
         v_named: Dict[str, torch.Tensor],
         eta: float,
+        *,
+        tf_batch_size: int = 1
     ) -> _SeqStats:
         """
         One TF no-grad pass on θ' = θ + η v using a *params-only* functional mapping in fp32.
@@ -338,7 +351,7 @@ class DeltaEntropyTrue:
         lp, diag = self.sp.teacher_force_logprobs_with_diagnostics(
             sequences=seqs,
             with_grad=False,
-            tf_batch_size=1,
+            tf_batch_size=tf_batch_size,
             compute_rb=not use_simple,
             return_baseline_features=False,
             params_override=params_override,
@@ -353,6 +366,8 @@ class DeltaEntropyTrue:
         E_batch: Dict[str, Any],
         v_named_list: List[Dict[str, torch.Tensor]],
         eta: float,
+        *,
+        tf_batch_size: int = 1
     ) -> List[_SeqStats]:
         if not v_named_list:
             return []
@@ -384,7 +399,7 @@ class DeltaEntropyTrue:
         lp_diag_list = self.sp.teacher_force_logprobs_with_diagnostics(
             sequences=seqs,
             with_grad=False,
-            tf_batch_size=1,
+            tf_batch_size=tf_batch_size,
             compute_rb=not use_simple,
             return_baseline_features=False,
             params_override=params_overrides,
