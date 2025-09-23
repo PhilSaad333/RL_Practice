@@ -278,7 +278,13 @@ class DeltaEntropyTrue:
         return id(E_batch)
 
     @torch.no_grad()
-    def _score_batch_base(self, E_batch: Dict[str, Any], *, report_per_token: bool = False) -> Tuple[_SeqStats, float]:
+    def _score_batch_base(
+        self,
+        E_batch: Dict[str, Any],
+        *,
+        report_per_token: bool = False,
+        tf_batch_size: int = 1
+    ) -> Tuple[_SeqStats, float]:
         """
         One TF no-grad pass on θ to collect sequence logprobs and the integrand.
         Returns per-sequence stats and the mean baseline H across sequences.
