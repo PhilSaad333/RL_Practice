@@ -37,6 +37,7 @@ def to_serializable(obj: Any) -> Any:
 
 def main() -> None:
     cfg = yaml.safe_load(CONFIG_PATH.read_text())
+    cfg.setdefault("true_delta_h", {})["tf_batch_size"] = 8
     runner = EntropyInfluenceRunner(cfg)
 
     plan = EntropyInfluencePlan(
