@@ -43,8 +43,8 @@ def main() -> None:
         workspace=WorkspaceSpec(
             kind=BatchRequestKind.UPDATE,
             params={
-                "batch_size_prompts": 4,
-                "completions_per_prompt": 8,
+                "batch_size_prompts": 2,
+                "completions_per_prompt": 4,
                 "dataset_split": "test",
                 "seed": 20250203,
             },
@@ -53,7 +53,7 @@ def main() -> None:
             BatchRequest(
                 kind=BatchRequestKind.EVALUATION,
                 params={
-                    "batch_size_prompts": 256,
+                    "batch_size_prompts": 32,
                     "completions_per_prompt": 1,
                     "dataset_split": "train",
                     "seed": 13579,

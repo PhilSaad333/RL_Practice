@@ -555,7 +555,16 @@ class EntropyInfluenceRunner:
                 for eta in eta_list:
                     eta_key = f"{eta:g}"
 
-                    full_details = full_detail_cache[eta]
+                    full_details = full_detail_cache.get(eta)
+                    if full_details is None:
+                        full_details = delta_true.compute_delta_h_true(
+                            ctx["data"],
+                            update_vector,
+                            eta,
+                            cfg=true_cfg,
+                            return_details=True,
+                        )
+                        full_detail_cache[eta] = full_details
                     full_seq = _compute_sequence_contributions(full_details, report_per_token=per_token)
                     full_eta_per_sequence[eta_key] = full_seq
                     grad_eta_deltas[eta_key] = []  # will fill below
