@@ -22,7 +22,7 @@ from entropy_experiments.entropy_influence import (
 CONFIG_PATH = Path("entropy_experiments/configs/config_template.yaml")
 OUTPUT_ROOT = Path("entropy_experiments/results/entropy_influence")
 
-ETAS = [2e-6, 4e-6, 6e-6, 8e-6, 1e-5]
+ETAS = [8e-6, 1.6e-5, 3.2e-5]
 
 
 def to_serializable(obj: Any) -> Any:

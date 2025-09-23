@@ -311,10 +311,52 @@ class SequenceProcessor:
         if not params_mappings:
             raise ValueError("params_mappings must be non-empty")
 
-        outputs = []
-        for mapping in params_mappings:
-            outputs.append(self._fc_logits_noautocast(input_ids, attention_mask, mapping))
-        return torch.stack(outputs, dim=0)
+        if not params_mappings:
+            raise ValueError("params_mappings must be non-empty")
+
+        m = self._mdl_target
+        was_training = m.training
+        m.eval()
+        was_gc = getattr(m, "gradient_checkpointing", False)
+        if was_gc:
+            try:
+                m.gradient_checkpointing_disable()
+            except AttributeError:
+                was_gc = False
+
+        try:
+            stacked = {
+                name: torch.stack([mapping[name] for mapping in params_mappings], dim=0)
+                for name in params_mappings[0]
+            }
+
+            def _single_call(params):
+                out = torch.func.functional_call(
+                    m, params, (input_ids,),
+                    {"attention_mask": attention_mask, "use_cache": False}
+                )
+                return out.logits if hasattr(out, "logits") else out[0]
+
+            try:
+                with torch.autocast(device_type="cuda", enabled=False):
+                    logits = torch.func.vmap(_single_call)(stacked)
+                return logits
+            except RuntimeError as exc:
+                if "requires_grad_" not in str(exc):
+                    raise
+                outputs = [
+                    self._fc_logits_noautocast(input_ids, attention_mask, mapping)
+                    for mapping in params_mappings
+                ]
+                return torch.stack(outputs, dim=0)
+        finally:
+            if was_gc:
+                try:
+                    m.gradient_checkpointing_enable()
+                except AttributeError:
+                    pass
+            if was_training:
+                m.train()
 
 
 
