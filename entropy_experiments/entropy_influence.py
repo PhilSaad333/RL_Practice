@@ -57,6 +57,10 @@ class PerSequenceEntropyResult:
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     grad_eta_deltas: Dict[str, List[float]] = field(default_factory=dict)
     baseline_eta_delta: Dict[str, float] = field(default_factory=dict)
+    full_eta_per_sequence: Dict[str, List[float]] = field(default_factory=dict)
+    baseline_eta_per_sequence: Dict[str, List[float]] = field(default_factory=dict)
+    grad_eta_per_sequence: Dict[str, List[List[float]]] = field(default_factory=dict)
+    grad_eta_baseline_per_sequence: Dict[str, List[List[float]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -503,6 +507,7 @@ class EntropyInfluenceRunner:
                 )
 
             aggregate_results: List[AggregateEntropyResult] = []
+            full_detail_cache: Dict[float, Dict[str, Any]] = {}
             eta_iter: Iterable[float]
             eta_iter = eta_list
             if plan.show_progress and eta_list:
@@ -540,42 +545,83 @@ class EntropyInfluenceRunner:
 
             grad_eta_deltas: Dict[str, List[float]] = {}
             baseline_eta_delta: Dict[str, float] = {}
-            if plan.record_per_sequence_eta and per_sequence_vectors and eta_list:
-                chunk_size = max(1, int(plan.grad_chunk_size))
-                total_vectors = len(per_sequence_vectors)
-                num_chunks = max(1, math.ceil(total_vectors / chunk_size))
+            full_eta_per_sequence: Dict[str, List[float]] = {}
+            baseline_eta_per_sequence: Dict[str, List[float]] = {}
+            grad_eta_per_sequence: Dict[str, List[List[float]]] = {}
+            grad_eta_baseline_per_sequence: Dict[str, List[List[float]]] = {}
 
+            if plan.record_per_sequence_eta and eta_list:
+                # baseline per-sequence delta once per η
                 for eta in eta_list:
                     eta_key = f"{eta:g}"
-                    values: List[float] = []
-                    chunk_indices: Iterable[int] = range(0, total_vectors, chunk_size)
-                    if plan.show_progress and num_chunks > 1:
-                        chunk_indices = tqdm(
-                            chunk_indices,
-                            total=num_chunks,
-                            desc=f"Eval {eval_idx} per-seq η={eta:g}",
-                            leave=False,
-                        )
-                    for start in chunk_indices:
-                        chunk = per_sequence_vectors[start: start + chunk_size]
-                        details_list = delta_true.compute_delta_h_true_multi(
-                            ctx["data"],
-                            chunk,
-                            eta,
-                            cfg=true_cfg,
-                        )
-                        values.extend(float(detail.get("delta_h_true", 0.0)) for detail in details_list)
 
-                    grad_eta_deltas[eta_key] = values
-                    baseline_eta_delta[eta_key] = float(
-                        delta_true.compute_delta_h_true(
-                            ctx["data"],
-                            baseline_vector,
-                            eta,
-                            cfg=true_cfg,
-                            return_details=False,
-                        )
+                    full_details = full_detail_cache[eta]
+                    full_seq = _compute_sequence_contributions(full_details, report_per_token=per_token)
+                    full_eta_per_sequence[eta_key] = full_seq
+                    grad_eta_deltas[eta_key] = []  # will fill below
+
+                    baseline_details = delta_true.compute_delta_h_true(
+                        ctx["data"],
+                        baseline_vector,
+                        eta,
+                        cfg=true_cfg,
+                        return_details=True,
                     )
+                    baseline_seq = _compute_sequence_contributions(baseline_details, report_per_token=per_token)
+                    baseline_eta_delta[eta_key] = float(baseline_details.get("delta_h_true", 0.0))
+                    baseline_eta_per_sequence[eta_key] = baseline_seq
+
+                    if per_sequence_vectors:
+                        chunk_size = max(1, int(plan.grad_chunk_size))
+                        total_vectors = len(per_sequence_vectors)
+                        num_chunks = max(1, math.ceil(total_vectors / chunk_size))
+
+                        grad_rows: List[List[float]] = []
+                        grad_baseline_rows: List[List[float]] = []
+
+                        chunk_indices: Iterable[int] = range(0, total_vectors, chunk_size)
+                        if plan.show_progress and num_chunks > 1:
+                            chunk_indices = tqdm(
+                                chunk_indices,
+                                total=num_chunks,
+                                desc=f"Eval {eval_idx} per-seq η={eta:g}",
+                                leave=False,
+                            )
+
+                        for start in chunk_indices:
+                            chunk = per_sequence_vectors[start: start + chunk_size]
+                            details_grad = delta_true.compute_delta_h_true_multi(
+                                ctx["data"],
+                                chunk,
+                                eta,
+                                cfg=true_cfg,
+                            )
+
+                            combined_chunk = []
+                            for direction in chunk:
+                                combined = {
+                                    name: baseline_vector[name] + direction[name]
+                                    for name in baseline_vector
+                                }
+                                combined_chunk.append(combined)
+
+                            details_combined = delta_true.compute_delta_h_true_multi(
+                                ctx["data"],
+                                combined_chunk,
+                                eta,
+                                cfg=true_cfg,
+                            )
+
+                            for detail_grad, detail_combined in zip(details_grad, details_combined):
+                                grad_seq = _compute_sequence_contributions(detail_grad, report_per_token=per_token)
+                                grad_rows.append(grad_seq)
+                                combined_seq = _compute_sequence_contributions(detail_combined, report_per_token=per_token)
+                                diff_seq = [c - b for c, b in zip(combined_seq, baseline_seq)]
+                                grad_baseline_rows.append(diff_seq)
+                                grad_eta_deltas[eta_key].append(float(detail_grad.get("delta_h_true", 0.0)))
+
+                        grad_eta_per_sequence[eta_key] = grad_rows
+                        grad_eta_baseline_per_sequence[eta_key] = grad_baseline_rows
 
             per_sequence = PerSequenceEntropyResult(
                 eta_reference=eta_reference,
@@ -585,6 +631,10 @@ class EntropyInfluenceRunner:
                 diagnostics=diagnostics_per_sequence,
                 grad_eta_deltas=grad_eta_deltas,
                 baseline_eta_delta=baseline_eta_delta,
+                full_eta_per_sequence=full_eta_per_sequence,
+                baseline_eta_per_sequence=baseline_eta_per_sequence,
+                grad_eta_per_sequence=grad_eta_per_sequence,
+                grad_eta_baseline_per_sequence=grad_eta_baseline_per_sequence,
             )
 
             evaluation_results.append(

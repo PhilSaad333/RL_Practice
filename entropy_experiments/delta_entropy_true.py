@@ -314,20 +314,19 @@ class DeltaEntropyTrue:
         """
         One TF no-grad pass on θ' = θ + η v using a *params-only* functional mapping in fp32.
         """
-        # Reconstruct BatchedSequences from E_batch data
         from entropy_experiments.utils.sequence_processor import BatchedSequences
+
         seqs = BatchedSequences(
             sequences=E_batch["sequences"],
             prompt_lens=E_batch["prompt_lens"],
-            gen_lens=E_batch["gen_lens"],  # Use the original gen_lens
+            gen_lens=E_batch["gen_lens"],
             attention_masks=E_batch["attention_masks"],
-            responses_text=[]  # Not needed for teacher forcing
+            responses_text=[],
         )
         use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
 
-        # Build params-only mapping (fp32) – single source of truth for overrides.
         params_override, _ = build_functional_params_named(
-            self.sp._unwrap(self.model),  # keep PEFT/LoRA wrapper intact; SP unwraps DDP only
+            self.sp._unwrap(self.model),
             v_named=v_named,
             eta=float(eta),
             detach_params=True,
