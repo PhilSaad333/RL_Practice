@@ -311,28 +311,10 @@ class SequenceProcessor:
         if not params_mappings:
             raise ValueError("params_mappings must be non-empty")
 
-        m = self._mdl_target
-        was = m.training
-        m.eval()
-        try:
-            stacked = {
-                name: torch.stack([mapping[name] for mapping in params_mappings], dim=0)
-                for name in params_mappings[0]
-            }
-
-            def _single_call(params):
-                out = torch.func.functional_call(
-                    m, params, (input_ids,),
-                    {'attention_mask': attention_mask, 'use_cache': False}
-                )
-                return out.logits if hasattr(out, "logits") else out[0]
-
-            with torch.autocast(device_type="cuda", enabled=False):
-                logits = torch.func.vmap(_single_call)(stacked)
-            return logits
-        finally:
-            if was:
-                m.train()
+        outputs = []
+        for mapping in params_mappings:
+            outputs.append(self._fc_logits_noautocast(input_ids, attention_mask, mapping))
+        return torch.stack(outputs, dim=0)
 
 
 
