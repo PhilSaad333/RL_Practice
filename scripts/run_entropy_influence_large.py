@@ -37,7 +37,7 @@ def to_serializable(obj: Any) -> Any:
 
 def main() -> None:
     cfg = yaml.safe_load(CONFIG_PATH.read_text())
-    cfg.setdefault("true_delta_h", {})["tf_batch_size"] = 8
+    cfg.setdefault("true_delta_h", {})["tf_batch_size"] = 128
     runner = EntropyInfluenceRunner(cfg)
 
     plan = EntropyInfluencePlan(
@@ -45,7 +45,7 @@ def main() -> None:
             kind=BatchRequestKind.UPDATE,
             params={
                 "batch_size_prompts": 2,
-                "completions_per_prompt": 4,
+                "completions_per_prompt": 8,
                 "dataset_split": "test",
                 "seed": 20250203,
             },
@@ -54,7 +54,7 @@ def main() -> None:
             BatchRequest(
                 kind=BatchRequestKind.EVALUATION,
                 params={
-                    "batch_size_prompts": 32,
+                    "batch_size_prompts": 128,
                     "completions_per_prompt": 1,
                     "dataset_split": "train",
                     "seed": 13579,
