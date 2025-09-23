@@ -33,6 +33,7 @@ class EntropyInfluencePlan:
     auto_scale_target: float = 1e-6
     record_per_sequence_eta: bool = False
     show_progress: bool = True
+    grad_chunk_size: int = 1
 
 
 @dataclass
@@ -540,33 +541,33 @@ class EntropyInfluenceRunner:
             grad_eta_deltas: Dict[str, List[float]] = {}
             baseline_eta_delta: Dict[str, float] = {}
             if plan.record_per_sequence_eta and per_sequence_vectors and eta_list:
-                per_eta_values = {eta: [] for eta in eta_list}
-                seq_iter: Iterable[Tuple[int, Dict[str, torch.Tensor]]] = enumerate(per_sequence_vectors)
-                if plan.show_progress:
-                    seq_iter = tqdm(
-                        seq_iter,
-                        total=len(per_sequence_vectors),
-                        desc=f"Eval {eval_idx} per-seq",
-                        leave=False,
-                    )
-                for seq_idx, direction in seq_iter:
-                    for eta in eta_list:
-                        per_eta_values[eta].append(
-                            float(
-                                delta_true.compute_delta_h_true(
-                                    ctx["data"],
-                                    direction,
-                                    eta,
-                                    cfg=true_cfg,
-                                    return_details=False,
-                                )
-                            )
+                chunk_size = max(1, int(plan.grad_chunk_size))
+                total_vectors = len(per_sequence_vectors)
+                num_chunks = max(1, math.ceil(total_vectors / chunk_size))
+
+                for eta in eta_list:
+                    eta_key = f"{eta:g}"
+                    values: List[float] = []
+                    chunk_indices: Iterable[int] = range(0, total_vectors, chunk_size)
+                    if plan.show_progress and num_chunks > 1:
+                        chunk_indices = tqdm(
+                            chunk_indices,
+                            total=num_chunks,
+                            desc=f"Eval {eval_idx} per-seq η={eta:g}",
+                            leave=False,
                         )
-                grad_eta_deltas = {
-                    f"{eta:g}": per_eta_values[eta] for eta in eta_list
-                }
-                baseline_eta_delta = {
-                    f"{eta:g}": float(
+                    for start in chunk_indices:
+                        chunk = per_sequence_vectors[start: start + chunk_size]
+                        details_list = delta_true.compute_delta_h_true_multi(
+                            ctx["data"],
+                            chunk,
+                            eta,
+                            cfg=true_cfg,
+                        )
+                        values.extend(float(detail.get("delta_h_true", 0.0)) for detail in details_list)
+
+                    grad_eta_deltas[eta_key] = values
+                    baseline_eta_delta[eta_key] = float(
                         delta_true.compute_delta_h_true(
                             ctx["data"],
                             baseline_vector,
@@ -575,8 +576,6 @@ class EntropyInfluenceRunner:
                             return_details=False,
                         )
                     )
-                    for eta in eta_list
-                }
 
             per_sequence = PerSequenceEntropyResult(
                 eta_reference=eta_reference,

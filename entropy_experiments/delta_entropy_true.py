@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -195,6 +195,70 @@ class DeltaEntropyTrue:
 
         return diag
 
+    @torch.no_grad()
+    def compute_delta_h_true_multi(
+        self,
+        E_batch: Dict[str, Any],
+        v_named_list: List[Dict[str, torch.Tensor]],
+        eta: float,
+        cfg: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not v_named_list:
+            return []
+
+        cfg = cfg or {}
+        clip_c = float(cfg.get("clip_c", 10.0))
+        report_per_token = bool(cfg.get("report_per_token", False))
+        use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
+
+        key = (id(E_batch), int(report_per_token), int(use_simple))
+        base_info = self._base_cache.get(key)
+        if base_info is None:
+            base_stats, H_base_mean = self._score_batch_base(
+                E_batch, report_per_token=report_per_token
+            )
+            base_info = {"seq_stats": base_stats, "H_base_mean": float(H_base_mean)}
+            self._base_cache[key] = base_info
+
+        base_stats: _SeqStats = base_info["seq_stats"]
+        H_base_mean: float = base_info["H_base_mean"]
+
+        new_stats_list = self._score_batch_new_multi(E_batch, v_named_list, eta)
+
+        results: List[Dict[str, Any]] = []
+        for new_stats in new_stats_list:
+            H_new_snis, ess, lw_stats, detail = self._snis_reduce(
+                base=base_stats,
+                new=new_stats,
+                clip_c=clip_c,
+                report_per_token=report_per_token,
+                return_details=True,
+            )
+            delta_val = H_new_snis - H_base_mean
+
+            diag: Dict[str, Any] = {
+                "delta_h_true": float(delta_val),
+                "base_entropy": float(H_base_mean),
+                "ess": float(ess),
+                "logweight_stats": {
+                    "min": lw_stats[0],
+                    "median": lw_stats[1],
+                    "max": lw_stats[2],
+                },
+                "clip_fraction": float(detail.get("clip_fraction", 0.0)),
+                "weights_sum": float(detail.get("weights_sum", 0.0)),
+                "normalized_weights": list(detail.get("norm_weights", [])),
+                "log_weights": list(detail.get("log_weights", [])),
+                "h_base": base_stats.integrand_seq.tolist(),
+                "h_new": new_stats.integrand_seq.tolist(),
+                "delta_h_seq": (new_stats.integrand_seq - base_stats.integrand_seq).tolist(),
+                "token_counts": new_stats.T_tokens.astype(int).tolist(),
+            }
+
+            results.append(diag)
+
+        return results
+
     def _batch_key(self, E_batch: Dict[str, Any]) -> int:
         """
         Lightweight identity key for caching within a single run. We assume the same
@@ -283,6 +347,55 @@ class DeltaEntropyTrue:
         )
 
         return self._extract_seq_stats(lp, diag, use_simple=use_simple)
+
+    @torch.no_grad()
+    def _score_batch_new_multi(
+        self,
+        E_batch: Dict[str, Any],
+        v_named_list: List[Dict[str, torch.Tensor]],
+        eta: float,
+    ) -> List[_SeqStats]:
+        if not v_named_list:
+            return []
+
+        from entropy_experiments.utils.sequence_processor import BatchedSequences
+
+        seqs = BatchedSequences(
+            sequences=E_batch["sequences"],
+            prompt_lens=E_batch["prompt_lens"],
+            gen_lens=E_batch["gen_lens"],
+            attention_masks=E_batch["attention_masks"],
+            responses_text=[],
+        )
+        use_simple = bool(self.config.get("estimator", {}).get("use_simple_entropy_for_x", False))
+
+        params_overrides: List[Dict[str, torch.Tensor]] = []
+        for v_named in v_named_list:
+            params_override, _ = build_functional_params_named(
+                self.sp._unwrap(self.model),
+                v_named=v_named,
+                eta=float(eta),
+                detach_params=True,
+                detach_buffers=True,
+                force_param_dtype=torch.float32,
+                force_buffer_dtype=None,
+            )
+            params_overrides.append(params_override)
+
+        lp_diag_list = self.sp.teacher_force_logprobs_with_diagnostics(
+            sequences=seqs,
+            with_grad=False,
+            tf_batch_size=1,
+            compute_rb=not use_simple,
+            return_baseline_features=False,
+            params_override=params_overrides,
+            buffers_override=None,
+        )
+
+        stats_list: List[_SeqStats] = []
+        for lp, diag in lp_diag_list:
+            stats_list.append(self._extract_seq_stats(lp, diag, use_simple=use_simple))
+        return stats_list
 
     def _extract_seq_stats(
         self,

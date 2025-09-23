@@ -306,6 +306,34 @@ class SequenceProcessor:
         finally:
             if was: m.train()
 
+    @torch.no_grad()
+    def _fc_logits_noautocast_multi(self, input_ids, attention_mask, params_mappings: List[dict[str, torch.Tensor]]):
+        if not params_mappings:
+            raise ValueError("params_mappings must be non-empty")
+
+        m = self._mdl_target
+        was = m.training
+        m.eval()
+        try:
+            stacked = {
+                name: torch.stack([mapping[name] for mapping in params_mappings], dim=0)
+                for name in params_mappings[0]
+            }
+
+            def _single_call(params):
+                out = torch.func.functional_call(
+                    m, params, (input_ids,),
+                    {'attention_mask': attention_mask, 'use_cache': False}
+                )
+                return out.logits if hasattr(out, "logits") else out[0]
+
+            with torch.autocast(device_type="cuda", enabled=False):
+                logits = torch.func.vmap(_single_call)(stacked)
+            return logits
+        finally:
+            if was:
+                m.train()
+
 
 
     def _log_once(self, key: str, msg: str):
@@ -654,7 +682,7 @@ class SequenceProcessor:
         tf_batch_size: int,
         compute_rb: bool,
         return_baseline_features: bool = False,
-        params_override: dict[str, torch.Tensor] | None = None,
+        params_override: Union[dict[str, torch.Tensor], List[dict[str, torch.Tensor]]] | None = None,
         buffers_override: dict[str, torch.Tensor] | None = None,
     ) -> Tuple[LogprobResults, DiagnosticsResults]:
         """
@@ -715,6 +743,15 @@ class SequenceProcessor:
             but the current fp32 runtime should make that unnecessary.
 
         """
+        if isinstance(params_override, list):
+            return self._teacher_force_no_grad_multi(
+                sequences,
+                tf_batch_size,
+                compute_rb,
+                return_baseline_features,
+                params_override,
+            )
+
         import numpy as np
         import torch.nn.functional as F
 
@@ -940,7 +977,199 @@ class SequenceProcessor:
         )
         diagnostics_results = DiagnosticsResults(diagnostics=all_diagnostics)
         return logprob_results, diagnostics_results
-    
+
+    def _teacher_force_no_grad_multi(
+        self,
+        sequences: BatchedSequences,
+        tf_batch_size: int,
+        compute_rb: bool,
+        return_baseline_features: bool,
+        params_overrides: List[dict[str, torch.Tensor]],
+    ) -> List[Tuple[LogprobResults, DiagnosticsResults]]:
+        import numpy as np
+        import torch.nn.functional as F
+
+        if not params_overrides:
+            raise ValueError("params_overrides must be non-empty")
+
+        model = self._unwrap(self.model)
+        model_device = next(model.parameters()).device
+
+        B, G = sequences.sequences.shape[:2]
+        K = len(params_overrides)
+
+        def _empty_pack() -> DiagnosticsPack:
+            return DiagnosticsPack(
+                step=TokenStepDiagnostics(
+                    rb_entropy=np.array([]),
+                    head_mass=np.array([]),
+                    tail_mass=np.array([]),
+                    two_point_entropy=np.array([]),
+                    top1_prob=np.array([]),
+                    margin=np.array([]),
+                    collision=np.array([]),
+                    renyi2=np.array([]),
+                    eff_support=np.array([]),
+                    logit_mean=np.array([]),
+                    logit_var=np.array([]),
+                    eos_prob=None,
+                ),
+                seq=SequenceDiagnostics(
+                    T=0,
+                    rb_entropy_sum=0.0,
+                    rb_entropy_mean=0.0,
+                    rb_entropy_max=0.0,
+                    rb_entropy_min=0.0,
+                    early_rb_entropy_mean=0.0,
+                    late_rb_entropy_mean=0.0,
+                    naive_surprisal_sum=0.0,
+                    naive_surprisal_mean=0.0,
+                    margin_mean=0.0,
+                    margin_sum=0.0,
+                    top1_prob_mean=0.0,
+                    collision_mean=0.0,
+                    renyi2_mean=0.0,
+                    eff_support_mean=0.0,
+                    eos_prob_mean=None,
+                ),
+            )
+
+        storages = []
+        for _ in range(K):
+            storages.append(
+                {
+                    "logprobs": [[] for _ in range(B)],
+                    "entropies": [[] for _ in range(B)],
+                    "rb": [[] for _ in range(B)],
+                    "seq_logprobs": [[] for _ in range(B)],
+                    "token_logqs": [[] for _ in range(B)],
+                    "seq_logqs": [[] for _ in range(B)],
+                    "diagnostics": [[] for _ in range(B)],
+                }
+            )
+
+        top_p = float(getattr(self.config, "top_p", 1.0))
+        temperature = float(getattr(self.config, "temperature", 1.0))
+        diag_helper = DistributionDiagnostics(
+            top_p=top_p,
+            temperature=temperature,
+            eos_token_id=getattr(self.tokenizer, "eos_token_id", None),
+        )
+
+        ent_dtype = torch.float64 if getattr(self, "_entropy_fp64", False) else torch.float32
+
+        with torch.no_grad():
+            for b in range(B):
+                for g in range(G):
+                    seq = sequences.sequences[b, g]
+                    prompt_len_padded = int(sequences.prompt_lens[b])
+                    gen_len = int(sequences.gen_lens[b][g])
+                    L_total = int(seq.size(0))
+
+                    if gen_len > 0 and L_total > prompt_len_padded:
+                        actual_len = min(prompt_len_padded + gen_len, L_total)
+                        input_seq = seq[:actual_len].unsqueeze(0).to(model_device, non_blocking=True)
+                        attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(model_device, non_blocking=True)
+
+                        logits_multi = self._fc_logits_noautocast_multi(input_seq, attn, params_overrides)
+                        # logits_multi: [K, 1, L, V]
+
+                        gen_start = prompt_len_padded
+                        gen_end = prompt_len_padded + gen_len
+                        assert gen_end > gen_start >= 1, (
+                            f"Bad generation slice: gen_start={gen_start}, gen_end={gen_end}, "
+                            f"prompt_len_padded={prompt_len_padded}, actual_len={actual_len}"
+                        )
+
+                        gen_tokens = seq[gen_start: gen_end].to(model_device, non_blocking=True)
+
+                        for k in range(K):
+                            storage = storages[k]
+                            logits = logits_multi[k, 0]
+
+                            if not torch.isfinite(logits).all():
+                                bad_row = (~torch.isfinite(logits)).any(dim=-1).nonzero(as_tuple=False).flatten()
+                                idx = int(bad_row[0].item()) if bad_row.numel() > 0 else -1
+                                self.logger.warning(
+                                    "[TF no-grad multi] Non-finite logits (first bad row idx=%d)", idx
+                                )
+                                raise RuntimeError("Non-finite logits in TF no-grad forward (multi).")
+
+                            gen_logits = logits[gen_start - 1: gen_end - 1]
+                            if gen_logits.size(0) != gen_tokens.size(0) or gen_logits.size(0) == 0:
+                                storage["diagnostics"][b].append(_empty_pack())
+                                storage["logprobs"][b].append(torch.from_numpy(np.array([])))
+                                storage["entropies"][b].append(np.array([]))
+                                storage["rb"][b].append(np.array([]))
+                                storage["seq_logprobs"][b].append(0.0)
+                                storage["token_logqs"][b].append(torch.from_numpy(np.array([])))
+                                storage["seq_logqs"][b].append(0.0)
+                                continue
+
+                            pack = diag_helper.compute_from_logits(gen_logits.float(), gen_tokens)
+
+                            logits_for_entropy = gen_logits.to(ent_dtype)
+                            log_probs = F.log_softmax(logits_for_entropy, dim=-1)
+                            probs = log_probs.exp()
+
+                            tok_ix = gen_tokens.view(-1, 1).to(log_probs.device)
+                            logp_on_tok = log_probs.gather(1, tok_ix).squeeze(1)
+
+                            token_logqs = self._compute_logq_top_p(
+                                gen_logits, gen_tokens, top_p=top_p, temperature=temperature
+                            )
+
+                            gen_logprobs_np = torch.nan_to_num(logp_on_tok, nan=0.0, posinf=0.0, neginf=-100.0) \
+                                                .float().cpu().numpy()
+                            gen_logqs_np = torch.nan_to_num(token_logqs, nan=0.0, posinf=0.0, neginf=-100.0) \
+                                                .float().cpu().numpy()
+                            entropies_naive = (-gen_logprobs_np)
+
+                            if compute_rb:
+                                rb_H = self._rb_entropies_top_p(gen_logits, top_p=top_p, temperature=temperature)
+                                rb_np = torch.nan_to_num(rb_H, nan=0.0, posinf=0.0, neginf=0.0).float().cpu().numpy()
+                            else:
+                                rb_np = np.array([])
+
+                            seq_logprob = float(gen_logprobs_np.sum())
+                            seq_logq = float(gen_logqs_np.sum())
+
+                            storage["diagnostics"][b].append(pack)
+                            storage["logprobs"][b].append(torch.from_numpy(gen_logprobs_np))
+                            storage["entropies"][b].append(entropies_naive)
+                            storage["rb"][b].append(rb_np)
+                            storage["seq_logprobs"][b].append(seq_logprob)
+                            storage["token_logqs"][b].append(torch.from_numpy(gen_logqs_np))
+                            storage["seq_logqs"][b].append(seq_logq)
+                    else:
+                        empty_pack = _empty_pack()
+                        for storage in storages:
+                            storage["diagnostics"][b].append(empty_pack)
+                            storage["logprobs"][b].append(torch.from_numpy(np.array([])))
+                            storage["entropies"][b].append(np.array([]))
+                            storage["rb"][b].append(np.array([]))
+                            storage["seq_logprobs"][b].append(0.0)
+                            storage["token_logqs"][b].append(torch.from_numpy(np.array([])))
+                            storage["seq_logqs"][b].append(0.0)
+
+        results: List[Tuple[LogprobResults, DiagnosticsResults]] = []
+        for storage in storages:
+            logprob_results = LogprobResults(
+                logprobs=storage["logprobs"],
+                entropies=storage["entropies"],
+                sequence_logprobs=storage["seq_logprobs"],
+                rb_entropies=storage["rb"],
+                rewards=[],
+                rb_entropies_torch=None,
+                baseline_feats_torch=None,
+                token_logqs=storage["token_logqs"],
+                sequence_logqs=storage["seq_logqs"],
+            )
+            diagnostics_results = DiagnosticsResults(diagnostics=storage["diagnostics"])
+            results.append((logprob_results, diagnostics_results))
+
+        return results
+
     def _teacher_force_with_grad(
             self,
             sequences: BatchedSequences,
