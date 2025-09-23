@@ -786,13 +786,18 @@ class SequenceProcessor:
         # Shapes
         B, G = sequences.sequences.shape[:2]
 
-        # Storage
+        total_pairs = B * G
+        flat_records: List[Tuple[int, int]] = []
+        for b in range(B):
+            for g in range(G):
+                flat_records.append((b, g))
+
         all_logprobs = [[] for _ in range(B)]
         all_entropies = [[] for _ in range(B)]
         all_rb_entropies = [[] for _ in range(B)]
         all_sequence_logprobs = [[] for _ in range(B)]
-        all_token_logqs = [[] for _ in range(B)]      # Stage 2
-        all_sequence_logqs = [[] for _ in range(B)]   # Stage 2
+        all_token_logqs = [[] for _ in range(B)]
+        all_sequence_logqs = [[] for _ in range(B)]
         all_diagnostics = [[] for _ in range(B)]
 
         # Diagnostics helper (policy must match generation policy)
@@ -819,9 +824,19 @@ class SequenceProcessor:
         ent_dtype = torch.float64 if getattr(self, "_entropy_fp64", False) else torch.float32
 
         with torch.no_grad():
-            for b in range(B):
-                for g in range(G):
-                    seq = sequences.sequences[b, g]                # [L_total]
+            for chunk_start in range(0, total_pairs, tf_batch_size):
+                chunk_records = flat_records[chunk_start: chunk_start + tf_batch_size]
+                chunk_inputs = []
+                chunk_masks = []
+                chunk_prompt_lens = []
+                chunk_gen_lens = []
+                chunk_actual_lens = []
+                chunk_full_seqs = []
+                skip_flags = []
+
+                max_len = 0
+                for b, g in chunk_records:
+                    seq = sequences.sequences[b, g]
                     prompt_len_padded = int(sequences.prompt_lens[b])
                     gen_len = int(sequences.gen_lens[b][g])
                     L_total = int(seq.size(0))
@@ -835,38 +850,97 @@ class SequenceProcessor:
                     seq_logq = 0.0                    # Stage 2
 
                     if gen_len > 0 and L_total > prompt_len_padded:
-                        # Slice prompt + exactly gen_len tokens (prefix used for TF)
                         actual_len = min(prompt_len_padded + gen_len, L_total)
-                        input_seq = seq[:actual_len].unsqueeze(0).to(model_device, non_blocking=True)  # [1, L]
-                        attn = sequences.attention_masks[b, g, :actual_len].unsqueeze(0).to(model_device, non_blocking=True)
+                        chunk_full_seqs.append(seq)
+                        chunk_prompt_lens.append(prompt_len_padded)
+                        chunk_gen_lens.append(gen_len)
+                        chunk_actual_lens.append(actual_len)
+                        skip_flags.append(False)
+                        input_seq = seq[:actual_len]
+                        attn = sequences.attention_masks[b, g, :actual_len]
+                        chunk_inputs.append(input_seq)
+                        chunk_masks.append(attn)
+                        if actual_len > max_len:
+                            max_len = actual_len
+                    else:
+                        chunk_full_seqs.append(seq)
+                        chunk_prompt_lens.append(prompt_len_padded)
+                        chunk_gen_lens.append(gen_len)
+                        chunk_actual_lens.append(0)
+                        skip_flags.append(True)
+                        chunk_inputs.append(None)
+                        chunk_masks.append(None)
 
-                        # Mapping to use (params-only)
-                        mapping = params_override if params_override is not None else zero_mapping
+                if not chunk_inputs:
+                    continue
 
-                        # Forward (unified path; no autocast; use_cache=False)
-                        logits_full = self._fc_logits_noautocast(input_seq, attn, mapping)
-                        logits = logits_full[0]   # [L, V]
+                if params_override is None:
+                    mapping = zero_mapping
+                else:
+                    mapping = params_override
 
-                        # Guard: logits must be finite
-                        if not torch.isfinite(logits).all():
-                            bad_row = (~torch.isfinite(logits)).any(dim=-1).nonzero(as_tuple=False).flatten()
-                            idx = int(bad_row[0].item()) if bad_row.numel() > 0 else -1
-                            self.logger.warning(
-                                "[TF no-grad] Non-finite logits (first bad row idx=%d). "
-                                "Ensure model runtime is fp32 and mapping is params-only.", idx
-                            )
-                            raise RuntimeError("Non-finite logits in TF no-grad forward.")
+                padded_inputs = []
+                padded_masks = []
+                for inp, mask in zip(chunk_inputs, chunk_masks):
+                    if inp is None:
+                        padded_inputs.append(torch.zeros(max_len, dtype=torch.long, device=model_device))
+                        padded_masks.append(torch.zeros(max_len, dtype=torch.long, device=model_device))
+                    else:
+                        pad_len = max_len - inp.size(0)
+                        if pad_len > 0:
+                            inp_pad = torch.nn.functional.pad(inp, (0, pad_len), value=self.tokenizer.pad_token_id or 0)
+                            mask_pad = torch.nn.functional.pad(mask, (0, pad_len), value=0)
+                        else:
+                            inp_pad = inp
+                            mask_pad = mask
+                        padded_inputs.append(inp_pad.to(model_device, non_blocking=True))
+                        padded_masks.append(mask_pad.to(model_device, non_blocking=True))
+
+                input_batch = torch.stack(padded_inputs, dim=0)
+                mask_batch = torch.stack(padded_masks, dim=0)
+                logits_full = self._fc_logits_noautocast(input_batch, mask_batch, mapping)
+
+                if logits_full.dim() == 2:
+                    logits_full = logits_full.unsqueeze(0)
+
+                for idx, (b, g) in enumerate(chunk_records):
+                    seq = chunk_full_seqs[idx]
+                    prompt_len_padded = chunk_prompt_lens[idx]
+                    gen_len = chunk_gen_lens[idx]
+                    actual_len = chunk_actual_lens[idx]
+                    skip = skip_flags[idx]
+                    logits = logits_full[idx]
+
+                    if skip or gen_len <= 0 or seq.size(0) <= prompt_len_padded:
+                        all_diagnostics[b].append(_empty_pack())
+                        all_logprobs[b].append(torch.from_numpy(np.array([])))
+                        all_entropies[b].append(np.array([]))
+                        all_rb_entropies[b].append(np.array([]))
+                        all_sequence_logprobs[b].append(0.0)
+                        all_token_logqs[b].append(torch.from_numpy(np.array([])))
+                        all_sequence_logqs[b].append(0.0)
+                        continue
+
+                    # Guard: logits must be finite
+                    if not torch.isfinite(logits).all():
+                        bad_row = (~torch.isfinite(logits)).any(dim=-1).nonzero(as_tuple=False).flatten()
+                        bad_idx = int(bad_row[0].item()) if bad_row.numel() > 0 else -1
+                        self.logger.warning(
+                            "[TF no-grad] Non-finite logits (first bad row idx=%d). "
+                            "Ensure model runtime is fp32 and mapping is params-only.", bad_idx
+                        )
+                        raise RuntimeError("Non-finite logits in TF no-grad forward.")
 
                         # Align to generated tokens: we use logits at i-1 to score token at i
                         gen_start = prompt_len_padded
-                        gen_end = prompt_len_padded + gen_len
+                        gen_end = min(prompt_len_padded + gen_len, actual_len)
                         assert gen_end > gen_start >= 1, (
                             f"Bad generation slice: gen_start={gen_start}, gen_end={gen_end}, "
                             f"prompt_len_padded={prompt_len_padded}, actual_len={actual_len}"
                         )
 
-                        gen_logits = logits[gen_start - 1: gen_end - 1]  # [T, V]
-                        gen_tokens = seq[gen_start: gen_end].to(gen_logits.device, non_blocking=True)  # [T]
+                        gen_logits = logits[gen_start - 1: gen_end - 1]
+                        gen_tokens = seq[gen_start: gen_end].to(gen_logits.device, non_blocking=True)
 
                         # Sanity: lengths must match and be non-zero
                         if gen_logits.size(0) == gen_tokens.size(0) and gen_logits.size(0) > 0:
@@ -1079,6 +1153,42 @@ class SequenceProcessor:
             temperature=temperature,
             eos_token_id=getattr(self.tokenizer, "eos_token_id", None),
         )
+
+        def _empty_pack() -> DiagnosticsPack:
+            return DiagnosticsPack(
+                step=TokenStepDiagnostics(
+                    rb_entropy=np.array([]),
+                    head_mass=np.array([]),
+                    tail_mass=np.array([]),
+                    two_point_entropy=np.array([]),
+                    top1_prob=np.array([]),
+                    margin=np.array([]),
+                    collision=np.array([]),
+                    renyi2=np.array([]),
+                    eff_support=np.array([]),
+                    logit_mean=np.array([]),
+                    logit_var=np.array([]),
+                    eos_prob=None,
+                ),
+                seq=SequenceDiagnostics(
+                    T=0,
+                    rb_entropy_sum=0.0,
+                    rb_entropy_mean=0.0,
+                    rb_entropy_max=0.0,
+                    rb_entropy_min=0.0,
+                    early_rb_entropy_mean=0.0,
+                    late_rb_entropy_mean=0.0,
+                    naive_surprisal_sum=0.0,
+                    naive_surprisal_mean=0.0,
+                    margin_mean=0.0,
+                    margin_sum=0.0,
+                    top1_prob_mean=0.0,
+                    collision_mean=0.0,
+                    renyi2_mean=0.0,
+                    eff_support_mean=0.0,
+                    eos_prob_mean=None,
+                ),
+            )
 
         ent_dtype = torch.float64 if getattr(self, "_entropy_fp64", False) else torch.float32
 

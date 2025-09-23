@@ -64,7 +64,7 @@ def main() -> None:
         microbatch_size=1,
         auto_scale=False,
         record_per_sequence_eta=True,
-        grad_chunk_size=4,
+        grad_chunk_size=1,
     )
 
     results = runner.run(plan)
