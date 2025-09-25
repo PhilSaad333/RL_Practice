@@ -1,5 +1,36 @@
 # Entropy Experiments
 
+## Human-written outline
+This is the main folder for all of my experiments. Generally what I do is take a model checkpoint with saved optimizer state and do repeated experiments from that checkpoint.
+
+The main theme of these experiments is to understand "What properties of a training step cause certain changes measurable quantities". One approach to this I see a lot is to compare the results of a full training run with no changes to one where the training algorithm is tweaked. Clearly this is not a good way to get reliable results for things that can be measured on small timescales in training. For such things, like the step change in entropy, which is the quantity I'm focusing on for now, we can do controlled experiments and get reliable results by running repeated experiments from the same training state.
+
+For example, I'm interested in understanding what causes the model's entropy to decrease over training (why does it explore less over time?). In this paper https://arxiv.org/abs/2505.22617 which motivated my project, they identify a candidate criterion for tokens in training samples that have an outsized contribution on entropy decrease (low probability tokens in incorrect responses). To demonstrate this they run multiple full training runs with algorithm tweaks that decrease the influence of these tokens to varying degrees, and find that as they decrease the influence, the entropy flattens out at a higher value. With sufficiently many training runs, an experiment like this can of course give reliable results, but that is sensitive to the variance of the quantity of interest (In this case the floor of the entropy late in training - for N randomly sampled runs how does this value vary?), and is pretty expensive.
+
+Furthermore, experiments like this seem inflexible - each expensive series of runs only tests one feature (e.g. the influence of those outlier tokens). 
+
+So I'm particularly interested in learning how to do experiments that are both scientifically reliable, inexpensive, and scalable. My current approach is to focus on a relatively small number of checkpoints taken from a single training run (or maybe a small number of runs), and use those as a proxy for studying the long-timescale dynamics during training. 
+
+As an illustration consider the question: "Do tokens with low probability in incorrect responses have an outsized contribution on the entropy decrease?". To study this with the naive "do many runs" approach, we need to identify some way to control for the effect of those tokens (done imperfectly but practically by the algorithm tweak proposed in that paper). Then we do N runs of T training steps, so a total of $N\times T$ steps. 
+
+Instead of doing this, I would do a single run (let's assume a single run is cheap) and produce K checkpoints over the T steps. Each of the K checkpoints is morally a representative of that period during the full training run. Then we can run N' experiments (each requiring an order one number of simulated training steps) from each of the K steps, for a total of $N'\times K$ steps. With $K\ll T$ we can get more "controlled data points" out of the same budget - essentially, doing repeated full training runs wastes resources becauses we can, for these purposes, study all timescales during training by re-running from a much smaller number of checkpoints many times. Doing this re-running gives us controlled results, whereas needing to re-run every step for each run means having a lot of wasted training steps. 
+
+Furthermore, we can test a lot more things at once, and get much higher quality data, by doing these repeated simulated training step experiments. For example, we can simultaneously compute the correlation between our quantity of interest (entropy change) and many properties of the training samples. In this case we can do even better - in the regime where the entropy change can be linearized in the learning rate (As I show is valid for the learning rates I used in training), we can approximately isolate the effects of individual samples in a highly controlled way. By being more careful about our measurements in these ways, we can not only get much more reliable results for cheaper, but we can more easily discover new effects (e.g. if the criterion for samples with outlier influence is more general than the one identified in https://arxiv.org/abs/2505.22617). We could even do more interesting things like study the tradeoff between exploration and performance gain by doing controlled experiments that compare the influence of individual samples, or tweaks to the training algorithm, on the rate of performance gain vs entropy decrease.
+
+A minor caveat is that its harder to test long term effects. For example, the motivation behind studying this entropy stuff is that one would hope that if you can encourage more exploration at low 'local' cost in performance gain, long term performance gain would be higher. This is harder to measure.
+
+Another thing I want to emphasize in these experiments is getting reliable measurments of our quantities of interest (e.g. step change in entropy). I'm pretty new to all this stuff about variance reduction, but from my brief experience so far it seems pretty important to take it seriously. A large fraction of the time I've spent on this project has been trying to get more precise measurements, which meant learning about fancy stats techniques. Before this I had no idea how useful they were!
+
+
+
+
+
+
+Below is an AI generated summary of the structure of this folder.
+
+
+
+
 ## Purpose
 - Study how RL-style parameter updates change policy entropy on curated evaluation batches.
 - Provide reproducible pipelines for AdamW update reconstruction, baseline decomposition, and per-sequence attributions.
