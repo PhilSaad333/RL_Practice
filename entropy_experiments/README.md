@@ -1,6 +1,6 @@
 # Entropy Experiments
 
-## Human-written outline
+## Basic Idea
 This is the main folder for all of my experiments. Generally what I do is take a model checkpoint with saved optimizer state and do repeated experiments from that checkpoint.
 
 The main theme of these experiments is to understand "What properties of a training step cause certain changes measurable quantities". One approach to this I see a lot is to compare the results of a full training run with no changes to one where the training algorithm is tweaked. Clearly this is not a good way to get reliable results for things that can be measured on small timescales in training. For such things, like the step change in entropy, which is the quantity I'm focusing on for now, we can do controlled experiments and get reliable results by running repeated experiments from the same training state.
@@ -21,21 +21,23 @@ A minor caveat is that its harder to test long term effects. For example, the mo
 
 Another thing I want to emphasize in these experiments is getting reliable measurments of our quantities of interest (e.g. step change in entropy). I'm pretty new to all this stuff about variance reduction, but from my brief experience so far it seems pretty important to take it seriously. A large fraction of the time I've spent on this project has been trying to get more precise measurements, which meant learning about fancy stats techniques. Before this I had no idea how useful they were!
 
+## What I do in practice
 
+For all the experiments, we have to run repeated measurements from the same model state. For various reasons, I decided that the best approach would be that for each measurement we should compute the 'update vector' (change in model parameters normalized by learning rate) explicitly from the saved optimizer state and the gradients from the samples used for an update. This is done in `update_vector.py` (I confirmed it works correctly by comparing with the results form a true model update). This update vector is used in two different ways: 
 
+- We can do simulated model updates by calling the model using Pytorch's `functional_call` with parameters $\theta +\eta*v$.
 
+- We can compute the formulas for the linearized entropy change directy by estimating $\nabla H$ and taking the dot product with $\eta*v$. It is most convenient to do this using Pytorch's `jvp`, which requires using `functional_call` (this is why I did this in the first place)
+
+We can also decompose the update vector as $v = v_{momentum} + \sum_{i\in U} v_i$, where $U$ is the batch of update samples. With these individual components we can isolate the effect of each sample (This crucially takes advantage of the linearized approximation).
+
+Currently, I'm studying the correlation between properties of each sample and its effect on the entropy.
 
 
 Below is an AI generated summary of the structure of this folder.
 
 
 
-
-## Purpose
-- Study how RL-style parameter updates change policy entropy on curated evaluation batches.
-- Provide reproducible pipelines for AdamW update reconstruction, baseline decomposition, and per-sequence attributions.
-- Support both ground-truth entropy deltas via importance sampling and faster approximations for iteration.
-- Capture rich diagnostics (logging, cached stats, per-token views) that feed downstream analysis notebooks and scripts.
 
 ## Workflows At A Glance
 - `EntropyMeasurements` (from `entropy_experiment_runner.py`) runs smaller sweeps directly from a YAML config.
