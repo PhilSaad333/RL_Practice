@@ -1,0 +1,20 @@
+Summary:
+- Ensure DeltaEntropyTrue respects cfg['tf_batch_size'] when scoring perturbed parameters.
+
+Rationale:
+- Without passing tf_batch_size, _score_batch_new may ignore micro-batching constraints leading to inconsistent SP runs between baseline and perturbed evaluations.
+
+Minimal Diffs:
+- Thread tf_batch_size through compute_delta_h_true, _compute_symmetric_fd, and _score_batch_new invocations so the SequenceProcessor sees the same batching policy.
+
+Steps:
+1. Update compute_delta_h_true to pass tf_batch_size into _score_batch_new.
+2. Extend _compute_symmetric_fd signature and invocations to include tf_batch_size and thread through to _score_batch_new.
+3. Verify no other callers require updates or default adjustments.
+
+Validation:
+- TODO: Run pytest -q entropy_experiments after syncing with Lambda to confirm entropy probes remain stable.
+
+Rollback:
+- Revert the tf_batch_size parameter threading or drop the new argument if batching alignment proves unnecessary.
+

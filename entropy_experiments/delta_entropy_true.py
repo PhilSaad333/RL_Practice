@@ -97,7 +97,12 @@ class DeltaEntropyTrue:
         base_stats: _SeqStats = base_info["seq_stats"]
         H_base_mean: float = base_info["H_base_mean"]
 
-        new_stats = self._score_batch_new(E_batch, v_named, eta)
+        new_stats = self._score_batch_new(
+            E_batch,
+            v_named,
+            eta,
+            tf_batch_size=tf_batch_size,
+        )
 
         clip_overrides = tuple(float(x) for x in (clip_overrides or ()))
         H_new_snis, ess, lw_stats, detail = self._snis_reduce(
@@ -186,6 +191,7 @@ class DeltaEntropyTrue:
                 eta=float(symmetric_eta),
                 clip_c=clip_c,
                 report_per_token=report_per_token,
+                tf_batch_size=tf_batch_size,
             )
 
         if self.logger:
@@ -538,12 +544,18 @@ class DeltaEntropyTrue:
         eta: float,
         clip_c: float,
         report_per_token: bool,
+        tf_batch_size: int,
     ) -> Dict[str, Any]:
         eta_abs = abs(float(eta))
         if eta_abs == 0.0:
             return {"eta": 0.0, "finite_difference": 0.0}
 
-        stats_plus = self._score_batch_new(E_batch, v_named, eta_abs)
+        stats_plus = self._score_batch_new(
+            E_batch,
+            v_named,
+            eta_abs,
+            tf_batch_size=tf_batch_size,
+        )
         H_plus, ess_plus, _, detail_plus = self._snis_reduce(
             base=base_stats,
             new=stats_plus,
@@ -553,7 +565,12 @@ class DeltaEntropyTrue:
         )
         delta_plus = H_plus - H_base
 
-        stats_minus = self._score_batch_new(E_batch, v_named, -eta_abs)
+        stats_minus = self._score_batch_new(
+            E_batch,
+            v_named,
+            -eta_abs,
+            tf_batch_size=tf_batch_size,
+        )
         H_minus, ess_minus, _, detail_minus = self._snis_reduce(
             base=base_stats,
             new=stats_minus,
