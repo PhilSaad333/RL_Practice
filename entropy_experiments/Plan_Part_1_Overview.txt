@@ -1,0 +1,379 @@
+Me:
+
+So i've made a file update_vector.py which computes the update direction (\Delta parameters, divided by learning rate) - see compute_update_vector_adamw (we also have the option to compute it using an actual optimizer step but that was mainly for debugging, i will want to get rid of it) Now what I want to do is modify my offiline_entropy_probe.py to use this. in the main method run_mixed_probe we will 1) we use the U batch to compute the update direction 2) give this to delta_entropy_is.py so that we can simulate a model update for various learning rates by computing \theta + \eta v for update vector v, and using torch.func.functional_call to compute the updated entropy using parameters \theta+\eta v 3) give v to the delta_entropy_approx (let's go over the details later, i haven't even attached it yet) So i think step 2, which is what i want to do now, will require changing sequence_proccessor.py and delta_entropy_is. We need sequence_processor.py to be able to compute logits as usual, or with this functional approach. This seems like possible the biggest organizational change. I want things to be clean, not have too many redundanceis, etc, so I'm open to reorganization if it will give a better end result. Then we need delta_entropy_is to use this new functionality of sequence processor to compute the entropies with these various updated parameters One thing that we need to be super careful about is that we are using a lora checkpoint - we need to be sure that we are careful about the lora structure when using this functional stuff. ive attached the model loading code for some more detail on how we load it. For now, just think through the structual changes we need and give me a high-level implementation plan - how we want to restructure things, and which order we should make changes in. ill want to test along the way, espeically to make sure that the sequence processer changes work
+
+Assistant's plan:
+
+Phase 0 — A tiny, LoRA-safe “functional params” builder
+Goal
+
+Given the current model state and a name-keyed update vector 
+𝑣
+v (per-unit-LR), build the parameter dictionary required by functional_call for 
+𝜃
++
+𝜂
+𝑣
+θ+ηv, without mutating the module.
+
+API
+# new util, e.g. entropy_experiments/param_overrides.py
+def build_functional_params_named(
+    model: torch.nn.Module,
+    v_named: dict[str, torch.Tensor] | None,
+    eta: float = 0.0,
+    *,
+    dtype: torch.dtype = torch.float32,   # for numerical stability; upcast ok
+    device: torch.device | None = None,   # if None, keep per-parameter device
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """
+    Return (params_dict, buffers_dict) for functional_call.
+    If v_named is None or eta==0, params_dict mirrors the current model state.
+    Only adds deltas to *trainable* params present in v_named; frozen params
+    (including LoRA base) are passed through unchanged.
+    """
+
+Notes
+
+The builder should enumerate all named_parameters() so every parameter is present (trainable or frozen). For keys present in v_named, compute p_eff = p + eta * v_named[name]; else p_eff = p. Do not alter the live module.
+
+Also return named_buffers() as a separate dict for functional_call.
+
+This builder is the single place where we ensure LoRA naming and shapes are respected across the project.
+
+Why now? You will reuse this in both SequenceProcessor and DeltaEntropyIS. It centralizes the “LoRA-safe functional params” behavior so you do not duplicate logic.
+(You already use consistent, name-keyed registries in your update-vector code. Keep that convention. 
+
+update_vector
+
+)
+
+Phase 1 — Extend SequenceProcessor with a teacher-forcing functional path
+Goal
+
+Enable teacher-forced log-prob / (optionally RB) computation either from the live model state or from an explicit parameter dictionary (built in Phase 0). We do not need generation under functional_call for Step 2—only TF evaluation on the E batch.
+
+Changes (surgical, low risk)
+
+Add a small internal helper:
+
+def _call_model_tf(self, input_ids, attention_mask, *, params_override=None, buffers_override=None):
+    mdl = self._unwrap(self.model)  # DDP-safe
+    if params_override is None:
+        return mdl(input_ids, attention_mask=attention_mask)
+    else:
+        return torch.func.functional_call(mdl, {**params_override, **(buffers_override or {})},
+                                          (input_ids, ), {'attention_mask': attention_mask})
+
+
+Use this in teacher-forcing code paths only (generation stays as-is).
+
+Plumb an optional argument through the TF entry points:
+
+teacher_force_logprobs(..., params_override: dict[str, Tensor] | None = None, buffers_override: dict[str, Tensor] | None = None)
+
+Same for teacher_force_logprobs_with_diagnostics(...).
+
+Inside _teacher_force_no_grad (and the with_grad variant if applicable), replace direct model(...) calls with _call_model_tf(...) and pass the overrides when provided.
+
+Testing as you go
+
+With params_override=None the outputs must be bit-identical to today’s behavior on a tiny E batch.
+
+With params_override built for eta=0, outputs must still match.
+
+With a synthetic v_named (e.g., a single LoRA weight perturbed by 
+10
+−
+6
+10
+−6
+), verify logits change continuously and TF still works.
+(Reference the current TF machinery and dataclasses here. 
+
+sequence_processor
+
+)
+
+Phase 2 — Add a “vector-driven” path in DeltaEntropyIS
+Goal
+
+A new method that does not step the optimizer. Instead, it:
+
+reads the base E-batch quantities at 
+𝜃
+θ,
+
+for each 
+𝜂
+η builds 
+𝜃
++
+𝜂
+𝑣
+θ+ηv via the Phase-0 builder,
+
+evaluates the updated E-batch quantities via the Phase-1 TF functional path,
+
+computes SNIS (or the configured IS estimator) to get 
+𝐻
+upd
+(
+𝜂
+)
+H
+upd
+	​
+
+(η), and
+
+returns 
+Δ
+𝐻
+true
+(
+𝜂
+)
+=
+𝐻
+upd
+(
+𝜂
+)
+−
+𝐻
+orig
+ΔH
+true
+	​
+
+(η)=H
+upd
+	​
+
+(η)−H
+orig
+	​
+
+ along with diagnostics.
+
+API
+# in DeltaEntropyIS
+def entropy_change_two_batch_vector(
+    self,
+    model: torch.nn.Module,
+    E_batch: dict,
+    *,
+    update_vector_named: dict[str, torch.Tensor],
+    etas: list[float],
+) -> dict:
+    """
+    Compute H_orig at θ and H_upd(η) at θ+ηv for each η using functional_call.
+    Returns { 'H_orig': ..., 'H_upd_list': [...], 'etas': [...], 'deltaH_true_list': [...],
+              'snis_diagnostics': [... per-eta ...] }.
+    """
+
+Implementation sketch
+
+Reuse your existing E-batch evaluation to get the “before” payloads needed by SNIS (RB sums or logp sums) at 
+𝜃
+θ. Your current code computes these and SNIS weights around before/after snapshots; you will replicate the “before” once, then only swap the “after” evaluation by calling TF with overrides for each 
+𝜂
+η. 
+
+delta_entropy_is
+
+For each 
+𝜂
+η:
+
+Build params_override, buffers_override = build_functional_params_named(model, v_named, eta).
+
+Call SequenceProcessor.teacher_force_logprobs(..., params_override=..., buffers_override=...) to compute the updated payloads on the same E batch.
+
+Construct log-weights 
+log
+⁡
+𝑤
+=
+log
+⁡
+𝑝
+𝜃
+(
+𝑦
+∣
+𝑥
+)
+−
+log
+⁡
+𝑝
+𝜃
++
+𝜂
+𝑣
+(
+𝑦
+∣
+𝑥
+)
+logw=logp
+θ
+	​
+
+(y∣x)−logp
+θ+ηv
+	​
+
+(y∣x) or whichever convention your SNIS routine expects; then call your existing _compute_snis_two_batch(...). (Re-use the robust float64 IS path you added.) 
+
+delta_entropy_is
+
+No optimizer snapshot/restore; no _rl_update. This path is purely functional.
+
+Testing as you go
+
+With etas=[0.0], verify 
+𝐻
+upd
+=
+𝐻
+orig
+H
+upd
+	​
+
+=H
+orig
+	​
+
+ within tolerance and SNIS ESS ≈ 1.
+
+With small etas=[±1e-4, ±5e-4], verify linear scaling of 
+Δ
+𝐻
+true
+ΔH
+true
+	​
+
+ and reasonable ESS.
+
+Confirm that only LoRA trainables appear in the update vector 
+𝑣
+v; base weights are untouched (by construction of the builder and your vector code).
+
+Phase 3 — Wire it in OfflineEntropyProbe.run_mixed_probe
+Goal
+
+Replace the old “take a real optimizer step” path with:
+
+Build 
+𝑣
+v once from the U-batch (AdamW math),
+
+Call the vector-driven IS path for a sweep of 
+𝜂
+η,
+
+Later (when ready) call your 
+𝛿
+𝐻
+1
+δH
+1
+	​
+
+ code with the same 
+𝑣
+v.
+
+Changes
+
+Import your update-vector API and compute 
+𝑣
+v using the AdamW-from-grads implementation on the 
+𝑈
+U batch (your new update_vector.py). Store as CPU/FP32 name-keyed tensors. 
+
+update_vector
+
+Add a config key such as true_delta_h.etas: [0.0, 1e-4, 3e-4, 1e-3].
+
+Call entropy_change_two_batch_vector(...) with update_vector_named=v and etas. Log results and diagnostics.
+(Integrate with the existing orchestration and logging in OfflineEntropyProbe—you already have the SequenceProcessor lifecycle and the IS component. 
+
+offline_entropy_probe
+
+)
+
+Testing as you go
+
+Quick end-to-end on a tiny E/U (e.g., B_E=2, B_U=2) with etas=[0, 1e-4].
+
+Verify no parameter mutation (compare a checksum of model weights before/after run_mixed_probe).
+
+Verify DDP remains off in your probe (you have a single-GPU mode); if you enable DDP later, ensure SequenceProcessor._unwrap is used for functional_call. 
+
+offline_entropy_probe
+
+Phase 4 — Clean out the “real step” paths (optional, once stable)
+
+In DeltaEntropyIS, the snapshot/restore + _rl_update_streaming path can remain for comparative experiments, but your “vector” method should become the default for LR sweeps.
+
+In update_vector.py, you can drop the “take one real step” builder if you no longer need it for debugging. (Right now it is helpful for parity checks; consider keeping it behind a debug flag. 
+
+update_vector
+
+)
+
+LoRA-specific cautions (and why the plan is safe)
+
+Parameter coverage. The Phase-0 builder enumerates all parameters; only trainables in 
+𝑣
+v receive a delta. Frozen LoRA base (and any frozen backbone) are passed through. Names and shapes match what your optimizer and loaders already use. (Model loading shows PEFT/LoRA structure and the trainable set; keep names consistent. 
+
+model_loader
+
+)
+
+Buffers. functional_call requires a buffers dict. Always pass named_buffers() from the unwrapped module alongside params; the helper _unwrap() you already have ensures consistent naming between DDP and non-DDP. 
+
+sequence_processor
+
+Autocast / dtype. functional_call respects the current autocast context; preserve your AMP settings as in the existing TF paths. (Your IS code already toggles AMP and dtype; reuse that.) 
+
+delta_entropy_is
+
+Suggested change order (to minimize risk)
+
+Phase 0 utility. Unit test: (params0, bufs) = build(..., v=None, eta=0) produces a dict whose tensors are equal to model’s current parameters; with a tiny synthetic v, check only the intended LoRA names differ by eta v[name].
+
+Phase 1 functional TF path in SequenceProcessor. Unit test:
+
+params_override=None equals current outputs,
+
+params_override(eta=0) equals current outputs,
+
+with a synthetic one-parameter perturbation, logits change as expected.
+
+Phase 2 new IS method in DeltaEntropyIS. Unit test on tiny E: η=0 returns 
+𝐻
+upd
+=
+𝐻
+orig
+H
+upd
+	​
+
+=H
+orig
+	​
+
+; small η matches a finite-difference check.
+
+Phase 3 wire in OfflineEntropyProbe. Integration test with tiny E/U and a short etas grid.
+
+(Optional) Remove legacy “real step” plumbing once you are confident.
